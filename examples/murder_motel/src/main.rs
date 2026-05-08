@@ -30,14 +30,18 @@
 //!
 //! [`CARGO_MANIFEST_DIR`]: https://doc.rust-lang.org/cargo/reference/environment-variables.html
 
+use std::cell::RefCell;
+use std::rc::Rc;
+
 use foglet_game::{
-    load_context, parse_map, process_env, render_menu_list, Game, GameConfig, GameContext, Input,
-    Map, MenuList, Screen, ScreenCommand, TileLegend,
+    load_context, load_dialog, parse_map, process_env, render_menu_list, Dialog, DialogState,
+    FlagSet, Game, GameConfig, GameContext, Input, Map, MenuList, Screen, ScreenCommand,
+    TileLegend,
 };
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::Frame;
 
 /// Absolute path to `examples/murder_motel/assets/game.toml`.
@@ -59,6 +63,19 @@ const GAME_TOML_PATH: &str = concat!(
 /// `assets/maps/<name>.txt`; switch to `std::fs::read_to_string` if you
 /// copy this scaffold and want hot-editable maps in dev.
 const LOBBY_MAP_TEXT: &str = include_str!("../assets/maps/lobby.txt");
+
+/// Dialog scripts for each NPC, embedded at compile time.
+///
+/// Same rationale as [`LOBBY_MAP_TEXT`] — keeping the YAML inside the
+/// binary means `cargo run --example` works no matter the CWD, and
+/// `fgk new`-generated scaffolds can swap to `std::fs::read_to_string`
+/// when authors want hot-edit iteration in dev. The Night Clerk's
+/// script carries the SPEC §13 branching requirement; the other two
+/// are short linear flavour beats so the map feels populated rather
+/// than decorated with one talkable NPC and two scenery glyphs.
+const NIGHT_CLERK_DIALOG: &str = include_str!("../assets/dialog/night_clerk.yaml");
+const BELLHOP_DIALOG: &str = include_str!("../assets/dialog/bellhop.yaml");
+const MAID_DIALOG: &str = include_str!("../assets/dialog/maid.yaml");
 
 /// First screen the player sees on launch.
 ///
@@ -277,6 +294,35 @@ impl Screen for MainMenuScreen {
     }
 }
 
+/// A non-player character pinned to a fixed cell on the lobby map.
+///
+/// `Npc` is intentionally `Copy` and built from `&'static str` slices
+/// so the whole NPC roster lives as a `const` array on
+/// [`MapScreen::NPCS`]. The conversation YAML is also `&'static str`
+/// (via `include_str!`); the dialog graph is parsed lazily when the
+/// player actually engages, which keeps the example's startup cost
+/// at zero NPC-related allocations.
+#[derive(Debug, Clone, Copy)]
+pub struct Npc {
+    /// Display name shown in the dialog header. Stable across runs.
+    pub name: &'static str,
+    /// Map glyph painted at `(x, y)`. Single-cell ASCII — the render
+    /// path treats it the same way it treats the player glyph.
+    pub glyph: char,
+    /// Map column. Must reference a walkable floor cell in the lobby
+    /// legend; the constructor does not validate this because the
+    /// roster is hand-authored and any drift will surface as a
+    /// failing test rather than a runtime panic.
+    pub x: u16,
+    /// Map row. Same constraint as [`Self::x`].
+    pub y: u16,
+    /// Embedded dialog YAML this NPC opens with. Loaded by
+    /// [`DialogScreen::new`] on first interaction; parse failures are
+    /// build-time bugs (the YAML ships in the binary) so the dialog
+    /// constructor uses `expect`.
+    pub dialog_yaml: &'static str,
+}
+
 /// Lobby map screen — the SPEC §13 "5 rooms with player movement"
 /// fixture (Task 13c).
 ///
@@ -313,6 +359,14 @@ pub struct MapScreen {
     player_x: u16,
     /// Player row. Same invariant as `player_x`.
     player_y: u16,
+    /// Narrative-flag store shared with [`DialogScreen`] so flags set
+    /// during a conversation persist across the dialog stack push/pop
+    /// boundary. The dialog state machine takes a `&mut FlagSet`; an
+    /// `Rc<RefCell<_>>` is the lightest way to lend the same
+    /// collection to two screens without the runtime needing a
+    /// flag-store concept yet (Task 13h will move this onto the save
+    /// manager so flags survive process exit).
+    flags: Rc<RefCell<FlagSet>>,
 }
 
 impl MapScreen {
@@ -344,6 +398,43 @@ impl MapScreen {
         ("Room 4", 38),
     ];
 
+    /// Non-player characters placed on the lobby map (Task 13d).
+    ///
+    /// Three NPCs satisfies the SPEC §13 acceptance criterion. Two of
+    /// them — Bellhop and Maid — exist as flavour with short linear
+    /// scripts; the Night Clerk carries the branching dialog the
+    /// acceptance fixture requires (a `requires`-gated choice that
+    /// only unlocks after the player asks about the murder).
+    ///
+    /// Coordinates are expressed in map cells. Each NPC sits on a
+    /// floor cell inside its room — see the lobby ASCII source for
+    /// the room geometry. Glyphs are single uppercase ASCII letters
+    /// so even monochrome BBS clients can tell them apart from the
+    /// player's `@`.
+    pub const NPCS: [Npc; 3] = [
+        Npc {
+            name: "Night Clerk",
+            glyph: 'C',
+            x: 24,
+            y: 2,
+            dialog_yaml: NIGHT_CLERK_DIALOG,
+        },
+        Npc {
+            name: "Bellhop",
+            glyph: 'B',
+            x: 4,
+            y: 2,
+            dialog_yaml: BELLHOP_DIALOG,
+        },
+        Npc {
+            name: "Maid",
+            glyph: 'M',
+            x: 41,
+            y: 2,
+            dialog_yaml: MAID_DIALOG,
+        },
+    ];
+
     /// Build the lobby map screen with the player at `(start_x,
     /// start_y)`. The constructor parses [`LOBBY_MAP_TEXT`] against
     /// the lobby legend; the parse can only fail if the embedded
@@ -357,6 +448,7 @@ impl MapScreen {
             map,
             player_x: 0,
             player_y: 0,
+            flags: Rc::new(RefCell::new(FlagSet::new())),
         };
         // Clamp the spawn against the map bounds and walkability so a
         // misconfigured `start_x` / `start_y` in `assets/game.toml`
@@ -406,13 +498,53 @@ impl MapScreen {
             Some(v) if v >= 0 => v as u16,
             _ => return false,
         };
-        if self.map.is_walkable(target_x, target_y) {
-            self.player_x = target_x;
-            self.player_y = target_y;
-            true
-        } else {
-            false
+        if !self.map.is_walkable(target_x, target_y) {
+            return false;
         }
+        // NPCs are solid: walking into one is converted to "stand
+        // adjacent". The talk affordance (Enter while next to an
+        // NPC) handles interaction; without this guard the player
+        // would have to step *off* an NPC's cell to address them,
+        // which is the wrong feel for a top-down game.
+        if Self::npc_at(target_x, target_y).is_some() {
+            return false;
+        }
+        self.player_x = target_x;
+        self.player_y = target_y;
+        true
+    }
+
+    /// Find the NPC standing on the given cell, if any. Pulled out
+    /// so both [`Self::try_move`] (blocking) and the talk handler
+    /// (adjacency probe) consult the same roster.
+    pub fn npc_at(x: u16, y: u16) -> Option<&'static Npc> {
+        Self::NPCS.iter().find(|n| n.x == x && n.y == y)
+    }
+
+    /// NPC the player can talk to right now, or `None`. Returns the
+    /// first NPC whose cell is the player's own cell or one of the
+    /// four cardinal neighbours — diagonal "talk through the wall"
+    /// would be ambiguous when an NPC is in a different room and
+    /// also feels wrong on a square grid.
+    pub fn nearby_npc(&self) -> Option<&'static Npc> {
+        const OFFSETS: &[(i32, i32)] = &[(0, 0), (1, 0), (-1, 0), (0, 1), (0, -1)];
+        for (dx, dy) in OFFSETS {
+            let cx = self.player_x as i32 + dx;
+            let cy = self.player_y as i32 + dy;
+            if cx < 0 || cy < 0 {
+                continue;
+            }
+            if let Some(npc) = Self::npc_at(cx as u16, cy as u16) {
+                return Some(npc);
+            }
+        }
+        None
+    }
+
+    /// Shared handle to the narrative-flag store. Cloned so the
+    /// dialog screen and the map screen mutate the same `RefCell`.
+    pub fn flags(&self) -> Rc<RefCell<FlagSet>> {
+        Rc::clone(&self.flags)
     }
 
     /// Locate a walkable cell near `(x, y)` by widening rings.
@@ -502,6 +634,9 @@ impl Screen for MapScreen {
         let label_style = Style::default()
             .fg(Color::Cyan)
             .add_modifier(Modifier::BOLD);
+        let npc_style = Style::default()
+            .fg(Color::Magenta)
+            .add_modifier(Modifier::BOLD);
 
         let mut lines: Vec<Line<'_>> = Vec::with_capacity(self.map.cells.len());
         for (y, row) in self.map.cells.iter().enumerate() {
@@ -527,6 +662,16 @@ impl Screen for MapScreen {
                         Self::PLAYER_GLYPH.to_string(),
                         player_glyph_style,
                     ));
+                    x += 1;
+                    continue;
+                }
+                // NPCs win over labels but lose to the player. The
+                // player and NPCs never share a cell because
+                // `try_move` blocks the player from stepping onto
+                // an NPC, so the priority here is purely a tiebreak
+                // against the room-label overlay.
+                if let Some(npc) = Self::npc_at(x as u16, y as u16) {
+                    spans.push(Span::styled(npc.glyph.to_string(), npc_style));
                     x += 1;
                     continue;
                 }
@@ -590,6 +735,15 @@ impl Screen for MapScreen {
                 self.try_move(1, 0);
                 ScreenCommand::None
             }
+            // Talk affordance: Enter (or `t`) when the player is
+            // adjacent to an NPC opens that NPC's dialog. With no
+            // one nearby the key is inert — silent rejection rather
+            // than an error message, the same feedback model as
+            // walking into a wall.
+            Input::Enter | Input::Char('t') | Input::Char('T') => match self.nearby_npc() {
+                Some(npc) => ScreenCommand::Push(Box::new(DialogScreen::new(npc, self.flags()))),
+                None => ScreenCommand::None,
+            },
             // Esc / Backspace pop back to the main menu so a curious
             // player can return to the splash flow without quitting.
             Input::Esc | Input::Backspace => ScreenCommand::Pop,
@@ -604,7 +758,281 @@ impl MapScreen {
     /// One-line movement hint shown directly below the map block.
     /// Pulled out as a constant so tests can assert it appears in the
     /// rendered buffer without binding to the precise wording.
-    pub const HINT_LINE: &'static str = "Move: arrows/hjkl    Back: Esc    Quit: Q";
+    pub const HINT_LINE: &'static str = "Move: arrows/hjkl    Talk: Enter    Back: Esc    Quit: Q";
+}
+
+/// Modal dialog screen pushed when the player talks to an NPC.
+///
+/// Owns a parsed [`Dialog`] graph and a [`DialogState`] cursor walking
+/// it. The shared [`FlagSet`] is borrowed from the [`MapScreen`] beneath
+/// us via an `Rc<RefCell<_>>`, so flags set during this conversation
+/// (the Night Clerk's `heard_rumor`, `has_key`, etc.) survive after the
+/// screen pops and are visible to later conversations and to future
+/// game logic (locked doors in 13f, win conditions in 13g).
+///
+/// ## Render contract
+///
+/// While the cursor sits on a line, the body shows the speaker's name
+/// and the line text plus a "[Enter] continue" hint. Once the lines on
+/// the current node are exhausted, the body shows the available
+/// choices through the shared [`MenuList`] widget. When the dialog has
+/// finished (no more lines, no more choices, no goto) the body shows
+/// a "[Esc] leave" hint.
+///
+/// ## Input contract
+///
+/// - `Up` / `Down` (and `j`/`k`) move the choice cursor when choices
+///   are visible.
+/// - `Enter` advances the next line, picks the highlighted choice, or
+///   pops the screen when the dialog is finished.
+/// - `Esc` / `Backspace` pops at any time — the player can always walk
+///   away mid-conversation.
+/// - `Q` / `Ctrl-C` still hard-quit, matching the rest of the kit.
+pub struct DialogScreen {
+    /// Speaker label rendered in the dialog block's title. Owned as
+    /// `&'static str` because [`Npc`] is `Copy` and lives in
+    /// [`MapScreen::NPCS`].
+    speaker: &'static str,
+    /// Parsed dialog graph. Held by value so `DialogState` can borrow
+    /// it across multiple input dispatches without lifetime gymnastics.
+    dialog: Dialog,
+    /// Cursor walking [`Self::dialog`].
+    state: DialogState,
+    /// Shared narrative-flag store. Cloned from [`MapScreen::flags`]
+    /// at construction time.
+    flags: Rc<RefCell<FlagSet>>,
+    /// Highlighted choice when choices are visible. Clamped against
+    /// `available_choices().len()` at render time, so it's safe to
+    /// keep around even when choices change between frames.
+    selected_choice: usize,
+}
+
+impl DialogScreen {
+    /// Build a dialog screen for the given NPC, sharing the supplied
+    /// flag store. The dialog YAML is parsed eagerly here so any
+    /// schema error surfaces at the moment the player presses Enter
+    /// rather than on the first render.
+    ///
+    /// `expect` is acceptable because the YAML ships in the binary
+    /// (`include_str!`); a parse failure is a build-time bug, not a
+    /// runtime input.
+    pub fn new(npc: &Npc, flags: Rc<RefCell<FlagSet>>) -> Self {
+        let dialog = load_dialog(npc.dialog_yaml).expect("embedded NPC dialog parses");
+        let state = {
+            let mut fs = flags.borrow_mut();
+            DialogState::start(&dialog, &mut fs)
+        };
+        Self {
+            speaker: npc.name,
+            dialog,
+            state,
+            flags,
+            selected_choice: 0,
+        }
+    }
+
+    /// Speaker name. Exposed for tests asserting which NPC is on
+    /// screen without poking at private fields.
+    pub fn speaker(&self) -> &str {
+        self.speaker
+    }
+
+    /// Whether the dialog cursor reports finished. Read-only: tests
+    /// assert end-state without driving the screen through input.
+    pub fn is_finished(&self) -> bool {
+        self.state.is_finished()
+    }
+
+    /// Borrow the underlying dialog state. Mostly for tests; gameplay
+    /// code routes through `handle_input`.
+    pub fn state(&self) -> &DialogState {
+        &self.state
+    }
+
+    /// Snapshot of the choice labels currently presented. Useful for
+    /// tests that want to assert "the unlocked branch appears after
+    /// the rumor flag is set" without owning a `Frame`.
+    pub fn current_choice_labels(&self) -> Vec<String> {
+        let flags = self.flags.borrow();
+        self.state
+            .available_choices(&self.dialog, &flags)
+            .into_iter()
+            .map(|c| c.text.clone())
+            .collect()
+    }
+}
+
+impl Screen for DialogScreen {
+    fn render(&mut self, _ctx: &mut GameContext<'_>, frame: &mut Frame<'_>) {
+        // Dialog modal sits across the bottom of the screen — high
+        // enough to fit the longest two-line node in the night clerk's
+        // script plus a hint row, and wide enough to fit the longest
+        // choice label without truncation. We centre it horizontally
+        // so the player's eye returns to roughly where the map sat.
+        let outer = frame.area();
+        let modal_w = outer.width.min(60);
+        let modal_h = outer.height.min(10);
+        let area = Rect {
+            x: outer.x + outer.width.saturating_sub(modal_w) / 2,
+            y: outer.y + outer.height.saturating_sub(modal_h) / 2,
+            width: modal_w,
+            height: modal_h,
+        };
+
+        let block = Block::default().borders(Borders::ALL).title(self.speaker);
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+
+        // Body decision: line-pumping mode, choice mode, or finished
+        // mode. Each mode renders its own widget into `inner`.
+        if let Some(line) = self.state.current_line(&self.dialog) {
+            // Reserve a one-row hint band at the bottom of `inner` for
+            // the "[Enter] continue" prompt; the rest is the line text
+            // wrapped to fit. `Wrap { trim: false }` keeps the
+            // author's literal punctuation but still wraps long lines.
+            let hint_h = 1.min(inner.height);
+            let body_h = inner.height.saturating_sub(hint_h);
+            let body = Rect {
+                x: inner.x,
+                y: inner.y,
+                width: inner.width,
+                height: body_h,
+            };
+            let hint = Rect {
+                x: inner.x,
+                y: inner.y + body_h,
+                width: inner.width,
+                height: hint_h,
+            };
+            let body_widget = Paragraph::new(line.to_string())
+                .alignment(Alignment::Left)
+                .wrap(Wrap { trim: false });
+            frame.render_widget(body_widget, body);
+            if hint_h > 0 {
+                frame.render_widget(
+                    Paragraph::new("[Enter] continue   [Esc] leave")
+                        .alignment(Alignment::Center)
+                        .style(Style::default().fg(Color::DarkGray)),
+                    hint,
+                );
+            }
+            return;
+        }
+
+        if self.is_finished() {
+            // Terminal node — the dialog ran off the end. Nothing to
+            // render except a leave hint; pressing Esc (or Enter)
+            // returns to the map.
+            let hint = Paragraph::new("(They turn away.)\n\n[Enter / Esc] leave")
+                .alignment(Alignment::Center)
+                .style(Style::default().fg(Color::DarkGray));
+            frame.render_widget(hint, inner);
+            return;
+        }
+
+        // Choice mode. Build owned `String`s for the menu widget and
+        // clamp the selection cursor against the live choice count.
+        let choice_labels = self.current_choice_labels();
+        if choice_labels.is_empty() {
+            // Defensive: validator guarantees this shape can only
+            // happen if every choice is gated *and* the node has no
+            // goto; render a leave hint so the player isn't stuck.
+            let hint = Paragraph::new("(There's nothing more to say.)\n\n[Esc] leave")
+                .alignment(Alignment::Center)
+                .style(Style::default().fg(Color::DarkGray));
+            frame.render_widget(hint, inner);
+            return;
+        }
+        let selected = self.selected_choice.min(choice_labels.len() - 1);
+        let menu = MenuList {
+            title: None,
+            items: &choice_labels,
+            selected,
+        };
+        // Reserve a hint band at the bottom of the modal.
+        let hint_h = 1.min(inner.height);
+        let body_h = inner.height.saturating_sub(hint_h);
+        let body = Rect {
+            x: inner.x,
+            y: inner.y,
+            width: inner.width,
+            height: body_h,
+        };
+        let hint = Rect {
+            x: inner.x,
+            y: inner.y + body_h,
+            width: inner.width,
+            height: hint_h,
+        };
+        render_menu_list(frame, body, &menu);
+        if hint_h > 0 {
+            frame.render_widget(
+                Paragraph::new("[Up/Down] choose    [Enter] pick    [Esc] leave")
+                    .alignment(Alignment::Center)
+                    .style(Style::default().fg(Color::DarkGray)),
+                hint,
+            );
+        }
+    }
+
+    fn handle_input(&mut self, _ctx: &mut GameContext<'_>, input: Input) -> ScreenCommand {
+        match input {
+            // Always-on quit affordances.
+            Input::Char('q') | Input::Char('Q') | Input::Ctrl('c') => ScreenCommand::Quit,
+            // Walk away from the conversation.
+            Input::Esc | Input::Backspace => ScreenCommand::Pop,
+
+            // Cursor movement applies only while choices are showing;
+            // outside that mode we treat it as inert (silent reject)
+            // so a stray arrow keystroke doesn't accidentally advance
+            // the line cursor.
+            Input::Up | Input::Char('k') | Input::Char('K') => {
+                if self.selected_choice > 0 {
+                    self.selected_choice -= 1;
+                }
+                ScreenCommand::None
+            }
+            Input::Down | Input::Char('j') | Input::Char('J') => {
+                let labels = self.current_choice_labels();
+                if !labels.is_empty() && self.selected_choice + 1 < labels.len() {
+                    self.selected_choice += 1;
+                }
+                ScreenCommand::None
+            }
+
+            Input::Enter => {
+                if self.is_finished() {
+                    return ScreenCommand::Pop;
+                }
+                let mut flags = self.flags.borrow_mut();
+                if self.state.current_line(&self.dialog).is_some() {
+                    // Pump the next line. `advance` only errors if
+                    // already finished, which we just checked.
+                    let _ = self.state.advance(&self.dialog, &mut flags);
+                    return ScreenCommand::None;
+                }
+                // Choice mode. Use the live count to clamp the index;
+                // an out-of-range pick returns NoChoices/OutOfRange
+                // and we fall through to a no-op rather than crashing.
+                let labels_len = self.state.available_choices(&self.dialog, &flags).len();
+                if labels_len == 0 {
+                    // Hub with all choices gated + no goto: try
+                    // advancing to honour any fallback the validator
+                    // permitted. If `advance` finishes the dialog,
+                    // the next Enter will Pop.
+                    let _ = self.state.advance(&self.dialog, &mut flags);
+                    return ScreenCommand::None;
+                }
+                let idx = self.selected_choice.min(labels_len - 1);
+                let _ = self.state.choose(&self.dialog, &mut flags, idx);
+                // Reset cursor for the next node so a long previous
+                // selection doesn't carry over to a short choice list.
+                self.selected_choice = 0;
+                ScreenCommand::None
+            }
+            _ => ScreenCommand::None,
+        }
+    }
 }
 
 /// Static help / controls reference, pushed from the main menu.
@@ -624,6 +1052,7 @@ impl HelpScreen {
     /// frame.
     pub const LINES: &'static [&'static str] = &[
         "Move          Arrow keys, or h/j/k/l",
+        "Talk          Enter (when standing next to an NPC)",
         "Select        Enter",
         "Back / Cancel Esc or Backspace",
         "Save          S",
@@ -1289,6 +1718,264 @@ mod tests {
             MapScreen::PLAYER_GLYPH,
             "expected `@` at player column; row was {:?}",
             rows[py as usize]
+        );
+    }
+
+    // ---- NPCs and DialogScreen (Task 13d) ------------------------------
+
+    #[test]
+    fn map_has_three_npcs_on_walkable_floors() {
+        // SPEC §13 says exactly three NPCs. Each must stand on a
+        // walkable floor cell — placing one on a wall would silently
+        // erase that wall in the renderer and confuse navigation.
+        let map = fresh_map_screen();
+        assert_eq!(MapScreen::NPCS.len(), 3, "expected exactly three NPCs");
+        for npc in MapScreen::NPCS.iter() {
+            assert!(
+                map.map().is_walkable(npc.x, npc.y),
+                "NPC {:?} stands on an unwalkable cell ({}, {})",
+                npc.name,
+                npc.x,
+                npc.y
+            );
+        }
+    }
+
+    #[test]
+    fn map_npc_glyphs_render_into_buffer() {
+        // Paint the lobby and confirm every NPC's glyph appears. Locks
+        // in the contract that the NPC overlay actually fires from
+        // `render`.
+        let cfg = fixture_config();
+        let fc = fixture_context();
+        let mut ctx = GameContext::new(&cfg, &fc, (80, 24));
+        let mut map = fresh_map_screen();
+        let mut term = Terminal::new(TestBackend::new(80, 24)).expect("test backend");
+        term.draw(|frame| map.render(&mut ctx, frame))
+            .expect("draw");
+        let buf = term.backend().buffer().clone();
+        let mut found = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                found.push_str(buf.cell((x, y)).expect("cell").symbol());
+            }
+            found.push('\n');
+        }
+        for npc in MapScreen::NPCS.iter() {
+            assert!(
+                found.contains(npc.glyph),
+                "missing NPC glyph {:?} for {:?}; buffer was:\n{}",
+                npc.glyph,
+                npc.name,
+                found
+            );
+        }
+    }
+
+    #[test]
+    fn map_npcs_block_player_movement() {
+        // Stepping into an NPC must be a no-op. Drive the player up
+        // to a cell adjacent to the Night Clerk and confirm the next
+        // Up does not enter the clerk's cell.
+        let cfg = fixture_config();
+        let fc = fixture_context();
+        let mut ctx = GameContext::new(&cfg, &fc, (80, 24));
+        let mut map = fresh_map_screen();
+        // Spawn (22, 4) → Up to (22, 3) → Right twice to (24, 3).
+        // Night Clerk sits on (24, 2).
+        map.handle_input(&mut ctx, Input::Up);
+        map.handle_input(&mut ctx, Input::Right);
+        map.handle_input(&mut ctx, Input::Right);
+        assert_eq!(map.player(), (24, 3));
+        // Up would step onto the clerk; movement must be rejected.
+        map.handle_input(&mut ctx, Input::Up);
+        assert_eq!(
+            map.player(),
+            (24, 3),
+            "player must not be able to walk onto an NPC's cell"
+        );
+    }
+
+    #[test]
+    fn map_enter_with_no_npc_nearby_is_inert() {
+        // From spawn the nearest NPC (Night Clerk at (24, 2)) is two
+        // cells diagonal away. Enter should not push a dialog.
+        let (_, cmd) = dispatch_map(Input::Enter);
+        assert!(
+            matches!(cmd, ScreenCommand::None),
+            "Enter with no nearby NPC must be inert, got {cmd:?}"
+        );
+    }
+
+    #[test]
+    fn map_enter_adjacent_to_npc_pushes_dialog() {
+        // Walk to the cell directly south of the Night Clerk and
+        // press Enter; the screen must push a DialogScreen.
+        let cfg = fixture_config();
+        let fc = fixture_context();
+        let mut ctx = GameContext::new(&cfg, &fc, (80, 24));
+        let mut map = fresh_map_screen();
+        map.handle_input(&mut ctx, Input::Up); // (22, 3)
+        map.handle_input(&mut ctx, Input::Right); // (23, 3)
+        map.handle_input(&mut ctx, Input::Right); // (24, 3)
+        let cmd = map.handle_input(&mut ctx, Input::Enter);
+        assert!(
+            matches!(cmd, ScreenCommand::Push(_)),
+            "Enter adjacent to Night Clerk must push a dialog, got {cmd:?}"
+        );
+    }
+
+    /// Construct a Night Clerk dialog screen with an empty flag store
+    /// for tests that need to drive the conversation directly.
+    fn fresh_clerk_dialog() -> (DialogScreen, Rc<RefCell<FlagSet>>) {
+        let flags = Rc::new(RefCell::new(FlagSet::new()));
+        let clerk = MapScreen::NPCS
+            .iter()
+            .find(|n| n.name == "Night Clerk")
+            .expect("night clerk in roster");
+        let screen = DialogScreen::new(clerk, Rc::clone(&flags));
+        (screen, flags)
+    }
+
+    #[test]
+    fn dialog_starts_on_speaker_and_first_line() {
+        let (screen, _flags) = fresh_clerk_dialog();
+        assert_eq!(screen.speaker(), "Night Clerk");
+        assert!(!screen.is_finished());
+        assert_eq!(screen.state().current_node(), "greeting");
+    }
+
+    #[test]
+    fn dialog_clerk_branch_is_gated_until_rumor_flag_set() {
+        // Branching contract: the "Got a master key" choice must NOT
+        // appear before the player asks about the murder, and MUST
+        // appear after the rumor flag has been set.
+        let cfg = fixture_config();
+        let fc = fixture_context();
+        let mut ctx = GameContext::new(&cfg, &fc, (80, 24));
+        let (mut screen, flags) = fresh_clerk_dialog();
+        // Advance through both greeting lines so choices are visible.
+        screen.handle_input(&mut ctx, Input::Enter);
+        screen.handle_input(&mut ctx, Input::Enter);
+        let initial = screen.current_choice_labels();
+        assert!(
+            !initial.iter().any(|t| t.contains("master key")),
+            "master-key choice should be gated initially; saw {initial:?}"
+        );
+
+        // Set the flag directly to keep the test focused on the gate
+        // rather than re-driving the whole conversation; the choose()
+        // path is exercised by the round-trip test below.
+        flags.borrow_mut().insert("heard_rumor".into());
+        let unlocked = screen.current_choice_labels();
+        assert!(
+            unlocked.iter().any(|t| t.contains("master key")),
+            "master-key choice should unlock once `heard_rumor` is set; saw {unlocked:?}"
+        );
+    }
+
+    #[test]
+    fn dialog_clerk_choose_rumor_then_key_sets_flags() {
+        // End-to-end: drive the conversation through the rumor →
+        // key handover branch and assert both flags persist on the
+        // shared store.
+        let cfg = fixture_config();
+        let fc = fixture_context();
+        let mut ctx = GameContext::new(&cfg, &fc, (80, 24));
+        let (mut screen, flags) = fresh_clerk_dialog();
+        // Pump greeting lines.
+        screen.handle_input(&mut ctx, Input::Enter);
+        screen.handle_input(&mut ctx, Input::Enter);
+        // Highlight "I heard about the murder." (index 1) and pick it.
+        screen.handle_input(&mut ctx, Input::Down);
+        screen.handle_input(&mut ctx, Input::Enter);
+        assert_eq!(screen.state().current_node(), "rumor");
+        assert!(flags.borrow().contains("heard_rumor"));
+        // Pump rumor lines.
+        screen.handle_input(&mut ctx, Input::Enter);
+        screen.handle_input(&mut ctx, Input::Enter);
+        // First choice on rumor is "What about that key?" — pick it.
+        screen.handle_input(&mut ctx, Input::Enter);
+        assert_eq!(screen.state().current_node(), "key_handed_over");
+        assert!(flags.borrow().contains("has_key"));
+    }
+
+    #[test]
+    fn dialog_esc_pops() {
+        let cfg = fixture_config();
+        let fc = fixture_context();
+        let mut ctx = GameContext::new(&cfg, &fc, (80, 24));
+        let (mut screen, _flags) = fresh_clerk_dialog();
+        let cmd = screen.handle_input(&mut ctx, Input::Esc);
+        assert!(matches!(cmd, ScreenCommand::Pop));
+    }
+
+    #[test]
+    fn dialog_q_quits() {
+        let cfg = fixture_config();
+        let fc = fixture_context();
+        let mut ctx = GameContext::new(&cfg, &fc, (80, 24));
+        let (mut screen, _flags) = fresh_clerk_dialog();
+        assert!(matches!(
+            screen.handle_input(&mut ctx, Input::Char('q')),
+            ScreenCommand::Quit
+        ));
+    }
+
+    #[test]
+    fn dialog_finished_then_enter_pops() {
+        // Walk the linear Bellhop dialog to its terminal node and
+        // confirm one more Enter pops the screen rather than
+        // erroring.
+        let cfg = fixture_config();
+        let fc = fixture_context();
+        let mut ctx = GameContext::new(&cfg, &fc, (80, 24));
+        let flags = Rc::new(RefCell::new(FlagSet::new()));
+        let bellhop = MapScreen::NPCS
+            .iter()
+            .find(|n| n.name == "Bellhop")
+            .expect("bellhop in roster");
+        let mut screen = DialogScreen::new(bellhop, Rc::clone(&flags));
+        // Two greeting lines, then advance past the last line into
+        // the goto, then a final advance to land on the empty `end`
+        // node and finish.
+        for _ in 0..4 {
+            screen.handle_input(&mut ctx, Input::Enter);
+        }
+        assert!(
+            screen.is_finished(),
+            "expected linear dialog to finish after 4 advances"
+        );
+        let cmd = screen.handle_input(&mut ctx, Input::Enter);
+        assert!(matches!(cmd, ScreenCommand::Pop));
+    }
+
+    #[test]
+    fn dialog_renders_into_test_backend() {
+        // Headless render check: the speaker name appears in the
+        // border and the first greeting line shows up in the body.
+        let cfg = fixture_config();
+        let fc = fixture_context();
+        let mut ctx = GameContext::new(&cfg, &fc, (80, 24));
+        let (mut screen, _flags) = fresh_clerk_dialog();
+        let mut term = Terminal::new(TestBackend::new(80, 24)).expect("test backend");
+        term.draw(|frame| screen.render(&mut ctx, frame))
+            .expect("draw");
+        let buf = term.backend().buffer().clone();
+        let mut found = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                found.push_str(buf.cell((x, y)).expect("cell").symbol());
+            }
+            found.push('\n');
+        }
+        assert!(
+            found.contains("Night Clerk"),
+            "expected speaker name in dialog frame; buffer was:\n{found}"
+        );
+        assert!(
+            found.contains("slouches"),
+            "expected first greeting line in dialog body; buffer was:\n{found}"
         );
     }
 }

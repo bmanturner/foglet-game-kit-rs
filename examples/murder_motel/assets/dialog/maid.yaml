@@ -1,0 +1,12 @@
+# Maid dialog — second linear NPC (Task 13d). She populates Room 4
+# (the eventual murder room from the Night Clerk's rumor) and gives
+# the player a small atmospheric beat without branching.
+
+start: greet
+nodes:
+  greet:
+    lines:
+      - "The Maid keeps her eyes on the floor."
+      - "'I just clean. I don't see nothin'.'"
+    goto: end
+  end: {}

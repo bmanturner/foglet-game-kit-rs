@@ -1,0 +1,13 @@
+# Bellhop dialog — short linear flavour text (Task 13d). The Bellhop
+# does not branch; he only exists to populate Room 1 and prove the
+# dialog screen handles linear conversations as well as the Night
+# Clerk's branching one.
+
+start: greet
+nodes:
+  greet:
+    lines:
+      - "The Bellhop adjusts his cap. 'Welcome to the Murder Motel.'"
+      - "'Lemme know if you need bags carried.'"
+    goto: end
+  end: {}
