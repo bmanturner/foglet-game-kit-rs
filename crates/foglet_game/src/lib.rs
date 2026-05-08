@@ -33,7 +33,10 @@
 
 pub mod foglet;
 
-pub use foglet::{load_context_from_file, ContextError, ContextSource, FogletContext};
+pub use foglet::{
+    load_context, load_context_from_env, load_context_from_file, process_env, ContextError,
+    ContextSource, FogletContext,
+};
 
 /// Crate version string, sourced from `Cargo.toml` at build time.
 ///

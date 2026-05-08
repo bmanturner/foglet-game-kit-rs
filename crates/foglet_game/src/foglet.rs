@@ -9,17 +9,25 @@
 //!
 //! The loader is split across three sub-tasks:
 //!
-//! - **Task 2a (this commit)** — the [`FogletContext`] type and the
+//! - **Task 2a** — the [`FogletContext`] type and the
 //!   `FOGLET_DOOR_CONTEXT` path → file → parse → typed value path.
-//! - **Task 2b** — env-var fallback (`FOGLET_DOOR_ID`, etc.) when the
-//!   context file is absent.
+//! - **Task 2b (this commit)** — env-var fallback (`FOGLET_DOOR_ID`,
+//!   etc.) when the context file is absent, plus the top-level
+//!   [`load_context`] orchestrator that enforces the SPEC §5.1
+//!   precedence rule "`FOGLET_DOOR_CONTEXT` JSON MUST win over
+//!   individual env vars".
 //! - **Task 2c** — local-dev synthesis when neither the file nor the
 //!   env vars are present, plus `--local-dev-fallback` semantics for
 //!   malformed JSON.
 //!
-//! Only the file-based path is wired up here so each sub-task ships
-//! with its own focused tests; the public entry point will gain the
-//! fallback branches in 2b/2c without breaking 2a's contract.
+//! All env-var inspection in this module goes through a caller-supplied
+//! `Fn(&str) -> Option<String>` closure rather than touching
+//! `std::env::var` directly. This is deliberate: process-environment
+//! mutation in tests is racy under `cargo test`'s default thread pool,
+//! and the orchestrator's whole job is "what does the env look like
+//! right now?". A closure makes that question pure and the tests
+//! parallel-safe. Callers who genuinely want process env can pass
+//! [`process_env`].
 
 use std::path::{Path, PathBuf};
 
@@ -142,6 +150,59 @@ pub enum ContextError {
         #[source]
         source: serde_json::Error,
     },
+
+    /// A required `FOGLET_*` environment variable was not set when the
+    /// loader fell back to the env-var path (no `FOGLET_DOOR_CONTEXT`).
+    /// "Required" here means the field is non-optional on
+    /// [`FogletContext`]: `door_id`, `terminal_width`, `terminal_height`.
+    /// Optional identity fields (`user_id`, `username`, `role`,
+    /// `session_id`) silently default to `None` per SPEC §5.1.
+    #[error("required environment variable {var} is not set")]
+    MissingEnv {
+        /// The variable name we looked for.
+        var: &'static str,
+    },
+
+    /// A `FOGLET_*` environment variable was set but did not parse as
+    /// the expected type. Only the numeric `FOGLET_TERMINAL_WIDTH` /
+    /// `FOGLET_TERMINAL_HEIGHT` vars can hit this branch — the string
+    /// fields are accepted as-is.
+    #[error("environment variable {var}={value:?} could not be parsed: {source}")]
+    InvalidEnv {
+        /// The variable name whose value did not parse.
+        var: &'static str,
+        /// The raw string value that failed parsing. Captured so the
+        /// operator-facing error message can show what Foglet (or the
+        /// dev shell) actually set, rather than just "parse error".
+        value: String,
+        /// The underlying parse error.
+        #[source]
+        source: std::num::ParseIntError,
+    },
+}
+
+pub mod env_vars {
+    //! `FOGLET_*` env-var names, mirrored from SPEC §2.2.
+    //!
+    //! Centralised as constants so the loader, the error messages, and
+    //! (eventually) the manifest emitter in Task 3 all reference
+    //! exactly the same string.
+
+    /// Path to the Foglet context JSON file. When set, takes
+    /// precedence over every other `FOGLET_*` variable per SPEC §5.1.
+    pub const DOOR_CONTEXT: &str = "FOGLET_DOOR_CONTEXT";
+    /// Stable door instance identifier. Required in env-fallback mode.
+    pub const DOOR_ID: &str = "FOGLET_DOOR_ID";
+    /// Foglet user id. Optional.
+    pub const USER_ID: &str = "FOGLET_USER_ID";
+    /// Display handle / username. Optional.
+    pub const USERNAME: &str = "FOGLET_USERNAME";
+    /// Foglet session id. Optional.
+    pub const SESSION_ID: &str = "FOGLET_SESSION_ID";
+    /// Terminal width in columns. Required in env-fallback mode.
+    pub const TERMINAL_WIDTH: &str = "FOGLET_TERMINAL_WIDTH";
+    /// Terminal height in rows. Required in env-fallback mode.
+    pub const TERMINAL_HEIGHT: &str = "FOGLET_TERMINAL_HEIGHT";
 }
 
 /// Read and parse a Foglet context JSON file from `path`.
@@ -171,6 +232,124 @@ pub fn load_context_from_file(path: impl AsRef<Path>) -> Result<FogletContext, C
         })?;
     ctx.source = ContextSource::ContextFile;
     Ok(ctx)
+}
+
+/// Build a [`FogletContext`] from individual `FOGLET_*` environment
+/// variables.
+///
+/// This is the env-var fallback path described in SPEC §5.1: used when
+/// `FOGLET_DOOR_CONTEXT` is not set but the operator (or a developer
+/// running the door directly in a shell) has populated the discrete
+/// `FOGLET_*` vars from SPEC §2.2.
+///
+/// `getenv` is the lookup closure. Tests pass a closure backed by a
+/// `HashMap` so the env state is purely local; production code passes
+/// [`process_env`].
+///
+/// Required vars: `FOGLET_DOOR_ID`, `FOGLET_TERMINAL_WIDTH`,
+/// `FOGLET_TERMINAL_HEIGHT`. Anything missing yields
+/// [`ContextError::MissingEnv`]. Width/height that do not parse as
+/// `u16` yield [`ContextError::InvalidEnv`]. Optional identity fields
+/// quietly default to `None` per SPEC §5.1.
+///
+/// The returned context is stamped with [`ContextSource::Env`] —
+/// callers (including the save manager in Task 8) use this to switch
+/// between production and local-dev paths.
+pub fn load_context_from_env<F>(getenv: F) -> Result<FogletContext, ContextError>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    // Required: door id. Without it, the save path resolver and the
+    // manifest emitter both lose their primary key, so we error rather
+    // than fabricate a default at this layer (Task 2c handles the
+    // "fabricate" case explicitly under a different `source`).
+    let door_id = getenv(env_vars::DOOR_ID).ok_or(ContextError::MissingEnv {
+        var: env_vars::DOOR_ID,
+    })?;
+
+    let terminal_width = parse_u16_env(env_vars::TERMINAL_WIDTH, &getenv)?;
+    let terminal_height = parse_u16_env(env_vars::TERMINAL_HEIGHT, &getenv)?;
+
+    Ok(FogletContext {
+        door_id,
+        // Optionals: empty-string env values are treated as absent.
+        // Foglet-side conventions on whether unset vars are absent or
+        // empty are not load-bearing here; either way a blank handle
+        // is not useful.
+        user_id: optional_env(env_vars::USER_ID, &getenv),
+        username: optional_env(env_vars::USERNAME, &getenv),
+        // `role` has no documented `FOGLET_*` env spelling in SPEC §2.2;
+        // it only appears in the JSON context. Env-fallback callers
+        // therefore never see a role and we leave it `None`.
+        role: None,
+        session_id: optional_env(env_vars::SESSION_ID, &getenv),
+        terminal_width,
+        terminal_height,
+        source: ContextSource::Env,
+    })
+}
+
+/// Read a `u16` env var or surface a structured error.
+fn parse_u16_env<F>(var: &'static str, getenv: &F) -> Result<u16, ContextError>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let raw = getenv(var).ok_or(ContextError::MissingEnv { var })?;
+    raw.parse::<u16>()
+        .map_err(|source| ContextError::InvalidEnv {
+            var,
+            value: raw,
+            source,
+        })
+}
+
+/// Read an optional string env var, treating empty strings as absent.
+fn optional_env<F>(var: &str, getenv: &F) -> Option<String>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    getenv(var).filter(|s| !s.is_empty())
+}
+
+/// Closure suitable for [`load_context`] / [`load_context_from_env`]
+/// that reads from the real process environment.
+///
+/// Pulled out so production callers spell their intent — "use real
+/// process env" — at the call site, and so tests can be obvious about
+/// not using it. Using `std::env::var` directly inside the loaders
+/// would have made them harder to test and easier to accidentally
+/// couple to global state.
+pub fn process_env(name: &str) -> Option<String> {
+    std::env::var(name).ok()
+}
+
+/// Top-level Foglet context loader.
+///
+/// Implements the SPEC §5.1 precedence rule:
+///
+/// 1. If `FOGLET_DOOR_CONTEXT` is set, load that JSON file. The file
+///    wins even if individual `FOGLET_*` vars are also populated — we
+///    do not "merge" them, because the JSON is Foglet's authoritative
+///    snapshot and the env vars exist primarily for local dev where
+///    the file is not produced.
+/// 2. Otherwise, fall back to [`load_context_from_env`].
+///
+/// Task 2c will extend step 2 with local-dev synthesis when no env
+/// vars are present and with `--local-dev-fallback` semantics for
+/// malformed JSON; until then, both branches surface their failures
+/// as [`ContextError`].
+///
+/// `getenv` is injected for the same reason as in
+/// [`load_context_from_env`] — testability without process-env
+/// mutation. Production callers use [`process_env`].
+pub fn load_context<F>(getenv: F) -> Result<FogletContext, ContextError>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    if let Some(path) = optional_env(env_vars::DOOR_CONTEXT, &getenv) {
+        return load_context_from_file(path);
+    }
+    load_context_from_env(getenv)
 }
 
 #[cfg(test)]
@@ -278,6 +457,197 @@ mod tests {
             }
             other => panic!("expected ParseFile, got {other:?}"),
         }
+    }
+
+    /// Build a `getenv`-style closure backed by a literal slice of
+    /// `(name, value)` pairs. Keeps the env-loader tests parallel-safe
+    /// (no `std::env::set_var` race) and self-documenting at the call
+    /// site.
+    fn fake_env<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |name: &str| {
+            pairs.iter().find_map(|(k, v)| {
+                if *k == name {
+                    Some((*v).to_owned())
+                } else {
+                    None
+                }
+            })
+        }
+    }
+
+    /// Env-only happy path: every required var present, every optional
+    /// var present. The resulting context carries [`ContextSource::Env`]
+    /// so downstream code can branch on "we are in env-fallback mode".
+    #[test]
+    fn env_fallback_loads_full_set() {
+        let env = fake_env(&[
+            ("FOGLET_DOOR_ID", "door-env-1"),
+            ("FOGLET_USER_ID", "u-env-9"),
+            ("FOGLET_USERNAME", "ada-env"),
+            ("FOGLET_SESSION_ID", "s-env-2"),
+            ("FOGLET_TERMINAL_WIDTH", "120"),
+            ("FOGLET_TERMINAL_HEIGHT", "40"),
+        ]);
+
+        let ctx = load_context_from_env(env).expect("load env context");
+
+        assert_eq!(ctx.door_id, "door-env-1");
+        assert_eq!(ctx.user_id.as_deref(), Some("u-env-9"));
+        assert_eq!(ctx.username.as_deref(), Some("ada-env"));
+        // `role` is not in SPEC §2.2's env-var list, so env mode never
+        // populates it regardless of any custom var the operator might
+        // have set.
+        assert!(ctx.role.is_none());
+        assert_eq!(ctx.session_id.as_deref(), Some("s-env-2"));
+        assert_eq!(ctx.terminal_width, 120);
+        assert_eq!(ctx.terminal_height, 40);
+        assert_eq!(ctx.source, ContextSource::Env);
+    }
+
+    /// Optionals are genuinely optional — present door id + terminal
+    /// dims is enough; the loader does not fail just because user/
+    /// session metadata is unset (SPEC §5.1).
+    #[test]
+    fn env_fallback_tolerates_missing_optionals() {
+        let env = fake_env(&[
+            ("FOGLET_DOOR_ID", "door-env-2"),
+            ("FOGLET_TERMINAL_WIDTH", "80"),
+            ("FOGLET_TERMINAL_HEIGHT", "24"),
+        ]);
+
+        let ctx = load_context_from_env(env).expect("load env context");
+
+        assert_eq!(ctx.door_id, "door-env-2");
+        assert!(ctx.user_id.is_none());
+        assert!(ctx.username.is_none());
+        assert!(ctx.session_id.is_none());
+    }
+
+    /// Empty-string env vars are treated as absent. Some shells and
+    /// orchestration tools "unset" a var by exporting it empty; we
+    /// don't want that to surface as `Some("")` user ids that confuse
+    /// the save-path resolver in Task 8.
+    #[test]
+    fn env_fallback_treats_empty_strings_as_absent() {
+        let env = fake_env(&[
+            ("FOGLET_DOOR_ID", "door-env-3"),
+            ("FOGLET_USER_ID", ""),
+            ("FOGLET_USERNAME", ""),
+            ("FOGLET_TERMINAL_WIDTH", "80"),
+            ("FOGLET_TERMINAL_HEIGHT", "24"),
+        ]);
+
+        let ctx = load_context_from_env(env).expect("load env context");
+
+        assert!(ctx.user_id.is_none());
+        assert!(ctx.username.is_none());
+    }
+
+    /// Missing required var → typed [`ContextError::MissingEnv`] with
+    /// the variable name attached so the operator-facing message can
+    /// say *which* one.
+    #[test]
+    fn env_fallback_errors_on_missing_required_var() {
+        // Door id missing.
+        let env = fake_env(&[
+            ("FOGLET_TERMINAL_WIDTH", "80"),
+            ("FOGLET_TERMINAL_HEIGHT", "24"),
+        ]);
+
+        let err = load_context_from_env(env).expect_err("must fail");
+        match err {
+            ContextError::MissingEnv { var } => assert_eq!(var, "FOGLET_DOOR_ID"),
+            other => panic!("expected MissingEnv, got {other:?}"),
+        }
+    }
+
+    /// Non-numeric width surfaces as [`ContextError::InvalidEnv`] with
+    /// both the variable name and the offending value, so an operator
+    /// staring at the message can see what they actually exported.
+    #[test]
+    fn env_fallback_errors_on_non_numeric_width() {
+        let env = fake_env(&[
+            ("FOGLET_DOOR_ID", "door-env-4"),
+            ("FOGLET_TERMINAL_WIDTH", "wide"),
+            ("FOGLET_TERMINAL_HEIGHT", "24"),
+        ]);
+
+        let err = load_context_from_env(env).expect_err("must fail");
+        match err {
+            ContextError::InvalidEnv { var, value, .. } => {
+                assert_eq!(var, "FOGLET_TERMINAL_WIDTH");
+                assert_eq!(value, "wide");
+            }
+            other => panic!("expected InvalidEnv, got {other:?}"),
+        }
+    }
+
+    /// SPEC §5.1: `FOGLET_DOOR_CONTEXT` JSON MUST win over individual
+    /// env vars. When both are set the JSON's identity must surface,
+    /// not the env vars'. We assert both the door id (proves the file
+    /// was read) and `source = ContextFile` (proves the file path won
+    /// the precedence check, not env-then-overwrite).
+    #[test]
+    fn json_context_wins_over_env_vars() {
+        let json = r#"{
+            "door_id": "door-from-json",
+            "user_id": "u-from-json",
+            "terminal_width": 100,
+            "terminal_height": 30
+        }"#;
+        let mut file = NamedTempFile::new().expect("create temp file");
+        file.write_all(json.as_bytes()).expect("write json");
+
+        let path_str = file.path().to_str().expect("utf-8 path").to_owned();
+        let env = move |name: &str| match name {
+            "FOGLET_DOOR_CONTEXT" => Some(path_str.clone()),
+            "FOGLET_DOOR_ID" => Some("door-from-env".to_owned()),
+            "FOGLET_USER_ID" => Some("u-from-env".to_owned()),
+            "FOGLET_TERMINAL_WIDTH" => Some("80".to_owned()),
+            "FOGLET_TERMINAL_HEIGHT" => Some("24".to_owned()),
+            _ => None,
+        };
+
+        let ctx = load_context(env).expect("load context");
+
+        assert_eq!(ctx.door_id, "door-from-json");
+        assert_eq!(ctx.user_id.as_deref(), Some("u-from-json"));
+        assert_eq!(ctx.terminal_width, 100);
+        assert_eq!(ctx.terminal_height, 30);
+        assert_eq!(ctx.source, ContextSource::ContextFile);
+    }
+
+    /// When `FOGLET_DOOR_CONTEXT` is unset, the orchestrator delegates
+    /// to the env path. This is the "running directly in a dev shell
+    /// with FOGLET_* exported" scenario.
+    #[test]
+    fn load_context_falls_back_to_env_when_no_context_file() {
+        let env = fake_env(&[
+            ("FOGLET_DOOR_ID", "door-env-5"),
+            ("FOGLET_TERMINAL_WIDTH", "80"),
+            ("FOGLET_TERMINAL_HEIGHT", "24"),
+        ]);
+
+        let ctx = load_context(env).expect("load context");
+        assert_eq!(ctx.door_id, "door-env-5");
+        assert_eq!(ctx.source, ContextSource::Env);
+    }
+
+    /// An empty `FOGLET_DOOR_CONTEXT` env var is treated as unset, not
+    /// as "open the file at path empty-string". Otherwise we'd surface
+    /// a confusing read error for what is really a "var was exported
+    /// blank" situation.
+    #[test]
+    fn empty_door_context_var_falls_back_to_env() {
+        let env = fake_env(&[
+            ("FOGLET_DOOR_CONTEXT", ""),
+            ("FOGLET_DOOR_ID", "door-env-6"),
+            ("FOGLET_TERMINAL_WIDTH", "80"),
+            ("FOGLET_TERMINAL_HEIGHT", "24"),
+        ]);
+
+        let ctx = load_context(env).expect("load context");
+        assert_eq!(ctx.source, ContextSource::Env);
     }
 
     /// The loader stamps `source = ContextFile` even if the JSON
