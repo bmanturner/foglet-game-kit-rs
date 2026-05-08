@@ -41,6 +41,7 @@ pub mod runtime;
 pub mod save;
 pub mod screen;
 pub mod terminal;
+pub mod widgets;
 
 pub use config::{
     ConfigError, GameConfig, GameSection, ManifestSection, SaveSection, SaveStrategy,
@@ -75,6 +76,10 @@ pub use terminal::{
     arm_panic_hook, disarm_panic_hook, flush_stdout, install_panic_hook, install_panic_hook_with,
     is_panic_hook_armed, CrosstermBackend, PanicRestoreFn, TerminalBackend, TerminalError,
     TerminalGuard,
+};
+pub use widgets::{
+    render_inventory_list, render_menu_list, render_message_line, InventoryList, MenuList,
+    MessageKind, MessageLine,
 };
 
 /// Crate version string, sourced from `Cargo.toml` at build time.
