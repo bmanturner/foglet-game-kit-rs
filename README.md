@@ -154,6 +154,41 @@ through the terminal guard (normal quit, error, panic, Ctrl-C, resize).
 Read SPEC §13.1 and [`docs/terminal-safety.md`](docs/terminal-safety.md)
 before touching anything that owns the alternate screen.
 
+## Limitations and known constraints
+
+Per SPEC §15 these are documented rather than worked around. They
+affect the *verification* surface, not the runtime contract.
+
+- **Scaffolded projects depend on an unpublished crate.** `fgk new`
+  emits a `Cargo.toml` with `foglet_game = "0.1"`, matching the kit's
+  pre-1.0 plan. Until `foglet_game` is published to crates.io, point
+  the dependency at a checkout — e.g. `foglet_game = { path =
+  "../foglet-game-kit-rs/crates/foglet_game" }` — to compile a
+  freshly-scaffolded project. The scaffold smoke test in
+  `crates/fgk/tests/cli_new.rs` verifies file generation; running
+  `cargo test` inside the scaffold is gated on the publish step.
+- **`murder_motel` is a workspace example, not a standalone project.**
+  Sources live at `examples/murder_motel/` and compile via
+  `cargo run --example murder_motel`. To package it with `fgk
+  package`, build the example first and pass `--binary` so the CLI
+  skips its own `cargo build --release`:
+
+  ```bash
+  cargo build --release --example murder_motel
+  fgk package \
+    --project examples/murder_motel \
+    --out dist/ \
+    --binary target/release/examples/murder_motel
+  ```
+
+  Projects produced by `fgk new` build a regular release binary and
+  do not need the `--binary` flag.
+- **TUI smoke is manual.** SPEC §13.1 explicitly accepts manual
+  evidence for the terminal-guard contract (raw mode + alternate
+  screen + panic-hook restoration) because CI cannot drive a real
+  terminal. The recipe and evidence trail live in
+  [`docs/terminal-safety.md`](docs/terminal-safety.md).
+
 ## License
 
 Dual-licensed under MIT or Apache-2.0, matching the wider Rust
