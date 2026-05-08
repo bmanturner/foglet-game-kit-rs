@@ -37,17 +37,12 @@
 //!
 //! # What this module does NOT do (yet)
 //!
-//! - **No explicit `cleanup()` destructor.** That lands in Task 5b so
-//!   callers can run the restoration sequence eagerly (e.g. before
-//!   printing a controlled error per SPEC §7.3) and leave Drop as a
-//!   safety net.
 //! - **No panic-hook installation.** Task 5c installs a panic hook
 //!   that runs the same restoration *before* the default panic
-//!   handler prints, per SPEC §7.3 / §13.1.
-//!
-//! Both of those layers will reuse [`TerminalGuard`]'s `cleaned` flag
-//! and backend trait; this module is laid out to absorb them without
-//! re-shaping the public type.
+//!   handler prints, per SPEC §7.3 / §13.1. The hook will reuse the
+//!   `cleaned` flag below — by setting it to `true` after running
+//!   restoration itself, it makes the eventual Drop a no-op without
+//!   needing a back-channel to the guard instance.
 
 use std::io::{self, Stdout, Write};
 
@@ -255,6 +250,40 @@ impl<B: TerminalBackend> TerminalGuard<B> {
     pub fn is_cleaned(&self) -> bool {
         self.cleaned
     }
+
+    /// Explicitly restore the terminal *now* and mark the guard spent.
+    ///
+    /// The motivating use case is SPEC §7.3's "controlled error" path:
+    /// the runtime hits a recoverable failure inside the loop and
+    /// wants to restore the terminal *before* printing the error
+    /// message — otherwise the message lands inside the alternate
+    /// screen and disappears the moment the process exits. Drop is
+    /// the safety net; this is the eager path callers reach for when
+    /// they need the error text to actually be visible.
+    ///
+    /// After this returns (success or failure) the guard is marked
+    /// cleaned, so the eventual Drop is a no-op. Calling `cleanup`
+    /// twice is safe and a no-op the second time — the surfaced
+    /// teardown error is whatever the *first* call observed.
+    ///
+    /// Unlike Drop, this returns the teardown error so callers can
+    /// log it. By the time the error fires the terminal is in an
+    /// undefined state and there is no useful recovery beyond
+    /// reporting it; the runtime's response should be to log via the
+    /// file appender (SPEC §13.2 — never stdout while we may have
+    /// been in raw mode) and exit.
+    pub fn cleanup(&mut self) -> Result<(), TerminalError> {
+        if self.cleaned {
+            return Ok(());
+        }
+        // Mark cleaned *before* attempting `leave`. Even on failure
+        // the terminal has been partially poked — running `leave`
+        // again from Drop would compound the corruption rather than
+        // recover from it. The flag's invariant is "we have made our
+        // one teardown attempt," not "teardown succeeded."
+        self.cleaned = true;
+        self.backend.leave()
+    }
 }
 
 impl<B: TerminalBackend> Drop for TerminalGuard<B> {
@@ -418,6 +447,70 @@ mod tests {
             guard.cleaned = true;
         }
         // Exactly one leave despite the guard going through Drop.
+        assert_eq!(*log.borrow(), vec!["enter", "leave"]);
+    }
+
+    #[test]
+    fn explicit_cleanup_then_drop_runs_leave_exactly_once() {
+        // SPEC §7.3 controlled-error path: the runtime restores the
+        // terminal *before* printing the error, then the guard is
+        // dropped on the way out. Drop must observe `cleaned = true`
+        // and skip its own `leave` call.
+        let backend = RecordingBackend::default();
+        let log = backend.log.clone();
+        {
+            let mut guard = TerminalGuard::with_backend(backend).expect("setup ok");
+            guard.cleanup().expect("cleanup ok");
+            assert!(guard.is_cleaned(), "cleanup must mark guard spent");
+        }
+        assert_eq!(*log.borrow(), vec!["enter", "leave"]);
+    }
+
+    #[test]
+    fn drop_without_explicit_cleanup_still_restores() {
+        // The dual of the previous test: callers who never reach
+        // `cleanup()` (panic mid-loop, normal Quit path before 5c
+        // lands, etc.) must still get a one-shot Drop teardown.
+        let backend = RecordingBackend::default();
+        let log = backend.log.clone();
+        {
+            let _guard = TerminalGuard::with_backend(backend).expect("setup ok");
+            // No explicit cleanup; just fall out of scope.
+        }
+        assert_eq!(*log.borrow(), vec!["enter", "leave"]);
+    }
+
+    #[test]
+    fn double_cleanup_is_a_noop() {
+        // Idempotency: a defensive caller (or a future runtime that
+        // calls cleanup from both the controlled-error path *and* a
+        // shutdown hook) must not double-restore.
+        let backend = RecordingBackend::default();
+        let log = backend.log.clone();
+        let mut guard = TerminalGuard::with_backend(backend).expect("setup ok");
+        guard.cleanup().expect("first cleanup ok");
+        guard.cleanup().expect("second cleanup is a noop");
+        drop(guard);
+        assert_eq!(*log.borrow(), vec!["enter", "leave"]);
+    }
+
+    #[test]
+    fn cleanup_surfaces_teardown_error_and_marks_spent() {
+        // Failed teardown is observable through `cleanup()` — that is
+        // its whole reason for existing on top of Drop. The guard
+        // still ends up marked spent so a subsequent Drop will not
+        // re-attempt teardown on a half-restored terminal.
+        let backend = RecordingBackend {
+            fail_leave: true,
+            ..RecordingBackend::default()
+        };
+        let log = backend.log.clone();
+        let mut guard = TerminalGuard::with_backend(backend).expect("setup ok");
+        let res = guard.cleanup();
+        assert!(matches!(res, Err(TerminalError::Teardown(_))));
+        assert!(guard.is_cleaned(), "failed cleanup still marks guard spent");
+        drop(guard);
+        // Exactly one leave attempt despite the failure + Drop.
         assert_eq!(*log.borrow(), vec!["enter", "leave"]);
     }
 
