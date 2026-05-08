@@ -31,6 +31,10 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs, rust_2018_idioms)]
 
+pub mod foglet;
+
+pub use foglet::{load_context_from_file, ContextError, ContextSource, FogletContext};
+
 /// Crate version string, sourced from `Cargo.toml` at build time.
 ///
 /// Exposed primarily so the `fgk` CLI and example games can print

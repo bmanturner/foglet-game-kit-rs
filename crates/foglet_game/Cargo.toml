@@ -24,9 +24,17 @@ name = "foglet_game"
 path = "src/lib.rs"
 
 [dependencies]
-# No runtime deps land in Task 1. They're added in the task that
-# first uses them so the dependency graph stays auditable against
-# SPEC §6.
+# Task 2 (Foglet context loader) pulls in serde for the typed
+# `FogletContext` struct, serde_json to parse the
+# `FOGLET_DOOR_CONTEXT` file, and thiserror for library-internal
+# error variants (per SPEC §6 + the "thiserror inside libraries"
+# rule in PROMPT.md).
+serde      = { workspace = true }
+serde_json = { workspace = true }
+thiserror  = { workspace = true }
 
 [dev-dependencies]
-# Test-only helpers. None pulled in yet; added per-task as needed.
+# `tempfile` lets the loader tests write a context file to a real
+# path on disk, exercising the same code path Foglet uses in prod
+# (env var → filesystem → parse) instead of stubbing the filesystem.
+tempfile = { workspace = true }
