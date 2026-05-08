@@ -31,12 +31,13 @@
 //! [`CARGO_MANIFEST_DIR`]: https://doc.rust-lang.org/cargo/reference/environment-variables.html
 
 use std::cell::RefCell;
+use std::collections::BTreeSet;
 use std::rc::Rc;
 
 use foglet_game::{
-    load_context, load_dialog, parse_map, process_env, render_menu_list, Dialog, DialogState,
-    FlagSet, Game, GameConfig, GameContext, Input, Map, MenuList, Screen, ScreenCommand,
-    TileLegend,
+    load_context, load_dialog, parse_map, process_env, render_inventory_list, render_menu_list,
+    Dialog, DialogState, FlagSet, Game, GameConfig, GameContext, Input, InventoryList, Map,
+    MenuList, Screen, ScreenCommand, TileLegend,
 };
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -323,6 +324,35 @@ pub struct Npc {
     pub dialog_yaml: &'static str,
 }
 
+/// A collectable item pinned to a fixed cell on the lobby map.
+///
+/// Like [`Npc`], `Item` is `Copy` and built from `&'static str` slices
+/// so the entire item catalog lives as a `const` array on
+/// [`MapScreen::ITEMS`]. The collected set is tracked separately on the
+/// map screen as a [`BTreeSet`] of item IDs; the catalog is the
+/// authoritative source for an item's display name and glyph regardless
+/// of whether the player has picked it up.
+#[derive(Debug, Clone, Copy)]
+pub struct Item {
+    /// Stable identifier used as the inventory key. Chosen from a
+    /// constrained ASCII namespace so it round-trips through the save
+    /// file (Task 13h) without serialisation surprises.
+    pub id: &'static str,
+    /// Display name shown on the inventory screen. Stored separately
+    /// from `id` so we can rename the player-facing label without
+    /// invalidating saves.
+    pub name: &'static str,
+    /// Map glyph painted at `(x, y)` while the item is uncollected.
+    /// Single-cell ASCII to match the player and NPC overlays.
+    pub glyph: char,
+    /// Map column. Must reference a walkable floor cell that is *not*
+    /// occupied by an NPC; the test
+    /// `map_items_sit_on_walkable_non_npc_cells` enforces this.
+    pub x: u16,
+    /// Map row. Same constraint as [`Self::x`].
+    pub y: u16,
+}
+
 /// Lobby map screen — the SPEC §13 "5 rooms with player movement"
 /// fixture (Task 13c).
 ///
@@ -367,6 +397,11 @@ pub struct MapScreen {
     /// flag-store concept yet (Task 13h will move this onto the save
     /// manager so flags survive process exit).
     flags: Rc<RefCell<FlagSet>>,
+    /// Set of collected item IDs, shared with the [`InventoryScreen`]
+    /// the same way `flags` is shared with the [`DialogScreen`]. A
+    /// `BTreeSet<String>` mirrors the [`FlagSet`] shape so Task 13h
+    /// can serialise both stores through the same code path.
+    inventory: Rc<RefCell<BTreeSet<String>>>,
 }
 
 impl MapScreen {
@@ -435,6 +470,55 @@ impl MapScreen {
         },
     ];
 
+    /// Catalog of collectable items distributed across the lobby's
+    /// five rooms (Task 13e).
+    ///
+    /// Exactly five items, exactly one per room, satisfies the
+    /// SPEC §13 acceptance criterion. Coordinates land on floor cells
+    /// that are not occupied by an NPC; the
+    /// `map_items_sit_on_walkable_non_npc_cells` test enforces both
+    /// invariants so accidental drift surfaces as a failed test rather
+    /// than a confusing render. Glyphs are single lowercase ASCII
+    /// letters so they're visually distinguishable from the player's
+    /// `@` and the uppercase NPC glyphs even on monochrome BBS clients.
+    pub const ITEMS: [Item; 5] = [
+        Item {
+            id: "matchbook",
+            name: "Matchbook",
+            glyph: 'm',
+            x: 6,
+            y: 5,
+        },
+        Item {
+            id: "cigarette_case",
+            name: "Cigarette case",
+            glyph: 'c',
+            x: 13,
+            y: 2,
+        },
+        Item {
+            id: "newspaper",
+            name: "Newspaper clipping",
+            glyph: 'n',
+            x: 20,
+            y: 5,
+        },
+        Item {
+            id: "lipstick",
+            name: "Lipstick tube",
+            glyph: 'l',
+            x: 32,
+            y: 2,
+        },
+        Item {
+            id: "brass_key",
+            name: "Brass key",
+            glyph: 'k',
+            x: 39,
+            y: 5,
+        },
+    ];
+
     /// Build the lobby map screen with the player at `(start_x,
     /// start_y)`. The constructor parses [`LOBBY_MAP_TEXT`] against
     /// the lobby legend; the parse can only fail if the embedded
@@ -449,6 +533,7 @@ impl MapScreen {
             player_x: 0,
             player_y: 0,
             flags: Rc::new(RefCell::new(FlagSet::new())),
+            inventory: Rc::new(RefCell::new(BTreeSet::new())),
         };
         // Clamp the spawn against the map bounds and walkability so a
         // misconfigured `start_x` / `start_y` in `assets/game.toml`
@@ -511,6 +596,14 @@ impl MapScreen {
         }
         self.player_x = target_x;
         self.player_y = target_y;
+        // Items pick up on step. The render path filters collected
+        // items out of the overlay, so the cell visually clears the
+        // same frame the inventory grows. Items aren't blocking — a
+        // stranded item under foot would otherwise trap the player
+        // until they pressed Enter, which is the wrong feel here.
+        if let Some(item) = Self::item_at(target_x, target_y) {
+            self.inventory.borrow_mut().insert(item.id.to_string());
+        }
         true
     }
 
@@ -545,6 +638,30 @@ impl MapScreen {
     /// dialog screen and the map screen mutate the same `RefCell`.
     pub fn flags(&self) -> Rc<RefCell<FlagSet>> {
         Rc::clone(&self.flags)
+    }
+
+    /// Shared handle to the inventory store. Cloned so the
+    /// [`InventoryScreen`] reads the same set the [`MapScreen`] writes
+    /// when the player walks over an item. Task 13h will lift this
+    /// onto the save manager so contents survive process exit; until
+    /// then it lives on the map screen for the play session.
+    pub fn inventory(&self) -> Rc<RefCell<BTreeSet<String>>> {
+        Rc::clone(&self.inventory)
+    }
+
+    /// The catalog item sitting on `(x, y)`, or `None`. Walks the
+    /// static [`Self::ITEMS`] array; the catalog is small enough that
+    /// a linear scan matches how [`Self::npc_at`] queries the NPC
+    /// roster and avoids per-frame map allocations.
+    pub fn item_at(x: u16, y: u16) -> Option<&'static Item> {
+        Self::ITEMS.iter().find(|i| i.x == x && i.y == y)
+    }
+
+    /// Whether the given item ID has already been collected. Render
+    /// and `try_move` both consult this so an item disappears from
+    /// the map atomically with its appearance in the inventory.
+    pub fn is_collected(&self, id: &str) -> bool {
+        self.inventory.borrow().contains(id)
     }
 
     /// Locate a walkable cell near `(x, y)` by widening rings.
@@ -637,6 +754,9 @@ impl Screen for MapScreen {
         let npc_style = Style::default()
             .fg(Color::Magenta)
             .add_modifier(Modifier::BOLD);
+        let item_style = Style::default()
+            .fg(Color::Green)
+            .add_modifier(Modifier::BOLD);
 
         let mut lines: Vec<Line<'_>> = Vec::with_capacity(self.map.cells.len());
         for (y, row) in self.map.cells.iter().enumerate() {
@@ -674,6 +794,16 @@ impl Screen for MapScreen {
                     spans.push(Span::styled(npc.glyph.to_string(), npc_style));
                     x += 1;
                     continue;
+                }
+                // Items appear under the player and NPCs but over
+                // labels and plain floor — once collected they vanish
+                // from the map until a future replay/save reset.
+                if let Some(item) = Self::item_at(x as u16, y as u16) {
+                    if !self.is_collected(item.id) {
+                        spans.push(Span::styled(item.glyph.to_string(), item_style));
+                        x += 1;
+                        continue;
+                    }
                 }
                 // Room label?
                 if let Some((label, _)) = labels_for_row.iter().find(|(_, lx)| (*lx as usize) == x)
@@ -744,6 +874,13 @@ impl Screen for MapScreen {
                 Some(npc) => ScreenCommand::Push(Box::new(DialogScreen::new(npc, self.flags()))),
                 None => ScreenCommand::None,
             },
+            // Open the inventory modal. `i` is the canonical RPG key
+            // for this affordance and the help screen documents it
+            // explicitly so a player can find their pockets without
+            // hunting for the right keystroke.
+            Input::Char('i') | Input::Char('I') => {
+                ScreenCommand::Push(Box::new(InventoryScreen::new(self.inventory())))
+            }
             // Esc / Backspace pop back to the main menu so a curious
             // player can return to the splash flow without quitting.
             Input::Esc | Input::Backspace => ScreenCommand::Pop,
@@ -758,7 +895,8 @@ impl MapScreen {
     /// One-line movement hint shown directly below the map block.
     /// Pulled out as a constant so tests can assert it appears in the
     /// rendered buffer without binding to the precise wording.
-    pub const HINT_LINE: &'static str = "Move: arrows/hjkl    Talk: Enter    Back: Esc    Quit: Q";
+    pub const HINT_LINE: &'static str =
+        "Move: arrows/hjkl    Talk: Enter    Inv: I    Back: Esc    Quit: Q";
 }
 
 /// Modal dialog screen pushed when the player talks to an NPC.
@@ -1054,6 +1192,7 @@ impl HelpScreen {
         "Move          Arrow keys, or h/j/k/l",
         "Talk          Enter (when standing next to an NPC)",
         "Select        Enter",
+        "Inventory     I",
         "Back / Cancel Esc or Backspace",
         "Save          S",
         "Quit          Q  (Ctrl-C also works anywhere)",
@@ -1079,6 +1218,146 @@ impl Screen for HelpScreen {
             // a player who just wants out.
             Input::Esc | Input::Backspace => ScreenCommand::Pop,
             Input::Char('q') | Input::Char('Q') | Input::Ctrl('c') => ScreenCommand::Quit,
+            _ => ScreenCommand::None,
+        }
+    }
+}
+
+/// Modal inventory screen pushed from the [`MapScreen`] via `i`.
+///
+/// Reads from the same `Rc<RefCell<BTreeSet<String>>>` the map screen
+/// writes to, so the screen always reflects the current pocket
+/// contents. Looks each ID up in [`MapScreen::ITEMS`] to recover its
+/// display name; items in the set without a catalog entry are skipped
+/// silently — that shape is unreachable today but a forward-compatible
+/// no-op keeps the screen safe across future Task 13h save migrations
+/// that might surface a stale ID.
+///
+/// ## Render contract
+///
+/// Items show as a [`InventoryList`] with the screen title on the
+/// border and a "(nothing in your pockets)" empty hint when the set
+/// is empty. A one-row band beneath the list shows close affordances.
+///
+/// ## Input contract
+///
+/// - `Up` / `Down` (and `j`/`k`) move the highlight cursor.
+/// - `Esc` / `Backspace` / `i` pop back to the map.
+/// - `Q` / `Ctrl-C` still hard-quit, matching the rest of the kit.
+pub struct InventoryScreen {
+    /// Shared store cloned from [`MapScreen::inventory`] at construction.
+    inventory: Rc<RefCell<BTreeSet<String>>>,
+    /// Highlighted row. Clamped against the visible item count at
+    /// render time so an item collected mid-frame never points the
+    /// cursor off the end of the list.
+    selected: usize,
+}
+
+impl InventoryScreen {
+    /// Block title rendered on the bordered modal.
+    pub const TITLE: &'static str = "Inventory";
+    /// Empty-state hint shown when the player's pockets are empty.
+    /// Pulled out as a constant so the renderer test can assert it
+    /// without binding to incidental wording elsewhere in the code.
+    pub const EMPTY_HINT: &'static str = "(nothing in your pockets)";
+
+    /// Build an inventory screen sharing the supplied store.
+    pub fn new(inventory: Rc<RefCell<BTreeSet<String>>>) -> Self {
+        Self {
+            inventory,
+            selected: 0,
+        }
+    }
+
+    /// Display labels for each currently held item, in catalog order.
+    ///
+    /// Walks the static [`MapScreen::ITEMS`] catalog rather than
+    /// iterating the set directly so the UI order is stable and
+    /// independent of insertion order. Tests use this to assert
+    /// "exactly the picked-up items appear, with their canonical
+    /// names" without going through a `Frame`.
+    pub fn current_labels(&self) -> Vec<String> {
+        let held = self.inventory.borrow();
+        MapScreen::ITEMS
+            .iter()
+            .filter(|item| held.contains(item.id))
+            .map(|item| item.name.to_string())
+            .collect()
+    }
+}
+
+impl Screen for InventoryScreen {
+    fn render(&mut self, _ctx: &mut GameContext<'_>, frame: &mut Frame<'_>) {
+        let labels = self.current_labels();
+        // Modal sized for the longest possible item label plus the
+        // selection gutter, with vertical room for all five items
+        // and a hint row. Clamps inside `centred_rect` if the
+        // terminal is smaller (e.g. `TestBackend` fixtures).
+        let outer = frame.area();
+        let area = centred_rect(36, (MapScreen::ITEMS.len() as u16) + 4, outer);
+
+        // Reserve a one-row hint band at the bottom of the modal so
+        // the controls are always visible regardless of inventory
+        // contents.
+        let hint_h = 1.min(area.height);
+        let body_h = area.height.saturating_sub(hint_h);
+        let body = Rect {
+            x: area.x,
+            y: area.y,
+            width: area.width,
+            height: body_h,
+        };
+        let hint = Rect {
+            x: area.x,
+            y: area.y + body_h,
+            width: area.width,
+            height: hint_h,
+        };
+
+        let selected = if labels.is_empty() {
+            0
+        } else {
+            self.selected.min(labels.len() - 1)
+        };
+        let inv = InventoryList {
+            title: Some(Self::TITLE),
+            items: &labels,
+            selected,
+            empty_hint: Self::EMPTY_HINT,
+        };
+        render_inventory_list(frame, body, &inv);
+        if hint_h > 0 {
+            let widget = Paragraph::new("[Up/Down] choose    [Esc/I] close")
+                .alignment(Alignment::Center)
+                .style(Style::default().fg(Color::DarkGray));
+            frame.render_widget(widget, hint);
+        }
+    }
+
+    fn handle_input(&mut self, _ctx: &mut GameContext<'_>, input: Input) -> ScreenCommand {
+        match input {
+            // Always-on hard-quit affordances.
+            Input::Char('q') | Input::Char('Q') | Input::Ctrl('c') => ScreenCommand::Quit,
+            // Esc / Backspace / `i` close the modal — `i` toggles so
+            // the same keystroke that opens the screen also closes
+            // it, which is the muscle-memory shortcut every BBS
+            // inventory screen has trained players to expect.
+            Input::Esc | Input::Backspace | Input::Char('i') | Input::Char('I') => {
+                ScreenCommand::Pop
+            }
+            Input::Up | Input::Char('k') | Input::Char('K') => {
+                if self.selected > 0 {
+                    self.selected -= 1;
+                }
+                ScreenCommand::None
+            }
+            Input::Down | Input::Char('j') | Input::Char('J') => {
+                let len = self.inventory.borrow().len();
+                if len > 0 && self.selected + 1 < len {
+                    self.selected += 1;
+                }
+                ScreenCommand::None
+            }
             _ => ScreenCommand::None,
         }
     }
@@ -1977,5 +2256,309 @@ mod tests {
             found.contains("slouches"),
             "expected first greeting line in dialog body; buffer was:\n{found}"
         );
+    }
+
+    // ---- Items and InventoryScreen (Task 13e) -------------------------
+
+    /// Walk the player from spawn onto the cell at `(target_x,
+    /// target_y)` using a simple axis-aligned route. Used by the
+    /// pickup tests to land on an item without re-deriving the
+    /// movement sequence each time. Returns the live screen so the
+    /// caller can keep driving it.
+    fn walk_to(map: &mut MapScreen, ctx: &mut GameContext<'_>, tx: u16, ty: u16) {
+        // Doors live on y=3 — that's the only row connecting rooms.
+        // Route there first, traverse horizontally, then settle on
+        // the target row. A break-on-no-progress guard prevents the
+        // helper from looping forever if a wall ever blocks the
+        // route.
+        let step = |map: &mut MapScreen, ctx: &mut GameContext<'_>, key: Input| -> bool {
+            let before = map.player();
+            map.handle_input(ctx, key);
+            map.player() != before
+        };
+        while map.player().1 != 3 {
+            let key = if map.player().1 < 3 {
+                Input::Down
+            } else {
+                Input::Up
+            };
+            if !step(map, ctx, key) {
+                break;
+            }
+        }
+        while map.player().0 != tx {
+            let key = if map.player().0 < tx {
+                Input::Right
+            } else {
+                Input::Left
+            };
+            if !step(map, ctx, key) {
+                break;
+            }
+        }
+        while map.player().1 != ty {
+            let key = if map.player().1 < ty {
+                Input::Down
+            } else {
+                Input::Up
+            };
+            if !step(map, ctx, key) {
+                break;
+            }
+        }
+    }
+
+    #[test]
+    fn map_has_five_items_in_distinct_rooms() {
+        // SPEC §13 calls for exactly five collectables. We further
+        // enforce one per room — the rooms are 8 cells wide, so
+        // bucketing items by `x / 9` gives 0,1,2,3,4 with no
+        // duplicates if the catalog is correctly distributed.
+        assert_eq!(MapScreen::ITEMS.len(), 5, "expected exactly five items");
+        let mut buckets: Vec<u16> = MapScreen::ITEMS.iter().map(|i| i.x / 9).collect();
+        buckets.sort();
+        assert_eq!(
+            buckets,
+            vec![0, 1, 2, 3, 4],
+            "expected one item per room (x/9 bucket)"
+        );
+    }
+
+    #[test]
+    fn map_items_sit_on_walkable_non_npc_cells() {
+        // Catalog invariant: every item is on a floor cell with no
+        // NPC standing on it. Drift (an item placed on a wall, or on
+        // top of the Night Clerk) silently breaks render and pickup.
+        let map = fresh_map_screen();
+        for item in MapScreen::ITEMS.iter() {
+            assert!(
+                map.map().is_walkable(item.x, item.y),
+                "item {:?} at ({}, {}) sits on an unwalkable cell",
+                item.name,
+                item.x,
+                item.y
+            );
+            assert!(
+                MapScreen::npc_at(item.x, item.y).is_none(),
+                "item {:?} at ({}, {}) overlaps an NPC",
+                item.name,
+                item.x,
+                item.y
+            );
+        }
+    }
+
+    #[test]
+    fn map_item_glyphs_render_into_buffer_until_collected() {
+        // Each catalog glyph appears on a fresh map; once an item is
+        // marked collected, its glyph drops from the next render.
+        let cfg = fixture_config();
+        let fc = fixture_context();
+        let mut ctx = GameContext::new(&cfg, &fc, (80, 24));
+        let mut map = fresh_map_screen();
+        let mut term = Terminal::new(TestBackend::new(80, 24)).expect("test backend");
+        term.draw(|frame| map.render(&mut ctx, frame))
+            .expect("draw");
+        let buf = term.backend().buffer().clone();
+        let mut found = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                found.push_str(buf.cell((x, y)).expect("cell").symbol());
+            }
+            found.push('\n');
+        }
+        for item in MapScreen::ITEMS.iter() {
+            assert!(
+                found.contains(item.glyph),
+                "missing item glyph {:?} for {:?}; buffer was:\n{}",
+                item.glyph,
+                item.name,
+                found
+            );
+        }
+        // Mark the matchbook collected and re-render; the `m` glyph
+        // should disappear from the painted map.
+        map.inventory().borrow_mut().insert("matchbook".to_string());
+        term.draw(|frame| map.render(&mut ctx, frame))
+            .expect("redraw");
+        let buf = term.backend().buffer().clone();
+        // Inspect the matchbook's exact cell rather than the whole
+        // buffer; the lowercase `m` could plausibly recur elsewhere
+        // (it doesn't today, but a future label change shouldn't
+        // weaken the assertion).
+        let item = MapScreen::ITEMS
+            .iter()
+            .find(|i| i.id == "matchbook")
+            .expect("matchbook in catalog");
+        let cell = buf.cell((item.x, item.y)).expect("cell").symbol();
+        assert_ne!(
+            cell, "m",
+            "collected item must not paint its glyph; cell was {cell:?}"
+        );
+    }
+
+    #[test]
+    fn map_walking_onto_item_collects_it() {
+        // Drive the player onto the matchbook cell (6, 5) and confirm
+        // the inventory grows by exactly that ID.
+        let cfg = fixture_config();
+        let fc = fixture_context();
+        let mut ctx = GameContext::new(&cfg, &fc, (80, 24));
+        let mut map = fresh_map_screen();
+        walk_to(&mut map, &mut ctx, 6, 5);
+        assert_eq!(map.player(), (6, 5), "should land on matchbook cell");
+        assert!(
+            map.is_collected("matchbook"),
+            "stepping onto an item must add it to the inventory"
+        );
+    }
+
+    #[test]
+    fn map_i_key_pushes_inventory_screen() {
+        let (_, cmd) = dispatch_map(Input::Char('i'));
+        assert!(
+            matches!(cmd, ScreenCommand::Push(_)),
+            "`i` must push the inventory screen, got {cmd:?}"
+        );
+    }
+
+    #[test]
+    fn inventory_empty_renders_hint() {
+        let cfg = fixture_config();
+        let fc = fixture_context();
+        let mut ctx = GameContext::new(&cfg, &fc, (80, 24));
+        let inv = Rc::new(RefCell::new(BTreeSet::new()));
+        let mut screen = InventoryScreen::new(Rc::clone(&inv));
+        let mut term = Terminal::new(TestBackend::new(80, 24)).expect("test backend");
+        term.draw(|frame| screen.render(&mut ctx, frame))
+            .expect("draw");
+        let buf = term.backend().buffer().clone();
+        let mut found = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                found.push_str(buf.cell((x, y)).expect("cell").symbol());
+            }
+            found.push('\n');
+        }
+        assert!(
+            found.contains(InventoryScreen::EMPTY_HINT),
+            "empty inventory must surface the empty-hint; buffer was:\n{found}"
+        );
+    }
+
+    #[test]
+    fn inventory_lists_collected_item_names() {
+        // Stuff two known IDs into the shared store and confirm the
+        // screen renders their canonical names from the catalog.
+        let cfg = fixture_config();
+        let fc = fixture_context();
+        let mut ctx = GameContext::new(&cfg, &fc, (80, 24));
+        let inv = Rc::new(RefCell::new(BTreeSet::new()));
+        inv.borrow_mut().insert("matchbook".to_string());
+        inv.borrow_mut().insert("brass_key".to_string());
+        let mut screen = InventoryScreen::new(Rc::clone(&inv));
+        let labels = screen.current_labels();
+        assert_eq!(
+            labels,
+            vec!["Matchbook".to_string(), "Brass key".to_string()],
+            "labels must follow catalog order, not insertion order"
+        );
+        let mut term = Terminal::new(TestBackend::new(80, 24)).expect("test backend");
+        term.draw(|frame| screen.render(&mut ctx, frame))
+            .expect("draw");
+        let buf = term.backend().buffer().clone();
+        let mut found = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                found.push_str(buf.cell((x, y)).expect("cell").symbol());
+            }
+            found.push('\n');
+        }
+        assert!(found.contains(InventoryScreen::TITLE));
+        assert!(
+            found.contains("Matchbook"),
+            "Matchbook must render in the inventory list; buffer was:\n{found}"
+        );
+        assert!(
+            found.contains("Brass key"),
+            "Brass key must render in the inventory list; buffer was:\n{found}"
+        );
+    }
+
+    #[test]
+    fn inventory_unknown_id_is_skipped() {
+        // Forward-compatibility: a stale ID from a future save must
+        // not crash the screen — it just doesn't render.
+        let inv = Rc::new(RefCell::new(BTreeSet::new()));
+        inv.borrow_mut().insert("ghost_item".to_string());
+        let screen = InventoryScreen::new(Rc::clone(&inv));
+        assert!(
+            screen.current_labels().is_empty(),
+            "unknown IDs must be silently ignored"
+        );
+    }
+
+    #[test]
+    fn inventory_esc_pops() {
+        let cfg = fixture_config();
+        let fc = fixture_context();
+        let mut ctx = GameContext::new(&cfg, &fc, (80, 24));
+        let inv = Rc::new(RefCell::new(BTreeSet::new()));
+        let mut screen = InventoryScreen::new(inv);
+        assert!(matches!(
+            screen.handle_input(&mut ctx, Input::Esc),
+            ScreenCommand::Pop
+        ));
+    }
+
+    #[test]
+    fn inventory_i_toggles_closed() {
+        // The same key that opens the screen also closes it — muscle
+        // memory shortcut every BBS inventory does.
+        let cfg = fixture_config();
+        let fc = fixture_context();
+        let mut ctx = GameContext::new(&cfg, &fc, (80, 24));
+        let inv = Rc::new(RefCell::new(BTreeSet::new()));
+        let mut screen = InventoryScreen::new(inv);
+        assert!(matches!(
+            screen.handle_input(&mut ctx, Input::Char('i')),
+            ScreenCommand::Pop
+        ));
+    }
+
+    #[test]
+    fn inventory_quit_keys_quit() {
+        let cfg = fixture_config();
+        let fc = fixture_context();
+        let mut ctx = GameContext::new(&cfg, &fc, (80, 24));
+        let inv = Rc::new(RefCell::new(BTreeSet::new()));
+        let mut screen = InventoryScreen::new(inv);
+        for key in [Input::Char('q'), Input::Char('Q'), Input::Ctrl('c')] {
+            assert!(
+                matches!(screen.handle_input(&mut ctx, key), ScreenCommand::Quit),
+                "{key:?} should quit the inventory screen"
+            );
+        }
+    }
+
+    #[test]
+    fn inventory_cursor_clamps() {
+        // Selection cursor must not advance past the live item count
+        // and must not underflow at zero.
+        let cfg = fixture_config();
+        let fc = fixture_context();
+        let mut ctx = GameContext::new(&cfg, &fc, (80, 24));
+        let inv = Rc::new(RefCell::new(BTreeSet::new()));
+        inv.borrow_mut().insert("matchbook".to_string());
+        inv.borrow_mut().insert("brass_key".to_string());
+        let mut screen = InventoryScreen::new(Rc::clone(&inv));
+        for _ in 0..10 {
+            screen.handle_input(&mut ctx, Input::Down);
+        }
+        assert_eq!(screen.selected, 1, "cursor must clamp at last row");
+        for _ in 0..10 {
+            screen.handle_input(&mut ctx, Input::Up);
+        }
+        assert_eq!(screen.selected, 0, "cursor must clamp at top row");
     }
 }
