@@ -1,0 +1,32 @@
+# `examples/murder_motel/assets/game.toml`
+#
+# Game manifest for the SPEC §13 acceptance fixture. The shape mirrors
+# the scaffold `fgk new` produces; later Task 13 sub-iterations will
+# extend this file with map references, NPC tables, and dialog files
+# as those primitives come online.
+
+[game]
+title = "Murder Motel"
+slug = "murder-motel"
+description = "A noir whodunit at the edge of town."
+min_width = 80
+min_height = 24
+# Task 13c introduces the lobby map; for 13a a placeholder reference is
+# enough — the runtime does not load maps until a screen asks it to.
+start_map = "lobby"
+start_x = 5
+start_y = 3
+
+[save]
+# Per-user saves so the integration test can exercise SPEC §5.6 once
+# Task 13h lands. The title-screen iteration writes nothing.
+strategy = "per_foglet_user"
+
+[manifest]
+# Conservative defaults; tighten before shipping. Values match the
+# `fgk new` scaffold so `fgk emit-manifest` produces equivalent JSON
+# shape regardless of which template the operator started from.
+timeout_ms = 1800000
+idle_timeout_ms = 300000
+visibility = "members"
+auth_scope = "site"

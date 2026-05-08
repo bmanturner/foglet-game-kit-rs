@@ -68,3 +68,23 @@ tempfile   = { workspace = true }
 # (Tests reuse `tempfile` from `[dependencies]` above — no extra entry
 # needed. The context-loader tests write a context file to a real path
 # on disk via the same crate.)
+#
+# `anyhow` is pulled in only so the `murder_motel` example (Task 13)
+# can present a single Foglet door binary the way author code is meant
+# to: `fn main() -> anyhow::Result<()>` matching the scaffold template
+# from SPEC §10.1. Library code stays on `thiserror`-derived errors per
+# the architecture tenets.
+anyhow = { workspace = true }
+
+# --- Examples ---------------------------------------------------------
+#
+# `murder_motel` is the SPEC §13 acceptance fixture: a small but
+# complete door game exercised by `cargo run --example murder_motel`.
+# Its sources live at the workspace root (`examples/murder_motel/`)
+# rather than under `crates/foglet_game/examples/` so the project also
+# reads as a self-contained scaffold an author can copy. Cargo accepts
+# example paths outside the package directory — the only constraint is
+# that the file lives somewhere on disk relative to this manifest.
+[[example]]
+name = "murder_motel"
+path = "../../examples/murder_motel/src/main.rs"
