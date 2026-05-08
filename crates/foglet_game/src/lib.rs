@@ -32,6 +32,7 @@
 #![warn(missing_docs, rust_2018_idioms)]
 
 pub mod config;
+pub mod dialog;
 pub mod foglet;
 pub mod input;
 pub mod manifest;
@@ -43,6 +44,9 @@ pub mod terminal;
 
 pub use config::{
     ConfigError, GameConfig, GameSection, ManifestSection, SaveSection, SaveStrategy,
+};
+pub use dialog::{
+    load_dialog, Choice, ChoiceError, Dialog, DialogError, DialogState, FlagSet, Node,
 };
 pub use foglet::{
     load_context, load_context_from_env, load_context_from_file, load_context_with_options,

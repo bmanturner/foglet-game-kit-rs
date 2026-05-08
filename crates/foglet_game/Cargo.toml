@@ -31,6 +31,12 @@ path = "src/lib.rs"
 # rule in PROMPT.md).
 serde      = { workspace = true }
 serde_json = { workspace = true }
+# Task 9b (dialog state machine) reads dialog scripts as structured
+# YAML. The format choice is locked in `DECISIONS.md` (ADR
+# 2026-05-08): YAML for content, JSON for saves and manifests, TOML
+# for config + tile legends. Pulled in at the library boundary so
+# games depend on it transitively rather than re-adding it themselves.
+serde_yaml = { workspace = true }
 # Task 4 (game config parser) reads `assets/game.toml` into a typed
 # `GameConfig`. Sourced from the workspace-pinned crate budget so any
 # other crate parsing TOML in the tree stays in lockstep.
