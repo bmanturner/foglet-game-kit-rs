@@ -14,8 +14,12 @@ min_height = 24
 # Task 13c introduces the lobby map; for 13a a placeholder reference is
 # enough — the runtime does not load maps until a screen asks it to.
 start_map = "lobby"
-start_x = 5
-start_y = 3
+# Lobby is the centre room of `assets/maps/lobby.txt`; the player
+# spawn is the mid-room floor cell (col 22, row 4) so movement tests
+# can step in every direction without immediately bumping a wall or
+# straddling the door row at y=3.
+start_x = 22
+start_y = 4
 
 [save]
 # Per-user saves so the integration test can exercise SPEC §5.6 once
