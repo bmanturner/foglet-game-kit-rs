@@ -51,7 +51,10 @@ pub use manifest::{
     FogletManifest, ManifestError, ManifestInputs, DEFAULT_AUTH_SCOPE, DEFAULT_IDLE_TIMEOUT_MS,
     DEFAULT_TIMEOUT_MS, DEFAULT_VISIBILITY, RUNTIME_EXTERNAL_PTY,
 };
-pub use runtime::{run_built, BuiltGame, Game, GameError, GameResult, SavePolicy};
+pub use runtime::{
+    run_built, run_with_io, BuiltGame, CrosstermEventSource, EventSource, Game, GameError,
+    GameResult, SavePolicy, TICK_INTERVAL,
+};
 pub use screen::{
     apply_command, ExitReason, GameContext, Screen, ScreenCommand, ScreenStack, SideEffect,
 };
