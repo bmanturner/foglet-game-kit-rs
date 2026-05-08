@@ -39,13 +39,31 @@ path = "src/main.rs"
 # `foglet_game` (manifest emission, config parsing, etc.).
 foglet_game = { path = "../foglet_game" }
 
-# Real subcommand dependencies (clap, anyhow, serde_json, …) are
-# pulled in by the task that introduces the subcommand needing them.
+# Argument parsing for the `fgk` subcommands. `derive` keeps the
+# subcommand definitions colocated with the structs they populate.
+# Introduced by Task 10b (`fgk new`); future subcommands extend the
+# same enum.
+clap = { workspace = true }
+
+# Process-boundary error chain for the binary. Library-internal
+# scaffolding errors are `thiserror`-based and convert into
+# `anyhow::Error` via `?` at the CLI boundary.
+anyhow = { workspace = true }
+
+thiserror = { workspace = true }
 
 [dev-dependencies]
 # Round-trip the embedded `Cargo.toml` template through a real TOML
 # parser as part of the template fixture tests (Task 10a).
 toml = { workspace = true }
+
+# Scratch directories for scaffolder tests (Task 10b). The scaffolder
+# writes real files; `tempfile::TempDir` keeps each test hermetic.
+tempfile = { workspace = true }
+
+# Drives the `fgk` binary as an end-to-end smoke test (Task 10b).
+assert_cmd = { workspace = true }
+predicates = { workspace = true }
 
 # Syntactic validation of the embedded `src/main.rs` template — see
 # DECISIONS.md ADR 2026-05-08 (template fixture validation) for why
