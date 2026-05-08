@@ -35,21 +35,200 @@
 //! unit-tested — its correctness rests on `crossterm`'s own coverage
 //! and the manual-smoke recipe documented for SPEC §13.1.
 //!
-//! # What this module does NOT do (yet)
+//! # Panic-hook integration (Task 5c)
 //!
-//! - **No panic-hook installation.** Task 5c installs a panic hook
-//!   that runs the same restoration *before* the default panic
-//!   handler prints, per SPEC §7.3 / §13.1. The hook will reuse the
-//!   `cleaned` flag below — by setting it to `true` after running
-//!   restoration itself, it makes the eventual Drop a no-op without
-//!   needing a back-channel to the guard instance.
+//! SPEC §7.3 / §13.1 require that a panic mid-loop restore the
+//! terminal *before* the default panic handler prints — otherwise the
+//! panic message lands inside the alternate screen and is wiped out
+//! the instant the process exits, leaving the operator with both a
+//! corrupted terminal and no diagnostic.
+//!
+//! The integration is process-global because [`std::panic::set_hook`]
+//! is process-global. We expose four pieces:
+//!
+//! - [`install_panic_hook`] (and [`install_panic_hook_with`] for
+//!   tests) registers a hook that runs a configured restoration
+//!   callback then chains to the previously-installed hook.
+//!   Idempotent — the underlying [`std::sync::Once`] guarantees the
+//!   hook is set exactly once even if multiple guards are constructed
+//!   over a process's lifetime (e.g. a test binary that constructs
+//!   several).
+//! - [`arm_panic_hook`] / [`disarm_panic_hook`] toggle whether the
+//!   hook actually runs restoration. The guard arms on construction
+//!   (production path only) and disarms on `cleanup()` / Drop, so a
+//!   panic *outside* a TUI session is left to the default hook.
+//! - [`is_panic_hook_armed`] is exposed mainly for tests asserting
+//!   the arm/disarm contract.
+//!
+//! The hook itself does *not* hold a reference to a [`TerminalGuard`].
+//! The terminal is process-global state; the guard is just one
+//! supervisor of it. Passing a function pointer instead of a closure
+//! lets the registry stay `Sync` without unsafe code and keeps the
+//! panic-hook path allocation-free at the moment it matters most.
 
 use std::io::{self, Stdout, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, Once};
 
 use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
+
+/// Function-pointer signature for the restoration callback the panic
+/// hook invokes when armed.
+///
+/// We require a `fn()` (not a closure) on purpose: function pointers
+/// are `Copy + Send + Sync` and so live inside a `Mutex<Option<_>>`
+/// without any `Box<dyn ...>` ceremony, and they keep the hook path
+/// — which runs while the runtime is already mid-collapse —
+/// allocation-free. The production restorer (`default_panic_restore`)
+/// is the only `fn()` the runtime registers; tests register their own
+/// to assert the arm/disarm contract without touching a real
+/// terminal.
+pub type PanicRestoreFn = fn();
+
+/// One-shot guard for the [`std::panic::set_hook`] call.
+///
+/// `set_hook` replaces the current process-wide hook; calling it more
+/// than once would either drop earlier restorers (data race for any
+/// running guard) or stack hooks unbounded across test runs. The
+/// `Once` ensures we install exactly once and treat subsequent
+/// `install_panic_hook*` calls as "update the restorer, leave the
+/// hook itself alone."
+static PANIC_HOOK_INSTALLED: Once = Once::new();
+
+/// Process-wide armed flag.
+///
+/// `true` while a [`TerminalGuard`] is responsible for the terminal
+/// and a panic should restore it. The hook flips it back to `false`
+/// the first time it fires so a chained panic (rare, but possible if
+/// a destructor panics during unwind) does not re-run restoration on
+/// an already-restored terminal.
+static PANIC_HOOK_ARMED: AtomicBool = AtomicBool::new(false);
+
+/// The restorer that the installed hook invokes when armed.
+///
+/// Stored behind a mutex so [`install_panic_hook_with`] (the test
+/// seam) can swap the production crossterm restorer for a recording
+/// stub without ripping out the hook itself.
+static PANIC_RESTORE_FN: Mutex<Option<PanicRestoreFn>> = Mutex::new(None);
+
+/// Install the production panic hook.
+///
+/// Idempotent. Safe to call from every [`TerminalGuard::new`]; only
+/// the first call registers with the standard library, subsequent
+/// calls just refresh the restorer to `default_panic_restore`
+/// (which is what production always wants — the single shared
+/// terminal is restored the same way regardless of which guard
+/// armed the hook).
+///
+/// Call before constructing the guard so the hook is in place even
+/// if `enter()` itself triggers a panic (rare, but the cost of being
+/// defensive here is one `Once` check).
+pub fn install_panic_hook() {
+    install_panic_hook_with(default_panic_restore);
+}
+
+/// Install the panic hook with a caller-supplied restorer.
+///
+/// Public-but-test-leaning. The runtime always uses
+/// [`install_panic_hook`]; this entry point exists so the unit tests
+/// can register a recording function pointer and assert that it
+/// fires (or does not) under the arm/disarm contract — without
+/// driving a real TTY or relying on the default crossterm calls
+/// silently no-op'ing on a piped stdout.
+pub fn install_panic_hook_with(restore: PanicRestoreFn) {
+    // Update the restorer first so the hook installation below sees
+    // a populated slot if anything in the std-lib `set_hook` path
+    // were to fire spuriously (it does not in practice; the order
+    // here is for invariant clarity, not to defend against real
+    // races).
+    *PANIC_RESTORE_FN
+        .lock()
+        .expect("panic restore mutex poisoned") = Some(restore);
+    PANIC_HOOK_INSTALLED.call_once(|| {
+        // Capture and chain the previous hook. This matters in two
+        // realistic environments: (a) `cargo test` installs its own
+        // hook to capture per-test panic output — chaining preserves
+        // that diagnostic; (b) a host application embedding the
+        // runtime may have already installed its own hook for
+        // crash reporting. Replacing instead of chaining would
+        // silently break either.
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            run_panic_restoration();
+            prev(info);
+        }));
+    });
+}
+
+/// Mark the panic hook as armed.
+///
+/// Idempotent. Called by the runtime after a [`TerminalGuard`] is in
+/// place; until then a panic should fall through to the default
+/// (chained) hook with no terminal touching.
+pub fn arm_panic_hook() {
+    PANIC_HOOK_ARMED.store(true, Ordering::SeqCst);
+}
+
+/// Mark the panic hook as disarmed.
+///
+/// Called by [`TerminalGuard::cleanup`] and [`TerminalGuard`]'s Drop
+/// impl. After disarming, a subsequent panic runs the chained
+/// previous hook without first invoking the restorer — correct,
+/// because by definition the terminal is no longer in raw mode.
+pub fn disarm_panic_hook() {
+    PANIC_HOOK_ARMED.store(false, Ordering::SeqCst);
+}
+
+/// Read the armed flag.
+///
+/// Primarily a test affordance; the runtime never branches on this.
+pub fn is_panic_hook_armed() -> bool {
+    PANIC_HOOK_ARMED.load(Ordering::SeqCst)
+}
+
+/// Body of the installed panic hook, factored out so tests can call
+/// it directly (driving a real panic from a unit test would tear
+/// down the test binary).
+///
+/// Performs an atomic disarm (`swap`) so a re-entrant panic during
+/// the restorer cannot run restoration twice — once is the contract,
+/// twice on an already-restored terminal is the regression we are
+/// guarding against.
+pub(crate) fn run_panic_restoration() {
+    if PANIC_HOOK_ARMED.swap(false, Ordering::SeqCst) {
+        // Copy the function pointer out before releasing the lock —
+        // we do not want to hold the mutex across the call, both for
+        // panic-during-panic safety and because the production
+        // restorer touches stdout which can in pathological cases
+        // block.
+        let restore = PANIC_RESTORE_FN
+            .lock()
+            .expect("panic restore mutex poisoned")
+            .as_ref()
+            .copied();
+        if let Some(f) = restore {
+            f();
+        }
+    }
+}
+
+/// Production restorer used by [`install_panic_hook`].
+///
+/// Best-effort: every step is wrapped in `let _ =` because we are
+/// already on the panic path and the only thing worse than a borked
+/// terminal is a panic-during-panic abort that hides the original
+/// diagnostic. Matches the order in [`CrosstermBackend::leave`]
+/// (alt-screen exit before raw-mode disable) so the user-visible
+/// behaviour of a panic is the same as a clean shutdown.
+fn default_panic_restore() {
+    let mut out = io::stdout();
+    let _ = execute!(out, LeaveAlternateScreen);
+    let _ = disable_raw_mode();
+    let _ = out.flush();
+}
 
 /// Errors the terminal guard can surface during setup or teardown.
 ///
@@ -221,7 +400,15 @@ impl TerminalGuard<CrosstermBackend> {
     /// untouched in that case so the caller can surface a clear
     /// error per SPEC §7.3.
     pub fn new() -> Result<Self, TerminalError> {
-        Self::with_backend(CrosstermBackend::new())
+        // Install the panic hook *before* attempting `enter()`. If
+        // `enter()` itself panics (vanishingly rare — it would mean
+        // crossterm panicked rather than returning Err) we still want
+        // restoration to fire. Arming happens after the guard is
+        // built so a setup failure leaves the hook un-armed.
+        install_panic_hook();
+        let guard = Self::with_backend(CrosstermBackend::new())?;
+        arm_panic_hook();
+        Ok(guard)
     }
 }
 
@@ -282,7 +469,14 @@ impl<B: TerminalBackend> TerminalGuard<B> {
         // recover from it. The flag's invariant is "we have made our
         // one teardown attempt," not "teardown succeeded."
         self.cleaned = true;
-        self.backend.leave()
+        let res = self.backend.leave();
+        // Disarm regardless of success: by this point we have made
+        // our one teardown attempt, and a future panic must not
+        // re-toggle a half-restored terminal. Arming is the
+        // runtime's signal that "I own raw mode right now"; that
+        // signal is no longer true.
+        disarm_panic_hook();
+        res
     }
 }
 
@@ -293,6 +487,10 @@ impl<B: TerminalBackend> Drop for TerminalGuard<B> {
         // already restored corrupts state on some hosts. The flag
         // is the one source of truth for "guard is spent."
         if self.cleaned {
+            // Even if `leave` already ran (via `cleanup()` or the
+            // panic hook), the armed flag may still be set if the
+            // guard skipped its disarm path — defend in depth.
+            disarm_panic_hook();
             return;
         }
         // Drop is the safety net: every termination path eventually
@@ -303,6 +501,7 @@ impl<B: TerminalBackend> Drop for TerminalGuard<B> {
         // observe teardown failures; Drop just does its best.
         let _ = self.backend.leave();
         self.cleaned = true;
+        disarm_panic_hook();
     }
 }
 
@@ -512,6 +711,160 @@ mod tests {
         drop(guard);
         // Exactly one leave attempt despite the failure + Drop.
         assert_eq!(*log.borrow(), vec!["enter", "leave"]);
+    }
+
+    // -----------------------------------------------------------------
+    // Panic hook tests (Task 5c)
+    //
+    // These touch process-global state (the armed flag and the
+    // registered restorer). Cargo runs tests in parallel by default,
+    // so we serialize the panic-hook tests behind a single mutex.
+    // The mutex is `'static` and recovered from poisoning because a
+    // failed assertion in one test must not block the rest.
+    // -----------------------------------------------------------------
+
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::Mutex as StdMutex;
+
+    static PANIC_HOOK_TEST_LOCK: StdMutex<()> = StdMutex::new(());
+
+    fn lock_panic_hook_tests() -> std::sync::MutexGuard<'static, ()> {
+        // Recover from a previously-poisoned guard: a single failing
+        // assertion should not cascade into "all subsequent panic-hook
+        // tests fail to acquire the lock."
+        match PANIC_HOOK_TEST_LOCK.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        }
+    }
+
+    /// Registered restorer counter used by the panic-hook tests.
+    static TEST_RESTORE_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    fn test_restore_fn() {
+        TEST_RESTORE_CALLS.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn reset_panic_hook_state() {
+        // Always end a test with the hook *disarmed* and the counter
+        // cleared, regardless of how the previous test left things.
+        disarm_panic_hook();
+        TEST_RESTORE_CALLS.store(0, Ordering::SeqCst);
+        install_panic_hook_with(test_restore_fn);
+    }
+
+    #[test]
+    fn install_panic_hook_is_idempotent() {
+        let _guard = lock_panic_hook_tests();
+        // Calling install twice must not panic and must leave a
+        // restorer registered. We cannot directly observe the std-lib
+        // hook count, but a working arm + run_panic_restoration cycle
+        // proves the hook chained through.
+        install_panic_hook();
+        install_panic_hook_with(test_restore_fn);
+        TEST_RESTORE_CALLS.store(0, Ordering::SeqCst);
+        arm_panic_hook();
+        run_panic_restoration();
+        assert_eq!(TEST_RESTORE_CALLS.load(Ordering::SeqCst), 1);
+        reset_panic_hook_state();
+    }
+
+    #[test]
+    fn run_panic_restoration_invokes_restorer_when_armed() {
+        let _guard = lock_panic_hook_tests();
+        reset_panic_hook_state();
+        arm_panic_hook();
+        assert!(is_panic_hook_armed(), "arm sets the flag");
+        run_panic_restoration();
+        assert_eq!(
+            TEST_RESTORE_CALLS.load(Ordering::SeqCst),
+            1,
+            "armed hook fires the restorer"
+        );
+        assert!(
+            !is_panic_hook_armed(),
+            "hook must disarm itself after firing — guards against re-entrant panics"
+        );
+        reset_panic_hook_state();
+    }
+
+    #[test]
+    fn run_panic_restoration_is_noop_when_disarmed() {
+        let _guard = lock_panic_hook_tests();
+        reset_panic_hook_state();
+        // Never arm, or explicitly disarm.
+        disarm_panic_hook();
+        run_panic_restoration();
+        assert_eq!(
+            TEST_RESTORE_CALLS.load(Ordering::SeqCst),
+            0,
+            "disarmed hook must not invoke the restorer"
+        );
+        reset_panic_hook_state();
+    }
+
+    #[test]
+    fn arm_then_disarm_prevents_restoration() {
+        let _guard = lock_panic_hook_tests();
+        reset_panic_hook_state();
+        arm_panic_hook();
+        disarm_panic_hook();
+        run_panic_restoration();
+        assert_eq!(TEST_RESTORE_CALLS.load(Ordering::SeqCst), 0);
+        reset_panic_hook_state();
+    }
+
+    #[test]
+    fn second_run_panic_restoration_is_noop_after_firing() {
+        // Re-entrant panic guard: if a destructor panics during the
+        // unwind triggered by the first panic, the hook fires again.
+        // The second invocation must not double-call the restorer on
+        // an already-restored terminal.
+        let _guard = lock_panic_hook_tests();
+        reset_panic_hook_state();
+        arm_panic_hook();
+        run_panic_restoration();
+        run_panic_restoration();
+        assert_eq!(TEST_RESTORE_CALLS.load(Ordering::SeqCst), 1);
+        reset_panic_hook_state();
+    }
+
+    #[test]
+    fn guard_cleanup_disarms_panic_hook() {
+        let _guard = lock_panic_hook_tests();
+        reset_panic_hook_state();
+        let backend = RecordingBackend::default();
+        let mut g = TerminalGuard::with_backend(backend).expect("setup ok");
+        // `with_backend` does not arm — that is the runtime's job.
+        // Simulate the runtime arming the hook after constructing
+        // the guard, then assert cleanup disarms it.
+        arm_panic_hook();
+        assert!(is_panic_hook_armed());
+        g.cleanup().expect("cleanup ok");
+        assert!(
+            !is_panic_hook_armed(),
+            "cleanup() must disarm the panic hook so post-TUI panics use the default handler"
+        );
+        reset_panic_hook_state();
+    }
+
+    #[test]
+    fn guard_drop_disarms_panic_hook() {
+        let _guard = lock_panic_hook_tests();
+        reset_panic_hook_state();
+        let backend = RecordingBackend::default();
+        {
+            let _g = TerminalGuard::with_backend(backend).expect("setup ok");
+            arm_panic_hook();
+            assert!(is_panic_hook_armed());
+            // Fall out of scope without calling cleanup — Drop must
+            // still disarm.
+        }
+        assert!(
+            !is_panic_hook_armed(),
+            "Drop must disarm the panic hook even when cleanup() was not called"
+        );
+        reset_panic_hook_state();
     }
 
     #[test]

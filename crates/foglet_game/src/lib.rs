@@ -47,7 +47,11 @@ pub use manifest::{
     FogletManifest, ManifestError, ManifestInputs, DEFAULT_AUTH_SCOPE, DEFAULT_IDLE_TIMEOUT_MS,
     DEFAULT_TIMEOUT_MS, DEFAULT_VISIBILITY, RUNTIME_EXTERNAL_PTY,
 };
-pub use terminal::{flush_stdout, CrosstermBackend, TerminalBackend, TerminalError, TerminalGuard};
+pub use terminal::{
+    arm_panic_hook, disarm_panic_hook, flush_stdout, install_panic_hook, install_panic_hook_with,
+    is_panic_hook_armed, CrosstermBackend, PanicRestoreFn, TerminalBackend, TerminalError,
+    TerminalGuard,
+};
 
 /// Crate version string, sourced from `Cargo.toml` at build time.
 ///
