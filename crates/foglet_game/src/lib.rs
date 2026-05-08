@@ -32,10 +32,15 @@
 #![warn(missing_docs, rust_2018_idioms)]
 
 pub mod foglet;
+pub mod manifest;
 
 pub use foglet::{
     load_context, load_context_from_env, load_context_from_file, load_context_with_options,
     process_env, synthesize_local_dev, ContextError, ContextSource, FogletContext, LoadOptions,
+};
+pub use manifest::{
+    FogletManifest, ManifestError, ManifestInputs, DEFAULT_AUTH_SCOPE, DEFAULT_IDLE_TIMEOUT_MS,
+    DEFAULT_TIMEOUT_MS, DEFAULT_VISIBILITY, RUNTIME_EXTERNAL_PTY,
 };
 
 /// Crate version string, sourced from `Cargo.toml` at build time.
