@@ -45,8 +45,11 @@
 //! `save.json` and may point at a directory that does not yet exist;
 //! Task 8b's writer is responsible for `mkdir -p` and atomic write.
 
+use std::fs;
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
+use serde::{de::DeserializeOwned, Serialize};
 use thiserror::Error;
 
 use crate::config::SaveStrategy;
@@ -181,6 +184,171 @@ where
     };
 
     Ok(Some(path))
+}
+
+/// Errors produced while reading or writing a save file.
+///
+/// Library-internal (`thiserror`) so the runtime can match on a stable
+/// closed set; `anyhow` translation happens at the binary boundary
+/// per PROMPT.md's "errors at boundaries" rule.
+///
+/// Variants are deliberately granular: when a save fails the operator
+/// reading the door log (SPEC §11) wants to know whether the parent
+/// directory was unwritable, the JSON was corrupt, or the rename
+/// itself blew up — each suggests a different remediation.
+#[derive(Debug, Error)]
+pub enum SaveIoError {
+    /// The save path had no parent component, e.g. a bare relative
+    /// `save.json` with no directory. Canonical save paths always
+    /// include at least one directory segment (`/srv/.../save.json` or
+    /// `.fgk/saves/local-dev/save.json`), so this only fires when a
+    /// caller hand-constructs a degenerate path.
+    #[error("save path has no parent directory: {path}")]
+    NoParent {
+        /// The offending path the caller passed in.
+        path: String,
+    },
+
+    /// `mkdir -p` of the parent directory failed. Most common causes:
+    /// the production `/srv/foglet/...` tree is missing or the operator
+    /// lacks write permission. Surfaced verbatim so the door log makes
+    /// the underlying `errno` visible.
+    #[error("creating save parent directory failed: {0}")]
+    Mkdir(#[source] io::Error),
+
+    /// Generic I/O failure during the write half of the cycle: opening
+    /// the temp file, writing JSON bytes, flushing, or fsync. The
+    /// inner [`io::Error`] preserves the OS-level cause.
+    #[error("writing save file failed: {0}")]
+    Write(#[source] io::Error),
+
+    /// `rename(2)` from the temp file to the final path failed. Treated
+    /// distinctly from generic write errors so the operator can tell
+    /// "the data never made it to disk" from "the swap-in failed and
+    /// the previous version is still authoritative".
+    #[error("renaming temp save into place failed: {0}")]
+    Persist(#[source] io::Error),
+
+    /// Reading an existing save file failed (open/read).
+    #[error("reading save file failed: {0}")]
+    Read(#[source] io::Error),
+
+    /// Serializing the caller's save value to JSON failed. In practice
+    /// this only happens for types whose `Serialize` impl returns an
+    /// error (e.g. a map with non-string keys); ordinary plain-data
+    /// game state never hits this branch.
+    #[error("serializing save state to JSON failed: {0}")]
+    Serialize(#[source] serde_json::Error),
+
+    /// Deserializing an existing save file's JSON failed. Surfaces the
+    /// parser error so a corrupt or schema-drifted save is debuggable
+    /// from the door log without further instrumentation.
+    #[error("deserializing save state from JSON failed: {0}")]
+    Deserialize(#[source] serde_json::Error),
+}
+
+/// Write `value` to `path` atomically.
+///
+/// The contract — matching SPEC §13's reliability bar and the
+/// "atomic writes" architecture tenet in PROMPT.md — is:
+///
+/// 1. Ensure the parent directory exists (`mkdir -p`).
+/// 2. Create a unique temp file *in the same directory* as `path`.
+///    Co-locating the temp file is what makes the final `rename(2)`
+///    atomic on POSIX: a cross-filesystem rename would fall back to
+///    copy+delete and leave a half-written file visible during the
+///    copy.
+/// 3. Serialize `value` as pretty-printed JSON, flush the writer's
+///    user-space buffer, and `sync_all()` the file to push the bytes
+///    out of the kernel page cache to disk. Pretty-printing is a
+///    deliberate choice for save files: they're rarely written, are
+///    read by humans during debugging, and the size cost is
+///    negligible compared to the JSON parser overhead.
+/// 4. Persist (rename) the temp file over `path`.
+///
+/// On any failure, the temp file is dropped and removed by `tempfile`
+/// before the function returns — `path` either contains the previous
+/// successful save or, if the file never existed, remains absent. It
+/// is *never* observed half-written, even if the process is killed
+/// between step 2 and step 4: `path` itself isn't touched until the
+/// rename, and the temp file's name isn't `path`.
+///
+/// The crash-mid-write test in this module's tests asserts this
+/// invariant directly by simulating an interrupted write (constructing
+/// a `NamedTempFile` and dropping it without `persist()`).
+pub fn write_atomic<T: Serialize>(path: &Path, value: &T) -> Result<(), SaveIoError> {
+    let parent = path.parent().ok_or_else(|| SaveIoError::NoParent {
+        path: path.display().to_string(),
+    })?;
+
+    // Empty parent (`save.json` with no directory) is treated the same
+    // way: we'd have nothing to mkdir into and no place to drop the
+    // temp file safely. Surface the same error so callers can rely on
+    // a single failure mode for "degenerate path".
+    if parent.as_os_str().is_empty() {
+        return Err(SaveIoError::NoParent {
+            path: path.display().to_string(),
+        });
+    }
+
+    fs::create_dir_all(parent).map_err(SaveIoError::Mkdir)?;
+
+    // `NamedTempFile::new_in` places the temp file alongside the target
+    // so the eventual rename stays within one filesystem. Names look
+    // like `.tmpXXXXXX`, distinct from `save.json`, so concurrent
+    // readers (if any) keep seeing the previous version.
+    let mut tmp = tempfile::NamedTempFile::new_in(parent).map_err(SaveIoError::Write)?;
+
+    // serde_json::to_writer_pretty streams directly into the tempfile
+    // without buffering the whole JSON document in memory — saves can
+    // grow large for inventory-heavy games and we'd rather not double
+    // the memory footprint at write time.
+    serde_json::to_writer_pretty(&mut tmp, value).map_err(SaveIoError::Serialize)?;
+
+    // Flush user-space buffer before the kernel-level fsync. `Write::flush`
+    // on a File is a no-op today but documenting the call protects the
+    // invariant if the impl ever grows internal buffering.
+    tmp.as_file_mut().flush().map_err(SaveIoError::Write)?;
+    // `sync_all` corresponds to fsync(2): pushes bytes + metadata to
+    // the disk surface. Without it, a power loss between rename and
+    // the next periodic flush could still strand the file as a
+    // zero-length entry — atomic rename guards visibility, fsync
+    // guards durability.
+    tmp.as_file().sync_all().map_err(SaveIoError::Write)?;
+
+    // `persist` performs the rename(2). It returns a `PersistError` on
+    // failure (which carries the original tempfile so the caller could
+    // retry); we discard that and surface only the io error since the
+    // tempfile's `Drop` will remove the scratch path either way.
+    tmp.persist(path)
+        .map_err(|e| SaveIoError::Persist(e.error))?;
+
+    Ok(())
+}
+
+/// Read the JSON save at `path` into a typed value.
+///
+/// Returns `Ok(None)` exactly when `path` does not exist — the common
+/// case for a brand-new player launching the game for the first time,
+/// and the only branch where "missing" is not an error. Other I/O
+/// failures (permission denied, unreadable file) surface as
+/// [`SaveIoError::Read`] so the runtime can distinguish "no save yet"
+/// from "save exists but unreachable".
+pub fn read_save<T: DeserializeOwned>(path: &Path) -> Result<Option<T>, SaveIoError> {
+    let mut file = match fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(SaveIoError::Read(e)),
+    };
+
+    // Reading the whole save into memory is fine: SPEC §12 expects a
+    // single-document `save.json` per user, which is small. Streaming
+    // through `from_reader` would also work but `read_to_string` gives
+    // us a tidier error path for malformed UTF-8.
+    let mut buf = String::new();
+    file.read_to_string(&mut buf).map_err(SaveIoError::Read)?;
+    let value = serde_json::from_str(&buf).map_err(SaveIoError::Deserialize)?;
+    Ok(Some(value))
 }
 
 #[cfg(test)]
@@ -445,5 +613,160 @@ mod tests {
         )
         .unwrap();
         assert!(path.is_none());
+    }
+
+    // ----- Atomic write/read tests (Task 8b) -------------------------
+    //
+    // These tests live alongside the path-resolution tests because the
+    // two halves of `save` are tightly coupled in the runtime: the
+    // resolved path is what the writer renames into. Keeping them in
+    // one module lets a future reader see the contract end-to-end.
+
+    use serde::Deserialize;
+
+    /// Tiny stand-in for an authored game's save state. Fields cover
+    /// the shapes a real game cares about (scalar, string, sequence,
+    /// nested) so the round-trip test exercises serde's normal paths.
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    struct SaveFixture {
+        version: u32,
+        player: String,
+        inventory: Vec<String>,
+        flags: Vec<(String, bool)>,
+    }
+
+    fn fixture_v1() -> SaveFixture {
+        SaveFixture {
+            version: 1,
+            player: "alice".into(),
+            inventory: vec!["matches".into(), "key-203".into()],
+            flags: vec![("met-clerk".into(), true)],
+        }
+    }
+
+    fn fixture_v2() -> SaveFixture {
+        SaveFixture {
+            version: 2,
+            player: "alice".into(),
+            inventory: vec!["matches".into(), "key-203".into(), "ledger".into()],
+            flags: vec![("met-clerk".into(), true), ("found-ledger".into(), true)],
+        }
+    }
+
+    #[test]
+    fn write_then_read_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("save.json");
+        let original = fixture_v1();
+
+        write_atomic(&path, &original).unwrap();
+        let loaded: SaveFixture = read_save(&path).unwrap().expect("file should exist");
+
+        assert_eq!(loaded, original);
+    }
+
+    #[test]
+    fn read_returns_none_for_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("never-written.json");
+
+        let loaded: Option<SaveFixture> = read_save(&path).unwrap();
+        assert!(
+            loaded.is_none(),
+            "missing file is the brand-new-player path"
+        );
+    }
+
+    #[test]
+    fn write_creates_missing_parent_directories() {
+        // SPEC §12's per-user save path includes a `<user_id>` dir that
+        // doesn't exist on first launch. The writer must `mkdir -p` it.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("saves").join("u-42").join("save.json");
+
+        write_atomic(&path, &fixture_v1()).unwrap();
+        assert!(
+            path.exists(),
+            "save.json should be created under freshly-made dirs"
+        );
+    }
+
+    #[test]
+    fn second_write_overwrites_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("save.json");
+
+        write_atomic(&path, &fixture_v1()).unwrap();
+        write_atomic(&path, &fixture_v2()).unwrap();
+
+        let loaded: SaveFixture = read_save(&path).unwrap().unwrap();
+        assert_eq!(loaded, fixture_v2());
+    }
+
+    #[test]
+    fn crash_mid_write_leaves_previous_version_intact() {
+        // Simulates the failure mode the SPEC §13 reliability bar and
+        // PROMPT.md's "atomic writes" tenet are meant to defend
+        // against: process death between "started writing" and
+        // "successfully renamed". The temp file is created and written
+        // but never `persist()`ed; on drop, `tempfile` removes the
+        // scratch file and the previously-renamed `save.json` must
+        // still hold v1 — never half-written, never absent.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("save.json");
+
+        // First, an honest save lands v1 atomically.
+        write_atomic(&path, &fixture_v1()).unwrap();
+
+        // Now begin a v2 write the way `write_atomic` does, but bail
+        // out before the `persist()` step.
+        {
+            let parent = path.parent().unwrap();
+            let mut tmp = tempfile::NamedTempFile::new_in(parent).unwrap();
+            serde_json::to_writer_pretty(&mut tmp, &fixture_v2()).unwrap();
+            tmp.as_file_mut().flush().unwrap();
+            // Intentionally drop `tmp` without calling `.persist(&path)`.
+            // This models a crash mid-write: the temp file vanishes,
+            // and `path` itself was never touched.
+            drop(tmp);
+        }
+
+        // Final check: `save.json` is *exactly* v1, byte-for-byte the
+        // outcome of the previous successful write. Never absent,
+        // never half-written, never v2.
+        let loaded: SaveFixture = read_save(&path).unwrap().unwrap();
+        assert_eq!(loaded, fixture_v1());
+
+        // And no stray temp files were left behind in the dir.
+        let leftovers: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n != "save.json")
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "no scratch files should outlive a dropped NamedTempFile, got {leftovers:?}",
+        );
+    }
+
+    #[test]
+    fn read_surfaces_deserialize_error_for_corrupt_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("save.json");
+        fs::write(&path, b"{ not valid json").unwrap();
+
+        let err = read_save::<SaveFixture>(&path).unwrap_err();
+        assert!(matches!(err, SaveIoError::Deserialize(_)));
+    }
+
+    #[test]
+    fn write_to_path_with_no_parent_errors() {
+        // Path `save.json` (no directory component) is degenerate: we
+        // can't drop a temp file alongside it deterministically. The
+        // writer surfaces a clear error rather than silently writing
+        // somewhere surprising like the cwd.
+        let path = Path::new("save.json");
+        let err = write_atomic(path, &fixture_v1()).unwrap_err();
+        assert!(matches!(err, SaveIoError::NoParent { .. }));
     }
 }

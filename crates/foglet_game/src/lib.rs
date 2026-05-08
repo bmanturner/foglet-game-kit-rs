@@ -56,7 +56,10 @@ pub use runtime::{
     run_built, run_with_io, BuiltGame, CrosstermEventSource, EventSource, Game, GameError,
     GameResult, SavePolicy, TICK_INTERVAL,
 };
-pub use save::{resolve_save_path, SavePathError, SavePathInputs, SAVE_DIR_ENV, SAVE_FILENAME};
+pub use save::{
+    read_save, resolve_save_path, write_atomic, SaveIoError, SavePathError, SavePathInputs,
+    SAVE_DIR_ENV, SAVE_FILENAME,
+};
 pub use screen::{
     apply_command, ExitReason, GameContext, Screen, ScreenCommand, ScreenStack, SideEffect,
 };

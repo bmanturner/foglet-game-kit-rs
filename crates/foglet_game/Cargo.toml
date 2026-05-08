@@ -47,9 +47,18 @@ crossterm  = { workspace = true }
 # library boundary because the trait is part of the public authoring
 # API — every game crate transitively depends on this anyway.
 ratatui    = { workspace = true }
+# Task 8b (atomic save manager) uses `tempfile::NamedTempFile::new_in`
+# to write the JSON sidecar in the *same* directory as the target
+# `save.json` and then `persist()` it. Co-locating the temp file is
+# what makes the final `rename(2)` atomic on POSIX (same filesystem)
+# and what the SPEC §10.4 wrapper, the architecture tenets in
+# PROMPT.md, and SPEC §13's reliability bar all require.
+tempfile   = { workspace = true }
+# `serde_json` from the workspace pin lets the save manager serialize
+# arbitrary author-defined save state to JSON via `serde_json::to_writer`
+# / `from_reader`. Already declared above for the context loader.
 
 [dev-dependencies]
-# `tempfile` lets the loader tests write a context file to a real
-# path on disk, exercising the same code path Foglet uses in prod
-# (env var → filesystem → parse) instead of stubbing the filesystem.
-tempfile = { workspace = true }
+# (Tests reuse `tempfile` from `[dependencies]` above — no extra entry
+# needed. The context-loader tests write a context file to a real path
+# on disk via the same crate.)
