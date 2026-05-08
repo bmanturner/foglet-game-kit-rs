@@ -212,10 +212,140 @@ pub trait Screen {
     }
 }
 
+/// The screen stack the runtime owns and reducers operate over.
+///
+/// A type alias rather than a newtype because the stack is just a
+/// `Vec<Box<dyn Screen>>` — wrapping it would force callers through an
+/// inherent-method API for trivial pushes/pops the runtime already
+/// drives via [`apply_command`]. Keeping it transparent also lets tests
+/// build a stack with `vec![Box::new(MyScreen)]` and inspect `.len()`
+/// directly.
+pub type ScreenStack = Vec<Box<dyn Screen>>;
+
+/// Reason the runtime should leave its main loop, returned by
+/// [`apply_command`] when a command transitions the stack into a
+/// terminal state.
+///
+/// The runtime translates this into the SPEC §7.3 exit path: restore
+/// terminal, flush dirty saves, return an exit code. Keeping the
+/// reason explicit (rather than collapsing both into a single bool)
+/// lets the runtime distinguish "the player asked to quit" from "the
+/// last screen popped itself" — useful for logging and for future
+/// behaviours like "auto-save on Quit but not on EmptyStack".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExitReason {
+    /// A screen returned [`ScreenCommand::Quit`].
+    Quit,
+    /// A [`ScreenCommand::Pop`] left the stack empty. SPEC §5.5 says
+    /// the runtime treats this as a clean exit.
+    EmptyStack,
+}
+
+/// Side effect produced by [`apply_command`] that the runtime must act
+/// on *after* the stack has been mutated.
+///
+/// This is deliberately a plain enum — the reducer stays pure
+/// (mutates only the stack it was handed) and the runtime is the one
+/// that actually calls into the save manager, the message line, the
+/// terminal guard, etc. That split is what makes 7b unit-testable
+/// without any `ratatui`/`crossterm` plumbing.
+///
+/// `Push` / `Replace` are absent on purpose: they only mutate the
+/// stack and have no out-of-band effect for the runtime to perform.
+#[derive(Debug, PartialEq, Eq)]
+pub enum SideEffect {
+    /// Nothing for the runtime to do beyond rendering the (possibly
+    /// updated) stack on the next frame.
+    None,
+    /// Runtime should ask the save manager to flush.
+    Save,
+    /// Runtime should surface a transient message to the player.
+    Message(String),
+    /// Runtime should surface an error to the player and/or operator
+    /// log. Plain `String` to match [`ScreenCommand::Error`].
+    Error(String),
+    /// Runtime should leave the loop and run the SPEC §7.3 shutdown.
+    Exit(ExitReason),
+}
+
+/// Pure reducer: apply a [`ScreenCommand`] to a [`ScreenStack`] and
+/// return the resulting [`SideEffect`].
+///
+/// ## Why a reducer rather than a method on the runtime
+///
+/// SPEC §7.2 says the runtime "applies returned `ScreenCommand`
+/// values" — but that step is entirely about manipulating the stack
+/// and choosing the next action. Pulling it out of the runtime means:
+///
+/// - The mapping from command → stack change is exhaustively
+///   specified by the type system (every variant is matched here).
+/// - Tests can drive scripted command sequences against a `Vec` and
+///   assert the final stack shape without mocking a terminal.
+/// - The runtime in 7d is left with a thin job: poll → normalize →
+///   dispatch → apply → render.
+///
+/// ## Behaviour matrix
+///
+/// | Command           | Stack effect                                   | SideEffect                  |
+/// |-------------------|------------------------------------------------|-----------------------------|
+/// | `None`            | none                                           | `None`                      |
+/// | `Push(s)`         | push `s` on top                                | `None`                      |
+/// | `Pop`             | pop top; empty afterwards → exit               | `None` or `Exit(EmptyStack)`|
+/// | `Replace(s)`      | pop top (if any), then push `s`                | `None`                      |
+/// | `Quit`            | clear the stack                                | `Exit(Quit)`                |
+/// | `Save`            | none                                           | `Save`                      |
+/// | `Message(s)`      | none                                           | `Message(s)`                |
+/// | `Error(s)`        | none                                           | `Error(s)`                  |
+///
+/// Notes:
+///
+/// - `Pop` on an already-empty stack is treated identically to popping
+///   the last screen: `Exit(EmptyStack)`. The runtime should never see
+///   this in practice (it stops looping the moment the first
+///   `EmptyStack` is reported), but defining the behaviour here keeps
+///   the function total.
+/// - `Replace` on an empty stack just pushes — no error. The runtime
+///   only reaches this codepath if a screen returned `Replace` while
+///   it was the top, and by then the stack is non-empty; the empty
+///   branch is defined only so the reducer is total.
+/// - `Quit` clears the stack so the runtime sees a consistent "no
+///   more screens" state on its way out, matching the SPEC §5.5
+///   description that `Quit` is "equivalent to popping every screen".
+pub fn apply_command(stack: &mut ScreenStack, command: ScreenCommand) -> SideEffect {
+    match command {
+        ScreenCommand::None => SideEffect::None,
+        ScreenCommand::Push(screen) => {
+            stack.push(screen);
+            SideEffect::None
+        }
+        ScreenCommand::Pop => {
+            stack.pop();
+            if stack.is_empty() {
+                SideEffect::Exit(ExitReason::EmptyStack)
+            } else {
+                SideEffect::None
+            }
+        }
+        ScreenCommand::Replace(screen) => {
+            stack.pop();
+            stack.push(screen);
+            SideEffect::None
+        }
+        ScreenCommand::Quit => {
+            stack.clear();
+            SideEffect::Exit(ExitReason::Quit)
+        }
+        ScreenCommand::Save => SideEffect::Save,
+        ScreenCommand::Message(s) => SideEffect::Message(s),
+        ScreenCommand::Error(s) => SideEffect::Error(s),
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    //! Type-level coverage for 7a. Stack operations and runtime wiring
-    //! are tested in 7b/7d respectively.
+    //! Type-level coverage for 7a plus reducer coverage for 7b.
+    //! Runtime wiring (event poll, render, terminal guard integration)
+    //! is tested in 7d.
 
     use super::*;
     use crate::config::{GameConfig, GameSection, ManifestSection, SaveSection, SaveStrategy};
@@ -377,6 +507,227 @@ mod tests {
         fn render(&mut self, _ctx: &mut GameContext<'_>, _frame: &mut ratatui::Frame<'_>) {
             self.renders += 1;
         }
+    }
+
+    /// A screen that records every input it receives — tagged with its
+    /// own identity into a shared log — and returns a pre-programmed
+    /// [`ScreenCommand`] from each `handle_input` call. Reducer tests
+    /// use the shared log to assert dispatch order without needing to
+    /// downcast trait objects.
+    struct ScriptedScreen {
+        tag: &'static str,
+        /// Shared dispatch log: each entry is the `tag` of the screen
+        /// whose `handle_input` was invoked. `Rc<RefCell<...>>` keeps
+        /// the test single-threaded and ergonomic; production code
+        /// never sees this.
+        log: std::rc::Rc<std::cell::RefCell<Vec<&'static str>>>,
+        /// Queue of commands to return from `handle_input`. If
+        /// exhausted, `handle_input` returns [`ScreenCommand::None`] so
+        /// the test can keep dispatching without panicking.
+        script: std::collections::VecDeque<ScreenCommand>,
+    }
+
+    impl ScriptedScreen {
+        fn new(
+            tag: &'static str,
+            log: std::rc::Rc<std::cell::RefCell<Vec<&'static str>>>,
+            script: Vec<ScreenCommand>,
+        ) -> Self {
+            Self {
+                tag,
+                log,
+                script: script.into(),
+            }
+        }
+    }
+
+    impl Screen for ScriptedScreen {
+        fn render(&mut self, _ctx: &mut GameContext<'_>, _frame: &mut ratatui::Frame<'_>) {}
+        fn handle_input(&mut self, _ctx: &mut GameContext<'_>, _input: Input) -> ScreenCommand {
+            self.log.borrow_mut().push(self.tag);
+            self.script.pop_front().unwrap_or(ScreenCommand::None)
+        }
+    }
+
+    /// Run a scripted dispatch loop: for each input, call the top
+    /// screen's `handle_input` and apply the returned command to the
+    /// stack. Returns the side effects produced. Dispatch order is
+    /// recovered from the shared log on the [`ScriptedScreen`]s. This
+    /// is the closest unit-level analogue to the runtime loop without
+    /// any terminal coupling.
+    fn scripted_run(
+        stack: &mut ScreenStack,
+        ctx: &mut GameContext<'_>,
+        inputs: &[Input],
+    ) -> Vec<SideEffect> {
+        let mut effects = Vec::new();
+        for input in inputs {
+            let cmd = match stack.last_mut() {
+                Some(top) => top.handle_input(ctx, *input),
+                None => break,
+            };
+            let effect = apply_command(stack, cmd);
+            let exited = matches!(effect, SideEffect::Exit(_));
+            effects.push(effect);
+            if exited {
+                break;
+            }
+        }
+        effects
+    }
+
+    #[test]
+    fn apply_none_is_noop() {
+        let mut stack: ScreenStack = vec![Box::new(NoopScreen)];
+        let effect = apply_command(&mut stack, ScreenCommand::None);
+        assert_eq!(effect, SideEffect::None);
+        assert_eq!(stack.len(), 1);
+    }
+
+    #[test]
+    fn apply_push_grows_stack() {
+        let mut stack: ScreenStack = vec![Box::new(NoopScreen)];
+        let effect = apply_command(&mut stack, ScreenCommand::Push(Box::new(NoopScreen)));
+        assert_eq!(effect, SideEffect::None);
+        assert_eq!(stack.len(), 2);
+    }
+
+    #[test]
+    fn apply_pop_shrinks_stack() {
+        let mut stack: ScreenStack = vec![Box::new(NoopScreen), Box::new(NoopScreen)];
+        let effect = apply_command(&mut stack, ScreenCommand::Pop);
+        assert_eq!(effect, SideEffect::None);
+        assert_eq!(stack.len(), 1);
+    }
+
+    #[test]
+    fn apply_pop_last_screen_signals_empty_stack_exit() {
+        let mut stack: ScreenStack = vec![Box::new(NoopScreen)];
+        let effect = apply_command(&mut stack, ScreenCommand::Pop);
+        assert_eq!(effect, SideEffect::Exit(ExitReason::EmptyStack));
+        assert!(stack.is_empty());
+    }
+
+    #[test]
+    fn apply_pop_on_empty_stack_signals_empty_stack_exit() {
+        let mut stack: ScreenStack = Vec::new();
+        let effect = apply_command(&mut stack, ScreenCommand::Pop);
+        assert_eq!(effect, SideEffect::Exit(ExitReason::EmptyStack));
+        assert!(stack.is_empty());
+    }
+
+    #[test]
+    fn apply_replace_swaps_top() {
+        let mut stack: ScreenStack = vec![Box::new(NoopScreen), Box::new(NoopScreen)];
+        let effect = apply_command(&mut stack, ScreenCommand::Replace(Box::new(NoopScreen)));
+        assert_eq!(effect, SideEffect::None);
+        // Replace pops + pushes — length unchanged.
+        assert_eq!(stack.len(), 2);
+    }
+
+    #[test]
+    fn apply_replace_on_empty_just_pushes() {
+        // Defined behaviour even though the runtime never reaches this
+        // branch in practice (a screen has to be on top to return
+        // `Replace`). Documented in the function's behaviour matrix.
+        let mut stack: ScreenStack = Vec::new();
+        let effect = apply_command(&mut stack, ScreenCommand::Replace(Box::new(NoopScreen)));
+        assert_eq!(effect, SideEffect::None);
+        assert_eq!(stack.len(), 1);
+    }
+
+    #[test]
+    fn apply_quit_clears_stack_and_exits() {
+        let mut stack: ScreenStack = vec![
+            Box::new(NoopScreen),
+            Box::new(NoopScreen),
+            Box::new(NoopScreen),
+        ];
+        let effect = apply_command(&mut stack, ScreenCommand::Quit);
+        assert_eq!(effect, SideEffect::Exit(ExitReason::Quit));
+        assert!(stack.is_empty());
+    }
+
+    #[test]
+    fn apply_save_leaves_stack_alone() {
+        let mut stack: ScreenStack = vec![Box::new(NoopScreen)];
+        let effect = apply_command(&mut stack, ScreenCommand::Save);
+        assert_eq!(effect, SideEffect::Save);
+        assert_eq!(stack.len(), 1);
+    }
+
+    #[test]
+    fn apply_message_passes_through() {
+        let mut stack: ScreenStack = vec![Box::new(NoopScreen)];
+        let effect = apply_command(&mut stack, ScreenCommand::Message("hi".into()));
+        assert_eq!(effect, SideEffect::Message("hi".into()));
+        assert_eq!(stack.len(), 1);
+    }
+
+    #[test]
+    fn apply_error_passes_through() {
+        let mut stack: ScreenStack = vec![Box::new(NoopScreen)];
+        let effect = apply_command(&mut stack, ScreenCommand::Error("boom".into()));
+        assert_eq!(effect, SideEffect::Error("boom".into()));
+        assert_eq!(stack.len(), 1);
+    }
+
+    #[test]
+    fn scripted_input_drives_push_then_pop_then_quit() {
+        // Title screen pushes a Menu on Enter; Menu pops on Esc; the
+        // exposed Title then quits on 'q'. This is the canonical round
+        // trip for the reducer wiring 7d will rely on.
+        let cfg = fixture_config();
+        let fc = fixture_context();
+        let mut ctx = GameContext::new(&cfg, &fc, (80, 24));
+
+        let log = std::rc::Rc::new(std::cell::RefCell::new(Vec::<&'static str>::new()));
+        let menu = ScriptedScreen::new("menu", log.clone(), vec![ScreenCommand::Pop]);
+        let title = ScriptedScreen::new(
+            "title",
+            log.clone(),
+            vec![ScreenCommand::Push(Box::new(menu)), ScreenCommand::Quit],
+        );
+        let mut stack: ScreenStack = vec![Box::new(title)];
+
+        let inputs = [Input::Enter, Input::Esc, Input::Char('q')];
+        let effects = scripted_run(&mut stack, &mut ctx, &inputs);
+
+        // First input dispatches to title (push menu); second to menu
+        // (pop back to title); third to title again (quit).
+        assert_eq!(log.borrow().clone(), vec!["title", "menu", "title"]);
+        assert_eq!(
+            effects,
+            vec![
+                SideEffect::None,
+                SideEffect::None,
+                SideEffect::Exit(ExitReason::Quit),
+            ]
+        );
+        assert!(stack.is_empty(), "Quit clears the stack");
+    }
+
+    #[test]
+    fn scripted_save_does_not_disturb_stack_or_top() {
+        let cfg = fixture_config();
+        let fc = fixture_context();
+        let mut ctx = GameContext::new(&cfg, &fc, (80, 24));
+
+        let log = std::rc::Rc::new(std::cell::RefCell::new(Vec::<&'static str>::new()));
+        let s = ScriptedScreen::new(
+            "only",
+            log.clone(),
+            vec![ScreenCommand::Save, ScreenCommand::Message("ok".into())],
+        );
+        let mut stack: ScreenStack = vec![Box::new(s)];
+        let effects = scripted_run(&mut stack, &mut ctx, &[Input::Enter, Input::Enter]);
+
+        assert_eq!(log.borrow().clone(), vec!["only", "only"]);
+        assert_eq!(
+            effects,
+            vec![SideEffect::Save, SideEffect::Message("ok".into())]
+        );
+        assert_eq!(stack.len(), 1);
     }
 
     #[test]
