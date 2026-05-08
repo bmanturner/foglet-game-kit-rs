@@ -1,0 +1,37 @@
+#
+# `fgk` — the operator-facing CLI for foglet-game-kit-rs.
+#
+# Eventual subcommands (per SPEC §15):
+#   - `fgk new <path>`            scaffold a starter game project
+#   - `fgk emit-manifest`         print Foglet manifest JSON
+#   - `fgk package`               produce a deployable door bundle
+#
+# Task 1 only stands the binary up so `cargo build -p fgk` works.
+# Real argument parsing and subcommand handlers land in Tasks 10–12.
+#
+
+[package]
+name        = "fgk"
+description = "CLI for scaffolding and packaging Foglet door games."
+version      = { workspace = true }
+edition      = { workspace = true }
+rust-version = { workspace = true }
+license      = { workspace = true }
+repository   = { workspace = true }
+authors      = { workspace = true }
+
+[[bin]]
+# Explicit binary name so `cargo run -p fgk -- ...` works without
+# needing to remember the package-name → binary mapping.
+name = "fgk"
+path = "src/main.rs"
+
+[dependencies]
+# Library crate: every CLI subcommand will eventually reach into
+# `foglet_game` (manifest emission, config parsing, etc.).
+foglet_game = { path = "../foglet_game" }
+
+# Real dependencies (clap, anyhow, serde_json, …) are pulled in by
+# the task that introduces the subcommand needing them.
+
+[dev-dependencies]

@@ -1,0 +1,32 @@
+#
+# `foglet_game` — the library crate authors depend on to build a
+# Foglet-compatible terminal door game. SPEC §6 lists the module
+# layout this crate will eventually grow into; for Task 1 we only
+# stand up the crate so `cargo check --workspace` and
+# `cargo test --workspace` are green. Real modules land in their own
+# tasks (terminal guard in Task 5, runtime in Task 7, etc.).
+#
+
+[package]
+name        = "foglet_game"
+description = "Authoring kit for Foglet external_pty terminal door games."
+version      = { workspace = true }
+edition      = { workspace = true }
+rust-version = { workspace = true }
+license      = { workspace = true }
+repository   = { workspace = true }
+authors      = { workspace = true }
+
+[lib]
+# Explicit so future binaries in `examples/` or `crates/fgk` can link
+# against this crate by its declared name.
+name = "foglet_game"
+path = "src/lib.rs"
+
+[dependencies]
+# No runtime deps land in Task 1. They're added in the task that
+# first uses them so the dependency graph stays auditable against
+# SPEC §6.
+
+[dev-dependencies]
+# Test-only helpers. None pulled in yet; added per-task as needed.
