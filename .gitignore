@@ -1,0 +1,12 @@
+/target
+**/*.rs.bk
+Cargo.lock.bak
+.env
+.env.local
+.DS_Store
+
+.ralph/
+CHECKLIST.md
+PROMPT.md
+SPEC.md
+ralph.sh
