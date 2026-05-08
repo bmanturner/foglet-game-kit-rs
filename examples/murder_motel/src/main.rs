@@ -482,10 +482,16 @@ impl MapScreen {
     /// letters so they're visually distinguishable from the player's
     /// `@` and the uppercase NPC glyphs even on monochrome BBS clients.
     pub const ITEMS: [Item; 5] = [
+        // The brass key sits in Room 1 (left of every door) so the
+        // player can collect it without first traversing the locked
+        // door at x=36 introduced in Task 13f. The matchbook moved to
+        // Room 4 so the locked door actually gates progress: there is
+        // exactly one collectable behind it, and it is reachable only
+        // after the brass key is in the inventory.
         Item {
-            id: "matchbook",
-            name: "Matchbook",
-            glyph: 'm',
+            id: "brass_key",
+            name: "Brass key",
+            glyph: 'k',
             x: 6,
             y: 5,
         },
@@ -511,13 +517,37 @@ impl MapScreen {
             y: 2,
         },
         Item {
-            id: "brass_key",
-            name: "Brass key",
-            glyph: 'k',
+            id: "matchbook",
+            name: "Matchbook",
+            glyph: 'm',
             x: 39,
             y: 5,
         },
     ];
+
+    /// Inventory ID required to pass the locked door at
+    /// [`Self::LOCKED_DOOR_POS`]. Must match the `id` of the brass-key
+    /// catalog entry above; the test
+    /// `locked_door_key_id_matches_catalog` asserts this invariant so
+    /// a future rename of either field surfaces immediately rather than
+    /// silently un-locking the door.
+    pub const LOCKED_DOOR_KEY_ID: &'static str = "brass_key";
+
+    /// Position of the lobby's one locked door. The cell is rendered
+    /// from the lobby ASCII map's `L` glyph (parsed as a `Custom`
+    /// tile kind via the lobby legend) so render code stays a thin
+    /// styling pass and the geometry lives in the asset file.
+    pub const LOCKED_DOOR_POS: (u16, u16) = (36, 3);
+
+    /// Glyph painted on the locked door cell while it is still locked.
+    /// Pulled out so render and tests share one source of truth.
+    pub const LOCKED_DOOR_GLYPH: char = 'L';
+
+    /// Glyph painted on the locked door cell once unlocked. Matches the
+    /// open-door glyph elsewhere on the map so a player who unlocks the
+    /// door visually understands the cell is now equivalent to its
+    /// unlocked siblings.
+    pub const UNLOCKED_DOOR_GLYPH: char = '+';
 
     /// Build the lobby map screen with the player at `(start_x,
     /// start_y)`. The constructor parses [`LOBBY_MAP_TEXT`] against
@@ -584,6 +614,14 @@ impl MapScreen {
             _ => return false,
         };
         if !self.map.is_walkable(target_x, target_y) {
+            return false;
+        }
+        // Locked-door gate (Task 13f). The lobby ASCII tags one cell
+        // with the `L` legend kind; passage is rejected unless the
+        // matching key item sits in the player's inventory. The map
+        // model itself treats `Custom` tiles as walkable — the lock
+        // is a screen-level concern, parallel to NPC blocking below.
+        if self.is_locked_door_blocking(target_x, target_y) {
             return false;
         }
         // NPCs are solid: walking into one is converted to "stand
@@ -664,6 +702,29 @@ impl MapScreen {
         self.inventory.borrow().contains(id)
     }
 
+    /// Whether the cell at `(x, y)` is the lobby's locked door. The
+    /// position lives in [`Self::LOCKED_DOOR_POS`]; centralising the
+    /// check means the renderer and movement gate consult the same
+    /// answer instead of re-deriving the comparison.
+    pub fn is_locked_door_at(x: u16, y: u16) -> bool {
+        (x, y) == Self::LOCKED_DOOR_POS
+    }
+
+    /// Whether the player currently holds the locked-door key item.
+    /// Used by both [`Self::is_locked_door_blocking`] and the renderer
+    /// (so an unlocked door is painted in the open-door glyph).
+    pub fn has_locked_door_key(&self) -> bool {
+        self.is_collected(Self::LOCKED_DOOR_KEY_ID)
+    }
+
+    /// Whether a step into `(x, y)` should be blocked by the locked
+    /// door. True only for the locked-door cell while the player is
+    /// missing the matching key item — every other case (a non-locked
+    /// cell, or the locked cell with the key in hand) returns false.
+    pub fn is_locked_door_blocking(&self, x: u16, y: u16) -> bool {
+        Self::is_locked_door_at(x, y) && !self.has_locked_door_key()
+    }
+
     /// Locate a walkable cell near `(x, y)` by widening rings.
     ///
     /// Used as a self-correcting safety net for misconfigured spawn
@@ -705,6 +766,21 @@ impl MapScreen {
             .iter()
             .map(|row| row.iter().map(|tile| tile.glyph).collect::<String>())
             .collect();
+        // Locked-door glyph swap mirrors the styled render path: once
+        // unlocked, paint the cell as a regular `+` so headless tests
+        // see the same character the player does.
+        if self.has_locked_door_key() {
+            let (lx, ly) = Self::LOCKED_DOOR_POS;
+            if (ly as usize) < rows.len() {
+                let row = &mut rows[ly as usize];
+                let col = lx as usize;
+                if col < row.len() {
+                    let mut chars: Vec<char> = row.chars().collect();
+                    chars[col] = Self::UNLOCKED_DOOR_GLYPH;
+                    *row = chars.into_iter().collect();
+                }
+            }
+        }
         // Stamp the player glyph by replacing the byte at the player's
         // column with `@`. The lobby legend uses ASCII space/`#`/`+`
         // (all 1-byte UTF-8) and the player glyph is also ASCII, so
@@ -733,9 +809,18 @@ impl MapScreen {
 /// - `#` → wall (blocking)
 /// - ` ` → floor (walkable)
 /// - `+` → door (walkable)
+/// - `L` → locked door (parsed as a `Custom` kind so the kit's tile
+///   model stays minimal; [`MapScreen::try_move`] gates passage on the
+///   brass key being in inventory, while render styles the cell red
+///   until unlocked)
 fn lobby_legend() -> TileLegend {
-    TileLegend::from_pairs([("#", "wall"), (" ", "floor"), ("+", "door")])
-        .expect("static lobby legend parses")
+    TileLegend::from_pairs([
+        ("#", "wall"),
+        (" ", "floor"),
+        ("+", "door"),
+        ("L", "locked_door"),
+    ])
+    .expect("static lobby legend parses")
 }
 
 impl Screen for MapScreen {
@@ -757,6 +842,12 @@ impl Screen for MapScreen {
         let item_style = Style::default()
             .fg(Color::Green)
             .add_modifier(Modifier::BOLD);
+        // Locked door is painted red+bold while still locked so the
+        // player has an unmissable visual cue that the cell is gating
+        // them. Once the brass key is in inventory the cell falls back
+        // to the open-door glyph in default style — no separate
+        // "unlocked but special" state to maintain.
+        let locked_door_style = Style::default().fg(Color::Red).add_modifier(Modifier::BOLD);
 
         let mut lines: Vec<Line<'_>> = Vec::with_capacity(self.map.cells.len());
         for (y, row) in self.map.cells.iter().enumerate() {
@@ -804,6 +895,23 @@ impl Screen for MapScreen {
                         x += 1;
                         continue;
                     }
+                }
+                // Locked door (Task 13f). The lobby map's `L` cell
+                // paints red+bold while the player is missing the
+                // brass key, then collapses to the regular `+` glyph
+                // once the key is in inventory. No items or labels
+                // overlap this cell, so this branch is unconditional.
+                if Self::is_locked_door_at(x as u16, y as u16) {
+                    if self.has_locked_door_key() {
+                        spans.push(Span::raw(Self::UNLOCKED_DOOR_GLYPH.to_string()));
+                    } else {
+                        spans.push(Span::styled(
+                            Self::LOCKED_DOOR_GLYPH.to_string(),
+                            locked_door_style,
+                        ));
+                    }
+                    x += 1;
+                    continue;
                 }
                 // Room label?
                 if let Some((label, _)) = labels_for_row.iter().find(|(_, lx)| (*lx as usize) == x)
@@ -2399,16 +2507,18 @@ mod tests {
 
     #[test]
     fn map_walking_onto_item_collects_it() {
-        // Drive the player onto the matchbook cell (6, 5) and confirm
-        // the inventory grows by exactly that ID.
+        // Drive the player onto the brass-key cell (6, 5) (Room 1,
+        // since Task 13f swapped the key into Room 1 so it is
+        // collectable without first traversing the locked door) and
+        // confirm the inventory grows by exactly that ID.
         let cfg = fixture_config();
         let fc = fixture_context();
         let mut ctx = GameContext::new(&cfg, &fc, (80, 24));
         let mut map = fresh_map_screen();
         walk_to(&mut map, &mut ctx, 6, 5);
-        assert_eq!(map.player(), (6, 5), "should land on matchbook cell");
+        assert_eq!(map.player(), (6, 5), "should land on brass-key cell");
         assert!(
-            map.is_collected("matchbook"),
+            map.is_collected("brass_key"),
             "stepping onto an item must add it to the inventory"
         );
     }
@@ -2460,7 +2570,7 @@ mod tests {
         let labels = screen.current_labels();
         assert_eq!(
             labels,
-            vec!["Matchbook".to_string(), "Brass key".to_string()],
+            vec!["Brass key".to_string(), "Matchbook".to_string()],
             "labels must follow catalog order, not insertion order"
         );
         let mut term = Terminal::new(TestBackend::new(80, 24)).expect("test backend");
@@ -2539,6 +2649,122 @@ mod tests {
                 "{key:?} should quit the inventory screen"
             );
         }
+    }
+
+    // ---- Locked door (Task 13f) ---------------------------------------
+
+    #[test]
+    fn locked_door_key_id_matches_catalog() {
+        // Renaming the brass-key item or the locked-door key constant
+        // would silently un-lock the door — assert they stay in sync.
+        assert!(MapScreen::ITEMS
+            .iter()
+            .any(|i| i.id == MapScreen::LOCKED_DOOR_KEY_ID));
+    }
+
+    #[test]
+    fn locked_door_blocks_player_without_key() {
+        // Walk to (36, 3) — the cell directly south of nothing but
+        // the locked door's own column — and try to step into it.
+        // Without the brass key in the inventory the step must be
+        // rejected and the player must remain on (35, 3).
+        let cfg = fixture_config();
+        let fc = fixture_context();
+        let mut ctx = GameContext::new(&cfg, &fc, (80, 24));
+        let mut map = fresh_map_screen();
+        // Spawn (22, 4) → Up to door row, then walk east toward Room
+        // 4. The door at x=36 should stop the player at x=35.
+        map.handle_input(&mut ctx, Input::Up);
+        for _ in 0..30 {
+            map.handle_input(&mut ctx, Input::Right);
+        }
+        let (x, y) = map.player();
+        assert_eq!(
+            (x, y),
+            (35, 3),
+            "locked door must clamp the eastward walk at x=35 (one cell west of the lock)"
+        );
+        assert!(
+            !map.has_locked_door_key(),
+            "test precondition: key must not yet be in inventory"
+        );
+    }
+
+    #[test]
+    fn locked_door_passes_player_with_key() {
+        // Pick up the brass key from Room 1 first, then walk back
+        // east across the locked door. The player must end up east
+        // of x=36 (Room 4).
+        let cfg = fixture_config();
+        let fc = fixture_context();
+        let mut ctx = GameContext::new(&cfg, &fc, (80, 24));
+        let mut map = fresh_map_screen();
+        walk_to(&mut map, &mut ctx, 6, 5);
+        assert!(
+            map.has_locked_door_key(),
+            "expected brass key to be collected at (6, 5)"
+        );
+        // Now route to Room 4 via the door row.
+        walk_to(&mut map, &mut ctx, 39, 5);
+        assert_eq!(
+            map.player(),
+            (39, 5),
+            "player should reach the matchbook cell once the door is unlocked"
+        );
+        assert!(
+            map.is_collected("matchbook"),
+            "matchbook in Room 4 should be picked up after passing the unlocked door"
+        );
+    }
+
+    #[test]
+    fn locked_door_renders_with_locked_glyph_until_unlocked() {
+        // Paint the lobby with no items collected and confirm the
+        // locked-door glyph (`L`) appears at its cell. Then mark the
+        // brass key as collected and re-render; the cell must paint
+        // the open-door glyph (`+`) instead.
+        let cfg = fixture_config();
+        let fc = fixture_context();
+        let mut ctx = GameContext::new(&cfg, &fc, (80, 24));
+        let mut map = fresh_map_screen();
+        let mut term = Terminal::new(TestBackend::new(80, 24)).expect("test backend");
+        term.draw(|frame| map.render(&mut ctx, frame))
+            .expect("draw");
+        let buf = term.backend().buffer().clone();
+        let (lx, ly) = MapScreen::LOCKED_DOOR_POS;
+        // The map block adds a one-cell border, and `centred_rect`
+        // offsets the map inside the frame — `rendered_rows` keeps the
+        // contract simpler, so use it for a direct cell check.
+        let rows = map.rendered_rows();
+        let locked_cell = rows[ly as usize].chars().nth(lx as usize).unwrap();
+        assert_eq!(
+            locked_cell,
+            MapScreen::LOCKED_DOOR_GLYPH,
+            "locked door must paint as `L` while still locked"
+        );
+        // The styled render path (TestBackend) must also include `L`
+        // somewhere visible.
+        let mut found = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                found.push_str(buf.cell((x, y)).expect("cell").symbol());
+            }
+            found.push('\n');
+        }
+        assert!(
+            found.contains('L'),
+            "expected locked-door glyph in render; buffer was:\n{found}"
+        );
+
+        // Unlock and re-check.
+        map.inventory().borrow_mut().insert("brass_key".into());
+        let rows = map.rendered_rows();
+        let cell = rows[ly as usize].chars().nth(lx as usize).unwrap();
+        assert_eq!(
+            cell,
+            MapScreen::UNLOCKED_DOOR_GLYPH,
+            "unlocked door must paint as `+`"
+        );
     }
 
     #[test]
