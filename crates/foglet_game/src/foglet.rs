@@ -16,9 +16,9 @@
 //!   [`load_context`] orchestrator that enforces the SPEC §5.1
 //!   precedence rule "`FOGLET_DOOR_CONTEXT` JSON MUST win over
 //!   individual env vars".
-//! - **Task 2c** — local-dev synthesis when neither the file nor the
-//!   env vars are present, plus `--local-dev-fallback` semantics for
-//!   malformed JSON.
+//! - **Task 2c (this commit)** — local-dev synthesis when neither the
+//!   file nor the env vars are present, plus `--local-dev-fallback`
+//!   semantics for malformed `FOGLET_DOOR_CONTEXT` JSON.
 //!
 //! All env-var inspection in this module goes through a caller-supplied
 //! `Fn(&str) -> Option<String>` closure rather than touching
@@ -323,33 +323,143 @@ pub fn process_env(name: &str) -> Option<String> {
     std::env::var(name).ok()
 }
 
+/// Tunable knobs for [`load_context_with_options`].
+///
+/// `LoadOptions` is a struct (rather than a bare bool) so that future
+/// SPEC-driven knobs — say, "treat empty optional fields as missing"
+/// or "override defaults for terminal size" — can land additively
+/// without forcing every existing call site through a major-version
+/// migration. The CLI translates its `--local-dev-fallback` flag into
+/// this struct at the process boundary.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct LoadOptions {
+    /// When `true`, treat an unreadable or malformed `FOGLET_DOOR_CONTEXT`
+    /// as "no context" and synthesise local-dev defaults instead of
+    /// surfacing the error.
+    ///
+    /// SPEC §5.1: malformed `FOGLET_DOOR_CONTEXT` SHOULD return a clear
+    /// error *unless* `--local-dev-fallback` is explicitly set. Leaving
+    /// this `false` is the production posture — Foglet should never be
+    /// silently downgraded to "local dev" because the context file got
+    /// corrupted on disk.
+    pub local_dev_fallback: bool,
+}
+
+/// Build a fully-populated [`FogletContext`] for "no Foglet at all"
+/// runs.
+///
+/// Used when neither `FOGLET_DOOR_CONTEXT` nor any of the `FOGLET_*`
+/// fallback vars are set. Defaults are deliberately conservative:
+///
+/// - `door_id = "local-dev"` so save paths and manifest emission have
+///   a stable identifier even outside Foglet (Task 8 derives a
+///   per-user save dir from `door_id`; see SPEC §11).
+/// - `username = Some("local-dev")` so dev-time UIs that greet the
+///   user have something to render.
+/// - `terminal_width = 80`, `terminal_height = 24` — the universal
+///   minimum that virtually every modern emulator hits. Games that
+///   require more declare a `min_size` and the runtime will error in
+///   the size check before raw mode (SPEC §7.1) just like in production.
+///
+/// Public so authoring code (and integration tests) can synthesise a
+/// context without having to fake out env state. Most callers should
+/// prefer [`load_context`] or [`load_context_with_options`] and let
+/// the loader pick this up automatically.
+pub fn synthesize_local_dev() -> FogletContext {
+    FogletContext {
+        door_id: "local-dev".to_owned(),
+        user_id: None,
+        username: Some("local-dev".to_owned()),
+        role: None,
+        session_id: None,
+        terminal_width: 80,
+        terminal_height: 24,
+        source: ContextSource::LocalDev,
+    }
+}
+
 /// Top-level Foglet context loader.
 ///
-/// Implements the SPEC §5.1 precedence rule:
-///
-/// 1. If `FOGLET_DOOR_CONTEXT` is set, load that JSON file. The file
-///    wins even if individual `FOGLET_*` vars are also populated — we
-///    do not "merge" them, because the JSON is Foglet's authoritative
-///    snapshot and the env vars exist primarily for local dev where
-///    the file is not produced.
-/// 2. Otherwise, fall back to [`load_context_from_env`].
-///
-/// Task 2c will extend step 2 with local-dev synthesis when no env
-/// vars are present and with `--local-dev-fallback` semantics for
-/// malformed JSON; until then, both branches surface their failures
-/// as [`ContextError`].
-///
-/// `getenv` is injected for the same reason as in
-/// [`load_context_from_env`] — testability without process-env
-/// mutation. Production callers use [`process_env`].
+/// Equivalent to `load_context_with_options(getenv, LoadOptions::default())`.
+/// This is the form game authors and the runtime use; the CLI uses
+/// [`load_context_with_options`] when it needs to thread
+/// `--local-dev-fallback` through.
 pub fn load_context<F>(getenv: F) -> Result<FogletContext, ContextError>
 where
     F: Fn(&str) -> Option<String>,
 {
+    load_context_with_options(getenv, LoadOptions::default())
+}
+
+/// Top-level Foglet context loader with explicit [`LoadOptions`].
+///
+/// Implements the SPEC §5.1 precedence rules in full:
+///
+/// 1. If `FOGLET_DOOR_CONTEXT` is set, load that JSON file. The file
+///    wins even when individual `FOGLET_*` vars are also populated —
+///    we do not "merge" them, because the JSON is Foglet's
+///    authoritative snapshot and the env vars exist primarily for
+///    local dev where the file is not produced.
+/// 2. If the file path is set but unreadable or malformed, surface the
+///    error — *unless* [`LoadOptions::local_dev_fallback`] is `true`,
+///    in which case the loader treats the broken file as "no context"
+///    and continues with steps 3–4. Production callers leave the flag
+///    `false`; only an operator passing `--local-dev-fallback` opts in
+///    to the silent downgrade.
+/// 3. Otherwise, if `FOGLET_DOOR_ID` is set, run [`load_context_from_env`]
+///    to synthesise from the discrete `FOGLET_*` vars. A partial env
+///    (door id present, width/height missing) still surfaces a clear
+///    [`ContextError::MissingEnv`] — the assumption is that anyone who
+///    sets `FOGLET_DOOR_ID` meant to run in env-fallback mode and a
+///    typo deserves a loud failure rather than silent local-dev synth.
+/// 4. Otherwise, fall through to [`synthesize_local_dev`]. This is the
+///    "no Foglet env at all" case — typical of `cargo run` during
+///    development.
+///
+/// `getenv` is injected for the same reason as in
+/// [`load_context_from_env`] — testability without process-env
+/// mutation. Production callers use [`process_env`].
+pub fn load_context_with_options<F>(
+    getenv: F,
+    opts: LoadOptions,
+) -> Result<FogletContext, ContextError>
+where
+    F: Fn(&str) -> Option<String>,
+{
     if let Some(path) = optional_env(env_vars::DOOR_CONTEXT, &getenv) {
-        return load_context_from_file(path);
+        match load_context_from_file(&path) {
+            Ok(ctx) => return Ok(ctx),
+            Err(err) => {
+                // Only ReadFile / ParseFile are recoverable under the
+                // fallback flag — those map directly to the
+                // "unreadable or malformed" wording in SPEC §5.1.
+                // Other variants (none today, but future ones) should
+                // not be papered over implicitly; new variants must opt
+                // in to the fallback by being added here intentionally.
+                if opts.local_dev_fallback
+                    && matches!(
+                        err,
+                        ContextError::ReadFile { .. } | ContextError::ParseFile { .. }
+                    )
+                {
+                    // Fall through to env / local-dev synthesis.
+                } else {
+                    return Err(err);
+                }
+            }
+        }
     }
-    load_context_from_env(getenv)
+
+    // Env-fallback path. Only enter it when the operator clearly meant
+    // to drive the loader with FOGLET_* vars (door_id is the signal).
+    // Otherwise we'd surface MissingEnv errors at every plain
+    // `cargo run`, which contradicts SPEC §5.1's "missing context MUST
+    // synthesize local-dev values".
+    if getenv(env_vars::DOOR_ID).is_some() {
+        return load_context_from_env(getenv);
+    }
+
+    Ok(synthesize_local_dev())
 }
 
 #[cfg(test)]
@@ -648,6 +758,163 @@ mod tests {
 
         let ctx = load_context(env).expect("load context");
         assert_eq!(ctx.source, ContextSource::Env);
+    }
+
+    /// SPEC §5.1: "Missing context MUST synthesize local-dev values."
+    /// With no `FOGLET_DOOR_CONTEXT` and no `FOGLET_*` vars set, the
+    /// orchestrator returns a fully populated context tagged
+    /// [`ContextSource::LocalDev`] rather than erroring.
+    #[test]
+    fn load_context_synthesizes_local_dev_when_no_env() {
+        let env = fake_env(&[]);
+
+        let ctx = load_context(env).expect("synthesize local-dev");
+
+        assert_eq!(ctx.source, ContextSource::LocalDev);
+        assert_eq!(ctx.door_id, "local-dev");
+        assert_eq!(ctx.username.as_deref(), Some("local-dev"));
+        // Conservative defaults that match the universal terminal
+        // minimum (SPEC §7.1 hooks check the game's declared minimum
+        // against these, just as in production).
+        assert_eq!(ctx.terminal_width, 80);
+        assert_eq!(ctx.terminal_height, 24);
+    }
+
+    /// A partial env set (door_id present but width missing) still
+    /// surfaces a typed error rather than silently synthesising
+    /// local-dev defaults. Reasoning: an operator who exported
+    /// `FOGLET_DOOR_ID` clearly meant to drive env-fallback mode; a
+    /// missing width is a typo, not a "no Foglet at all" run.
+    #[test]
+    fn load_context_with_partial_env_surfaces_error() {
+        let env = fake_env(&[
+            ("FOGLET_DOOR_ID", "door-partial"),
+            // FOGLET_TERMINAL_WIDTH / HEIGHT deliberately missing.
+        ]);
+
+        let err = load_context(env).expect_err("must fail");
+        assert!(
+            matches!(err, ContextError::MissingEnv { .. }),
+            "expected MissingEnv, got {err:?}"
+        );
+    }
+
+    /// Default [`LoadOptions`] preserve the SPEC §5.1 default posture:
+    /// malformed JSON surfaces a clear error rather than silently
+    /// downgrading to local-dev. Production Foglet runs use this path.
+    #[test]
+    fn malformed_json_errors_without_local_dev_fallback() {
+        let mut file = NamedTempFile::new().expect("create temp file");
+        file.write_all(b"definitely { not json")
+            .expect("write garbage");
+        let path_str = file.path().to_str().expect("utf-8 path").to_owned();
+        let env = move |name: &str| match name {
+            "FOGLET_DOOR_CONTEXT" => Some(path_str.clone()),
+            _ => None,
+        };
+
+        let err = load_context_with_options(env, LoadOptions::default()).expect_err("must fail");
+        assert!(
+            matches!(err, ContextError::ParseFile { .. }),
+            "expected ParseFile, got {err:?}"
+        );
+    }
+
+    /// With `--local-dev-fallback` set, malformed JSON is treated as
+    /// "no context" and the loader synthesises local-dev defaults.
+    /// Asserting `source = LocalDev` proves the loader did NOT silently
+    /// promote partial parse output — it took the synthesis branch.
+    #[test]
+    fn malformed_json_falls_back_with_flag_set() {
+        let mut file = NamedTempFile::new().expect("create temp file");
+        file.write_all(b"definitely { not json")
+            .expect("write garbage");
+        let path_str = file.path().to_str().expect("utf-8 path").to_owned();
+        let env = move |name: &str| match name {
+            "FOGLET_DOOR_CONTEXT" => Some(path_str.clone()),
+            _ => None,
+        };
+
+        let ctx = load_context_with_options(
+            env,
+            LoadOptions {
+                local_dev_fallback: true,
+            },
+        )
+        .expect("local-dev fallback");
+
+        assert_eq!(ctx.source, ContextSource::LocalDev);
+        assert_eq!(ctx.door_id, "local-dev");
+    }
+
+    /// `--local-dev-fallback` also recovers from a missing context
+    /// file (ReadFile, not just ParseFile). Operators sometimes point
+    /// FOGLET_DOOR_CONTEXT at a path that doesn't exist yet during
+    /// dev — the flag is for exactly that scenario.
+    #[test]
+    fn missing_file_falls_back_with_flag_set() {
+        let nonexistent = std::env::temp_dir()
+            .join("foglet-context-c-missing.json")
+            .to_string_lossy()
+            .into_owned();
+        let env = move |name: &str| match name {
+            "FOGLET_DOOR_CONTEXT" => Some(nonexistent.clone()),
+            _ => None,
+        };
+
+        let ctx = load_context_with_options(
+            env,
+            LoadOptions {
+                local_dev_fallback: true,
+            },
+        )
+        .expect("local-dev fallback");
+        assert_eq!(ctx.source, ContextSource::LocalDev);
+    }
+
+    /// Even with `--local-dev-fallback`, a *valid* context file is
+    /// still preferred. The flag is a recovery option, not an override.
+    #[test]
+    fn local_dev_fallback_does_not_override_valid_file() {
+        let json = r#"{
+            "door_id": "door-real",
+            "terminal_width": 100,
+            "terminal_height": 30
+        }"#;
+        let mut file = NamedTempFile::new().expect("create temp file");
+        file.write_all(json.as_bytes()).expect("write json");
+        let path_str = file.path().to_str().expect("utf-8 path").to_owned();
+        let env = move |name: &str| match name {
+            "FOGLET_DOOR_CONTEXT" => Some(path_str.clone()),
+            _ => None,
+        };
+
+        let ctx = load_context_with_options(
+            env,
+            LoadOptions {
+                local_dev_fallback: true,
+            },
+        )
+        .expect("load real context");
+        assert_eq!(ctx.source, ContextSource::ContextFile);
+        assert_eq!(ctx.door_id, "door-real");
+    }
+
+    /// The synthesised local-dev context round-trips through serde —
+    /// downstream code (e.g. the manifest emitter in Task 3) often
+    /// re-serialises pieces of the context, and the `source` enum's
+    /// snake_case representation must survive that.
+    #[test]
+    fn synthesize_local_dev_round_trips_through_json() {
+        let ctx = synthesize_local_dev();
+        let json = serde_json::to_string(&ctx).expect("serialize");
+        // Spot-check the wire form so a future rename of the enum
+        // variants doesn't silently break compatibility with anything
+        // that has already serialised a snapshot.
+        assert!(json.contains("\"source\":\"local_dev\""), "wire: {json}");
+
+        let round: FogletContext = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(round, ctx);
     }
 
     /// The loader stamps `source = ContextFile` even if the JSON
