@@ -31,6 +31,10 @@ path = "src/lib.rs"
 # rule in PROMPT.md).
 serde      = { workspace = true }
 serde_json = { workspace = true }
+# Task 4 (game config parser) reads `assets/game.toml` into a typed
+# `GameConfig`. Sourced from the workspace-pinned crate budget so any
+# other crate parsing TOML in the tree stays in lockstep.
+toml       = { workspace = true }
 thiserror  = { workspace = true }
 
 [dev-dependencies]
