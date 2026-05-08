@@ -36,6 +36,12 @@ serde_json = { workspace = true }
 # other crate parsing TOML in the tree stays in lockstep.
 toml       = { workspace = true }
 thiserror  = { workspace = true }
+# Task 5 (terminal guard) drives raw mode + alternate-screen toggling
+# through `crossterm`. The guard wraps these calls behind a trait so
+# the orchestration logic (Drop ordering, cleaned-flag, panic hook in
+# 5c) is unit-testable without a real TTY, but the production backend
+# delegates straight to `crossterm::terminal` per SPEC §6.
+crossterm  = { workspace = true }
 
 [dev-dependencies]
 # `tempfile` lets the loader tests write a context file to a real

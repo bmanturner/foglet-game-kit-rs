@@ -34,6 +34,7 @@
 pub mod config;
 pub mod foglet;
 pub mod manifest;
+pub mod terminal;
 
 pub use config::{
     ConfigError, GameConfig, GameSection, ManifestSection, SaveSection, SaveStrategy,
@@ -46,6 +47,7 @@ pub use manifest::{
     FogletManifest, ManifestError, ManifestInputs, DEFAULT_AUTH_SCOPE, DEFAULT_IDLE_TIMEOUT_MS,
     DEFAULT_TIMEOUT_MS, DEFAULT_VISIBILITY, RUNTIME_EXTERNAL_PTY,
 };
+pub use terminal::{flush_stdout, CrosstermBackend, TerminalBackend, TerminalError, TerminalGuard};
 
 /// Crate version string, sourced from `Cargo.toml` at build time.
 ///
