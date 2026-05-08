@@ -402,6 +402,13 @@ pub struct MapScreen {
     /// `BTreeSet<String>` mirrors the [`FlagSet`] shape so Task 13h
     /// can serialise both stores through the same code path.
     inventory: Rc<RefCell<BTreeSet<String>>>,
+    /// Whether the player has already triggered the win condition.
+    /// Latches to `true` the first time the player steps onto
+    /// [`Self::WIN_TILE_POS`] with [`Self::WIN_FLAG`] set; subsequent
+    /// steps onto the cell are inert so a player who Esc's out of the
+    /// [`WinScreen`] (a future Task 13h save loop will let them) does
+    /// not get the modal pushed every frame they remain on the tile.
+    won: bool,
 }
 
 impl MapScreen {
@@ -549,6 +556,27 @@ impl MapScreen {
     /// unlocked siblings.
     pub const UNLOCKED_DOOR_GLYPH: char = '+';
 
+    /// Position of the win tile — the spot the player must stand on,
+    /// after asking the Night Clerk about the murder, to solve the
+    /// case (Task 13g). Inside Room 4, which is itself only reachable
+    /// once the brass key has unlocked the door, so the natural play
+    /// chain is: talk to clerk → ask about the murder → grab the key →
+    /// walk into Room 4 → stand here.
+    pub const WIN_TILE_POS: (u16, u16) = (43, 4);
+
+    /// Glyph painted on [`Self::WIN_TILE_POS`] while the case is still
+    /// open. Stays put after winning: the player has already triggered
+    /// the modal, so re-painting an `*` would be misleading. Render
+    /// uses [`MapScreen::has_won`] to suppress the glyph post-win.
+    pub const WIN_TILE_GLYPH: char = '*';
+
+    /// Narrative flag that must be set for a step onto
+    /// [`Self::WIN_TILE_POS`] to win the game. Set by the Night Clerk's
+    /// `heard_rumor` branch (see `assets/dialog/night_clerk.yaml`).
+    /// Centralised as a constant so the tests can reference the exact
+    /// string the runtime checks without re-typing it.
+    pub const WIN_FLAG: &'static str = "heard_rumor";
+
     /// Build the lobby map screen with the player at `(start_x,
     /// start_y)`. The constructor parses [`LOBBY_MAP_TEXT`] against
     /// the lobby legend; the parse can only fail if the embedded
@@ -564,6 +592,7 @@ impl MapScreen {
             player_y: 0,
             flags: Rc::new(RefCell::new(FlagSet::new())),
             inventory: Rc::new(RefCell::new(BTreeSet::new())),
+            won: false,
         };
         // Clamp the spawn against the map bounds and walkability so a
         // misconfigured `start_x` / `start_y` in `assets/game.toml`
@@ -725,6 +754,41 @@ impl MapScreen {
         Self::is_locked_door_at(x, y) && !self.has_locked_door_key()
     }
 
+    /// Whether the win condition has already fired. Exposed so tests
+    /// can assert the latch without poking at private state and so the
+    /// renderer can drop the win-tile glyph after the modal triggers.
+    pub fn has_won(&self) -> bool {
+        self.won
+    }
+
+    /// Whether stepping onto the win tile right now would solve the
+    /// case. True only when the player stands on [`Self::WIN_TILE_POS`]
+    /// with [`Self::WIN_FLAG`] set and has not already triggered the
+    /// modal. Centralising the predicate keeps render and
+    /// [`Self::handle_input`] reading the same answer.
+    fn should_trigger_win(&self) -> bool {
+        if self.won {
+            return false;
+        }
+        if (self.player_x, self.player_y) != Self::WIN_TILE_POS {
+            return false;
+        }
+        self.flags.borrow().contains(Self::WIN_FLAG)
+    }
+
+    /// Latch the win flag and return the screen command that should be
+    /// emitted in response to the player's last move. Called after
+    /// every successful or attempted movement so a step onto the win
+    /// tile fires the modal in the same frame the move resolves.
+    fn maybe_win_command(&mut self) -> ScreenCommand {
+        if self.should_trigger_win() {
+            self.won = true;
+            ScreenCommand::Push(Box::new(WinScreen))
+        } else {
+            ScreenCommand::None
+        }
+    }
+
     /// Locate a walkable cell near `(x, y)` by widening rings.
     ///
     /// Used as a self-correcting safety net for misconfigured spawn
@@ -777,6 +841,23 @@ impl MapScreen {
                 if col < row.len() {
                     let mut chars: Vec<char> = row.chars().collect();
                     chars[col] = Self::UNLOCKED_DOOR_GLYPH;
+                    *row = chars.into_iter().collect();
+                }
+            }
+        }
+        // Win-tile glyph stamp (Task 13g). Mirrors the styled render
+        // path's behaviour: paint `*` until the player has won, then
+        // fall back to the underlying floor glyph. Stamped *before* the
+        // player overlay below so standing on the tile still shows the
+        // player's `@` rather than the marker.
+        if !self.won {
+            let (wx, wy) = Self::WIN_TILE_POS;
+            if (wy as usize) < rows.len() {
+                let row = &mut rows[wy as usize];
+                let col = wx as usize;
+                if col < row.len() {
+                    let mut chars: Vec<char> = row.chars().collect();
+                    chars[col] = Self::WIN_TILE_GLYPH;
                     *row = chars.into_iter().collect();
                 }
             }
@@ -848,6 +929,11 @@ impl Screen for MapScreen {
         // to the open-door glyph in default style — no separate
         // "unlocked but special" state to maintain.
         let locked_door_style = Style::default().fg(Color::Red).add_modifier(Modifier::BOLD);
+        // Win tile is painted in the same red+bold register as the
+        // locked door so the player reads "important" from the colour
+        // alone. Drops once the case has already been solved (see
+        // `has_won`) so a returning player does not see a stale marker.
+        let win_tile_style = Style::default().fg(Color::Red).add_modifier(Modifier::BOLD);
 
         let mut lines: Vec<Line<'_>> = Vec::with_capacity(self.map.cells.len());
         for (y, row) in self.map.cells.iter().enumerate() {
@@ -913,6 +999,18 @@ impl Screen for MapScreen {
                     x += 1;
                     continue;
                 }
+                // Win-tile marker (Task 13g). Painted only while the
+                // case is open; once the player has triggered the
+                // modal the cell falls back to its underlying floor
+                // glyph so a return visit reads as "ordinary room".
+                if !self.won && (x as u16, y as u16) == Self::WIN_TILE_POS {
+                    spans.push(Span::styled(
+                        Self::WIN_TILE_GLYPH.to_string(),
+                        win_tile_style,
+                    ));
+                    x += 1;
+                    continue;
+                }
                 // Room label?
                 if let Some((label, _)) = labels_for_row.iter().find(|(_, lx)| (*lx as usize) == x)
                 {
@@ -959,19 +1057,19 @@ impl Screen for MapScreen {
             // move fails — the lack of motion is the feedback.
             Input::Up | Input::Char('k') | Input::Char('K') => {
                 self.try_move(0, -1);
-                ScreenCommand::None
+                self.maybe_win_command()
             }
             Input::Down | Input::Char('j') | Input::Char('J') => {
                 self.try_move(0, 1);
-                ScreenCommand::None
+                self.maybe_win_command()
             }
             Input::Left | Input::Char('h') => {
                 self.try_move(-1, 0);
-                ScreenCommand::None
+                self.maybe_win_command()
             }
             Input::Right | Input::Char('l') | Input::Char('L') => {
                 self.try_move(1, 0);
-                ScreenCommand::None
+                self.maybe_win_command()
             }
             // Talk affordance: Enter (or `t`) when the player is
             // adjacent to an NPC opens that NPC's dialog. With no
@@ -1328,6 +1426,55 @@ impl Screen for HelpScreen {
             Input::Char('q') | Input::Char('Q') | Input::Ctrl('c') => ScreenCommand::Quit,
             _ => ScreenCommand::None,
         }
+    }
+}
+
+/// Terminal "you win" modal pushed when the player solves the case
+/// (Task 13g).
+///
+/// Reaching the win modal requires the player to have collected the
+/// brass key (otherwise Room 4 is unreachable) and to have asked the
+/// Night Clerk about the murder (otherwise the win flag is unset). In
+/// other words: the modal can only appear if the player has actually
+/// played through the SPEC §13 acceptance loop.
+///
+/// The screen is intentionally terminal — any keystroke quits the
+/// runtime. A future Task 13h save loop can introduce a "play again"
+/// affordance; for the 13g acceptance fixture, "Press any key to quit"
+/// is the simplest faithful end-state.
+#[derive(Debug, Default)]
+pub struct WinScreen;
+
+impl WinScreen {
+    /// Block title rendered on the bordered modal.
+    pub const TITLE: &'static str = "Case Closed";
+    /// Body lines for the modal. Stored as `&'static str` so the screen
+    /// is allocation-free per frame and tests can assert exact strings.
+    pub const LINES: &'static [&'static str] = &[
+        "You found the smoking gun. Lipstick on the wall spells out a name.",
+        "",
+        "The Night Clerk shrugs. 'Knew it'd be one of 'em. Lock up on your way out.'",
+        "",
+        "[Any key] quit",
+    ];
+}
+
+impl Screen for WinScreen {
+    fn render(&mut self, _ctx: &mut GameContext<'_>, frame: &mut Frame<'_>) {
+        // Centre the modal. Width matches the longest line plus border
+        // padding; height is the line count plus two for the border so
+        // every line is visible on an exactly-80x24 terminal.
+        let area = centred_rect(72, (Self::LINES.len() as u16) + 2, frame.area());
+        let lines: Vec<Line<'_>> = Self::LINES.iter().map(|s| Line::from(*s)).collect();
+        let widget = Paragraph::new(lines)
+            .alignment(Alignment::Center)
+            .block(Block::default().borders(Borders::ALL).title(Self::TITLE));
+        frame.render_widget(widget, area);
+    }
+
+    fn handle_input(&mut self, _ctx: &mut GameContext<'_>, _input: Input) -> ScreenCommand {
+        // Any key quits — the modal is the end of the game.
+        ScreenCommand::Quit
     }
 }
 
@@ -2764,6 +2911,234 @@ mod tests {
             cell,
             MapScreen::UNLOCKED_DOOR_GLYPH,
             "unlocked door must paint as `+`"
+        );
+    }
+
+    // ---- Win condition (Task 13g) -------------------------------------
+
+    #[test]
+    fn win_tile_sits_on_walkable_floor_inside_room_four() {
+        // The win cell must be reachable. We assert: walkable, no NPC
+        // overlap, no item overlap, and column inside Room 4 (x/9 == 4).
+        let map = fresh_map_screen();
+        let (wx, wy) = MapScreen::WIN_TILE_POS;
+        assert!(
+            map.map().is_walkable(wx, wy),
+            "win tile must be a walkable cell"
+        );
+        assert!(
+            MapScreen::npc_at(wx, wy).is_none(),
+            "win tile must not overlap an NPC"
+        );
+        assert!(
+            MapScreen::item_at(wx, wy).is_none(),
+            "win tile must not overlap a collectable item"
+        );
+        assert_eq!(wx / 9, 4, "win tile must live in Room 4 (x/9 bucket)");
+    }
+
+    #[test]
+    fn win_step_with_flag_pushes_win_screen() {
+        // Walk to a cell adjacent to the win tile (with the brass key
+        // in inventory so the door is open), set the rumor flag, then
+        // step onto the win tile. The handle_input call must emit a
+        // Push and `has_won` must latch.
+        let cfg = fixture_config();
+        let fc = fixture_context();
+        let mut ctx = GameContext::new(&cfg, &fc, (80, 24));
+        let mut map = fresh_map_screen();
+        // Pick up the brass key first so the locked door opens.
+        walk_to(&mut map, &mut ctx, 6, 5);
+        assert!(map.has_locked_door_key());
+        // Set the flag the dialog would set.
+        map.flags()
+            .borrow_mut()
+            .insert(MapScreen::WIN_FLAG.to_string());
+        // Walk to (42, 4) — the cell directly west of the win tile.
+        // Approaching from the west avoids crossing the win tile mid-
+        // route: `walk_to` traverses doors on y=3, then descends to
+        // (42, 4), so the player never steps on (43, 4) until the
+        // explicit final move below.
+        walk_to(&mut map, &mut ctx, 42, 4);
+        assert_eq!(map.player(), (42, 4), "should land west of the win tile");
+        assert!(!map.has_won(), "win latch must still be open");
+        // Final step onto (43, 4).
+        let cmd = map.handle_input(&mut ctx, Input::Right);
+        assert!(
+            matches!(cmd, ScreenCommand::Push(_)),
+            "step onto win tile with flag set must push WinScreen, got {cmd:?}"
+        );
+        assert!(map.has_won(), "win latch must close after firing");
+        assert_eq!(map.player(), MapScreen::WIN_TILE_POS);
+    }
+
+    #[test]
+    fn win_step_without_flag_is_inert() {
+        // Same path as above but with no flag set. The step must
+        // succeed (the cell is walkable) but emit None.
+        let cfg = fixture_config();
+        let fc = fixture_context();
+        let mut ctx = GameContext::new(&cfg, &fc, (80, 24));
+        let mut map = fresh_map_screen();
+        walk_to(&mut map, &mut ctx, 6, 5);
+        walk_to(&mut map, &mut ctx, 42, 4);
+        assert!(
+            !map.flags().borrow().contains(MapScreen::WIN_FLAG),
+            "test precondition: rumor flag must not be set"
+        );
+        let cmd = map.handle_input(&mut ctx, Input::Right);
+        assert!(
+            matches!(cmd, ScreenCommand::None),
+            "step onto win tile without flag must be inert, got {cmd:?}"
+        );
+        assert!(!map.has_won());
+        assert_eq!(map.player(), MapScreen::WIN_TILE_POS);
+    }
+
+    #[test]
+    fn win_latch_is_one_shot() {
+        // Once the latch fires, walking off and back onto the tile
+        // must not push WinScreen a second time. Without the latch a
+        // post-modal exit path could produce a stack of WinScreens.
+        let cfg = fixture_config();
+        let fc = fixture_context();
+        let mut ctx = GameContext::new(&cfg, &fc, (80, 24));
+        let mut map = fresh_map_screen();
+        walk_to(&mut map, &mut ctx, 6, 5);
+        map.flags()
+            .borrow_mut()
+            .insert(MapScreen::WIN_FLAG.to_string());
+        walk_to(&mut map, &mut ctx, 42, 4);
+        // Trigger the modal once.
+        let _ = map.handle_input(&mut ctx, Input::Right);
+        assert!(map.has_won());
+        // Step off (west back to (42, 4)) then back on (east to
+        // (43, 4)). The second step must NOT push another WinScreen.
+        let cmd_off = map.handle_input(&mut ctx, Input::Left);
+        assert!(matches!(cmd_off, ScreenCommand::None));
+        let cmd_back = map.handle_input(&mut ctx, Input::Right);
+        assert!(
+            matches!(cmd_back, ScreenCommand::None),
+            "win modal must not re-fire after the latch closes; got {cmd_back:?}"
+        );
+    }
+
+    #[test]
+    fn win_tile_renders_until_won() {
+        // The `*` glyph must paint into both the headless rendered_rows
+        // surface and the styled TestBackend buffer while `has_won` is
+        // false. After winning the cell falls back to a plain floor.
+        let cfg = fixture_config();
+        let fc = fixture_context();
+        let mut ctx = GameContext::new(&cfg, &fc, (80, 24));
+        let mut map = fresh_map_screen();
+        let (wx, wy) = MapScreen::WIN_TILE_POS;
+        let rows = map.rendered_rows();
+        let cell = rows[wy as usize].chars().nth(wx as usize).unwrap();
+        assert_eq!(
+            cell,
+            MapScreen::WIN_TILE_GLYPH,
+            "win tile must paint as `*` while the case is open"
+        );
+        let mut term = Terminal::new(TestBackend::new(80, 24)).expect("test backend");
+        term.draw(|frame| map.render(&mut ctx, frame))
+            .expect("draw");
+        let buf = term.backend().buffer().clone();
+        let mut found = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                found.push_str(buf.cell((x, y)).expect("cell").symbol());
+            }
+            found.push('\n');
+        }
+        assert!(
+            found.contains('*'),
+            "expected win-tile glyph in styled render; buffer was:\n{found}"
+        );
+
+        // Latch the win and re-render — the `*` must be gone from the
+        // win tile (we check that exact cell to avoid false positives
+        // from any future glyph reuse).
+        map.won = true;
+        let rows = map.rendered_rows();
+        let cell = rows[wy as usize].chars().nth(wx as usize).unwrap();
+        assert_ne!(
+            cell,
+            MapScreen::WIN_TILE_GLYPH,
+            "post-win render must drop the `*` from the win tile"
+        );
+    }
+
+    #[test]
+    fn win_flag_matches_dialog_yaml() {
+        // Renaming the flag in either place would silently un-gate the
+        // win condition. Drive the Night Clerk's rumor branch and
+        // confirm the flag the dialog sets is the same one the map
+        // checks.
+        let cfg = fixture_config();
+        let fc = fixture_context();
+        let mut ctx = GameContext::new(&cfg, &fc, (80, 24));
+        let (mut screen, flags) = fresh_clerk_dialog();
+        screen.handle_input(&mut ctx, Input::Enter);
+        screen.handle_input(&mut ctx, Input::Enter);
+        // Highlight "I heard about the murder." (index 1) and pick it.
+        screen.handle_input(&mut ctx, Input::Down);
+        screen.handle_input(&mut ctx, Input::Enter);
+        assert!(
+            flags.borrow().contains(MapScreen::WIN_FLAG),
+            "Night Clerk rumor branch must set the WIN_FLAG; saw {:?}",
+            flags.borrow()
+        );
+    }
+
+    #[test]
+    fn win_screen_quits_on_any_key() {
+        // The terminal modal must quit on every reasonable keystroke.
+        // Iterating a representative cross-section is enough to lock
+        // in the contract without enumerating every Input variant.
+        let cfg = fixture_config();
+        let fc = fixture_context();
+        let mut ctx = GameContext::new(&cfg, &fc, (80, 24));
+        for key in [
+            Input::Enter,
+            Input::Esc,
+            Input::Char('q'),
+            Input::Char('x'),
+            Input::Up,
+            Input::Backspace,
+        ] {
+            let mut screen = WinScreen;
+            assert!(
+                matches!(screen.handle_input(&mut ctx, key), ScreenCommand::Quit),
+                "{key:?} must quit the win screen"
+            );
+        }
+    }
+
+    #[test]
+    fn win_screen_renders_into_test_backend() {
+        // Sanity-check that the modal actually paints. We assert the
+        // title and a sentinel substring of the body so a future
+        // regression that drops the paragraph entirely surfaces here.
+        let cfg = fixture_config();
+        let fc = fixture_context();
+        let mut ctx = GameContext::new(&cfg, &fc, (80, 24));
+        let mut screen = WinScreen;
+        let mut term = Terminal::new(TestBackend::new(80, 24)).expect("test backend");
+        term.draw(|frame| screen.render(&mut ctx, frame))
+            .expect("draw");
+        let buf = term.backend().buffer().clone();
+        let mut found = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                found.push_str(buf.cell((x, y)).expect("cell").symbol());
+            }
+            found.push('\n');
+        }
+        assert!(found.contains(WinScreen::TITLE));
+        assert!(
+            found.contains("smoking gun"),
+            "expected win body in render; buffer was:\n{found}"
         );
     }
 
