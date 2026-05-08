@@ -11,7 +11,7 @@
 //!
 //! - `terminal` — raw-mode/alt-screen guard (Task 5)
 //! - `foglet`  — `FogletContext` loader (Task 2)
-//! - `input`   — `crossterm` event → `Input` normalization (Task 6)
+//! - `input`   — `crossterm` event → `Input` normalization (Task 6, done)
 //! - `screen`  — `Screen` trait + `ScreenCommand` (Task 7)
 //! - `runtime` — top-level `Game` builder + loop (Task 7)
 //! - `save`    — atomic save manager (Task 8)
@@ -33,6 +33,7 @@
 
 pub mod config;
 pub mod foglet;
+pub mod input;
 pub mod manifest;
 pub mod terminal;
 
@@ -43,6 +44,7 @@ pub use foglet::{
     load_context, load_context_from_env, load_context_from_file, load_context_with_options,
     process_env, synthesize_local_dev, ContextError, ContextSource, FogletContext, LoadOptions,
 };
+pub use input::{from_event, from_key_event, Input};
 pub use manifest::{
     FogletManifest, ManifestError, ManifestInputs, DEFAULT_AUTH_SCOPE, DEFAULT_IDLE_TIMEOUT_MS,
     DEFAULT_TIMEOUT_MS, DEFAULT_VISIBILITY, RUNTIME_EXTERNAL_PTY,
