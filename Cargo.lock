@@ -294,6 +294,7 @@ dependencies = [
  "clap",
  "foglet_game",
  "predicates",
+ "serde_json",
  "syn",
  "tempfile",
  "thiserror",

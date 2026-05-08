@@ -65,6 +65,11 @@ tempfile = { workspace = true }
 assert_cmd = { workspace = true }
 predicates = { workspace = true }
 
+# Parse the JSON `fgk emit-manifest` prints to stdout in the Task 11
+# CLI smoke test, so the assertion is on values rather than brittle
+# substring matches.
+serde_json = { workspace = true }
+
 # Syntactic validation of the embedded `src/main.rs` template — see
 # DECISIONS.md ADR 2026-05-08 (template fixture validation) for why
 # `syn` joins the crate budget. `default-features = false` keeps the
