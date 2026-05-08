@@ -9,7 +9,7 @@
 //! Subcommand status (per SPEC §15):
 //!   - `fgk new <path>`            ← Task 10b
 //!   - `fgk emit-manifest`         ← Task 11
-//!   - `fgk package`               ← Task 12 (not yet wired)
+//!   - `fgk package`               ← Task 12
 
 use std::path::PathBuf;
 
@@ -64,6 +64,40 @@ enum Command {
         #[arg(long, default_value = ".", value_name = "DIR")]
         project: PathBuf,
     },
+
+    /// Build and assemble a deployable Foglet door bundle.
+    ///
+    /// Runs `cargo build --release` in the project, then writes
+    /// `<out>/{<slug>, run.sh, manifest.json, assets/}` per SPEC §10.4.
+    /// The output directory must be empty or non-existent.
+    Package {
+        /// Output directory for the bundle. Required so operators
+        /// always say where the artifacts go — there is no implicit
+        /// `dist/` because we don't want to surprise CI by writing
+        /// into the project tree.
+        #[arg(long, value_name = "DIR")]
+        out: PathBuf,
+
+        /// Project directory (the one containing `assets/game.toml`).
+        /// Defaults to the current directory so authors can run
+        /// `fgk package --out ...` from inside their project tree.
+        #[arg(long, default_value = ".", value_name = "DIR")]
+        project: PathBuf,
+
+        /// Absolute install path on the Foglet host. Defaults to
+        /// `/srv/foglet/doors/<slug>` derived from the project's slug
+        /// — pass this when shipping into a non-default operator
+        /// layout.
+        #[arg(long, value_name = "ABSOLUTE_PATH")]
+        install_dir: Option<String>,
+
+        /// Path to a pre-built release binary. When set, skips
+        /// `cargo build --release` and copies this file into
+        /// `<out>/<slug>` instead. Useful for cross-compiled or
+        /// stripped binaries produced by an external build pipeline.
+        #[arg(long, value_name = "PATH")]
+        binary: Option<PathBuf>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -74,6 +108,12 @@ fn main() -> Result<()> {
             install_dir,
             project,
         } => run_emit_manifest(&project, &install_dir),
+        Command::Package {
+            out,
+            project,
+            install_dir,
+            binary,
+        } => run_package(&project, &out, install_dir.as_deref(), binary.as_deref()),
     }
 }
 
@@ -112,5 +152,47 @@ fn run_emit_manifest(project: &std::path::Path, install_dir: &str) -> Result<()>
         )
     })?;
     print!("{json}");
+    Ok(())
+}
+
+/// Entry point for `fgk package --out <dir>`.
+///
+/// Branches between the full `package_project` pipeline (cargo build
+/// then assemble) and the `assemble_bundle` shortcut (when `--binary`
+/// is supplied). The success summary names every artifact path so the
+/// operator can copy them into a Foglet door directory without
+/// re-deriving the layout.
+fn run_package(
+    project: &std::path::Path,
+    out: &std::path::Path,
+    install_dir: Option<&str>,
+    binary: Option<&std::path::Path>,
+) -> Result<()> {
+    let inputs = fgk::package::PackageInputs {
+        project_dir: project,
+        out_dir: out,
+        install_dir,
+    };
+    let outputs = match binary {
+        Some(path) => fgk::package::assemble_bundle(inputs, path),
+        None => fgk::package::package_project(inputs),
+    }
+    .with_context(|| {
+        format!(
+            "failed to package project `{}` into `{}`",
+            project.display(),
+            out.display()
+        )
+    })?;
+
+    println!(
+        "Packaged `{}` at {}\n  binary:   {}\n  run.sh:   {}\n  manifest: {}\n  assets:   {}",
+        outputs.slug,
+        outputs.out_dir.display(),
+        outputs.binary.display(),
+        outputs.run_sh.display(),
+        outputs.manifest.display(),
+        outputs.assets.display(),
+    );
     Ok(())
 }
