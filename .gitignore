@@ -6,8 +6,8 @@ Cargo.lock.bak
 .DS_Store
 
 .ralph/
-CHECKLIST.md
+CHECKLIST*.md
 PROMPT.md
-SPEC.md
+SPEC*.md
 DECISIONS.md
 ralph.sh

@@ -35,6 +35,7 @@ pub mod config;
 pub mod foglet;
 pub mod input;
 pub mod manifest;
+pub mod runtime;
 pub mod screen;
 pub mod terminal;
 
@@ -50,6 +51,7 @@ pub use manifest::{
     FogletManifest, ManifestError, ManifestInputs, DEFAULT_AUTH_SCOPE, DEFAULT_IDLE_TIMEOUT_MS,
     DEFAULT_TIMEOUT_MS, DEFAULT_VISIBILITY, RUNTIME_EXTERNAL_PTY,
 };
+pub use runtime::{run_built, BuiltGame, Game, GameError, GameResult, SavePolicy};
 pub use screen::{
     apply_command, ExitReason, GameContext, Screen, ScreenCommand, ScreenStack, SideEffect,
 };
