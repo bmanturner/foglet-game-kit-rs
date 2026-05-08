@@ -35,15 +35,17 @@ use std::collections::BTreeSet;
 use std::rc::Rc;
 
 use foglet_game::{
-    load_context, load_dialog, parse_map, process_env, render_inventory_list, render_menu_list,
-    Dialog, DialogState, FlagSet, Game, GameConfig, GameContext, Input, InventoryList, Map,
-    MenuList, Screen, ScreenCommand, TileLegend,
+    load_context, load_dialog, parse_map, process_env, read_save, render_inventory_list,
+    render_menu_list, resolve_save_path, write_atomic, Dialog, DialogState, FlagSet, Game,
+    GameConfig, GameContext, Input, InventoryList, Map, MenuList, SavePathInputs, Screen,
+    ScreenCommand, TileLegend,
 };
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::Frame;
+use serde::{Deserialize, Serialize};
 
 /// Absolute path to `examples/murder_motel/assets/game.toml`.
 ///
@@ -78,14 +80,129 @@ const NIGHT_CLERK_DIALOG: &str = include_str!("../assets/dialog/night_clerk.yaml
 const BELLHOP_DIALOG: &str = include_str!("../assets/dialog/bellhop.yaml");
 const MAID_DIALOG: &str = include_str!("../assets/dialog/maid.yaml");
 
+/// Persisted state for the player's save slot (Task 13h).
+///
+/// JSON-serialised through the kit's `write_atomic` helper, deserialised
+/// back via `read_save`. The shape matches [`SharedSlots::snapshot`] one
+/// field at a time so adding a new save field is "extend the struct,
+/// extend the snapshot/apply pair, run tests".
+///
+/// Field naming sticks to the shared-state vocabulary (`player_x`,
+/// `player_y`, `won`) rather than nesting a `PlayerSlot` so an operator
+/// reading `save.json` can map every key back to a screen field at a
+/// glance.
+#[derive(Default, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SaveState {
+    /// Player column at save time. Restored verbatim into
+    /// [`SharedSlots::player`] on `apply`.
+    pub player_x: u16,
+    /// Player row at save time.
+    pub player_y: u16,
+    /// Whether the win condition has fired in this save slot. A `true`
+    /// value preserves the post-win map render (no `*` marker) on
+    /// resume.
+    pub won: bool,
+    /// Narrative flags set during gameplay (`heard_rumor`, etc.).
+    pub flags: BTreeSet<String>,
+    /// Inventory item IDs the player has collected. The ID namespace is
+    /// the [`MapScreen::ITEMS`] catalog; ids without a catalog match are
+    /// rendered silently as gone — see [`InventoryScreen::current_labels`].
+    pub inventory: BTreeSet<String>,
+}
+
+/// Mutable runtime fields that need to survive a quit/launch cycle and
+/// are therefore shared between the screens that mutate them and the
+/// `main` scope that writes the save on exit.
+///
+/// Cloned freely (each clone is three `Rc::clone` calls) so every
+/// screen that needs read or write access holds its own handle. The
+/// canonical handle lives in `main`, which uses [`Self::snapshot`] /
+/// [`Self::apply`] to bridge to and from on-disk [`SaveState`].
+#[derive(Clone, Default, Debug)]
+pub struct SharedSlots {
+    /// Narrative-flag store. Same Rc the [`DialogScreen`] borrows for
+    /// `requires`-gated branches.
+    pub flags: Rc<RefCell<FlagSet>>,
+    /// Inventory id set. Same Rc the [`InventoryScreen`] reads to draw
+    /// the player's pockets.
+    pub inventory: Rc<RefCell<BTreeSet<String>>>,
+    /// Player position + win latch. Pulled into a single Rc so a single
+    /// `borrow_mut()` swap is enough to apply a loaded save without
+    /// briefly observing a half-restored position.
+    pub player: Rc<RefCell<PlayerSlot>>,
+}
+
+/// Small POD bundle inside [`SharedSlots::player`].
+///
+/// Held in a `RefCell` so movement, win-latch, and save-restore can all
+/// mutate it through the same Rc. `Copy` because every field is a
+/// primitive — cheaper than re-borrowing for every read.
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlayerSlot {
+    /// Player column.
+    pub x: u16,
+    /// Player row.
+    pub y: u16,
+    /// Whether the win condition has been triggered this run.
+    pub won: bool,
+}
+
+impl SharedSlots {
+    /// Reset every slot to a fresh-game baseline at `(start_x, start_y)`.
+    /// Called when the main menu activates "New Game" so leftover state
+    /// from a previously loaded save does not bleed into the new run.
+    pub fn reset(&self, start_x: u16, start_y: u16) {
+        self.flags.borrow_mut().clear();
+        self.inventory.borrow_mut().clear();
+        let mut p = self.player.borrow_mut();
+        p.x = start_x;
+        p.y = start_y;
+        p.won = false;
+    }
+
+    /// Build a [`SaveState`] from the current slot contents. Cloning the
+    /// flag/inventory sets keeps the on-disk JSON independent of the
+    /// live runtime — the save file is a frozen snapshot, not a mirror.
+    pub fn snapshot(&self) -> SaveState {
+        let player = *self.player.borrow();
+        SaveState {
+            player_x: player.x,
+            player_y: player.y,
+            won: player.won,
+            flags: self.flags.borrow().clone(),
+            inventory: self.inventory.borrow().clone(),
+        }
+    }
+
+    /// Overwrite slot contents from a loaded [`SaveState`]. The player
+    /// `RefCell` is swapped in one borrow so concurrent screen reads
+    /// never observe `(new_x, old_y)`.
+    pub fn apply(&self, state: SaveState) {
+        {
+            let mut p = self.player.borrow_mut();
+            p.x = state.player_x;
+            p.y = state.player_y;
+            p.won = state.won;
+        }
+        *self.flags.borrow_mut() = state.flags;
+        *self.inventory.borrow_mut() = state.inventory;
+    }
+}
+
 /// First screen the player sees on launch.
 ///
 /// Shows the configured title, a one-line tagline, and a "Press Enter"
 /// prompt that leads into the main menu added in Task 13b. Esc / Q /
 /// Ctrl-C still quit directly so a player who lands on the title screen
 /// with no patience for menus has an immediate exit.
-#[derive(Debug, Default)]
-pub struct TitleScreen;
+#[derive(Default)]
+pub struct TitleScreen {
+    /// Shared runtime state propagated into the [`MainMenuScreen`] when
+    /// the player presses Enter. Held on the title so the slots loaded
+    /// by `main` (Task 13h) survive the title → menu transition without
+    /// a static.
+    slots: SharedSlots,
+}
 
 impl TitleScreen {
     /// The label rendered in the bordered title block. Pulled out as a
@@ -97,6 +214,11 @@ impl TitleScreen {
     /// Prompt rendered beneath the tagline. The title screen is now a
     /// pure splash gate — Enter advances to the real menu.
     pub const ENTER_HINT: &'static str = "Press Enter to begin   ([Q] Quit)";
+
+    /// Build a title screen wired to the supplied shared slots.
+    pub fn with_slots(slots: SharedSlots) -> Self {
+        Self { slots }
+    }
 }
 
 impl Screen for TitleScreen {
@@ -125,7 +247,9 @@ impl Screen for TitleScreen {
             // Enter advances into the main menu. We push rather than
             // replace so a future "back to title" affordance from the
             // menu is a one-line `Pop` away if we ever want it.
-            Input::Enter => ScreenCommand::Push(Box::new(MainMenuScreen::new())),
+            Input::Enter => {
+                ScreenCommand::Push(Box::new(MainMenuScreen::with_slots(self.slots.clone())))
+            }
             // Direct quit affordances. Esc + Q + Ctrl-C match the
             // controls every other screen in the kit honors.
             Input::Esc | Input::Char('q') | Input::Char('Q') | Input::Ctrl('c') => {
@@ -181,16 +305,24 @@ impl MainMenuItem {
     /// them — the map screen pushes with whatever `start_x` /
     /// `start_y` the config carries, which keeps the example honest
     /// if those values are ever retuned.
-    fn activate(self, ctx: &GameContext<'_>) -> ScreenCommand {
+    fn activate(self, ctx: &GameContext<'_>, slots: &SharedSlots) -> ScreenCommand {
+        let (sx, sy) = (ctx.config.game.start_x, ctx.config.game.start_y);
         match self {
-            // Both New Game and Continue land on a fresh lobby map for
-            // now. Task 13h replaces Continue with a save-restoring
-            // path; until then both options take the player to the
-            // same starting state, which is the truthful behaviour for
-            // a game that has no persistence yet.
-            Self::NewGame | Self::Continue => {
-                let (sx, sy) = (ctx.config.game.start_x, ctx.config.game.start_y);
-                ScreenCommand::Push(Box::new(MapScreen::new_lobby(sx, sy)))
+            // New Game wipes the shared slots so a leftover loaded save
+            // does not bleed in, then pushes a fresh map at the
+            // configured spawn.
+            Self::NewGame => {
+                slots.reset(sx, sy);
+                ScreenCommand::Push(Box::new(MapScreen::with_shared(sx, sy, slots.clone())))
+            }
+            // Continue keeps whatever state the slots already carry —
+            // either the loaded save (if `main` populated them at
+            // startup) or the same default-zero state New Game would
+            // otherwise have built. The walkability fallback inside
+            // `MapScreen::with_shared` keeps an empty-default Continue
+            // safe even when no save was loaded.
+            Self::Continue => {
+                ScreenCommand::Push(Box::new(MapScreen::with_shared(sx, sy, slots.clone())))
             }
             Self::Help => ScreenCommand::Push(Box::new(HelpScreen)),
             Self::Quit => ScreenCommand::Quit,
@@ -214,6 +346,10 @@ pub struct MainMenuScreen {
     /// so out-of-range values are safe, but we still maintain it
     /// faithfully so keyboard navigation feels correct.
     selected: usize,
+    /// Shared runtime state. Routed into `MainMenuItem::activate` so
+    /// "New Game" can reset the slots and "Continue" can pass the
+    /// already-populated slots straight to a fresh [`MapScreen`].
+    slots: SharedSlots,
 }
 
 impl MainMenuScreen {
@@ -223,11 +359,23 @@ impl MainMenuScreen {
     /// row index can be cast straight to an item.
     pub const ITEMS: [&'static str; 4] = ["New Game", "Continue", "Help", "Quit"];
 
-    /// Build a menu with the cursor on `New Game`.
+    /// Build a menu with the cursor on `New Game` and freshly defaulted
+    /// shared slots. Used by tests and by callers that don't need to
+    /// participate in the save/load handshake. The non-test entry point
+    /// uses [`Self::with_slots`] so the slots threaded through `main`
+    /// reach the activate path.
     pub fn new() -> Self {
+        Self::with_slots(SharedSlots::default())
+    }
+
+    /// Build a menu wired to the supplied shared slots. The slots are
+    /// the bridge between the disk save (loaded by `main`) and the map
+    /// screen the menu pushes — see [`MainMenuItem::activate`].
+    pub fn with_slots(slots: SharedSlots) -> Self {
         Self {
             items: Self::ITEMS.iter().map(|s| s.to_string()).collect(),
             selected: 0,
+            slots,
         }
     }
 
@@ -279,14 +427,16 @@ impl Screen for MainMenuScreen {
             }
             // Activate the highlighted item.
             Input::Enter => MainMenuItem::from_index(self.selected)
-                .map(|item| item.activate(ctx))
+                .map(|item| item.activate(ctx, &self.slots))
                 .unwrap_or(ScreenCommand::None),
             // Per-item shortcuts mirror the first letter of each label.
             // `Q` doubles as a generic quit affordance — both meanings
             // resolve to `ScreenCommand::Quit` so there's no ambiguity.
-            Input::Char('n') | Input::Char('N') => MainMenuItem::NewGame.activate(ctx),
-            Input::Char('c') | Input::Char('C') => MainMenuItem::Continue.activate(ctx),
-            Input::Char('h') | Input::Char('H') => MainMenuItem::Help.activate(ctx),
+            Input::Char('n') | Input::Char('N') => MainMenuItem::NewGame.activate(ctx, &self.slots),
+            Input::Char('c') | Input::Char('C') => {
+                MainMenuItem::Continue.activate(ctx, &self.slots)
+            }
+            Input::Char('h') | Input::Char('H') => MainMenuItem::Help.activate(ctx, &self.slots),
             Input::Char('q') | Input::Char('Q') | Input::Esc | Input::Ctrl('c') => {
                 ScreenCommand::Quit
             }
@@ -383,32 +533,13 @@ pub struct MapScreen {
     /// directly rather than re-parsing each frame so render is
     /// allocation-light.
     map: Map,
-    /// Player column. Updated only by [`Self::try_move`] so the
-    /// invariant "player position is always walkable" is maintained
-    /// in one place.
-    player_x: u16,
-    /// Player row. Same invariant as `player_x`.
-    player_y: u16,
-    /// Narrative-flag store shared with [`DialogScreen`] so flags set
-    /// during a conversation persist across the dialog stack push/pop
-    /// boundary. The dialog state machine takes a `&mut FlagSet`; an
-    /// `Rc<RefCell<_>>` is the lightest way to lend the same
-    /// collection to two screens without the runtime needing a
-    /// flag-store concept yet (Task 13h will move this onto the save
-    /// manager so flags survive process exit).
-    flags: Rc<RefCell<FlagSet>>,
-    /// Set of collected item IDs, shared with the [`InventoryScreen`]
-    /// the same way `flags` is shared with the [`DialogScreen`]. A
-    /// `BTreeSet<String>` mirrors the [`FlagSet`] shape so Task 13h
-    /// can serialise both stores through the same code path.
-    inventory: Rc<RefCell<BTreeSet<String>>>,
-    /// Whether the player has already triggered the win condition.
-    /// Latches to `true` the first time the player steps onto
-    /// [`Self::WIN_TILE_POS`] with [`Self::WIN_FLAG`] set; subsequent
-    /// steps onto the cell are inert so a player who Esc's out of the
-    /// [`WinScreen`] (a future Task 13h save loop will let them) does
-    /// not get the modal pushed every frame they remain on the tile.
-    won: bool,
+    /// Save-bearing runtime state — player position, narrative flags,
+    /// inventory, win latch. Shared with `main` (which writes the save
+    /// on exit), with [`DialogScreen`] (`flags`), and with
+    /// [`InventoryScreen`] (`inventory`). The single Rc bundle replaces
+    /// what used to be three separate fields so Task 13h's save/load
+    /// path manipulates the same handles the screens read.
+    slots: SharedSlots,
 }
 
 impl MapScreen {
@@ -577,40 +708,53 @@ impl MapScreen {
     /// string the runtime checks without re-typing it.
     pub const WIN_FLAG: &'static str = "heard_rumor";
 
-    /// Build the lobby map screen with the player at `(start_x,
-    /// start_y)`. The constructor parses [`LOBBY_MAP_TEXT`] against
-    /// the lobby legend; the parse can only fail if the embedded
-    /// asset diverges from the legend, which is a build-time bug —
-    /// hence the `expect`.
+    /// Build a lobby map screen with fresh, unshared slots. Used by
+    /// tests that want an isolated screen instance and by callers that
+    /// don't need to participate in the Task 13h save/load handshake.
     pub fn new_lobby(start_x: u16, start_y: u16) -> Self {
+        let slots = SharedSlots::default();
+        slots.reset(start_x, start_y);
+        Self::with_shared(start_x, start_y, slots)
+    }
+
+    /// Build a lobby map screen against caller-supplied [`SharedSlots`].
+    ///
+    /// The slots' `player.x/y` are used as the spawn unless the menu
+    /// has already populated them from a loaded save — in which case
+    /// the saved coordinates take precedence over `(start_x, start_y)`.
+    /// Walkability is still checked: if the saved cell has been re-
+    /// authored into a wall the spiral fallback steers the player onto
+    /// the nearest floor, mirroring the misconfigured-config path.
+    pub fn with_shared(start_x: u16, start_y: u16, slots: SharedSlots) -> Self {
         let legend = lobby_legend();
         let map =
             parse_map(LOBBY_MAP_TEXT, &legend).expect("embedded lobby map parses against legend");
-        let mut screen = Self {
-            map,
-            player_x: 0,
-            player_y: 0,
-            flags: Rc::new(RefCell::new(FlagSet::new())),
-            inventory: Rc::new(RefCell::new(BTreeSet::new())),
-            won: false,
-        };
-        // Clamp the spawn against the map bounds and walkability so a
-        // misconfigured `start_x` / `start_y` in `assets/game.toml`
-        // can't put the player inside a wall. If the requested cell
-        // is unwalkable we walk a small spiral outward looking for a
-        // floor; if even that fails (a totally hostile map) we fall
-        // back to (1, 1) which the lobby legend guarantees is floor.
-        screen.player_x = start_x;
-        screen.player_y = start_y;
-        if !screen.map.is_walkable(start_x, start_y) {
-            if let Some((fx, fy)) = screen.find_nearest_walkable(start_x, start_y) {
-                screen.player_x = fx;
-                screen.player_y = fy;
+        let screen = Self { map, slots };
+        // Decide the spawn cell. If the slots arrived empty (e.g. a
+        // brand-new game) we honour the caller's `(start_x, start_y)`;
+        // otherwise the slots already carry the loaded player position
+        // and we trust that. Either way we then pass the chosen cell
+        // through the walkability gate so a re-authored map can never
+        // strand the player inside a wall.
+        let initial = {
+            let p = screen.slots.player.borrow();
+            if p.x == 0 && p.y == 0 {
+                (start_x, start_y)
             } else {
-                screen.player_x = 1;
-                screen.player_y = 1;
+                (p.x, p.y)
             }
-        }
+        };
+        let (chosen_x, chosen_y) = if screen.map.is_walkable(initial.0, initial.1) {
+            initial
+        } else {
+            screen
+                .find_nearest_walkable(initial.0, initial.1)
+                .unwrap_or((1, 1))
+        };
+        let mut p = screen.slots.player.borrow_mut();
+        p.x = chosen_x;
+        p.y = chosen_y;
+        drop(p);
         screen
     }
 
@@ -618,7 +762,8 @@ impl MapScreen {
     /// inventory screen, the save manager) can read the position
     /// without reaching into private state.
     pub fn player(&self) -> (u16, u16) {
-        (self.player_x, self.player_y)
+        let p = self.slots.player.borrow();
+        (p.x, p.y)
     }
 
     /// Reference to the parsed map. Useful for tests asserting that
@@ -634,11 +779,15 @@ impl MapScreen {
     /// coordinate space, so stepping left from column 0 silently
     /// no-ops instead of wrapping to `u16::MAX`.
     pub fn try_move(&mut self, dx: i32, dy: i32) -> bool {
-        let target_x = match (self.player_x as i32).checked_add(dx) {
+        let (cur_x, cur_y) = {
+            let p = self.slots.player.borrow();
+            (p.x, p.y)
+        };
+        let target_x = match (cur_x as i32).checked_add(dx) {
             Some(v) if v >= 0 => v as u16,
             _ => return false,
         };
-        let target_y = match (self.player_y as i32).checked_add(dy) {
+        let target_y = match (cur_y as i32).checked_add(dy) {
             Some(v) if v >= 0 => v as u16,
             _ => return false,
         };
@@ -661,15 +810,21 @@ impl MapScreen {
         if Self::npc_at(target_x, target_y).is_some() {
             return false;
         }
-        self.player_x = target_x;
-        self.player_y = target_y;
+        {
+            let mut p = self.slots.player.borrow_mut();
+            p.x = target_x;
+            p.y = target_y;
+        }
         // Items pick up on step. The render path filters collected
         // items out of the overlay, so the cell visually clears the
         // same frame the inventory grows. Items aren't blocking — a
         // stranded item under foot would otherwise trap the player
         // until they pressed Enter, which is the wrong feel here.
         if let Some(item) = Self::item_at(target_x, target_y) {
-            self.inventory.borrow_mut().insert(item.id.to_string());
+            self.slots
+                .inventory
+                .borrow_mut()
+                .insert(item.id.to_string());
         }
         true
     }
@@ -688,9 +843,10 @@ impl MapScreen {
     /// also feels wrong on a square grid.
     pub fn nearby_npc(&self) -> Option<&'static Npc> {
         const OFFSETS: &[(i32, i32)] = &[(0, 0), (1, 0), (-1, 0), (0, 1), (0, -1)];
+        let (px, py) = self.player();
         for (dx, dy) in OFFSETS {
-            let cx = self.player_x as i32 + dx;
-            let cy = self.player_y as i32 + dy;
+            let cx = px as i32 + dx;
+            let cy = py as i32 + dy;
             if cx < 0 || cy < 0 {
                 continue;
             }
@@ -704,7 +860,14 @@ impl MapScreen {
     /// Shared handle to the narrative-flag store. Cloned so the
     /// dialog screen and the map screen mutate the same `RefCell`.
     pub fn flags(&self) -> Rc<RefCell<FlagSet>> {
-        Rc::clone(&self.flags)
+        Rc::clone(&self.slots.flags)
+    }
+
+    /// Borrow the screen's [`SharedSlots`]. Used by the menu screen so
+    /// "New Game" can reset all slots without reaching into private
+    /// fields, and by tests asserting save-related invariants.
+    pub fn slots(&self) -> &SharedSlots {
+        &self.slots
     }
 
     /// Shared handle to the inventory store. Cloned so the
@@ -713,7 +876,7 @@ impl MapScreen {
     /// onto the save manager so contents survive process exit; until
     /// then it lives on the map screen for the play session.
     pub fn inventory(&self) -> Rc<RefCell<BTreeSet<String>>> {
-        Rc::clone(&self.inventory)
+        Rc::clone(&self.slots.inventory)
     }
 
     /// The catalog item sitting on `(x, y)`, or `None`. Walks the
@@ -728,7 +891,7 @@ impl MapScreen {
     /// and `try_move` both consult this so an item disappears from
     /// the map atomically with its appearance in the inventory.
     pub fn is_collected(&self, id: &str) -> bool {
-        self.inventory.borrow().contains(id)
+        self.slots.inventory.borrow().contains(id)
     }
 
     /// Whether the cell at `(x, y)` is the lobby's locked door. The
@@ -758,7 +921,7 @@ impl MapScreen {
     /// can assert the latch without poking at private state and so the
     /// renderer can drop the win-tile glyph after the modal triggers.
     pub fn has_won(&self) -> bool {
-        self.won
+        self.slots.player.borrow().won
     }
 
     /// Whether stepping onto the win tile right now would solve the
@@ -767,13 +930,15 @@ impl MapScreen {
     /// modal. Centralising the predicate keeps render and
     /// [`Self::handle_input`] reading the same answer.
     fn should_trigger_win(&self) -> bool {
-        if self.won {
+        let p = self.slots.player.borrow();
+        if p.won {
             return false;
         }
-        if (self.player_x, self.player_y) != Self::WIN_TILE_POS {
+        if (p.x, p.y) != Self::WIN_TILE_POS {
             return false;
         }
-        self.flags.borrow().contains(Self::WIN_FLAG)
+        drop(p);
+        self.slots.flags.borrow().contains(Self::WIN_FLAG)
     }
 
     /// Latch the win flag and return the screen command that should be
@@ -782,7 +947,7 @@ impl MapScreen {
     /// tile fires the modal in the same frame the move resolves.
     fn maybe_win_command(&mut self) -> ScreenCommand {
         if self.should_trigger_win() {
-            self.won = true;
+            self.slots.player.borrow_mut().won = true;
             ScreenCommand::Push(Box::new(WinScreen))
         } else {
             ScreenCommand::None
@@ -850,7 +1015,11 @@ impl MapScreen {
         // fall back to the underlying floor glyph. Stamped *before* the
         // player overlay below so standing on the tile still shows the
         // player's `@` rather than the marker.
-        if !self.won {
+        let (px, py, won) = {
+            let p = self.slots.player.borrow();
+            (p.x, p.y, p.won)
+        };
+        if !won {
             let (wx, wy) = Self::WIN_TILE_POS;
             if (wy as usize) < rows.len() {
                 let row = &mut rows[wy as usize];
@@ -868,9 +1037,9 @@ impl MapScreen {
         // byte-level replacement is safe here. If the legend ever
         // grows multi-byte glyphs this needs to switch to a
         // char-aware splice.
-        if (self.player_y as usize) < rows.len() {
-            let row = &mut rows[self.player_y as usize];
-            let col = self.player_x as usize;
+        if (py as usize) < rows.len() {
+            let row = &mut rows[py as usize];
+            let col = px as usize;
             if col < row.len() {
                 let mut chars: Vec<char> = row.chars().collect();
                 chars[col] = Self::PLAYER_GLYPH;
@@ -935,6 +1104,10 @@ impl Screen for MapScreen {
         // `has_won`) so a returning player does not see a stale marker.
         let win_tile_style = Style::default().fg(Color::Red).add_modifier(Modifier::BOLD);
 
+        let (px, py, won) = {
+            let p = self.slots.player.borrow();
+            (p.x, p.y, p.won)
+        };
         let mut lines: Vec<Line<'_>> = Vec::with_capacity(self.map.cells.len());
         for (y, row) in self.map.cells.iter().enumerate() {
             // Build each row as a sequence of spans: most cells are a
@@ -954,7 +1127,7 @@ impl Screen for MapScreen {
             let mut x = 0usize;
             while x < row_string.len() {
                 // Player glyph wins over labels and base cells.
-                if (y as u16) == self.player_y && (x as u16) == self.player_x {
+                if (y as u16) == py && (x as u16) == px {
                     spans.push(Span::styled(
                         Self::PLAYER_GLYPH.to_string(),
                         player_glyph_style,
@@ -1003,7 +1176,7 @@ impl Screen for MapScreen {
                 // case is open; once the player has triggered the
                 // modal the cell falls back to its underlying floor
                 // glyph so a return visit reads as "ordinary room".
-                if !self.won && (x as u16, y as u16) == Self::WIN_TILE_POS {
+                if !won && (x as u16, y as u16) == Self::WIN_TILE_POS {
                     spans.push(Span::styled(
                         Self::WIN_TILE_GLYPH.to_string(),
                         win_tile_style,
@@ -1651,12 +1824,43 @@ fn main() -> anyhow::Result<()> {
     let config = GameConfig::load(GAME_TOML_PATH)?;
     let foglet = load_context(process_env)?;
 
+    // Resolve where this user's save lives and (if a previous run wrote
+    // one) load it before the runtime takes over the terminal. Doing
+    // both before `Game::run` means a malformed save surfaces as a
+    // clean-error exit on stderr instead of a corrupted post-TUI scroll.
+    let save_path = resolve_save_path(
+        &SavePathInputs {
+            slug: &config.game.slug,
+            strategy: config.save.strategy,
+            context: &foglet,
+            cli_override: None,
+        },
+        process_env,
+    )?;
+    let slots = SharedSlots::default();
+    if let Some(path) = save_path.as_deref() {
+        if let Some(loaded) = read_save::<SaveState>(path)? {
+            slots.apply(loaded);
+        }
+    }
+
     Game::new(config.game.title.clone())
         .min_size(config.game.min_width, config.game.min_height)
         .with_config(config)
         .with_foglet_context(foglet)
-        .push_screen(Box::new(TitleScreen))
+        .push_screen(Box::new(TitleScreen::with_slots(slots.clone())))
         .run()?;
+
+    // Persist on clean exit. The runtime returns Ok only when a screen
+    // emitted Quit (or popped to empty), so reaching this line means
+    // the player has finished a session and the slot mutations on
+    // `slots` are the canonical state worth keeping. Errors propagate
+    // *after* the terminal has been restored — `Game::run` already
+    // tore the guard down — so the operator sees a clean message
+    // rather than a scrambled one.
+    if let Some(path) = save_path {
+        write_atomic(&path, &slots.snapshot())?;
+    }
     Ok(())
 }
 
@@ -1697,7 +1901,7 @@ mod tests {
         let cfg = fixture_config();
         let fc = fixture_context();
         let mut ctx = GameContext::new(&cfg, &fc, (80, 24));
-        TitleScreen.handle_input(&mut ctx, input)
+        TitleScreen::default().handle_input(&mut ctx, input)
     }
 
     /// Dispatch one input to a fresh main menu.
@@ -3059,7 +3263,7 @@ mod tests {
         // Latch the win and re-render — the `*` must be gone from the
         // win tile (we check that exact cell to avoid false positives
         // from any future glyph reuse).
-        map.won = true;
+        map.slots().player.borrow_mut().won = true;
         let rows = map.rendered_rows();
         let cell = rows[wy as usize].chars().nth(wx as usize).unwrap();
         assert_ne!(
@@ -3140,6 +3344,129 @@ mod tests {
             found.contains("smoking gun"),
             "expected win body in render; buffer was:\n{found}"
         );
+    }
+
+    // ---- SaveState / SharedSlots (Task 13h) ----------------------------
+
+    #[test]
+    fn shared_slots_snapshot_round_trips_through_apply() {
+        // Snapshot → apply on a fresh `SharedSlots` must reconstruct
+        // the same state byte-for-byte. This is the contract `main`
+        // relies on: write `snapshot()`, read on next launch, call
+        // `apply()`, see the same world.
+        let original = SharedSlots::default();
+        original.flags.borrow_mut().insert("heard_rumor".into());
+        original.flags.borrow_mut().insert("has_key".into());
+        original.inventory.borrow_mut().insert("brass_key".into());
+        original.inventory.borrow_mut().insert("matchbook".into());
+        {
+            let mut p = original.player.borrow_mut();
+            p.x = 43;
+            p.y = 4;
+            p.won = true;
+        }
+        let snap = original.snapshot();
+
+        let restored = SharedSlots::default();
+        restored.apply(snap);
+        let p = restored.player.borrow();
+        assert_eq!((p.x, p.y, p.won), (43, 4, true));
+        drop(p);
+        assert_eq!(*original.flags.borrow(), *restored.flags.borrow());
+        assert_eq!(*original.inventory.borrow(), *restored.inventory.borrow());
+    }
+
+    #[test]
+    fn shared_slots_reset_clears_all_state() {
+        // "New Game" hands a previously loaded slots into `reset` so
+        // resumed flags / inventory / coordinates do not bleed in.
+        let slots = SharedSlots::default();
+        slots.flags.borrow_mut().insert("heard_rumor".into());
+        slots.inventory.borrow_mut().insert("brass_key".into());
+        slots.player.borrow_mut().won = true;
+        slots.player.borrow_mut().x = 99;
+
+        slots.reset(22, 4);
+
+        assert!(slots.flags.borrow().is_empty(), "flags must be cleared");
+        assert!(
+            slots.inventory.borrow().is_empty(),
+            "inventory must be cleared"
+        );
+        let p = slots.player.borrow();
+        assert_eq!((p.x, p.y, p.won), (22, 4, false));
+    }
+
+    #[test]
+    fn save_state_serializes_to_json_and_back() {
+        // Round-trip through the same `serde_json` path
+        // `write_atomic`/`read_save` use. Catches accidental
+        // `#[serde(skip)]` / rename drift before it ships.
+        let mut state = SaveState::default();
+        state.player_x = 43;
+        state.player_y = 4;
+        state.won = true;
+        state.flags.insert("heard_rumor".into());
+        state.inventory.insert("brass_key".into());
+        let json = serde_json::to_string(&state).expect("serialise");
+        let parsed: SaveState = serde_json::from_str(&json).expect("parse");
+        assert_eq!(state, parsed);
+    }
+
+    #[test]
+    fn map_screen_with_shared_honours_loaded_player_position() {
+        // `with_shared` must honour the player position the slots
+        // already carry (the loaded-save case) instead of resetting to
+        // the configured spawn. Without this, "Continue" would teleport
+        // the player back to the lobby door every launch.
+        let slots = SharedSlots::default();
+        {
+            let mut p = slots.player.borrow_mut();
+            p.x = 39;
+            p.y = 5;
+            p.won = false;
+        }
+        let map = MapScreen::with_shared(22, 4, slots);
+        assert_eq!(map.player(), (39, 5));
+    }
+
+    #[test]
+    fn main_menu_new_game_resets_slots_before_pushing_map() {
+        // "New Game" wipes whatever was in the slots so a stale loaded
+        // save cannot leak items or flags into the new run.
+        let slots = SharedSlots::default();
+        slots.flags.borrow_mut().insert("heard_rumor".into());
+        slots.inventory.borrow_mut().insert("brass_key".into());
+        let mut menu = MainMenuScreen::with_slots(slots.clone());
+        let cfg = fixture_config();
+        let fc = fixture_context();
+        let mut ctx = GameContext::new(&cfg, &fc, (80, 24));
+        let cmd = menu.handle_input(&mut ctx, Input::Char('n'));
+        assert!(matches!(cmd, ScreenCommand::Push(_)));
+        assert!(slots.flags.borrow().is_empty());
+        assert!(slots.inventory.borrow().is_empty());
+        let p = slots.player.borrow();
+        assert_eq!((p.x, p.y), (cfg.game.start_x, cfg.game.start_y));
+    }
+
+    #[test]
+    fn main_menu_continue_preserves_slots() {
+        // "Continue" must not touch the slots — they came from the
+        // loaded save and the map screen reads them on construction.
+        let slots = SharedSlots::default();
+        slots.flags.borrow_mut().insert("heard_rumor".into());
+        slots.inventory.borrow_mut().insert("brass_key".into());
+        slots.player.borrow_mut().x = 39;
+        slots.player.borrow_mut().y = 5;
+        let mut menu = MainMenuScreen::with_slots(slots.clone());
+        let cfg = fixture_config();
+        let fc = fixture_context();
+        let mut ctx = GameContext::new(&cfg, &fc, (80, 24));
+        let cmd = menu.handle_input(&mut ctx, Input::Char('c'));
+        assert!(matches!(cmd, ScreenCommand::Push(_)));
+        assert!(slots.flags.borrow().contains("heard_rumor"));
+        assert!(slots.inventory.borrow().contains("brass_key"));
+        assert_eq!(slots.player.borrow().x, 39);
     }
 
     #[test]

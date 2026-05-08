@@ -84,6 +84,35 @@ applicable) is visible *outside* the alternate screen.
    attachment, so a `reset` is the worst case. Document any
    regression here in `DECISIONS.md`.
 
+## Scenario 6 — Save persistence round trip (Task 13h)
+
+The save manager writes per-user JSON via `write_atomic` and reloads it
+on the next launch. CI cannot drive a real Foglet door, so the
+quit/launch cycle is verified by hand:
+
+1. Pick a fresh save scratch directory: `export FGK_SAVE_DIR=$(mktemp -d)`.
+2. Launch: `cargo run --example murder_motel`. Press Enter on the title,
+   choose **New Game**, walk a few steps, talk to the Night Clerk and
+   pick the rumor branch (so `heard_rumor` is set), pick up the brass
+   key, then quit cleanly with `q`.
+3. **Expected:** `$FGK_SAVE_DIR/save.json` exists. Inspecting it shows
+   non-default `player_x` / `player_y`, `flags` containing
+   `heard_rumor`, `inventory` containing `brass_key`, and either
+   `won: true` or `won: false` depending on whether the player stepped
+   onto the win tile before quitting.
+4. Re-launch: `cargo run --example murder_motel`. Press Enter, choose
+   **Continue**.
+5. **Expected:** the player stands on the saved cell (not the configured
+   spawn), the inventory screen still lists the previously collected
+   items, and the locked door is rendered as already unlocked if the
+   brass key was held at save time.
+6. Choose **New Game** instead and confirm the slots reset: the player
+   is back at `(start_x, start_y)`, no items, no flags.
+
+Cleanup: `rm -rf "$FGK_SAVE_DIR"`. The save is JSON pretty-printed via
+`serde_json::to_writer_pretty` per `crates/foglet_game/src/save.rs`, so
+an operator inspecting `save.json` can read every field at a glance.
+
 ## What this file is not
 
 - Not a substitute for `cargo test` — the unit tests cover the
