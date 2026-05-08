@@ -6,8 +6,10 @@
 #   - `fgk emit-manifest`         print Foglet manifest JSON
 #   - `fgk package`               produce a deployable door bundle
 #
-# Task 1 only stands the binary up so `cargo build -p fgk` works.
-# Real argument parsing and subcommand handlers land in Tasks 10–12.
+# The crate ships as both a library and a binary: the library exposes
+# template fixtures and (later) manifest/package helpers so unit tests
+# can exercise them without driving the binary, while `main.rs` stays
+# the thin operator-facing entry point.
 #
 
 [package]
@@ -20,6 +22,12 @@ license      = { workspace = true }
 repository   = { workspace = true }
 authors      = { workspace = true }
 
+[lib]
+# Explicit lib name so `use fgk::...` works in both unit tests and
+# (eventually) the binary.
+name = "fgk"
+path = "src/lib.rs"
+
 [[bin]]
 # Explicit binary name so `cargo run -p fgk -- ...` works without
 # needing to remember the package-name → binary mapping.
@@ -31,7 +39,16 @@ path = "src/main.rs"
 # `foglet_game` (manifest emission, config parsing, etc.).
 foglet_game = { path = "../foglet_game" }
 
-# Real dependencies (clap, anyhow, serde_json, …) are pulled in by
-# the task that introduces the subcommand needing them.
+# Real subcommand dependencies (clap, anyhow, serde_json, …) are
+# pulled in by the task that introduces the subcommand needing them.
 
 [dev-dependencies]
+# Round-trip the embedded `Cargo.toml` template through a real TOML
+# parser as part of the template fixture tests (Task 10a).
+toml = { workspace = true }
+
+# Syntactic validation of the embedded `src/main.rs` template — see
+# DECISIONS.md ADR 2026-05-08 (template fixture validation) for why
+# `syn` joins the crate budget. `default-features = false` keeps the
+# dev-dep surface small: we only need the parser, not codegen.
+syn = { version = "2", features = ["full"] }

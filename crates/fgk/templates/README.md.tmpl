@@ -1,0 +1,36 @@
+# {name}
+
+A Foglet door game scaffolded with [`fgk`](https://github.com/foglet/foglet-game-kit-rs).
+
+## Develop
+
+```sh
+cargo run
+```
+
+The default `main.rs` displays a title screen. Press `Esc` or `Q` to
+quit. Edit `src/main.rs` to add screens (menu, map, dialog, …) and
+`assets/game.toml` to update door metadata.
+
+## Layout
+
+```
+{name}/
+  Cargo.toml
+  src/main.rs        # screen wiring + Game::run()
+  assets/
+    game.toml        # SPEC §9.1 game manifest
+    maps/start.txt   # starter ASCII map
+```
+
+## Package as a Foglet door
+
+Once your game is ready:
+
+```sh
+fgk emit-manifest --install-dir /srv/foglet/doors/{name}
+fgk package --out dist/
+```
+
+See `docs/foglet-install.md` in the kit repo for the operator-side
+walkthrough.

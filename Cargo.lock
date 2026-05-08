@@ -147,6 +147,8 @@ name = "fgk"
 version = "0.1.0"
 dependencies = [
  "foglet_game",
+ "syn",
+ "toml",
 ]
 
 [[package]]

@@ -1,0 +1,27 @@
+# `assets/game.toml` — game manifest read by `foglet_game::GameConfig`
+# and the `fgk` CLI (SPEC §9.1). Edit the fields below as the game
+# evolves; `fgk emit-manifest` and `fgk package` derive the operator
+# manifest from this file.
+
+[game]
+title = "{name}"
+slug = "{name}"
+description = "A Foglet door game scaffolded by fgk."
+min_width = 80
+min_height = 24
+start_map = "start"
+start_x = 2
+start_y = 2
+
+[save]
+# Default per SPEC §5.6. Set to "none" for kiosk-style demos that
+# should not persist any state.
+strategy = "per_foglet_user"
+
+[manifest]
+# Generated Foglet manifest defaults. Tighten as needed before
+# packaging for production.
+timeout_ms = 1800000
+idle_timeout_ms = 300000
+visibility = "members"
+auth_scope = "site"

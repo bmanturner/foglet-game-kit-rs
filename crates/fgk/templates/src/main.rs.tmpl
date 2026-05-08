@@ -1,0 +1,62 @@
+//! Starter Foglet door game scaffolded by `fgk new`.
+//!
+//! The default project ships a single title screen that quits on Esc
+//! or Q. Replace [`TitleScreen`] (or push more screens on top of it)
+//! as the game grows: a menu, a map, a dialog screen, an inventory,
+//! and so on. The `foglet_game` crate provides the runtime that
+//! drives those screens; this file only wires them together.
+//!
+//! Startup follows SPEC §7.1 by delegating to `foglet_game::Game`:
+//! the runtime checks the terminal's minimum size, installs the
+//! panic-cleanup hook, enters raw mode, and only then enters the
+//! event loop. There is intentionally no terminal-handling code in
+//! this file — that responsibility lives inside the kit.
+
+use foglet_game::{
+    load_context, process_env, Game, GameConfig, GameContext, Input, Screen, ScreenCommand,
+};
+use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::Frame;
+
+/// Starter screen: shows the configured title and waits for a quit
+/// keystroke. Replace this with your own screens as the game grows.
+#[derive(Default)]
+struct TitleScreen;
+
+impl Screen for TitleScreen {
+    fn render(&mut self, ctx: &mut GameContext<'_>, frame: &mut Frame<'_>) {
+        let title = ctx.config.game.title.as_str();
+        let body = format!(
+            "{title}\n\nPress Esc or Q to quit.\n\nReplace TitleScreen in src/main.rs to start building."
+        );
+        let widget = Paragraph::new(body)
+            .block(Block::default().borders(Borders::ALL).title(title));
+        frame.render_widget(widget, frame.area());
+    }
+
+    fn handle_input(&mut self, _ctx: &mut GameContext<'_>, input: Input) -> ScreenCommand {
+        match input {
+            Input::Esc | Input::Char('q') | Input::Char('Q') => ScreenCommand::Quit,
+            _ => ScreenCommand::None,
+        }
+    }
+}
+
+fn main() -> anyhow::Result<()> {
+    // `assets/game.toml` is the SPEC §9.1 game manifest; the kit's
+    // `GameConfig` parser handles every field validation rule.
+    let config = GameConfig::load("assets/game.toml")?;
+
+    // `load_context` reads `FOGLET_DOOR_CONTEXT` (production) or the
+    // discrete `FOGLET_*` env vars (local dev), and synthesises sane
+    // defaults when neither is present.
+    let foglet = load_context(process_env)?;
+
+    Game::new(config.game.title.clone())
+        .min_size(config.game.min_width, config.game.min_height)
+        .with_config(config)
+        .with_foglet_context(foglet)
+        .push_screen(Box::new(TitleScreen::default()))
+        .run()?;
+    Ok(())
+}
