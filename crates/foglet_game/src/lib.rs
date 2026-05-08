@@ -35,6 +35,7 @@ pub mod config;
 pub mod foglet;
 pub mod input;
 pub mod manifest;
+pub mod map;
 pub mod runtime;
 pub mod save;
 pub mod screen;
@@ -51,6 +52,9 @@ pub use input::{from_event, from_key_event, Input};
 pub use manifest::{
     FogletManifest, ManifestError, ManifestInputs, DEFAULT_AUTH_SCOPE, DEFAULT_IDLE_TIMEOUT_MS,
     DEFAULT_TIMEOUT_MS, DEFAULT_VISIBILITY, RUNTIME_EXTERNAL_PTY,
+};
+pub use map::{
+    parse_map, EntityPlacement, Map, MapError, Tile, TileKind, TileLegend, PLAYER_GLYPH,
 };
 pub use runtime::{
     run_built, run_with_io, BuiltGame, CrosstermEventSource, EventSource, Game, GameError,

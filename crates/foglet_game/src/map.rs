@@ -1,0 +1,647 @@
+//! ASCII map parser (SPEC §9.2).
+//!
+//! Foglet door games describe their world with two artifacts:
+//!
+//! 1. **A tile legend** in TOML — a `[tiles]` table mapping a single
+//!    character glyph to a semantic kind string (`"wall"`, `"floor"`,
+//!    `"door"`, `"npc:<id>"`, `"item:<id>"`, or an author-defined
+//!    custom kind). SPEC §9.2 ships this alongside the map so the same
+//!    glyph can mean different things in different games.
+//! 2. **An ASCII grid** — a plain-text rectangle where every cell
+//!    matches a glyph in the legend. The player spawn glyph (`@`) is
+//!    treated like any other glyph by the parser; `[game].start_x` /
+//!    `start_y` in `assets/game.toml` are the authoritative spawn,
+//!    so games typically map `@` to "floor" in their legend and rely
+//!    on config for placement.
+//!
+//! # Why parse this in the library and not the game
+//!
+//! Every door game would otherwise re-implement the same loop: walk
+//! the grid, stamp a tile per glyph, tease NPC/item placements out of
+//! the cells. Centralising the parser here means:
+//!
+//! - The walkability rule ("walls are solid, floors and doors are
+//!   passable, NPCs/items occupy a passable cell underneath") is
+//!   defined once.
+//! - Authoring errors (unknown glyph, ragged grid) raise the same
+//!   message everywhere instead of silently producing weird worlds.
+//! - The `fgk new` template can ship a working map without re-deriving
+//!   the parser.
+//!
+//! # What this module does NOT do
+//!
+//! - It does not load files — game code reads the grid string and
+//!   passes it to [`parse_map`]. This keeps the parser pure and
+//!   testable, and lets the runtime decide whether maps come from
+//!   `include_str!`, `assets/maps/*.txt`, or somewhere else.
+//! - It does not enforce a player-spawn glyph. SPEC §5.2 names
+//!   `start_x` / `start_y` in `[game]` as the spawn, so spawn lives
+//!   in config (Task 4), not the map.
+//! - It does not implement movement or pathing. Walkability is a
+//!   per-tile predicate; how a `Screen` consumes it is the game's
+//!   choice.
+
+use std::collections::HashMap;
+
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+
+/// Glyph reserved for the player spawn marker in author-facing maps.
+///
+/// The parser does not require this glyph to be present, but games
+/// that *do* use `@` in their grid generally want it treated as
+/// floor (the player stands on a walkable tile). Documented here so
+/// the constant has one canonical spelling rather than being
+/// scattered through templates.
+pub const PLAYER_GLYPH: char = '@';
+
+/// Semantic meaning of a tile, derived from a legend entry.
+///
+/// The legend is a string-typed map in TOML; we promote its values
+/// to a typed enum so games can pattern-match instead of comparing
+/// strings. The `Custom` variant preserves the original legend
+/// string verbatim — this is the escape hatch for author-defined
+/// terrain (lava, water, ladder, etc.) without forcing the SPEC to
+/// enumerate every possibility.
+///
+/// # Walkability
+///
+/// `Wall` is the only built-in *blocking* kind. `Floor`, `Door`,
+/// `Npc`, and `Item` are walkable so the player can stand on them
+/// (NPCs and items occupy a floor-equivalent cell underneath; the
+/// game decides whether to block movement when the player tries to
+/// step *through* the entity). `Custom` defaults to walkable; if a
+/// game needs blocking custom terrain, it should consult its own
+/// state — keeping `Custom` permissive avoids silently locking
+/// players out of areas behind unrecognised glyphs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TileKind {
+    /// Solid wall. Not walkable.
+    Wall,
+    /// Open floor. Walkable.
+    Floor,
+    /// Door tile (open passage). Walkable. Locked-door semantics are
+    /// game-defined; the parser does not encode lock state.
+    Door,
+    /// NPC anchor — the cell hosts an NPC identified by `id`. The
+    /// underlying tile is treated as floor for walkability purposes.
+    Npc(String),
+    /// Item anchor — the cell hosts a collectable item identified by
+    /// `id`. The underlying tile is treated as floor.
+    Item(String),
+    /// Author-defined kind. Treated as walkable. Use this for
+    /// game-specific terrain that doesn't fit the built-in kinds.
+    Custom(String),
+}
+
+impl TileKind {
+    /// Whether the player can stand on this tile.
+    ///
+    /// Centralised so renderers and movement code reach for the same
+    /// answer; see the doc on [`TileKind`] for the rule.
+    pub fn is_walkable(&self) -> bool {
+        !matches!(self, TileKind::Wall)
+    }
+}
+
+/// Legend mapping single-character glyphs to [`TileKind`] values.
+///
+/// Built from the `[tiles]` TOML table that ships alongside each
+/// map. The legend is intentionally tiny (one glyph → one kind) so
+/// authors can read a map at a glance and the parser can reject
+/// unknown glyphs with a precise error.
+///
+/// # Why a wrapper instead of `HashMap<char, TileKind>` directly
+///
+/// 1. The constructor enforces "exactly one character per key",
+///    which `serde` won't catch on its own.
+/// 2. It's the natural place to hang a [`TileLegend::lookup`] helper
+///    that returns the structured error type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TileLegend {
+    glyphs: HashMap<char, TileKind>,
+}
+
+impl TileLegend {
+    /// Build a legend from raw `(glyph_string, kind_string)` pairs as
+    /// they appear in TOML.
+    ///
+    /// Each `glyph_string` MUST be exactly one Unicode scalar value;
+    /// each `kind_string` is interpreted by the internal `parse_kind`
+    /// helper (see this module's source — recognised forms are
+    /// `wall`, `floor`, `door`, `npc:<id>`, `item:<id>`, or anything
+    /// else as [`TileKind::Custom`]). This constructor is the single
+    /// funnel through which legend data enters the type system.
+    pub fn from_pairs<I, S>(pairs: I) -> Result<Self, MapError>
+    where
+        I: IntoIterator<Item = (S, S)>,
+        S: AsRef<str>,
+    {
+        let mut glyphs = HashMap::new();
+        for (raw_glyph, raw_kind) in pairs {
+            let glyph_str = raw_glyph.as_ref();
+            let mut chars = glyph_str.chars();
+            let glyph = chars.next().ok_or(MapError::EmptyGlyph)?;
+            if chars.next().is_some() {
+                return Err(MapError::MultiCharGlyph(glyph_str.to_string()));
+            }
+            let kind = parse_kind(raw_kind.as_ref())?;
+            glyphs.insert(glyph, kind);
+        }
+        Ok(Self { glyphs })
+    }
+
+    /// Look up the kind for a glyph, returning the structured
+    /// "unknown glyph" error so callers don't have to re-wrap.
+    pub fn lookup(&self, glyph: char) -> Result<&TileKind, MapError> {
+        self.glyphs
+            .get(&glyph)
+            .ok_or(MapError::UnknownGlyph { glyph })
+    }
+
+    /// Number of glyphs registered. Useful for tests and diagnostics.
+    pub fn len(&self) -> usize {
+        self.glyphs.len()
+    }
+
+    /// Whether the legend contains zero glyphs.
+    pub fn is_empty(&self) -> bool {
+        self.glyphs.is_empty()
+    }
+}
+
+/// Parse a legend value string into a [`TileKind`].
+///
+/// Recognised forms:
+///
+/// - `"wall"` → [`TileKind::Wall`]
+/// - `"floor"` → [`TileKind::Floor`]
+/// - `"door"` → [`TileKind::Door`]
+/// - `"npc:<id>"` → [`TileKind::Npc`] with `<id>` (must be non-empty)
+/// - `"item:<id>"` → [`TileKind::Item`] with `<id>` (must be non-empty)
+/// - anything else → [`TileKind::Custom`] preserving the raw string
+///
+/// Empty input is rejected so a legend with `"" = "floor"` can't sneak
+/// through.
+fn parse_kind(raw: &str) -> Result<TileKind, MapError> {
+    if raw.is_empty() {
+        return Err(MapError::EmptyKind);
+    }
+    if let Some(id) = raw.strip_prefix("npc:") {
+        if id.is_empty() {
+            return Err(MapError::EmptyEntityId {
+                kind: "npc".to_string(),
+            });
+        }
+        return Ok(TileKind::Npc(id.to_string()));
+    }
+    if let Some(id) = raw.strip_prefix("item:") {
+        if id.is_empty() {
+            return Err(MapError::EmptyEntityId {
+                kind: "item".to_string(),
+            });
+        }
+        return Ok(TileKind::Item(id.to_string()));
+    }
+    Ok(match raw {
+        "wall" => TileKind::Wall,
+        "floor" => TileKind::Floor,
+        "door" => TileKind::Door,
+        other => TileKind::Custom(other.to_string()),
+    })
+}
+
+/// One cell in a parsed [`Map`].
+///
+/// Stored as the [`TileKind`] resolved through the legend at parse
+/// time, plus the originating `glyph` so renderers can fall back to
+/// raw ASCII without re-stringifying the kind.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Tile {
+    /// Original character from the source grid.
+    pub glyph: char,
+    /// Resolved semantic kind from the legend.
+    pub kind: TileKind,
+}
+
+impl Tile {
+    /// Convenience: walkability of this cell. Mirrors
+    /// [`TileKind::is_walkable`].
+    pub fn is_walkable(&self) -> bool {
+        self.kind.is_walkable()
+    }
+}
+
+/// A placement extracted from the grid for entity-like tiles
+/// (currently NPCs and items).
+///
+/// The map renderer typically draws the floor under the entity and
+/// lets the entity layer overlay its own glyph; the placement record
+/// is what the entity layer reads to decide where to spawn each NPC
+/// or item. Carrying the placement alongside the [`Map`] keeps the
+/// parser the single owner of "where things start out".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EntityPlacement {
+    /// Column (0-based, left to right).
+    pub x: u16,
+    /// Row (0-based, top to bottom).
+    pub y: u16,
+    /// What kind of entity stood on this cell. Currently always
+    /// [`TileKind::Npc`] or [`TileKind::Item`]; gated on those
+    /// variants by the parser.
+    pub kind: TileKind,
+}
+
+/// Parsed ASCII map (SPEC §9.2).
+///
+/// The grid is rectangular by construction (the parser rejects ragged
+/// input). `entities` is the *separate* list of NPC/item anchors —
+/// the corresponding cells in `cells` are stored as their entity kind
+/// so renderers that want to honour the original glyph can do so;
+/// movement code that wants "is this cell walkable" should still call
+/// [`Map::is_walkable`] which collapses entity tiles to their
+/// floor-equivalent passability.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Map {
+    /// Width in columns.
+    pub width: u16,
+    /// Height in rows.
+    pub height: u16,
+    /// `cells[y][x]` — row-major. Always exactly `height` rows of
+    /// exactly `width` tiles.
+    pub cells: Vec<Vec<Tile>>,
+    /// Entity placements harvested from `Npc(_)` / `Item(_)` cells,
+    /// in row-major reading order.
+    pub entities: Vec<EntityPlacement>,
+}
+
+impl Map {
+    /// Return the tile at `(x, y)`, or `None` if out of bounds.
+    pub fn tile_at(&self, x: u16, y: u16) -> Option<&Tile> {
+        let row = self.cells.get(y as usize)?;
+        row.get(x as usize)
+    }
+
+    /// Whether `(x, y)` is in-bounds. Cheaper than `tile_at` when the
+    /// caller doesn't need the tile itself.
+    pub fn in_bounds(&self, x: u16, y: u16) -> bool {
+        x < self.width && y < self.height
+    }
+
+    /// Whether the player can stand on `(x, y)`.
+    ///
+    /// Out-of-bounds coordinates return `false` so movement code can
+    /// uniformly treat "off the map" as a wall without first
+    /// bounds-checking.
+    pub fn is_walkable(&self, x: u16, y: u16) -> bool {
+        self.tile_at(x, y).is_some_and(Tile::is_walkable)
+    }
+}
+
+/// Errors produced by [`parse_map`] and the legend constructor.
+///
+/// All variants carry enough structured context that a CLI wrapping
+/// them with `anyhow` can render a useful single-line message
+/// (`fgk run` does this) without losing the typed branch for tests.
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum MapError {
+    /// Source text was empty or contained only blank lines.
+    #[error("map is empty (no rows)")]
+    Empty,
+    /// Rows in the grid disagreed on width — `expected` came from the
+    /// first non-blank row, `found` is the offending row.
+    #[error("ragged map: row {row} has width {found}, expected {expected}")]
+    Ragged {
+        /// 0-based row index.
+        row: u16,
+        /// Width of the first non-blank row.
+        expected: u16,
+        /// Width of the offending row.
+        found: u16,
+    },
+    /// Glyph appeared in the grid but not in the legend.
+    #[error("unknown glyph {glyph:?} in map")]
+    UnknownGlyph {
+        /// The unknown glyph as it appeared in the source.
+        glyph: char,
+    },
+    /// Legend entry's glyph string was the empty string.
+    #[error("legend glyph must be exactly one character (was empty)")]
+    EmptyGlyph,
+    /// Legend entry's glyph string had more than one character.
+    #[error("legend glyph must be exactly one character (got {0:?})")]
+    MultiCharGlyph(String),
+    /// Legend entry mapped a glyph to an empty kind string.
+    #[error("legend kind string is empty")]
+    EmptyKind,
+    /// `npc:` or `item:` prefix was given without an id (e.g. `npc:`).
+    #[error("legend kind {kind:?} requires a non-empty id")]
+    EmptyEntityId {
+        /// The kind prefix (`"npc"` or `"item"`).
+        kind: String,
+    },
+}
+
+/// Parse an ASCII grid against `legend` into a [`Map`].
+///
+/// The parser:
+///
+/// 1. Strips trailing blank lines (lets authors leave a newline at
+///    EOF without tripping the "empty row" rule).
+/// 2. Locks the map width to the first non-blank row's character
+///    count.
+/// 3. Rejects any subsequent row whose width disagrees.
+/// 4. Resolves every glyph through `legend`; an unknown glyph aborts
+///    with [`MapError::UnknownGlyph`].
+/// 5. Harvests entity placements (NPC/item) into `Map::entities` in
+///    row-major reading order.
+///
+/// # Errors
+///
+/// See [`MapError`] for the full enumeration. The function never
+/// panics on malformed input — every failure mode is surfaced as a
+/// typed variant.
+pub fn parse_map(text: &str, legend: &TileLegend) -> Result<Map, MapError> {
+    let trimmed_lines: Vec<&str> = text
+        .lines()
+        .skip_while(|l| l.is_empty())
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .skip_while(|l| l.is_empty())
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+
+    if trimmed_lines.is_empty() {
+        return Err(MapError::Empty);
+    }
+
+    let width = trimmed_lines[0].chars().count();
+    if width == 0 {
+        return Err(MapError::Empty);
+    }
+    let width_u16 = u16::try_from(width).unwrap_or(u16::MAX);
+
+    let mut cells: Vec<Vec<Tile>> = Vec::with_capacity(trimmed_lines.len());
+    let mut entities: Vec<EntityPlacement> = Vec::new();
+
+    for (row_idx, line) in trimmed_lines.iter().enumerate() {
+        let row_chars: Vec<char> = line.chars().collect();
+        if row_chars.len() != width {
+            return Err(MapError::Ragged {
+                row: u16::try_from(row_idx).unwrap_or(u16::MAX),
+                expected: width_u16,
+                found: u16::try_from(row_chars.len()).unwrap_or(u16::MAX),
+            });
+        }
+        let mut row: Vec<Tile> = Vec::with_capacity(width);
+        for (col_idx, glyph) in row_chars.into_iter().enumerate() {
+            let kind = legend.lookup(glyph)?.clone();
+            if matches!(kind, TileKind::Npc(_) | TileKind::Item(_)) {
+                entities.push(EntityPlacement {
+                    x: u16::try_from(col_idx).unwrap_or(u16::MAX),
+                    y: u16::try_from(row_idx).unwrap_or(u16::MAX),
+                    kind: kind.clone(),
+                });
+            }
+            row.push(Tile { glyph, kind });
+        }
+        cells.push(row);
+    }
+
+    let height_u16 = u16::try_from(cells.len()).unwrap_or(u16::MAX);
+
+    Ok(Map {
+        width: width_u16,
+        height: height_u16,
+        cells,
+        entities,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a legend that covers every glyph in the SPEC §9.2 example
+    /// plus the player marker mapped to floor (the convention `fgk new`
+    /// templates follow).
+    fn spec_legend() -> TileLegend {
+        TileLegend::from_pairs([
+            ("#", "wall"),
+            (".", "floor"),
+            ("+", "door"),
+            ("K", "npc:night_clerk"),
+            ("@", "floor"),
+        ])
+        .expect("static legend parses")
+    }
+
+    #[test]
+    fn parses_spec_example_map() {
+        let src = "\
+########################
+#..........#...........#
+#..@.......+.....K.....#
+#..........#...........#
+########+###############
+";
+        let legend = spec_legend();
+        let map = parse_map(src, &legend).expect("spec example parses");
+
+        assert_eq!(map.width, 24);
+        assert_eq!(map.height, 5);
+        assert_eq!(map.cells.len(), 5);
+        for row in &map.cells {
+            assert_eq!(row.len(), 24);
+        }
+
+        // Walls form the perimeter (corners + first/last row).
+        assert!(matches!(map.tile_at(0, 0).unwrap().kind, TileKind::Wall));
+        assert!(matches!(map.tile_at(23, 0).unwrap().kind, TileKind::Wall));
+        assert!(matches!(map.tile_at(0, 4).unwrap().kind, TileKind::Wall));
+        assert!(matches!(map.tile_at(23, 4).unwrap().kind, TileKind::Wall));
+
+        // Doors at the column-11 split on row 2 and at column 8 on the
+        // bottom wall.
+        assert!(matches!(map.tile_at(11, 2).unwrap().kind, TileKind::Door));
+        assert!(matches!(map.tile_at(8, 4).unwrap().kind, TileKind::Door));
+
+        // NPC harvested.
+        assert_eq!(map.entities.len(), 1);
+        assert_eq!(map.entities[0].x, 17);
+        assert_eq!(map.entities[0].y, 2);
+        assert_eq!(
+            map.entities[0].kind,
+            TileKind::Npc("night_clerk".to_string())
+        );
+    }
+
+    #[test]
+    fn walkability_rule() {
+        let legend = spec_legend();
+        let src = "\
+##.
+#@+
+##.
+";
+        let map = parse_map(src, &legend).unwrap();
+
+        assert!(!map.is_walkable(0, 0)); // wall
+        assert!(map.is_walkable(2, 0)); // floor
+        assert!(map.is_walkable(1, 1)); // floor (player marker glyph mapped to floor)
+        assert!(map.is_walkable(2, 1)); // door is walkable
+                                        // Out of bounds is treated as not walkable so movement code
+                                        // doesn't have to bounds-check separately.
+        assert!(!map.is_walkable(99, 99));
+        assert!(!map.in_bounds(99, 99));
+    }
+
+    #[test]
+    fn rejects_ragged_grid() {
+        let legend = spec_legend();
+        let src = "\
+####
+###
+####
+";
+        let err = parse_map(src, &legend).unwrap_err();
+        assert_eq!(
+            err,
+            MapError::Ragged {
+                row: 1,
+                expected: 4,
+                found: 3,
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_glyph() {
+        let legend = spec_legend();
+        let src = "\
+####
+#?.#
+####
+";
+        let err = parse_map(src, &legend).unwrap_err();
+        assert_eq!(err, MapError::UnknownGlyph { glyph: '?' });
+    }
+
+    #[test]
+    fn rejects_empty_input() {
+        let legend = spec_legend();
+        assert_eq!(parse_map("", &legend).unwrap_err(), MapError::Empty);
+        assert_eq!(parse_map("\n\n\n", &legend).unwrap_err(), MapError::Empty);
+    }
+
+    #[test]
+    fn ignores_leading_and_trailing_blank_lines() {
+        let legend = spec_legend();
+        let src = "\n\n\n##\n..\n\n";
+        let map = parse_map(src, &legend).expect("blank-bookended map parses");
+        assert_eq!(map.height, 2);
+        assert_eq!(map.width, 2);
+    }
+
+    #[test]
+    fn legend_rejects_multi_char_glyph() {
+        let err = TileLegend::from_pairs([("##", "wall")]).unwrap_err();
+        assert_eq!(err, MapError::MultiCharGlyph("##".to_string()));
+    }
+
+    #[test]
+    fn legend_rejects_empty_glyph() {
+        let err = TileLegend::from_pairs([("", "wall")]).unwrap_err();
+        assert_eq!(err, MapError::EmptyGlyph);
+    }
+
+    #[test]
+    fn legend_rejects_empty_kind() {
+        let err = TileLegend::from_pairs([("#", "")]).unwrap_err();
+        assert_eq!(err, MapError::EmptyKind);
+    }
+
+    #[test]
+    fn legend_rejects_entity_without_id() {
+        let err = TileLegend::from_pairs([("N", "npc:")]).unwrap_err();
+        assert_eq!(
+            err,
+            MapError::EmptyEntityId {
+                kind: "npc".to_string()
+            }
+        );
+        let err = TileLegend::from_pairs([("I", "item:")]).unwrap_err();
+        assert_eq!(
+            err,
+            MapError::EmptyEntityId {
+                kind: "item".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn parses_item_placements() {
+        let legend = TileLegend::from_pairs([
+            ("#", "wall"),
+            (".", "floor"),
+            ("k", "item:rusty_key"),
+            ("c", "item:candlestick"),
+        ])
+        .unwrap();
+        let src = "\
+####
+#k.#
+#.c#
+####
+";
+        let map = parse_map(src, &legend).unwrap();
+        assert_eq!(map.entities.len(), 2);
+        assert_eq!(
+            map.entities[0],
+            EntityPlacement {
+                x: 1,
+                y: 1,
+                kind: TileKind::Item("rusty_key".to_string()),
+            }
+        );
+        assert_eq!(
+            map.entities[1],
+            EntityPlacement {
+                x: 2,
+                y: 2,
+                kind: TileKind::Item("candlestick".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn custom_kind_is_walkable_and_round_trips_string() {
+        let legend = TileLegend::from_pairs([("#", "wall"), (".", "floor"), ("~", "water")])
+            .expect("custom legend parses");
+        let map = parse_map("###\n#~#\n###\n", &legend).unwrap();
+        let tile = map.tile_at(1, 1).unwrap();
+        assert_eq!(tile.kind, TileKind::Custom("water".to_string()));
+        assert!(tile.is_walkable());
+    }
+
+    #[test]
+    fn legend_lookup_reports_unknown_glyph() {
+        let legend = spec_legend();
+        let err = legend.lookup('?').unwrap_err();
+        assert_eq!(err, MapError::UnknownGlyph { glyph: '?' });
+    }
+
+    #[test]
+    fn legend_len_and_is_empty_track_pairs() {
+        let empty = TileLegend::from_pairs::<_, &str>([]).unwrap();
+        assert!(empty.is_empty());
+        assert_eq!(empty.len(), 0);
+
+        let two = TileLegend::from_pairs([("#", "wall"), (".", "floor")]).unwrap();
+        assert!(!two.is_empty());
+        assert_eq!(two.len(), 2);
+    }
+}
