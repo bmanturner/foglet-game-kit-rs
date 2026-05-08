@@ -35,6 +35,7 @@ pub mod config;
 pub mod foglet;
 pub mod input;
 pub mod manifest;
+pub mod screen;
 pub mod terminal;
 
 pub use config::{
@@ -49,6 +50,7 @@ pub use manifest::{
     FogletManifest, ManifestError, ManifestInputs, DEFAULT_AUTH_SCOPE, DEFAULT_IDLE_TIMEOUT_MS,
     DEFAULT_TIMEOUT_MS, DEFAULT_VISIBILITY, RUNTIME_EXTERNAL_PTY,
 };
+pub use screen::{GameContext, Screen, ScreenCommand};
 pub use terminal::{
     arm_panic_hook, disarm_panic_hook, flush_stdout, install_panic_hook, install_panic_hook_with,
     is_panic_hook_armed, CrosstermBackend, PanicRestoreFn, TerminalBackend, TerminalError,

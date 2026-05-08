@@ -42,6 +42,11 @@ thiserror  = { workspace = true }
 # 5c) is unit-testable without a real TTY, but the production backend
 # delegates straight to `crossterm::terminal` per SPEC §6.
 crossterm  = { workspace = true }
+# Task 7 (screen stack + runtime loop) needs `ratatui::Frame` so the
+# `Screen::render` signature in SPEC §8.2 compiles. Pulled in at the
+# library boundary because the trait is part of the public authoring
+# API — every game crate transitively depends on this anyway.
+ratatui    = { workspace = true }
 
 [dev-dependencies]
 # `tempfile` lets the loader tests write a context file to a real
