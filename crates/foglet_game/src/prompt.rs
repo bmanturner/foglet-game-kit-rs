@@ -441,6 +441,14 @@ pub struct ChoicePrompt<T> {
     /// `"Your gold: 173g"`. `None` means the renderer omits the
     /// footer row entirely (no blank gap).
     pub footer: Option<String>,
+    /// When `true`, pressing Esc on this prompt returns
+    /// [`PromptAction::Cancelled`]; when `false` (the default), Esc
+    /// collapses to [`PromptAction::None`] alongside other ignored
+    /// inputs. SPEC_v1_1.md §4.3 lists Esc support as
+    /// "when configured" — opt-in cancellation prevents a stray Esc
+    /// from dismissing a load-bearing prompt (vendor confirmation, save
+    /// overwrite) that the game wants to force the player to resolve.
+    pub cancellable: bool,
 }
 
 impl<T> Default for ChoicePrompt<T> {
@@ -460,6 +468,11 @@ impl<T> ChoicePrompt<T> {
             body: Vec::new(),
             choices: Vec::new(),
             footer: None,
+            // SPEC §4.3: Esc support is "when configured". Default off
+            // so the safer behaviour (Esc ignored) is the one a careless
+            // author gets for free; opting into cancellation is an
+            // explicit, single-line builder call.
+            cancellable: false,
         }
     }
 
@@ -520,6 +533,20 @@ impl<T> ChoicePrompt<T> {
         self
     }
 
+    /// Configure whether Esc cancels this prompt (SPEC_v1_1.md §4.3).
+    ///
+    /// Pass `true` for prompts that are safe to dismiss (a loot prompt,
+    /// a vendor menu, an informational pause); pass `false` for prompts
+    /// that must be resolved (a save-overwrite confirmation, an opening
+    /// menu where Esc would strand the player). The setter form (rather
+    /// than a marker `.cancellable()` method) lets the builder express
+    /// the dynamic case `cancellable(player.has_alt_exit())` without an
+    /// `if/else` arm.
+    pub fn cancellable(mut self, cancellable: bool) -> Self {
+        self.cancellable = cancellable;
+        self
+    }
+
     /// Run SPEC §4.1 hotkey validation against the current choice
     /// list. Returns `Err(PromptError::DuplicateHotkey)` on the first
     /// collision in declaration order; `Ok(())` for a valid prompt
@@ -575,6 +602,17 @@ impl<T: Clone> ChoicePrompt<T> {
         let Some(key) = PromptKey::from_input(input) else {
             return PromptAction::None;
         };
+
+        // Task 3d: Esc cancellation, opt-in via `.cancellable(true)`.
+        // Checked before the direct-hotkey scan so a choice that
+        // explicitly bound `PromptKey::Esc` (exotic but legal at the
+        // data level — see `validate_choices_treats_enter_and_esc_...`)
+        // does not accidentally short-circuit a configured cancel.
+        // When cancellation is off, Esc falls through to the trailing
+        // `None` so the prompt stays unchanged.
+        if key == PromptKey::Esc && self.cancellable {
+            return PromptAction::Cancelled;
+        }
 
         // Direct hotkey path (Task 3b). Only `Char` keys participate in
         // direct-key matching here; `Enter`/`Esc` are handled by Tasks
@@ -1342,6 +1380,7 @@ mod tests {
             body: Vec::new(),
             choices: vec![choice],
             footer: None,
+            cancellable: false,
         };
 
         assert_eq!(
@@ -1354,17 +1393,68 @@ mod tests {
     }
 
     #[test]
-    fn handle_enter_and_esc_are_no_ops_until_their_tasks_land() {
-        // Enter belongs to navigation mode (Task 4c); Esc belongs to
-        // cancellation (Task 3d). Neither is wired yet, so both must
-        // be no-ops on a default direct-key prompt — guards against a
-        // future change accidentally selecting the first choice on
-        // Enter, or marking the prompt cancelled on stray Esc.
+    fn handle_enter_is_a_no_op_until_navigation_mode_lands() {
+        // Enter belongs to navigation mode (Task 4c) — not wired yet,
+        // so it must stay a no-op on a default direct-key prompt rather
+        // than secretly selecting the first choice.
         let prompt: ChoicePrompt<LootAction> =
             ChoicePrompt::new().choice('e', LootAction::Equip, "Equip");
 
         assert_eq!(prompt.handle(Input::Enter), PromptAction::None);
+    }
+
+    #[test]
+    fn handle_esc_returns_none_when_cancellation_disabled() {
+        // SPEC_v1_1.md §4.3: Esc support is "when configured". A prompt
+        // that has not opted into cancellation MUST treat Esc as a
+        // no-op — otherwise a save-overwrite confirmation could be
+        // dismissed by a stray keystroke.
+        let prompt: ChoicePrompt<LootAction> =
+            ChoicePrompt::new().choice('e', LootAction::Equip, "Equip");
+
+        assert!(!prompt.cancellable);
         assert_eq!(prompt.handle(Input::Esc), PromptAction::None);
+    }
+
+    #[test]
+    fn handle_esc_returns_cancelled_when_cancellation_enabled() {
+        // Task 3d: opt-in via `.cancellable(true)`. Esc now produces
+        // `Cancelled`; non-Esc inputs are unaffected — direct-key
+        // selection still wins for a bound hotkey, and unbound printable
+        // keys still collapse to `None`.
+        let prompt: ChoicePrompt<LootAction> = ChoicePrompt::new()
+            .choice('e', LootAction::Equip, "Equip")
+            .cancellable(true);
+
+        assert!(prompt.cancellable);
+        assert_eq!(prompt.handle(Input::Esc), PromptAction::Cancelled);
+        assert_eq!(
+            prompt.handle(Input::Char('e')),
+            PromptAction::Selected(LootAction::Equip),
+        );
+        assert_eq!(prompt.handle(Input::Char('z')), PromptAction::None);
+    }
+
+    #[test]
+    fn cancellable_setter_round_trips_both_ways() {
+        // The setter takes a bool so dynamic chains like
+        // `.cancellable(player.can_back_out())` compile. Both arms must
+        // round-trip — an `if/else` that flipped the default would defeat
+        // the setter form.
+        let on: ChoicePrompt<LootAction> = ChoicePrompt::new().cancellable(true);
+        let off: ChoicePrompt<LootAction> =
+            ChoicePrompt::new().cancellable(true).cancellable(false);
+        assert!(on.cancellable);
+        assert!(!off.cancellable);
+    }
+
+    #[test]
+    fn default_prompt_is_not_cancellable() {
+        // Default-off is load-bearing: it is the SPEC §4.3 contract that
+        // Esc support is opt-in. If a future refactor flips the default
+        // to `true`, every existing prompt becomes silently dismissible.
+        let prompt: ChoicePrompt<LootAction> = ChoicePrompt::new();
+        assert!(!prompt.cancellable);
     }
 
     #[test]
