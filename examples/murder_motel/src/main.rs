@@ -108,6 +108,12 @@ pub struct SaveState {
     /// the [`MapScreen::ITEMS`] catalog; ids without a catalog match are
     /// rendered silently as gone — see [`InventoryScreen::current_labels`].
     pub inventory: BTreeSet<String>,
+    /// Coin balance carried into v1.1 for the night-clerk vendor scene
+    /// (SPEC §9). `#[serde(default)]` so a v1 save written before the
+    /// field existed deserialises cleanly with `cash == 0`; the New
+    /// Game / load paths reset to [`PlayerSlot::STARTING_CASH`].
+    #[serde(default)]
+    pub cash: u32,
 }
 
 /// Mutable runtime fields that need to survive a quit/launch cycle and
@@ -145,6 +151,19 @@ pub struct PlayerSlot {
     pub y: u16,
     /// Whether the win condition has been triggered this run.
     pub won: bool,
+    /// Player's coin balance, in the abstract "g" unit the SPEC §9
+    /// vendor prompt advertises ("You have: 40g"). The v1.1 proof scene
+    /// is the only consumer; gameplay paths that don't touch the
+    /// vendor leave this unchanged.
+    pub cash: u32,
+}
+
+impl PlayerSlot {
+    /// Coins the player starts a fresh run with. Tuned to the SPEC §9
+    /// vendor example: 40g is enough to buy the 25g coffee but not
+    /// enough to tip for a rumor (50g), so the disabled-state branch
+    /// fires on a clean New Game.
+    pub const STARTING_CASH: u32 = 40;
 }
 
 impl SharedSlots {
@@ -158,6 +177,11 @@ impl SharedSlots {
         p.x = start_x;
         p.y = start_y;
         p.won = false;
+        // Restore the v1.1 vendor-scene starting balance so a New Game
+        // hands the player the documented 40g regardless of what the
+        // previous run spent. The field is re-initialised in one place
+        // so a future re-tune touches a single constant.
+        p.cash = PlayerSlot::STARTING_CASH;
     }
 
     /// Build a [`SaveState`] from the current slot contents. Cloning the
@@ -171,6 +195,7 @@ impl SharedSlots {
             won: player.won,
             flags: self.flags.borrow().clone(),
             inventory: self.inventory.borrow().clone(),
+            cash: player.cash,
         }
     }
 
@@ -183,6 +208,7 @@ impl SharedSlots {
             p.x = state.player_x;
             p.y = state.player_y;
             p.won = state.won;
+            p.cash = state.cash;
         }
         *self.flags.borrow_mut() = state.flags;
         *self.inventory.borrow_mut() = state.inventory;
@@ -707,6 +733,28 @@ impl MapScreen {
     /// Centralised as a constant so the tests can reference the exact
     /// string the runtime checks without re-typing it.
     pub const WIN_FLAG: &'static str = "heard_rumor";
+
+    /// Inventory id for the SPEC §9 Lost-and-Found Drawer key. Distinct
+    /// from [`Self::LOCKED_DOOR_KEY_ID`] (the lobby brass key) so the
+    /// two collectables can co-exist in `SharedSlots::inventory` and
+    /// be queried independently. Lives outside [`Self::ITEMS`] because
+    /// the v1.1 proof scene grants it through a prompt rather than a
+    /// map cell — there is no glyph or coordinate to record.
+    pub const ROOM_7_KEY_ID: &'static str = "room_7_key";
+
+    /// Inventory id for the cracked matchbook offered by the
+    /// Lost-and-Found Drawer prompt. Re-uses the existing catalog id
+    /// so the prompt and the lobby map item never duplicate the same
+    /// keepsake in the player's pockets — picking it up either way
+    /// flips the same `BTreeSet` entry.
+    pub const MATCHBOOK_ID: &'static str = "matchbook";
+
+    /// Narrative flag set when the player reads the receipt at the
+    /// Lost-and-Found Drawer (SPEC §9 step 3). Flag rather than item
+    /// because the receipt isn't carried; reading it unlocks branches
+    /// downstream of the drawer scene without occupying an inventory
+    /// slot.
+    pub const RECEIPT_READ_FLAG: &'static str = "receipt_read";
 
     /// Build a lobby map screen with fresh, unshared slots. Used by
     /// tests that want an isolated screen instance and by callers that
@@ -3385,6 +3433,7 @@ mod tests {
         slots.inventory.borrow_mut().insert("brass_key".into());
         slots.player.borrow_mut().won = true;
         slots.player.borrow_mut().x = 99;
+        slots.player.borrow_mut().cash = 0;
 
         slots.reset(22, 4);
 
@@ -3395,6 +3444,61 @@ mod tests {
         );
         let p = slots.player.borrow();
         assert_eq!((p.x, p.y, p.won), (22, 4, false));
+        assert_eq!(
+            p.cash,
+            PlayerSlot::STARTING_CASH,
+            "reset must restore the v1.1 vendor-scene starting balance"
+        );
+    }
+
+    #[test]
+    fn fresh_run_state_matches_v1_1_proof_scene_baseline() {
+        // SPEC §9 Task 10a baseline: a New Game must hand the player
+        // an empty inventory (no Room 7 key, no matchbook), an unset
+        // receipt-read flag, and the documented 40g starting balance.
+        // If any of these drift, the Lost-and-Found Drawer and
+        // night-clerk vendor scenes will demo the wrong state.
+        let slots = SharedSlots::default();
+        // Coordinates here are arbitrary — `reset` always re-sets cash
+        // and clears flags/inventory regardless of where the player
+        // spawns, so the test is independent of the lobby layout.
+        slots.reset(22, 4);
+
+        let inv = slots.inventory.borrow();
+        assert!(
+            !inv.contains(MapScreen::ROOM_7_KEY_ID),
+            "fresh run must not start with the Room 7 key"
+        );
+        assert!(
+            !inv.contains(MapScreen::MATCHBOOK_ID),
+            "fresh run must not start with the matchbook"
+        );
+        drop(inv);
+
+        assert!(
+            !slots.flags.borrow().contains(MapScreen::RECEIPT_READ_FLAG),
+            "fresh run must not have the receipt-read flag set"
+        );
+
+        assert_eq!(
+            slots.player.borrow().cash,
+            PlayerSlot::STARTING_CASH,
+            "fresh run must hand the player the documented starting cash"
+        );
+    }
+
+    #[test]
+    fn shared_slots_round_trip_preserves_cash() {
+        // Cash joined SaveState in v1.1; the snapshot/apply pair must
+        // round-trip the field or the night-clerk vendor scene loses
+        // the player's balance across save/load. Covered separately
+        // from `shared_slots_snapshot_round_trips_through_apply` so a
+        // future failure points at exactly the new field.
+        let original = SharedSlots::default();
+        original.player.borrow_mut().cash = 137;
+        let restored = SharedSlots::default();
+        restored.apply(original.snapshot());
+        assert_eq!(restored.player.borrow().cash, 137);
     }
 
     #[test]
