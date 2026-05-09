@@ -11,8 +11,9 @@ use std::collections::BTreeSet;
 use std::rc::Rc;
 
 use foglet_game::{
-    centred_rect, render_inventory_list, EventRecord, FogletContext, GameContext, Input,
-    InventoryList, LeaderboardSort, ScoreRecord, Screen, ScreenCommand, WorldDb,
+    centred_rect, render_hint_line, render_inventory_list, render_modal, EventRecord,
+    FogletContext, GameContext, Input, InventoryList, LeaderboardSort, ScoreRecord, Screen,
+    ScreenCommand, WorldDb,
 };
 use ratatui::layout::{Alignment, Rect};
 use ratatui::style::{Color, Style};
@@ -54,11 +55,12 @@ impl HelpScreen {
 impl Screen for HelpScreen {
     fn render(&mut self, _ctx: &mut GameContext<'_>, frame: &mut Frame<'_>) {
         let area = centred_rect(60, (Self::LINES.len() as u16) + 2, frame.area());
-        let lines: Vec<Line<'_>> = Self::LINES.iter().map(|s| Line::from(*s)).collect();
-        let widget = Paragraph::new(lines)
-            .alignment(Alignment::Left)
-            .block(Block::default().borders(Borders::ALL).title(Self::TITLE));
-        frame.render_widget(widget, area);
+        // SPEC_v2_1 §4.3 modal: bordered, titled, left-aligned body.
+        // `render_modal` matches the prior shape (one-cell horizontal
+        // padding inside the border) so the help body and Task 13b
+        // substring assertions still hit.
+        let body = Self::LINES.join("\n");
+        render_modal(frame, area, Some(Self::TITLE), &body);
     }
 
     fn handle_input(&mut self, _ctx: &mut GameContext<'_>, input: Input) -> ScreenCommand {
@@ -260,16 +262,15 @@ impl Screen for ProfileScreen {
             height: hint_h,
         };
 
-        let body_lines: Vec<Line<'_>> = lines.iter().map(|s| Line::from(s.as_str())).collect();
-        let widget = Paragraph::new(body_lines)
-            .alignment(Alignment::Left)
-            .block(Block::default().borders(Borders::ALL).title(Self::TITLE));
-        frame.render_widget(widget, body);
+        // SPEC_v2_1 §4.3 modal + hint line: shared shape between the
+        // profile read-out and the kit's other left-aligned modals
+        // (HelpScreen). `render_hint_line` swaps the hand-rolled
+        // DarkGray paragraph for the kit-standard `StyleRole::Hint`
+        // (DIM) styling — visually similar but consistent across screens.
+        let body_text = lines.join("\n");
+        render_modal(frame, body, Some(Self::TITLE), &body_text);
         if hint_h > 0 {
-            let hint_widget = Paragraph::new(Self::HINT)
-                .alignment(Alignment::Center)
-                .style(Style::default().fg(Color::DarkGray));
-            frame.render_widget(hint_widget, hint);
+            render_hint_line(frame, hint, Self::HINT);
         }
     }
 
@@ -402,10 +403,7 @@ impl Screen for InventoryScreen {
         };
         render_inventory_list(frame, body, &inv);
         if hint_h > 0 {
-            let widget = Paragraph::new("[Up/Down] choose    [Esc/I] close")
-                .alignment(Alignment::Center)
-                .style(Style::default().fg(Color::DarkGray));
-            frame.render_widget(widget, hint);
+            render_hint_line(frame, hint, "[Up/Down] choose    [Esc/I] close");
         }
     }
 
@@ -604,10 +602,7 @@ impl Screen for BulletinScreen {
             frame.render_widget(list, body);
         }
         if hint_h > 0 {
-            let widget = Paragraph::new("[Up/Down] scroll    [Esc/E] close")
-                .alignment(Alignment::Center)
-                .style(Style::default().fg(Color::DarkGray));
-            frame.render_widget(widget, hint);
+            render_hint_line(frame, hint, "[Up/Down] scroll    [Esc/E] close");
         }
     }
 
@@ -815,10 +810,7 @@ impl Screen for LeaderboardScreen {
             frame.render_widget(list, body);
         }
         if hint_h > 0 {
-            let widget = Paragraph::new("[Up/Down] scroll    [Esc/L] close")
-                .alignment(Alignment::Center)
-                .style(Style::default().fg(Color::DarkGray));
-            frame.render_widget(widget, hint);
+            render_hint_line(frame, hint, "[Up/Down] scroll    [Esc/L] close");
         }
     }
 
