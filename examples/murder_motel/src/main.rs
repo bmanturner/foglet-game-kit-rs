@@ -47,6 +47,7 @@
 // because `cargo test` compiles the whole `mod tests` tree.
 #![cfg_attr(not(test), allow(dead_code))]
 
+mod clock;
 mod layout;
 mod map;
 mod modals;

@@ -1210,6 +1210,46 @@ impl Screen for MapScreen {
             // a debug menu.
             Input::Char('x') | Input::Char('X') => {
                 if self.nearby_lost_and_found() {
+                    // SPEC_v2 §Task 13a: examining clue hotspots spends
+                    // one daily turn. Route through the helper so the
+                    // upsert + spend + result-mapping live in one place
+                    // (see `crate::world::spend_clue_inspection_turn`
+                    // for the full rationale).
+                    //
+                    // Outcome routing:
+                    // - `Spent` / `NotConfigured` / `Failed`: open the
+                    //   prompt. A `Failed` SQLite hiccup must not
+                    //   soft-lock the player; the kit's terminal-safety
+                    //   contract forbids panicking out of `handle_input`.
+                    // - `InsufficientTurns`: surface the SPEC §Task 13a
+                    //   feedback line and DO NOT push the prompt — the
+                    //   player needs to come back tomorrow.
+                    use crate::world::{
+                        spend_clue_inspection_turn, ClueInspectionOutcome, NO_CLUE_TURNS_FEEDBACK,
+                    };
+                    let outcome = match ctx.world_db {
+                        Some(world) => spend_clue_inspection_turn(
+                            world,
+                            ctx.foglet,
+                            ctx.config,
+                            &*self.slots.date_provider,
+                        ),
+                        // No world DB attached (single-player or
+                        // headless tests that don't stand one up):
+                        // treat as if `[turns]` was opted out of so
+                        // the affordance remains reachable.
+                        None => ClueInspectionOutcome::NotConfigured,
+                    };
+                    match outcome {
+                        ClueInspectionOutcome::InsufficientTurns { .. } => {
+                            *self.slots.feedback.borrow_mut() =
+                                Some(FeedbackLine::error(NO_CLUE_TURNS_FEEDBACK));
+                            return ScreenCommand::None;
+                        }
+                        ClueInspectionOutcome::Spent { .. }
+                        | ClueInspectionOutcome::NotConfigured
+                        | ClueInspectionOutcome::Failed(_) => {}
+                    }
                     // Clear any prior feedback so a fresh interaction
                     // never pops in under stale narration from the last
                     // action — the prompt will write its own line on
@@ -2874,6 +2914,172 @@ pub(crate) mod tests {
         assert!(
             matches!(cmd, ScreenCommand::None),
             "buy key must be inert away from the clerk"
+        );
+    }
+
+    // ---- SPEC_v2 §Task 13a clue-inspection turn spend ---------------
+
+    /// Walk a fresh map screen up to the cell directly south of the
+    /// drawer (25, 3). Pulled out so each Task 13a integration test
+    /// reads "set up, drive search key, assert" rather than repeating
+    /// the four-step approach. Returns the live screen and a context
+    /// already pointed at the supplied world DB so the caller can
+    /// keep dispatching `Input::Char('x')` against the same borrow.
+    fn walk_to_drawer(map: &mut MapScreen, ctx: &mut GameContext<'_>) {
+        for _ in 0..3 {
+            map.handle_input(ctx, Input::Right);
+        }
+        map.handle_input(ctx, Input::Up);
+        assert_eq!(map.player(), (25, 3), "approach must land south of drawer");
+        assert!(map.nearby_lost_and_found());
+    }
+
+    /// Set up the kit + Murder Motel migrations a real install would
+    /// have applied by the time the lobby's X-press fires. Mirrors
+    /// the helper used by the `world.rs` Task 13a tests so a future
+    /// schema add lands in one place.
+    fn world_with_full_stack(dir: &tempfile::TempDir) -> foglet_game::WorldDb {
+        use crate::world::MOTEL_WORLD_STATE_MIGRATION;
+        let db_path = dir.path().join("world.sqlite");
+        let mut world = foglet_game::WorldDb::open(&db_path).expect("open world db");
+        world
+            .apply_migration(&foglet_game::PLAYERS_MIGRATION)
+            .expect("apply players migration");
+        world
+            .apply_migration(&foglet_game::TURN_LEDGER_MIGRATION)
+            .expect("apply turn_ledger migration");
+        world
+            .apply_migration(&MOTEL_WORLD_STATE_MIGRATION)
+            .expect("apply motel_world_state migration");
+        world
+    }
+
+    /// Build [`SharedSlots`] with a [`FixedDateProvider`] pinned to
+    /// "today" so the turn ledger's date math is independent of the
+    /// wall clock. Without this the Task 13a tests would have to walk
+    /// the date forward to hit the carryover branch — covered by the
+    /// kit-level reset tests, not by these integration ones.
+    fn fixed_date_slots() -> SharedSlots {
+        use foglet_game::{FixedDateProvider, LocalDate};
+        SharedSlots::default().with_date_provider(Rc::new(FixedDateProvider::new(
+            LocalDate::parse("2026-05-09").expect("valid date"),
+        )))
+    }
+
+    fn fresh_map_screen_with_slots(slots: SharedSlots) -> MapScreen {
+        let cfg = fixture_config();
+        slots.reset(cfg.game.start_x, cfg.game.start_y);
+        // After `reset` the fixed date provider survives because
+        // `SharedSlots::reset` only touches the persisted slots, not
+        // the runtime services. Construct via `with_shared` so the
+        // map keys off the same handle.
+        MapScreen::with_shared(cfg.game.start_x, cfg.game.start_y, slots)
+    }
+
+    /// SPEC_v2 §Task 13a: pressing the search key adjacent to the
+    /// drawer with a live world DB attached must spend one daily turn
+    /// AND still push the prompt. Drives the screen end-to-end (no
+    /// helper short-circuit) so a regression that disconnected the
+    /// X-press from the turn helper would surface here.
+    #[test]
+    fn search_key_spends_a_turn_when_world_db_attached() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let world = world_with_full_stack(&dir);
+        let cfg = fixture_config();
+        let fc = fixture_context();
+        let slots = fixed_date_slots();
+        let mut map = fresh_map_screen_with_slots(slots.clone());
+
+        let cmd = {
+            let mut ctx = GameContext::new(&cfg, &fc, (80, 24)).with_world_db(&world);
+            walk_to_drawer(&mut map, &mut ctx);
+            map.handle_input(&mut ctx, Input::Char('x'))
+        };
+
+        assert!(
+            matches!(cmd, ScreenCommand::Push(_)),
+            "search key with attached world DB must still push the prompt; got {cmd:?}"
+        );
+
+        // The scaffold's daily_allowance is 3 — a single press leaves
+        // 2 turns. We read straight out of the ledger via the helper
+        // because the screen has no remaining-turns surface yet (Task
+        // 13b will add one).
+        use crate::world::{spend_clue_inspection_turn, ClueInspectionOutcome};
+        let next = spend_clue_inspection_turn(&world, &fc, &cfg, &*slots.date_provider);
+        assert_eq!(
+            next,
+            ClueInspectionOutcome::Spent { remaining: 1 },
+            "second spend must observe the post-X-press balance (3 - 1 - 1 = 1)"
+        );
+    }
+
+    /// Once the day's allowance is exhausted, the X-press must NOT
+    /// push the prompt — the player gets a feedback line instead and
+    /// stays on the lobby map. Mirrors the SPEC_v2 §Task 13a "examine
+    /// hotspots spends turns" contract: out of turns means out of
+    /// inspections.
+    #[test]
+    fn search_key_blocks_prompt_when_balance_exhausted() {
+        use crate::world::{spend_clue_inspection_turn, NO_CLUE_TURNS_FEEDBACK};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let world = world_with_full_stack(&dir);
+        let cfg = fixture_config();
+        let fc = fixture_context();
+        let slots = fixed_date_slots();
+        let mut map = fresh_map_screen_with_slots(slots.clone());
+
+        // Drain the allowance directly through the helper so the test
+        // isolates the *blocked* X-press. Three spends at
+        // daily_allowance=3 ⇒ balance 0.
+        for _ in 0..3 {
+            let _ = spend_clue_inspection_turn(&world, &fc, &cfg, &*slots.date_provider);
+        }
+
+        let cmd = {
+            let mut ctx = GameContext::new(&cfg, &fc, (80, 24)).with_world_db(&world);
+            walk_to_drawer(&mut map, &mut ctx);
+            map.handle_input(&mut ctx, Input::Char('x'))
+        };
+
+        assert!(
+            matches!(cmd, ScreenCommand::None),
+            "exhausted balance must keep the prompt closed; got {cmd:?}"
+        );
+        let feedback = slots
+            .feedback
+            .borrow()
+            .clone()
+            .expect("rejected X-press must surface the no-turns feedback line");
+        assert_eq!(
+            feedback.text(),
+            NO_CLUE_TURNS_FEEDBACK,
+            "feedback text must match the SPEC §Task 13a constant"
+        );
+    }
+
+    /// Without a world DB attached, the X-press still pushes the
+    /// prompt — the helper short-circuits to `NotConfigured` and the
+    /// screen treats that exactly like `Spent`. Pre-v2 single-player
+    /// games and headless tests that don't stand up a world DB keep
+    /// working unchanged.
+    #[test]
+    fn search_key_without_world_db_still_pushes_prompt() {
+        let cfg = fixture_config();
+        let fc = fixture_context();
+        let slots = fixed_date_slots();
+        let mut map = fresh_map_screen_with_slots(slots);
+
+        let cmd = {
+            let mut ctx = GameContext::new(&cfg, &fc, (80, 24));
+            walk_to_drawer(&mut map, &mut ctx);
+            map.handle_input(&mut ctx, Input::Char('x'))
+        };
+
+        assert!(
+            matches!(cmd, ScreenCommand::Push(_)),
+            "no world DB attached must fall back to the unconditional push; got {cmd:?}"
         );
     }
 }

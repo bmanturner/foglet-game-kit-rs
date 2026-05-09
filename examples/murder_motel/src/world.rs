@@ -32,7 +32,9 @@
 //! migration tomorrow doesn't push game versions around — the kit and
 //! the game evolve in independent number bands.
 
-use foglet_game::{FeedbackLine, WorldDb, WorldMigration};
+use foglet_game::{
+    DateProvider, FeedbackLine, FogletContext, GameConfig, TurnError, WorldDb, WorldMigration,
+};
 use rusqlite::OptionalExtension;
 
 /// First version number a Murder Motel migration may use. Picked far
@@ -288,6 +290,147 @@ pub fn shared_room_7_arrival_feedback(
     )))
 }
 
+/// Number of daily turns one clue-inspection action consumes — SPEC_v2
+/// §7 ("Daily clue turns: examining clue hotspots spends turns") and
+/// §Task 13a. Centralised so the helper, the lobby's X-press handler,
+/// and the tests all agree on the cost.
+pub const CLUE_INSPECTION_TURN_COST: u32 = 1;
+
+/// Player-facing line surfaced when a clue-inspection press is rejected
+/// because today's balance is exhausted. Phrased to make the recovery
+/// path ("come back tomorrow") obvious without naming a specific
+/// timezone — SPEC_v2 §4.6's reset is configured per-game and the
+/// example's [`crate::clock::SystemDateProvider`] runs in UTC, so a
+/// player-friendly summary is the safest copy.
+pub const NO_CLUE_TURNS_FEEDBACK: &str = "You're out of clue turns for today — come back tomorrow.";
+
+/// Outcome of a clue-inspection turn-spend attempt (SPEC_v2 §Task 13a).
+///
+/// Modelled as an enum rather than `Result<i64, _>` because three of
+/// the four arms are non-error "this is what happened, here's the new
+/// state" outcomes the caller routes on directly:
+///
+/// - [`Self::Spent`] — turn deducted; carry on with the inspection.
+/// - [`Self::InsufficientTurns`] — balance was zero; surface the
+///   `NO_CLUE_TURNS_FEEDBACK` line and **do not** open the prompt.
+/// - [`Self::NotConfigured`] — `[turns]` is absent from `game.toml`,
+///   meaning the author opted out of the daily allowance system.
+///   Caller treats this exactly like a single-player run: open the
+///   prompt unconditionally.
+/// - [`Self::Failed`] — DB or upsert error. Logged-and-swallowed at
+///   the call site (the kit's terminal-safety contract forbids
+///   panicking out of `handle_input`); caller still opens the prompt
+///   so a transient SQLite hiccup doesn't soft-lock the game.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClueInspectionOutcome {
+    /// Turn was deducted. `remaining` is the post-spend balance — the
+    /// status UI in Task 13b will paint this to the screen.
+    Spent {
+        /// Player's remaining clue-turn balance after the spend.
+        remaining: i64,
+    },
+    /// Today's balance is below [`CLUE_INSPECTION_TURN_COST`].
+    /// `balance` is the canonical pre-spend value (see SPEC_v2 §Task
+    /// 6e on `TurnError::InsufficientTurns`'s no-mutation guarantee).
+    InsufficientTurns {
+        /// Current (unchanged) balance at the moment the spend was
+        /// rejected.
+        balance: i64,
+    },
+    /// The game.toml has no `[turns]` section, so spending is a no-op.
+    /// Authors who never opt into the turn ledger get the full pre-v2
+    /// behaviour: every clue inspection is free.
+    NotConfigured,
+    /// SQLite or upsert error during the spend. The boxed string is a
+    /// formatted message suitable for tracing/logging; the caller
+    /// should not surface it to the player.
+    Failed(String),
+}
+
+/// Spend one clue-inspection turn for the player identified by `foglet`
+/// against the shared `world` database (SPEC_v2 §Task 13a).
+///
+/// This is the single chokepoint Murder Motel uses for "examining a
+/// clue hotspot". Right now the only consumer is the lobby's
+/// Lost-and-Found Drawer search affordance ([`crate::map::MapScreen`]'s
+/// `'x'`/`'X'` handler); future Task 13 sub-iterations (Room 7 body,
+/// matchbook pickup) route through the same helper so the per-action
+/// cost stays consistent and the status UI in Task 13b has one source
+/// of truth.
+///
+/// ## Why a helper rather than inline code in the screen
+///
+/// 1. The spend is a sequence of three SQL writes (player upsert →
+///    today's ledger row ensure → atomic decrement). Inlining all
+///    three in `handle_input` would push the screen layer into
+///    SQLite-shaped territory.
+/// 2. Tests can drive the helper directly with a [`FixedDateProvider`]
+///    (SPEC_v2 §Task 6f's deterministic-reset story) without
+///    constructing a `MapScreen`.
+/// 3. Failure routing (insufficient vs not-configured vs SQLite
+///    error) is enumerated in [`ClueInspectionOutcome`] so the screen
+///    handler stays a small `match`.
+///
+/// ## Concurrency
+///
+/// Three statements, executed serially through the same `&WorldDb`
+/// shared borrow that [`crate::map::MapScreen::handle_input`] already
+/// holds. The kit's busy timeout (configured at open time) is the
+/// only contention story we need; SPEC_v2 §Task 6e's atomic-decrement
+/// guard inside [`WorldDb::spend_turns`] keeps two racing spenders
+/// from both satisfying `balance >= 1` against the same starting
+/// balance.
+///
+/// ## Errors are non-fatal
+///
+/// On a SQLite or upsert failure the function returns
+/// [`ClueInspectionOutcome::Failed`] with a formatted message rather
+/// than propagating an `Err`. The caller (the screen handler) opens
+/// the prompt unconditionally on this branch — a transient DB hiccup
+/// must not soft-lock the player out of clue inspection. The kit's
+/// `tracing` boundary will pick the message up once it's wired into
+/// `foglet_game` (see SPEC §Task 12b's note).
+pub fn spend_clue_inspection_turn(
+    world: &WorldDb,
+    foglet: &FogletContext,
+    cfg: &GameConfig,
+    date: &dyn DateProvider,
+) -> ClueInspectionOutcome {
+    // Fast-path: when the author hasn't opted into the turn ledger,
+    // every inspection is free. Returning early before the upsert
+    // keeps a `[turns]`-free game.toml from spinning the players
+    // table for read-only inspections.
+    let Some(turns) = cfg.turns.as_ref() else {
+        return ClueInspectionOutcome::NotConfigured;
+    };
+
+    // Player upsert is the single SQL call that produces the
+    // `players.id` the ledger row is keyed by. Failure here is rare
+    // (the row already exists by the time the player reaches the
+    // drawer in normal play) and we route it through the
+    // logged-and-swallowed branch so the inspection still lands.
+    let player = match world.upsert_player(foglet) {
+        Ok(p) => p,
+        Err(err) => return ClueInspectionOutcome::Failed(format!("upsert_player failed: {err}")),
+    };
+
+    match world.spend_turns(
+        player.id,
+        CLUE_INSPECTION_TURN_COST,
+        turns.daily_allowance,
+        turns.carryover_max,
+        date,
+    ) {
+        Ok(row) => ClueInspectionOutcome::Spent {
+            remaining: row.balance,
+        },
+        Err(TurnError::InsufficientTurns { balance, .. }) => {
+            ClueInspectionOutcome::InsufficientTurns { balance }
+        }
+        Err(other) => ClueInspectionOutcome::Failed(format!("spend_turns failed: {other}")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     //! Migration smoke tests — apply the migration into a temp DB and
@@ -522,6 +665,139 @@ mod tests {
         assert!(
             text.contains("2026-05-09 12:34:56"),
             "banner must include the original opening timestamp: {text}"
+        );
+    }
+
+    // ---- SPEC_v2 §Task 13a clue-inspection turn spend ---------------
+
+    use crate::test_support::{fixture_config, fixture_context};
+    use foglet_game::{FixedDateProvider, GameConfig, LocalDate, PLAYERS_MIGRATION};
+
+    /// Stand up a world DB with the migrations a real Murder Motel
+    /// install would have applied by the time the lobby's X-press
+    /// fires: kit `players` and `turn_ledger`, plus the example's
+    /// `motel_world_state`. Pulled out so each Task 13a test reads
+    /// "set up world, drive helper, assert" instead of repeating
+    /// six lines of boilerplate.
+    fn world_with_turn_stack(dir: &tempfile::TempDir) -> WorldDb {
+        let db_path = dir.path().join("world.sqlite");
+        let mut world = WorldDb::open(&db_path).expect("open world db");
+        world
+            .apply_migration(&PLAYERS_MIGRATION)
+            .expect("apply players migration");
+        world
+            .apply_migration(&foglet_game::TURN_LEDGER_MIGRATION)
+            .expect("apply turn_ledger migration");
+        world
+            .apply_migration(&MOTEL_WORLD_STATE_MIGRATION)
+            .expect("apply motel_world_state migration");
+        world
+    }
+
+    fn fixed_today() -> FixedDateProvider {
+        FixedDateProvider::new(LocalDate::parse("2026-05-09").expect("valid date"))
+    }
+
+    /// First call against a fresh ledger consumes one turn from the
+    /// configured `daily_allowance` (3 in the scaffold's `game.toml`)
+    /// and returns the post-spend balance.
+    #[test]
+    fn spend_clue_inspection_first_call_decrements_balance() {
+        let dir = tempdir().expect("tempdir");
+        let world = world_with_turn_stack(&dir);
+        let cfg = fixture_config();
+        let fc = fixture_context();
+        let date = fixed_today();
+
+        let outcome = spend_clue_inspection_turn(&world, &fc, &cfg, &date);
+        assert_eq!(
+            outcome,
+            ClueInspectionOutcome::Spent { remaining: 2 },
+            "scaffold game.toml has daily_allowance=3, so spending 1 leaves 2"
+        );
+    }
+
+    /// Repeat calls walk the balance down to zero, matching the
+    /// "examining a clue hotspot costs one turn" SPEC §7 contract.
+    #[test]
+    fn spend_clue_inspection_walks_balance_to_zero() {
+        let dir = tempdir().expect("tempdir");
+        let world = world_with_turn_stack(&dir);
+        let cfg = fixture_config();
+        let fc = fixture_context();
+        let date = fixed_today();
+
+        let mut observed = Vec::new();
+        for _ in 0..3 {
+            observed.push(spend_clue_inspection_turn(&world, &fc, &cfg, &date));
+        }
+        assert_eq!(
+            observed,
+            vec![
+                ClueInspectionOutcome::Spent { remaining: 2 },
+                ClueInspectionOutcome::Spent { remaining: 1 },
+                ClueInspectionOutcome::Spent { remaining: 0 },
+            ],
+            "three back-to-back inspections must consume the day's allowance"
+        );
+    }
+
+    /// Once the day's allowance is exhausted, the helper rejects with
+    /// `InsufficientTurns` and reports the unchanged balance. SPEC_v2
+    /// §Task 6e's no-mutation guarantee on `TurnError::InsufficientTurns`
+    /// means the row is *not* decremented past zero.
+    #[test]
+    fn spend_clue_inspection_rejects_when_balance_exhausted() {
+        let dir = tempdir().expect("tempdir");
+        let world = world_with_turn_stack(&dir);
+        let cfg = fixture_config();
+        let fc = fixture_context();
+        let date = fixed_today();
+
+        // Drain the allowance.
+        for _ in 0..3 {
+            assert!(matches!(
+                spend_clue_inspection_turn(&world, &fc, &cfg, &date),
+                ClueInspectionOutcome::Spent { .. }
+            ));
+        }
+
+        let outcome = spend_clue_inspection_turn(&world, &fc, &cfg, &date);
+        assert_eq!(
+            outcome,
+            ClueInspectionOutcome::InsufficientTurns { balance: 0 },
+            "fourth attempt must reject with the unchanged zero balance"
+        );
+
+        // Re-spending again still fails — the rejected attempt didn't
+        // mutate the row, so the balance stays at zero rather than
+        // sliding negative.
+        let outcome_again = spend_clue_inspection_turn(&world, &fc, &cfg, &date);
+        assert_eq!(
+            outcome_again,
+            ClueInspectionOutcome::InsufficientTurns { balance: 0 },
+            "repeat rejected attempts must observe the same zero balance"
+        );
+    }
+
+    /// A `game.toml` without a `[turns]` section opts out of the daily
+    /// ledger entirely. The helper short-circuits to `NotConfigured` so
+    /// pre-v2 games keep working — every clue inspection stays free.
+    #[test]
+    fn spend_clue_inspection_returns_not_configured_when_turns_missing() {
+        let dir = tempdir().expect("tempdir");
+        let world = world_with_turn_stack(&dir);
+        let mut cfg: GameConfig = fixture_config();
+        // Strip the turns section so we exercise the fast-path.
+        cfg.turns = None;
+        let fc = fixture_context();
+        let date = fixed_today();
+
+        let outcome = spend_clue_inspection_turn(&world, &fc, &cfg, &date);
+        assert_eq!(
+            outcome,
+            ClueInspectionOutcome::NotConfigured,
+            "missing [turns] config must short-circuit to NotConfigured"
         );
     }
 }

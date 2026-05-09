@@ -10,8 +10,10 @@ use std::cell::RefCell;
 use std::collections::BTreeSet;
 use std::rc::Rc;
 
-use foglet_game::{FeedbackLine, FlagSet};
+use foglet_game::{DateProvider, FeedbackLine, FlagSet};
 use serde::{Deserialize, Serialize};
+
+use crate::clock::SystemDateProvider;
 
 /// Persisted state for the player's save slot (Task 13h).
 ///
@@ -74,7 +76,12 @@ pub fn default_map_name() -> String {
 /// screen that needs read or write access holds its own handle. The
 /// canonical handle lives in `main`, which uses [`Self::snapshot`] /
 /// [`Self::apply`] to bridge to and from on-disk [`SaveState`].
-#[derive(Clone, Debug)]
+///
+/// `Debug` is hand-written rather than derived because
+/// [`Self::date_provider`] holds a `dyn DateProvider` trait object
+/// that does not require `Debug`. The manual impl prints a stable
+/// placeholder for that one field and forwards the rest verbatim.
+#[derive(Clone)]
 pub struct SharedSlots {
     /// Narrative-flag store. Same Rc the [`crate::scenes::dialog::DialogScreen`]
     /// borrows for `requires`-gated branches.
@@ -103,6 +110,35 @@ pub struct SharedSlots {
     /// `SharedSlots` so a New Game starting in the lobby never has a
     /// blank map identifier.
     pub map_name: Rc<RefCell<String>>,
+    /// Source of "today's local date" used by the SPEC_v2 §Task 13a
+    /// clue-inspection turn-spend helper. Held as an `Rc<dyn _>` so
+    /// the live game can plug in [`SystemDateProvider`] while tests
+    /// inject [`foglet_game::FixedDateProvider`] (or any other impl)
+    /// without recompiling.
+    ///
+    /// Not part of [`SaveState`] — the date provider is a runtime
+    /// service, not persisted state, and a save written on day N
+    /// reloaded on day M MUST observe the new day's allowance via
+    /// the freshly-constructed provider, not via a stale value
+    /// frozen into the JSON.
+    pub date_provider: Rc<dyn DateProvider>,
+}
+
+impl std::fmt::Debug for SharedSlots {
+    /// Hand-written so the `Rc<dyn DateProvider>` field doesn't force
+    /// the trait to require `Debug`. Every other field forwards through
+    /// the standard derive shape so existing test assertions keep
+    /// reading like the old derived output.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SharedSlots")
+            .field("flags", &self.flags)
+            .field("inventory", &self.inventory)
+            .field("player", &self.player)
+            .field("feedback", &self.feedback)
+            .field("map_name", &self.map_name)
+            .field("date_provider", &"<dyn DateProvider>")
+            .finish()
+    }
 }
 
 /// Small POD bundle inside [`SharedSlots::player`].
@@ -146,7 +182,32 @@ impl Default for SharedSlots {
             player: Rc::new(RefCell::new(PlayerSlot::default())),
             feedback: Rc::new(RefCell::new(None)),
             map_name: Rc::new(RefCell::new(default_map_name())),
+            // Live games walk wall-clock time via `SystemDateProvider`;
+            // tests overwrite this slot through `with_date_provider`
+            // to drive the SPEC §Task 6f deterministic-reset story.
+            date_provider: Rc::new(SystemDateProvider),
         }
+    }
+}
+
+impl SharedSlots {
+    /// Replace [`Self::date_provider`] with a caller-supplied handle.
+    /// Returns `self` so the call composes with [`Self::default`] for
+    /// tests that want a fixed clock without writing into the field
+    /// post-hoc:
+    ///
+    /// ```ignore
+    /// let slots = SharedSlots::default()
+    ///     .with_date_provider(Rc::new(FixedDateProvider::new(date)));
+    /// ```
+    ///
+    /// Production code uses the [`SystemDateProvider`] default; tests
+    /// reach for this builder so the date the turn ledger sees is
+    /// independent of wall-clock time when the test runs.
+    #[must_use]
+    pub fn with_date_provider(mut self, provider: Rc<dyn DateProvider>) -> Self {
+        self.date_provider = provider;
+        self
     }
 }
 

@@ -477,7 +477,7 @@ impl WorldDb {
     /// `carryover_max`" without restricting to a single calendar
     /// day, and capping by the configured maximum keeps a long
     /// absence from materialising as a windfall.
-    pub fn ensure_today_turns<P: DateProvider>(
+    pub fn ensure_today_turns<P: DateProvider + ?Sized>(
         &self,
         player_id: i64,
         daily_allowance: u32,
@@ -571,7 +571,7 @@ impl WorldDb {
     ///   returned; the variant carries the current `balance` and the
     ///   `requested` amount so callers can render a player-facing
     ///   message directly from the error.
-    pub fn spend_turns<P: DateProvider>(
+    pub fn spend_turns<P: DateProvider + ?Sized>(
         &self,
         player_id: i64,
         amount: u32,
