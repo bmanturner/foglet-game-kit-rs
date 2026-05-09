@@ -56,11 +56,25 @@
 //! compact unboxed layout will be able to opt in with the
 //! `DialogScreen::compact` builder method (Task 2e).
 
-// `Screen`, `GameContext`, and `ScreenCommand` from `crate::screen`
-// will be imported in Task 2b alongside the `DialogScreen` struct and
-// its `Screen` impl. Task 2a keeps this module to types only so the
-// `-D warnings` gate stays green without `#[allow(unused_imports)]`
-// shims that we'd just have to remove a commit later.
+use std::cell::RefCell;
+use std::rc::Rc;
+
+use crate::dialog::{Dialog, DialogState, FlagSet};
+use crate::screen::ScreenCommand;
+
+// The `Screen` trait impl (render, handle_input) lands in Tasks 2c
+// and 2d. Task 2b just stands up the struct and its constructor so
+// downstream tasks have a concrete type to reach for; we intentionally
+// avoid pulling in `Screen` / `GameContext` here because doing so
+// before there is a `Screen for DialogScreen` impl would trip the
+// `-D warnings` gate on unused imports.
+
+/// Boxed callback type translating a [`DialogAction`] outcome into a
+/// [`ScreenCommand`]. Aliased so the field type stays readable in
+/// `Debug` impls and so the trait-object bound (`'static` +
+/// [`FnMut`]) lives in one place. Mirrors
+/// [`crate::prompt_screen`]'s `ActionCallback<T>`.
+type ActionCallback = Box<dyn FnMut(DialogAction) -> ScreenCommand + 'static>;
 
 /// Layout mode for `DialogScreen` rendering (Task 2b lands the
 /// struct itself).
@@ -138,6 +152,139 @@ pub enum DialogAction {
     Cancelled,
 }
 
+/// `Screen` adapter wrapping a [`Dialog`] / [`DialogState`] /
+/// [`FlagSet`] triple plus a callback that converts each
+/// [`DialogAction`] into a [`ScreenCommand`] (SPEC_v2_1.md §4.2).
+///
+/// # Lifecycle (Tasks 2c–2d will fill these in)
+///
+/// 1. `render` will paint the speaker name (when present), the
+///    current node body, and the filtered choice list using the
+///    configured [`DialogLayout`]. Modal layout draws a centred
+///    bordered block; compact draws the same content unboxed.
+/// 2. `handle_input` will route navigation keys (`Up`/`Down`) into a
+///    cursor over the available-choices list, and `Enter` into a
+///    [`crate::dialog::dialog_handle_prompt_input`] call that
+///    advances [`DialogState`] and applies branch flags. The
+///    resulting [`DialogAction`] is passed to `on_action`.
+/// 3. `tick` and `on_resize` fall back to the [`crate::screen::Screen`]
+///    defaults — dialogs have no animation and resize is covered by
+///    the runtime re-rendering against the new size.
+///
+/// # Why `flags` is `Rc<RefCell<FlagSet>>`
+///
+/// The flag store is owned by the game-side state (`SharedSlots` in
+/// the Murder Motel example), and multiple screens have to read and
+/// mutate it across frames — a quest-flag set during a Lost-and-Found
+/// dialog has to be visible to the next door scene. A shared
+/// `Rc<RefCell<FlagSet>>` is the same shape every existing
+/// hand-rolled dialog scene already uses; the adapter takes the same
+/// shape so authors can hand it the slot they already have rather
+/// than restructure their state.
+///
+/// # Why `on_action` does not see `GameContext`
+///
+/// Same rationale as [`crate::prompt_screen::PromptScreen`]: the
+/// callback fires *after* `handle_input` has already classified the
+/// outcome, so by construction it cannot peek at the per-frame
+/// runtime context. Authors who need that level of access should
+/// drop one layer down to
+/// [`crate::dialog::dialog_handle_prompt_input`] inside a custom
+/// [`crate::screen::Screen`] impl.
+// Fields are read by Tasks 2c (render), 2d (input), and 2e
+// (accessors). Task 2b lands the storage shape only; the
+// `dead_code` lint correctly flags that there is not yet a non-test
+// reader, but adding the trait impls here would balloon the commit
+// past the one-task budget. The `allow` is removed when 2c–2e land.
+#[allow(dead_code)]
+pub struct DialogScreen {
+    /// The parsed, validated dialog graph the screen is walking.
+    /// Owned (not borrowed) so a `DialogScreen` can outlive whatever
+    /// loaded the YAML — the typical Murder Motel pattern is
+    /// `load_dialog(asset_yaml).map(|d| DialogScreen::new(d, ...))`,
+    /// after which the asset string is dropped.
+    dialog: Dialog,
+    /// The mutable cursor through `dialog`. Constructed by the
+    /// caller via [`DialogState::start`] so the first node's
+    /// entry-set flags are applied before the screen ever renders.
+    state: DialogState,
+    /// Shared flag store. The adapter only mutates it inside the
+    /// branch-transition path described by the loaded `Dialog`
+    /// (SPEC_v2_1.md §4.2 forbids side-channel writes); other
+    /// screens are free to read or mutate concurrently between
+    /// frames.
+    flags: Rc<RefCell<FlagSet>>,
+    /// Index into [`DialogState::available_choices`] highlighted on
+    /// the current frame. Reset to `0` on construction; Task 2d
+    /// updates it on `Up`/`Down` navigation. Stored as `usize`
+    /// rather than `Option<usize>` because the cursor always points
+    /// at a real choice once one exists — when the choice list is
+    /// empty (line-pumping phase or finished dialog) the field is
+    /// simply ignored by the render path.
+    choice_cursor: usize,
+    /// Render shape — modal frame (default) or compact unboxed.
+    layout: DialogLayout,
+    /// Game-supplied callback translating each [`DialogAction`] into
+    /// a [`ScreenCommand`]. Boxed `FnMut` matches
+    /// [`crate::prompt_screen::PromptScreen`] so authors can close
+    /// over their own `Rc<RefCell<_>>` state.
+    on_action: ActionCallback,
+}
+
+impl DialogScreen {
+    /// Build a new `DialogScreen` from a [`Dialog`], its starting
+    /// [`DialogState`], a shared [`FlagSet`] handle, and a callback
+    /// mapping [`DialogAction`] outcomes to [`ScreenCommand`] values
+    /// (SPEC_v2_1.md §4.2 required API).
+    ///
+    /// Defaults to [`DialogLayout::Modal`]; the `compact` builder
+    /// method (Task 2e) switches to the unboxed layout. The
+    /// starting [`DialogState`] is supplied by the
+    /// caller rather than constructed internally because
+    /// [`DialogState::start`] requires `&mut FlagSet` access — the
+    /// same flag store the caller already owns — and reaching into
+    /// the `Rc<RefCell<_>>` from the constructor would either
+    /// duplicate that borrow or introduce a hidden re-entrancy gate.
+    /// Letting the caller build the state first keeps both concerns
+    /// explicit at the call site.
+    ///
+    /// The callback is stored as a boxed `FnMut`, so it can mutate
+    /// captured state across calls — the typical Murder Motel shape
+    /// is closing over a shared feedback slot to set a one-line
+    /// message before returning [`ScreenCommand::Pop`].
+    pub fn new<F>(
+        dialog: Dialog,
+        start: DialogState,
+        flags: Rc<RefCell<FlagSet>>,
+        on_action: F,
+    ) -> Self
+    where
+        F: FnMut(DialogAction) -> ScreenCommand + 'static,
+    {
+        Self {
+            dialog,
+            state: start,
+            flags,
+            choice_cursor: 0,
+            layout: DialogLayout::Modal,
+            on_action: Box::new(on_action),
+        }
+    }
+
+    /// Inspect the configured [`DialogLayout`].
+    ///
+    /// Exposed now (rather than waiting for Task 2e's full accessor
+    /// suite) because Task 2b's tests need to pin that the
+    /// constructor defaults to [`DialogLayout::Modal`] — the
+    /// authoring rule of thumb that motivates the whole adapter.
+    /// The remaining accessors (`dialog`, `state`, `modal`,
+    /// `compact`) land in Task 2e alongside the `Screen` impl from
+    /// Tasks 2c/2d.
+    pub fn layout(&self) -> DialogLayout {
+        self.layout
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -192,5 +339,98 @@ mod tests {
                 target_node: "n".into(),
             }
         );
+    }
+
+    use crate::dialog::{load_dialog, DialogState, FlagSet};
+    use crate::screen::ScreenCommand;
+
+    /// Smallest possible dialog graph that both validates and is
+    /// safe to drive through `DialogState::start`. Only one terminal
+    /// node, no choices, no flag predicates — the constructor tests
+    /// only need a well-formed [`Dialog`] to hand to `new`, not the
+    /// full Murder Motel scene shape.
+    fn fixture_dialog_yaml() -> &'static str {
+        r#"
+start: greeting
+nodes:
+  greeting:
+    lines: ["Hello, traveller."]
+    goto: end
+  end: {}
+"#
+    }
+
+    #[test]
+    fn new_stores_dialog_state_flags_and_callback() {
+        // Build the same `(dialog, state, flags)` triple a real
+        // game would: load YAML, create `DialogState::start` against
+        // a fresh flag store, then hand both into the adapter
+        // alongside a callback that records every action it sees.
+        let dialog = load_dialog(fixture_dialog_yaml()).expect("fixture parses");
+        let flags = Rc::new(RefCell::new(FlagSet::new()));
+        let start = {
+            let mut borrowed = flags.borrow_mut();
+            DialogState::start(&dialog, &mut borrowed)
+        };
+        let recorded: Rc<RefCell<Vec<DialogAction>>> = Rc::new(RefCell::new(Vec::new()));
+        let recorded_writer = recorded.clone();
+
+        let screen = DialogScreen::new(dialog.clone(), start.clone(), flags.clone(), move |a| {
+            recorded_writer.borrow_mut().push(a);
+            ScreenCommand::None
+        });
+
+        // Storage check — the constructor must hand the dialog,
+        // state, and flag handle through unchanged. We compare via
+        // the private fields (the test module sees them) so the
+        // assertion does not depend on Task 2e's `dialog()` /
+        // `state()` accessors landing first.
+        assert_eq!(screen.dialog, dialog);
+        assert_eq!(screen.state, start);
+        assert!(Rc::ptr_eq(&screen.flags, &flags));
+        // Cursor starts at zero — Task 2d will move it on Up/Down.
+        assert_eq!(screen.choice_cursor, 0);
+        // The callback must not have fired yet — the constructor
+        // is meant to be inert with respect to the action stream.
+        assert!(recorded.borrow().is_empty());
+    }
+
+    #[test]
+    fn new_defaults_to_modal_layout() {
+        // SPEC_v2_1.md §4.2 picks `Modal` as the default because
+        // every Murder Motel dialog scene already renders that way;
+        // pin that here so a future contributor switching the
+        // default has to revisit the spec.
+        let dialog = load_dialog(fixture_dialog_yaml()).expect("fixture parses");
+        let flags = Rc::new(RefCell::new(FlagSet::new()));
+        let start = {
+            let mut borrowed = flags.borrow_mut();
+            DialogState::start(&dialog, &mut borrowed)
+        };
+        let screen = DialogScreen::new(dialog, start, flags, |_| ScreenCommand::None);
+        assert_eq!(screen.layout(), DialogLayout::Modal);
+    }
+
+    #[test]
+    fn new_shares_flag_handle_with_caller() {
+        // Pin that the adapter holds the *same* `Rc` the caller
+        // passed in, not a clone of the inner `FlagSet`. The Murder
+        // Motel state shape relies on this: outer screens mutate the
+        // flag store between frames and expect the adapter to see
+        // the new flags on the next render.
+        let dialog = load_dialog(fixture_dialog_yaml()).expect("fixture parses");
+        let flags = Rc::new(RefCell::new(FlagSet::new()));
+        let start = {
+            let mut borrowed = flags.borrow_mut();
+            DialogState::start(&dialog, &mut borrowed)
+        };
+        let screen = DialogScreen::new(dialog, start, flags.clone(), |_| ScreenCommand::None);
+
+        // Mutate via the *caller's* handle and observe the change
+        // through the screen's stored handle — the only way both
+        // borrows can see the same insertion is if they point at the
+        // same `RefCell`.
+        flags.borrow_mut().insert("heard_rumor".to_string());
+        assert!(screen.flags.borrow().contains("heard_rumor"));
     }
 }
