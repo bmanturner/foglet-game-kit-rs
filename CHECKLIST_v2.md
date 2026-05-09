@@ -65,7 +65,7 @@ One unchecked item per iteration. Dependencies in `[brackets]` must be checked o
 ### Task 9 — Transaction helper
 
 - [x] **9a** — Expose `WorldDb::transaction` wrapper. Test: commit persists writes. [3a]
-- [ ] **9b** — Test rollback on closure error. [9a]
+- [x] **9b** — Test rollback on closure error. [9a]
 - [ ] **9c** — Add helper for spend-turn + mutate + append-event transaction. Test: insufficient turns rolls back event/world mutation. [6d, 7b, 9a]
 
 ### Task 10 — Runtime context integration

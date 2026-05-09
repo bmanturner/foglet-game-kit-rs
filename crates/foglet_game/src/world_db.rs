@@ -1233,6 +1233,98 @@ mod tests {
         assert_eq!(label, "committed");
     }
 
+    /// SPEC_v2 §Task 9b acceptance: a closure that returns `Err`
+    /// rolls back. Any writes the closure issued before failing must
+    /// not be observable after [`WorldDb::transaction`] returns, and
+    /// the wrapper must propagate the original error verbatim.
+    ///
+    /// This is the load-bearing safety property of the helper: the
+    /// Task 9c spend-turn flow assumes that a failed event-append
+    /// undoes the turn deduction. A regression where the wrapper
+    /// committed-on-error (or even left the transaction dangling so
+    /// rusqlite's `Drop` rolled it back *but* the wrapper still
+    /// returned `Ok`) would silently corrupt the ledger. We assert
+    /// both the data side (zero rows after rollback) and the error
+    /// side (the original error reaches the caller unchanged).
+    #[test]
+    fn transaction_rolls_back_on_closure_error() {
+        let dir = tempdir().expect("tempdir creates");
+        let db_path = dir.path().join("world.sqlite");
+        let mut world = WorldDb::open(&db_path).expect("open succeeds");
+
+        world
+            .connection()
+            .execute_batch("CREATE TABLE demo (id INTEGER PRIMARY KEY, label TEXT NOT NULL);")
+            .expect("create demo table");
+
+        // Construct a sentinel `WorldDbError` we can identify on the
+        // way out. `ApplyMigration` is reused here purely as a tagged
+        // carrier — the test asserts on the variant fields, not the
+        // message — because it's a pre-existing variant with a
+        // `String` payload and a numeric tag that survive the round
+        // trip through the transaction wrapper unchanged.
+        let result: Result<(), WorldDbError> = world.transaction(|tx| {
+            // Issue a real write inside the transaction so the rollback
+            // assertion below is meaningful — without this the test
+            // would pass even if the wrapper committed-on-error.
+            tx.execute(
+                "INSERT INTO demo (label) VALUES (?1)",
+                rusqlite::params!["should-not-persist"],
+            )
+            .map_err(|source| WorldDbError::Transaction { source })?;
+
+            Err(WorldDbError::ApplyMigration {
+                version: 9_001,
+                name: "sentinel".to_string(),
+                source: rusqlite::Error::InvalidQuery,
+            })
+        });
+
+        match result {
+            Err(WorldDbError::ApplyMigration { version, name, .. }) => {
+                assert_eq!(version, 9_001, "original error version is preserved");
+                assert_eq!(name, "sentinel", "original error name is preserved");
+            }
+            other => panic!("expected ApplyMigration sentinel error, got {other:?}"),
+        }
+
+        // The write inside the closure must be gone. This is the
+        // assertion that would fail if the wrapper called `commit()`
+        // on the error path.
+        let row_count: i64 = world
+            .connection()
+            .query_row("SELECT COUNT(*) FROM demo", [], |row| row.get(0))
+            .expect("count query runs");
+        assert_eq!(
+            row_count, 0,
+            "closure error must roll the transaction back; no rows should persist"
+        );
+
+        // And the connection is still usable afterwards — a botched
+        // rollback would leave SQLite in a state where the next
+        // transaction errors with `cannot start a transaction within
+        // a transaction`.
+        world
+            .transaction(|tx| {
+                tx.execute(
+                    "INSERT INTO demo (label) VALUES (?1)",
+                    rusqlite::params!["after-rollback"],
+                )
+                .map_err(|source| WorldDbError::Transaction { source })?;
+                Ok(())
+            })
+            .expect("connection remains usable after a rolled-back transaction");
+
+        let row_count_after: i64 = world
+            .connection()
+            .query_row("SELECT COUNT(*) FROM demo", [], |row| row.get(0))
+            .expect("count query runs");
+        assert_eq!(
+            row_count_after, 1,
+            "follow-up transaction commits independently of the rolled-back one"
+        );
+    }
+
     /// SPEC_v2 §Task 3b acceptance: a nested `world/world.sqlite`
     /// path whose parent directory does not yet exist is created on
     /// open rather than rejected. This is the SPEC §10.4 packaging
