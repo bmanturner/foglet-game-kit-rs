@@ -256,6 +256,27 @@ pub enum TurnError {
         #[source]
         source: rusqlite::Error,
     },
+    /// A spend was rejected because today's balance is below the
+    /// requested amount — SPEC_v2 §Task 6e. The persisted balance is
+    /// **not** mutated when this variant is returned; callers can
+    /// surface `balance` to the player as "you only have N turns
+    /// left" without re-querying.
+    ///
+    /// `requested` is the unsigned amount the caller asked to spend,
+    /// widened to `i64` so the error formats consistently with
+    /// `balance` (which is the SQLite `INTEGER` storage type).
+    #[error(
+        "insufficient turns for player {player_id}: requested {requested}, \
+         balance is {balance}"
+    )]
+    InsufficientTurns {
+        /// Player whose row was checked.
+        player_id: i64,
+        /// Current balance at the moment the spend was rejected.
+        balance: i64,
+        /// Amount the caller asked to spend.
+        requested: i64,
+    },
 }
 
 /// Source of "what is today's local date" for the turn ledger.
@@ -518,17 +539,22 @@ impl WorldDb {
     /// for the ledger; the single-statement form delivers it without
     /// an explicit transaction.
     ///
+    /// # Insufficient-turn rejection (SPEC_v2 §Task 6e)
+    ///
+    /// The `UPDATE` carries a `WHERE balance >= ?` guard so a spend
+    /// that would push the balance below zero matches zero rows
+    /// instead of running. We detect the zero-row case via
+    /// `Connection::execute`'s row count, re-read the canonical
+    /// balance for the error payload, and return
+    /// [`TurnError::InsufficientTurns`]. The persisted row is
+    /// guaranteed untouched on this path: the guard prevents the
+    /// `UPDATE` from landing, and the read-back `SELECT` only ever
+    /// reads. Callers can therefore display "you only have N turns
+    /// left" straight from the error variant without a follow-up
+    /// query.
+    ///
     /// # What this method does *not* do (yet)
     ///
-    /// - **Insufficient-turn rejection.** SPEC_v2 §Task 6e is a
-    ///   separate sub-task: it adds the `WHERE balance >= ?` guard
-    ///   plus a typed [`TurnError`] variant for callers to surface to
-    ///   the player. Until that lands, this method will happily
-    ///   decrement past zero. Callers in v2 that care (Murder Motel's
-    ///   clue inspection, Task 13a) gate on the returned balance via
-    ///   a preceding `ensure_today_turns` read, which already returns
-    ///   the current value. The TODO is recorded explicitly so a
-    ///   future reviewer doesn't mistake the gap for a bug.
     /// - **New-day reset / carryover.** Task 6f. The spend path
     ///   always operates on *today's* row as reported by the
     ///   `date_provider`; if the date has rolled over since the last
@@ -556,10 +582,15 @@ impl WorldDb {
     ///
     /// # Errors
     ///
-    /// Returns [`TurnError::Sqlite`] if any of the three round-trips
-    /// (ensure-row, update, readback) fails. The variant wraps the
-    /// underlying `rusqlite::Error` so the operator-facing layer
-    /// (Task 10) can surface SQLite's wording verbatim.
+    /// - [`TurnError::Sqlite`] if any of the round-trips (ensure-row,
+    ///   update, readback) fails. The variant wraps the underlying
+    ///   `rusqlite::Error` so the operator-facing layer (Task 10) can
+    ///   surface SQLite's wording verbatim.
+    /// - [`TurnError::InsufficientTurns`] if today's balance is below
+    ///   `amount`. The persisted row is unchanged when this is
+    ///   returned; the variant carries the current `balance` and the
+    ///   `requested` amount so callers can render a player-facing
+    ///   message directly from the error.
     pub fn spend_turns<P: DateProvider>(
         &self,
         player_id: i64,
@@ -585,14 +616,50 @@ impl WorldDb {
         // requires. `updated_at = CURRENT_TIMESTAMP` keeps the audit
         // column meaningful — operators reading the table cold see
         // when the last spend landed.
-        self.connection()
+        //
+        // The `balance >= ?1` guard is the SPEC_v2 §Task 6e
+        // insufficient-turn check. Folding it into the same UPDATE
+        // (rather than checking `row.balance` from
+        // `ensure_today_turns` and branching in Rust) lets SQLite
+        // serialise the read-and-write atomically — even with a
+        // sibling connection racing through its own busy-timeout
+        // queue, only one of the two spends can satisfy the guard.
+        // A zero-amount spend still matches because `balance >= 0`
+        // is trivially true; the existing 6d "zero amount is a
+        // no-op" contract is preserved.
+        let updated = self
+            .connection()
             .execute(
                 "UPDATE turn_ledger \
                  SET balance = balance - ?1, updated_at = CURRENT_TIMESTAMP \
-                 WHERE player_id = ?2 AND local_date = ?3",
+                 WHERE player_id = ?2 AND local_date = ?3 AND balance >= ?1",
                 rusqlite::params![delta, player_id, row.local_date.as_str()],
             )
             .map_err(|source| TurnError::Sqlite { source })?;
+
+        // Zero rows updated ⇒ the guard rejected the spend. The row
+        // exists (ensure_today_turns just materialised it), so a
+        // miss can only mean `balance < amount`. Re-read the
+        // canonical balance for the error payload rather than
+        // trusting `row.balance` — a sibling spend could have landed
+        // between ensure and update, and we want the error to report
+        // what the next caller will actually see.
+        if updated == 0 {
+            let current_balance: i64 = self
+                .connection()
+                .query_row(
+                    "SELECT balance FROM turn_ledger \
+                     WHERE player_id = ?1 AND local_date = ?2",
+                    rusqlite::params![player_id, row.local_date.as_str()],
+                    |r| r.get(0),
+                )
+                .map_err(|source| TurnError::Sqlite { source })?;
+            return Err(TurnError::InsufficientTurns {
+                player_id,
+                balance: current_balance,
+                requested: delta,
+            });
+        }
 
         // Read back the row so the caller sees the post-spend
         // balance. The stored `daily_allowance` is unchanged by the
@@ -1313,5 +1380,126 @@ mod tests {
             msg.contains("turn_ledger") || msg.contains("no such table"),
             "underlying SQLite error should mention the missing table, got: {msg}"
         );
+    }
+
+    /// SPEC_v2 §Task 6e headline: a spend that exceeds today's
+    /// balance is rejected as [`TurnError::InsufficientTurns`] **and**
+    /// the persisted row is left untouched. The test spends the
+    /// allowance most of the way down, then asks for more than is
+    /// left; we assert both the typed error variant and the unchanged
+    /// DB balance. A regression that decremented past zero (the
+    /// pre-6e behavior) would change the persisted row and flunk the
+    /// readback assertion.
+    #[test]
+    fn spend_turns_rejects_insufficient_turns_without_changing_balance() {
+        let dir = tempdir().expect("tempdir creates");
+        let (world, player_id) = world_with_player(&dir);
+        let provider =
+            FixedDateProvider::new(LocalDate::parse("2026-05-08").expect("fixture date parses"));
+
+        // Burn most of the daily allowance via the public API so the
+        // setup goes through the same code path real callers use.
+        // Allowance = 5, spent = 4 → balance = 1 going into the
+        // attempted over-spend.
+        let pre = world
+            .spend_turns(player_id, 4, 5, &provider)
+            .expect("setup spend succeeds");
+        assert_eq!(
+            pre.balance, 1,
+            "precondition: one turn left before over-spend"
+        );
+
+        let err = world
+            .spend_turns(player_id, 2, 5, &provider)
+            .expect_err("over-spend must be rejected");
+        match err {
+            TurnError::InsufficientTurns {
+                player_id: pid,
+                balance,
+                requested,
+            } => {
+                assert_eq!(pid, player_id);
+                assert_eq!(balance, 1, "error must report the actual remaining balance");
+                assert_eq!(requested, 2, "error must echo the rejected request size");
+            }
+            other => panic!("expected InsufficientTurns, got {other:?}"),
+        }
+
+        // The persisted row must be untouched by the rejected spend.
+        // Reading it back via SQL (rather than another spend_turns
+        // call) keeps the assertion focused on the persistence
+        // contract and avoids any chance the readback path papers
+        // over a half-applied UPDATE.
+        let persisted: i64 = world
+            .connection()
+            .query_row(
+                "SELECT balance FROM turn_ledger \
+                 WHERE player_id = ?1 AND local_date = ?2",
+                rusqlite::params![player_id, "2026-05-08"],
+                |row| row.get(0),
+            )
+            .expect("balance readback");
+        assert_eq!(
+            persisted, 1,
+            "persisted balance must be unchanged when InsufficientTurns is returned"
+        );
+    }
+
+    /// A spend that exactly equals the remaining balance succeeds and
+    /// drives the balance to zero. This pins the off-by-one corner of
+    /// the `WHERE balance >= ?` guard: `>=` (not `>`) is what allows
+    /// the player to spend the very last turn. A regression that
+    /// tightened the guard to `>` would reject this spend and flunk
+    /// here.
+    #[test]
+    fn spend_turns_allows_exact_balance_spend_to_zero() {
+        let dir = tempdir().expect("tempdir creates");
+        let (world, player_id) = world_with_player(&dir);
+        let provider =
+            FixedDateProvider::new(LocalDate::parse("2026-05-08").expect("fixture date parses"));
+
+        let after = world
+            .spend_turns(player_id, 5, 5, &provider)
+            .expect("spending the exact balance must succeed");
+        assert_eq!(
+            after.balance, 0,
+            "exact-balance spend must drive the balance to zero"
+        );
+
+        // A subsequent spend of any positive amount with balance == 0
+        // must be rejected — confirms the guard still works at the
+        // boundary on the next call.
+        let err = world
+            .spend_turns(player_id, 1, 5, &provider)
+            .expect_err("any positive spend at zero balance must be rejected");
+        assert!(
+            matches!(err, TurnError::InsufficientTurns { balance: 0, .. }),
+            "expected InsufficientTurns at balance 0, got {err:?}"
+        );
+    }
+
+    /// Zero-amount spend at zero balance is still a no-op success.
+    /// `balance >= 0` is trivially true, so the existing Task 6d
+    /// "zero amount leaves balance unchanged" contract continues to
+    /// hold even after the 6e guard is in place. Without this test a
+    /// future tightening of the guard (e.g. `balance >= ?1 AND ?1 >
+    /// 0`) could silently break the no-op contract.
+    #[test]
+    fn spend_turns_zero_amount_at_zero_balance_remains_a_no_op() {
+        let dir = tempdir().expect("tempdir creates");
+        let (world, player_id) = world_with_player(&dir);
+        let provider =
+            FixedDateProvider::new(LocalDate::parse("2026-05-08").expect("fixture date parses"));
+
+        // Drain the balance to exactly zero first.
+        let drained = world
+            .spend_turns(player_id, 5, 5, &provider)
+            .expect("drain to zero");
+        assert_eq!(drained.balance, 0);
+
+        let again = world
+            .spend_turns(player_id, 0, 5, &provider)
+            .expect("zero-amount spend at zero balance must still succeed");
+        assert_eq!(again.balance, 0);
     }
 }
