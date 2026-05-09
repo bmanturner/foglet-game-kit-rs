@@ -342,6 +342,65 @@ impl WorldDb {
 
         Ok(())
     }
+
+    /// Run `f` inside a SQLite transaction, committing on `Ok` and
+    /// rolling back on `Err`.
+    ///
+    /// This is the SPEC §3.1 "transaction helper for shared-world
+    /// mutations" exposed for sibling modules (Task 9c will compose it
+    /// for the spend-turn + mutate + append-event flow). The closure
+    /// receives a borrowed [`rusqlite::Transaction`] so it can issue
+    /// any number of statements that all observe-or-don't as a unit.
+    ///
+    /// # Why a closure rather than handing back a `Transaction`
+    ///
+    /// `rusqlite::Transaction` rolls back on `Drop` *unless* `commit()`
+    /// has been called. Owning it from a higher-level module makes it
+    /// far too easy to forget the commit and silently drop writes —
+    /// the kind of bug that only shows up after a player notices their
+    /// turn-spend "didn't take". By inverting the control flow we
+    /// guarantee both branches: a clean `Ok` always commits, an `Err`
+    /// always rolls back. There is no path that returns the closure's
+    /// success without also flushing the transaction.
+    ///
+    /// # Error type
+    ///
+    /// The closure's error channel is the library-wide
+    /// [`WorldDbError`]. Sibling modules that already speak `rusqlite`
+    /// errors at the boundary (Task 4 migrations, Task 9c spend-turn
+    /// helper) can map their own errors into a `WorldDbError` variant;
+    /// callers that need to propagate a non-`WorldDbError` failure can
+    /// stash it in [`WorldDbError::Transaction`] via the `source`
+    /// field, but the common case is a closure that simply returns
+    /// the same error type the rest of the world DB layer uses.
+    ///
+    /// # Borrow shape
+    ///
+    /// `&mut self` is required because [`Connection::transaction`]
+    /// needs a unique borrow; this matches the call shape Task 10
+    /// already plans for, where `GameContext` holds the world DB
+    /// behind a `&mut` borrow scoped to a single screen tick.
+    pub fn transaction<T, F>(&mut self, f: F) -> Result<T, WorldDbError>
+    where
+        F: FnOnce(&rusqlite::Transaction<'_>) -> Result<T, WorldDbError>,
+    {
+        let tx = self
+            .conn
+            .transaction()
+            .map_err(|source| WorldDbError::Transaction { source })?;
+
+        // Run the caller's body. On `Err` we return early; `tx` drops
+        // without `commit()`, and `rusqlite::Transaction`'s `Drop` impl
+        // rolls the SQLite transaction back. This is the only path
+        // that exists for closure failures — there is no "commit on
+        // error" branch, intentionally.
+        let value = f(&tx)?;
+
+        tx.commit()
+            .map_err(|source| WorldDbError::Transaction { source })?;
+
+        Ok(value)
+    }
 }
 
 /// A schema/bootstrap step authored by a game.
@@ -565,6 +624,21 @@ pub enum WorldDbError {
         name: String,
         /// Underlying `rusqlite` error from the transaction, batch, or
         /// insert.
+        #[source]
+        source: rusqlite::Error,
+    },
+
+    /// `Connection::transaction` or `Transaction::commit` returned an
+    /// error from inside [`WorldDb::transaction`]. Distinct from
+    /// [`Self::ApplyMigration`] so the operator-facing error names
+    /// "transaction" rather than implying a migration is in flight —
+    /// Task 9c's spend-turn helper, for example, surfaces here when
+    /// the SQLite layer itself rejects begin/commit.
+    #[error("world database transaction failed: {source}")]
+    Transaction {
+        /// Underlying `rusqlite` error from begin or commit. Closure-
+        /// originated failures don't land here — they propagate
+        /// whatever variant the closure returned.
         #[source]
         source: rusqlite::Error,
     },
@@ -1102,6 +1176,61 @@ mod tests {
             })
             .expect("count query runs");
         assert_eq!(row_count_after, 1, "retry must record exactly one row");
+    }
+
+    /// SPEC_v2 §Task 9a acceptance: a successful closure inside
+    /// [`WorldDb::transaction`] commits — the writes it issued are
+    /// observable to the next read. Pairing the inside-the-closure
+    /// `INSERT` with an outside-the-closure `SELECT` proves that the
+    /// commit hand-off works: a regression that returned the closure's
+    /// `Ok` without actually calling `tx.commit()` would leave the
+    /// table empty (rusqlite rolls back on `Drop`) and flunk this test.
+    #[test]
+    fn transaction_commits_writes_on_ok() {
+        let dir = tempdir().expect("tempdir creates");
+        let db_path = dir.path().join("world.sqlite");
+        let mut world = WorldDb::open(&db_path).expect("open succeeds");
+
+        // Set up a target table outside the transaction so the test
+        // covers the transaction wrapper itself, not table creation.
+        world
+            .connection()
+            .execute_batch("CREATE TABLE demo (id INTEGER PRIMARY KEY, label TEXT NOT NULL);")
+            .expect("create demo table");
+
+        let returned: i64 = world
+            .transaction(|tx| {
+                tx.execute(
+                    "INSERT INTO demo (label) VALUES (?1)",
+                    rusqlite::params!["committed"],
+                )
+                .map_err(|source| WorldDbError::Transaction { source })?;
+                Ok(42)
+            })
+            .expect("transaction body succeeds and commits");
+
+        // The closure's `Ok` value is threaded back through the wrapper
+        // unchanged — callers (Task 9c) rely on this to return the new
+        // turn balance, the appended event id, etc.
+        assert_eq!(returned, 42, "transaction must return the closure's value");
+
+        // The write is visible after the transaction returns. This is
+        // the load-bearing assertion for 9a: a wrapper that forgot to
+        // call `tx.commit()` would see zero rows here.
+        let row_count: i64 = world
+            .connection()
+            .query_row("SELECT COUNT(*) FROM demo", [], |row| row.get(0))
+            .expect("count query runs");
+        assert_eq!(
+            row_count, 1,
+            "committed transaction must persist its writes"
+        );
+
+        let label: String = world
+            .connection()
+            .query_row("SELECT label FROM demo LIMIT 1", [], |row| row.get(0))
+            .expect("label query runs");
+        assert_eq!(label, "committed");
     }
 
     /// SPEC_v2 §Task 3b acceptance: a nested `world/world.sqlite`
