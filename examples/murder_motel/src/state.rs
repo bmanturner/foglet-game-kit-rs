@@ -1,64 +1,159 @@
 //! Persisted and runtime state shared across screens.
 //!
-//! [`SaveState`] is the on-disk JSON shape; [`SharedSlots`] is the
-//! `Rc<RefCell<_>>` bundle every screen mutates while the game is
-//! running. [`SharedSlots::snapshot`] / [`Self::apply`] are the bridge
-//! between the two — extending the save schema is "add a field, add a
-//! line to each, run tests".
+//! [`SaveState`] is both the on-disk shape (serialised through a flat
+//! wire helper) **and** the live runtime bundle: each persisted field
+//! is held as an `Rc<RefCell<T>>` so every screen sharing the slot sees
+//! the same mutations. v2.1 §Task 5a moves the canonical handle behind
+//! [`foglet_game::SaveSlot`] — `SharedSlots::save` is the typed slot
+//! the runtime save handler reads, and the per-field Rcs in
+//! [`SharedSlots`] are aliases cloned from the slot's inner state so
+//! existing screen code keeps compiling unchanged. Tasks 5b–5d migrate
+//! consumers off the aliases and onto `slots.save.borrow().<field>`.
 
 use std::cell::RefCell;
 use std::collections::BTreeSet;
 use std::rc::Rc;
 
-use foglet_game::{DateProvider, FeedbackLine, FlagSet};
+use foglet_game::{DateProvider, FeedbackLine, FlagSet, SaveSlot};
 use serde::{Deserialize, Serialize};
 
 use crate::clock::SystemDateProvider;
 use crate::world::PendingClueEvent;
 
-/// Persisted state for the player's save slot (Task 13h).
+/// Persisted state for the player's save slot (Task 13h, restructured
+/// in SPEC_v2_1 §Task 5a).
 ///
-/// JSON-serialised through the kit's `write_atomic` helper, deserialised
-/// back via `read_save`. The shape matches [`SharedSlots::snapshot`] one
-/// field at a time so adding a new save field is "extend the struct,
-/// extend the snapshot/apply pair, run tests".
+/// Each persisted field lives behind an `Rc<RefCell<T>>` so the
+/// [`SharedSlots`] bundle and the runtime [`SaveSlot<SaveState>`]
+/// share *one* set of cells — mutating through any handle is observed
+/// everywhere. Serialisation goes through [`SaveStateWire`], a flat
+/// helper that pins the on-disk JSON shape (`player_x`, `player_y`,
+/// `won`, `flags`, `inventory`, `cash`, `map_name`) so v1 / v1.1 / v2
+/// save files keep round-tripping.
 ///
-/// Field naming sticks to the shared-state vocabulary (`player_x`,
-/// `player_y`, `won`) rather than nesting a `PlayerSlot` so an operator
+/// Field naming sticks to the shared-state vocabulary so an operator
 /// reading `save.json` can map every key back to a screen field at a
 /// glance.
-#[derive(Default, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Default)]
 pub struct SaveState {
-    /// Player column at save time. Restored verbatim into
-    /// [`SharedSlots::player`] on `apply`.
-    pub player_x: u16,
-    /// Player row at save time.
-    pub player_y: u16,
-    /// Whether the win condition has fired in this save slot. A `true`
-    /// value preserves the post-win map render (no `*` marker) on
-    /// resume.
-    pub won: bool,
+    /// Player position + win latch + cash, behind a single
+    /// `Rc<RefCell<_>>` so a screen swapping `(x, y)` in one
+    /// borrow_mut never lets a concurrent reader observe a half-applied
+    /// position.
+    pub player: Rc<RefCell<PlayerSlot>>,
     /// Narrative flags set during gameplay (`heard_rumor`, etc.).
-    pub flags: BTreeSet<String>,
+    /// Cloned into a screen-local handle when a [`foglet_game::DialogScreen`]
+    /// needs `Rc<RefCell<FlagSet>>` access — the inner refcell is
+    /// shared, so flag writes inside a dialog branch are visible to
+    /// later conversations and to the win-condition check.
+    pub flags: Rc<RefCell<FlagSet>>,
     /// Inventory item IDs the player has collected. The ID namespace is
     /// the [`crate::map::MapScreen::ITEMS`] catalog; ids without a
     /// catalog match are rendered silently as gone — see
     /// [`crate::modals::InventoryScreen::current_labels`].
-    pub inventory: BTreeSet<String>,
+    pub inventory: Rc<RefCell<BTreeSet<String>>>,
+    /// Identifier of the map the player is currently standing on. Lets
+    /// the title-screen Continue path dispatch to the right map screen
+    /// (lobby vs. Room 7) instead of always pushing the lobby. Defaults
+    /// to [`default_map_name`] so a New Game starting in the lobby
+    /// never has a blank map identifier.
+    pub map_name: Rc<RefCell<String>>,
+}
+
+impl Clone for SaveState {
+    /// Deep-clone: each field gets a fresh `Rc<RefCell<_>>` whose inner
+    /// value is a clone of the original's. `SaveSlot::snapshot` relies
+    /// on this — a snapshot mutated by the caller MUST NOT bleed back
+    /// into the live state, which a refcount-bump `Clone` would not
+    /// guarantee.
+    fn clone(&self) -> Self {
+        Self {
+            player: Rc::new(RefCell::new(*self.player.borrow())),
+            flags: Rc::new(RefCell::new(self.flags.borrow().clone())),
+            inventory: Rc::new(RefCell::new(self.inventory.borrow().clone())),
+            map_name: Rc::new(RefCell::new(self.map_name.borrow().clone())),
+        }
+    }
+}
+
+impl PartialEq for SaveState {
+    /// Content-based equality. The Rc identities differ between a
+    /// snapshot and its origin, but the on-disk shape is what tests
+    /// compare — so equality reaches through the `RefCell` and asks
+    /// "do the bytes match?".
+    fn eq(&self, other: &Self) -> bool {
+        *self.player.borrow() == *other.player.borrow()
+            && *self.flags.borrow() == *other.flags.borrow()
+            && *self.inventory.borrow() == *other.inventory.borrow()
+            && *self.map_name.borrow() == *other.map_name.borrow()
+    }
+}
+
+impl Eq for SaveState {}
+
+/// Flat on-disk JSON shape for [`SaveState`] (SPEC_v2_1 §Task 5a).
+///
+/// Kept private and used only by the [`Serialize`] / [`Deserialize`]
+/// impls below. Pinning the wire shape here — instead of derive-on-
+/// `SaveState` — lets the runtime carry `Rc<RefCell<_>>` field-level
+/// handles (so screens can clone an `Rc<RefCell<FlagSet>>` for
+/// `DialogScreen`) without leaking that nesting into the JSON. v1 /
+/// v1.1 / v2 saves continue to deserialise unchanged.
+#[derive(Default, Debug, Serialize, Deserialize)]
+struct SaveStateWire {
+    player_x: u16,
+    player_y: u16,
+    won: bool,
+    flags: BTreeSet<String>,
+    inventory: BTreeSet<String>,
     /// Coin balance carried into v1.1 for the night-clerk vendor scene
     /// (SPEC §9). `#[serde(default)]` so a v1 save written before the
-    /// field existed deserialises cleanly with `cash == 0`; the New
-    /// Game / load paths reset to [`PlayerSlot::STARTING_CASH`].
+    /// field existed deserialises cleanly with `cash == 0`.
     #[serde(default)]
-    pub cash: u32,
-    /// Identifier of the map the player was on at save time. Lets the
-    /// title-screen Continue path dispatch to the right map screen
-    /// (lobby vs. Room 7) instead of always pushing the lobby. The
-    /// `#[serde(default = "default_map_name")]` keeps v1 saves
-    /// deserialising as the lobby — the only map the example shipped
-    /// with before the Room 7 addition.
+    cash: u32,
+    /// Identifier of the map the player was on at save time. Defaults
+    /// to `"lobby"` so any pre-Room-7 save resumes on the lobby map.
     #[serde(default = "default_map_name")]
-    pub map_name: String,
+    map_name: String,
+}
+
+impl Serialize for SaveState {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let player = *self.player.borrow();
+        let wire = SaveStateWire {
+            player_x: player.x,
+            player_y: player.y,
+            won: player.won,
+            flags: self.flags.borrow().clone(),
+            inventory: self.inventory.borrow().clone(),
+            cash: player.cash,
+            map_name: self.map_name.borrow().clone(),
+        };
+        wire.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for SaveState {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = SaveStateWire::deserialize(deserializer)?;
+        Ok(Self {
+            player: Rc::new(RefCell::new(PlayerSlot {
+                x: wire.player_x,
+                y: wire.player_y,
+                won: wire.won,
+                cash: wire.cash,
+            })),
+            flags: Rc::new(RefCell::new(wire.flags)),
+            inventory: Rc::new(RefCell::new(wire.inventory)),
+            map_name: Rc::new(RefCell::new(wire.map_name)),
+        })
+    }
 }
 
 /// Default map identifier baked into [`SaveState::map_name`] when a
@@ -73,10 +168,15 @@ pub fn default_map_name() -> String {
 /// are therefore shared between the screens that mutate them and the
 /// `main` scope that writes the save on exit.
 ///
-/// Cloned freely (each clone is three `Rc::clone` calls) so every
-/// screen that needs read or write access holds its own handle. The
-/// canonical handle lives in `main`, which uses [`Self::snapshot`] /
-/// [`Self::apply`] to bridge to and from on-disk [`SaveState`].
+/// Cloned freely (each clone is a handful of `Rc::clone` calls) so
+/// every screen that needs read or write access holds its own handle.
+/// The canonical persistence handle is [`Self::save`] — a typed
+/// [`SaveSlot<SaveState>`] whose inner [`SaveState`] holds the same
+/// `Rc<RefCell<_>>` field handles aliased into [`Self::flags`] /
+/// [`Self::inventory`] / [`Self::player`] / [`Self::map_name`]. SPEC_v2_1
+/// §Task 5a keeps the per-field aliases so existing screen code
+/// (`slots.flags.borrow_mut()`, …) compiles unchanged while migrations
+/// land in 5b–5d.
 ///
 /// `Debug` is hand-written rather than derived because
 /// [`Self::date_provider`] holds a `dyn DateProvider` trait object
@@ -84,14 +184,24 @@ pub fn default_map_name() -> String {
 /// placeholder for that one field and forwards the rest verbatim.
 #[derive(Clone)]
 pub struct SharedSlots {
-    /// Narrative-flag store. Same Rc the [`crate::scenes::dialog::DialogScreen`]
+    /// Typed save handle wrapping the canonical [`SaveState`]. The
+    /// runtime save handler (SPEC_v2_1 §Task 4) reads from this slot
+    /// directly; the per-field aliases below clone the slot's inner
+    /// `Rc<RefCell<_>>`s so mutations through any handle land in the
+    /// same cells the save handler will serialise.
+    pub save: SaveSlot<SaveState>,
+    /// Narrative-flag store. Cloned from `save.borrow().flags` so
+    /// `slots.flags.borrow_mut().insert(...)` is observed by any other
+    /// handle reading the same flag store, including the runtime save
+    /// path. Same Rc the [`crate::scenes::dialog::DialogScreen`]
     /// borrows for `requires`-gated branches.
     pub flags: Rc<RefCell<FlagSet>>,
-    /// Inventory id set. Same Rc the
-    /// [`crate::modals::InventoryScreen`] reads to draw the player's
-    /// pockets.
+    /// Inventory id set, aliased from `save.borrow().inventory`. Same
+    /// Rc the [`crate::modals::InventoryScreen`] reads to draw the
+    /// player's pockets.
     pub inventory: Rc<RefCell<BTreeSet<String>>>,
-    /// Player position + win latch. Pulled into a single Rc so a single
+    /// Player position + win latch + cash, aliased from
+    /// `save.borrow().player`. Pulled into a single Rc so a single
     /// `borrow_mut()` swap is enough to apply a loaded save without
     /// briefly observing a half-restored position.
     pub player: Rc<RefCell<PlayerSlot>>,
@@ -141,9 +251,10 @@ pub struct SharedSlots {
 
 impl std::fmt::Debug for SharedSlots {
     /// Hand-written so the `Rc<dyn DateProvider>` field doesn't force
-    /// the trait to require `Debug`. Every other field forwards through
-    /// the standard derive shape so existing test assertions keep
-    /// reading like the old derived output.
+    /// the trait to require `Debug`. The `save` slot is omitted —
+    /// every persisted field is already printed via its alias below,
+    /// and re-printing the same Rcs through the slot would just
+    /// duplicate the output.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SharedSlots")
             .field("flags", &self.flags)
@@ -186,18 +297,32 @@ impl PlayerSlot {
 }
 
 impl Default for SharedSlots {
-    /// Hand-written so the [`Self::map_name`] slot starts at the
-    /// canonical lobby identifier instead of an empty string. Every
-    /// other slot still uses its derived default — the only deviation
-    /// is the map name, which downstream code (snapshot, Continue
-    /// dispatch) relies on being non-empty.
+    /// Hand-written so the [`Self::map_name`] alias starts at the
+    /// canonical lobby identifier and so the per-field Rcs alias
+    /// **into** the [`Self::save`] slot's inner [`SaveState`]. The
+    /// SaveState is constructed first via [`SaveState::default`]
+    /// (zeroed player, empty flags/inventory, lobby map name) and the
+    /// aliases clone its field-level Rcs — bumping refcounts, not
+    /// duplicating cells — so every consumer observes the same
+    /// mutations regardless of which handle they read or write.
     fn default() -> Self {
-        Self {
+        let save_state = SaveState {
+            player: Rc::new(RefCell::new(PlayerSlot::default())),
             flags: Rc::new(RefCell::new(FlagSet::new())),
             inventory: Rc::new(RefCell::new(BTreeSet::new())),
-            player: Rc::new(RefCell::new(PlayerSlot::default())),
-            feedback: Rc::new(RefCell::new(None)),
             map_name: Rc::new(RefCell::new(default_map_name())),
+        };
+        let flags = Rc::clone(&save_state.flags);
+        let inventory = Rc::clone(&save_state.inventory);
+        let player = Rc::clone(&save_state.player);
+        let map_name = Rc::clone(&save_state.map_name);
+        Self {
+            save: SaveSlot::new(save_state),
+            flags,
+            inventory,
+            player,
+            feedback: Rc::new(RefCell::new(None)),
+            map_name,
             // Live games walk wall-clock time via `SystemDateProvider`;
             // tests overwrite this slot through `with_date_provider`
             // to drive the SPEC §Task 6f deterministic-reset story.
@@ -232,6 +357,13 @@ impl SharedSlots {
     /// Reset every slot to a fresh-game baseline at `(start_x, start_y)`.
     /// Called when the main menu activates "New Game" so leftover state
     /// from a previously loaded save does not bleed into the new run.
+    ///
+    /// Mutations go through the per-field aliases (which point into
+    /// [`Self::save`]'s inner cells), preserving Rc identity so every
+    /// screen handle keeps observing the same cells across resets. We
+    /// also flip the SaveSlot's dirty flag so a "save iff dirty" hook
+    /// (Task 4) treats a New Game as a meaningful state change worth
+    /// persisting.
     pub fn reset(&self, start_x: u16, start_y: u16) {
         self.flags.borrow_mut().clear();
         self.inventory.borrow_mut().clear();
@@ -244,6 +376,7 @@ impl SharedSlots {
         // previous run spent. The field is re-initialised in one place
         // so a future re-tune touches a single constant.
         p.cash = PlayerSlot::STARTING_CASH;
+        drop(p);
         // Clear any leftover feedback so a new run never opens under a
         // stale "Moved Room 7 key to inventory." line from a previous
         // session.
@@ -258,38 +391,52 @@ impl SharedSlots {
         // clean mailbox or the next world-DB flush would write a stale
         // row attributed to whoever happens to launch next.
         self.pending_clue_events.borrow_mut().clear();
+        // The SaveSlot's dirty flag tracks `borrow_mut` on the slot
+        // itself, not the per-field `Rc<RefCell<_>>`s we just mutated
+        // above. Take a no-op `borrow_mut` so the flag is set — a
+        // "save on dirty" hook would otherwise miss the New Game
+        // wipe entirely.
+        let _ = self.save.borrow_mut();
     }
 
-    /// Build a [`SaveState`] from the current slot contents. Cloning the
-    /// flag/inventory sets keeps the on-disk JSON independent of the
-    /// live runtime — the save file is a frozen snapshot, not a mirror.
+    /// Build a [`SaveState`] snapshot of the current slot contents.
+    ///
+    /// Delegates to [`SaveSlot::snapshot`] so the returned value is
+    /// independent of the live state — mutating the snapshot's fields
+    /// will not bleed back through the aliased Rcs in [`Self`]. Adopted
+    /// in SPEC_v2_1 §Task 5a as a thin wrapper; SPEC_v2_1 §Task 5b
+    /// removes this method and inlines `slots.save.snapshot()` at the
+    /// call sites.
     pub fn snapshot(&self) -> SaveState {
-        let player = *self.player.borrow();
-        SaveState {
-            player_x: player.x,
-            player_y: player.y,
-            won: player.won,
-            flags: self.flags.borrow().clone(),
-            inventory: self.inventory.borrow().clone(),
-            cash: player.cash,
-            map_name: self.map_name.borrow().clone(),
-        }
+        self.save.snapshot()
     }
 
-    /// Overwrite slot contents from a loaded [`SaveState`]. The player
-    /// `RefCell` is swapped in one borrow so concurrent screen reads
-    /// never observe `(new_x, old_y)`.
+    /// Overwrite slot contents from a loaded [`SaveState`].
+    ///
+    /// Mutates each field's `RefCell` **in place** rather than calling
+    /// [`SaveSlot::apply`]. The aliases in [`Self::flags`] /
+    /// [`Self::inventory`] / [`Self::player`] / [`Self::map_name`]
+    /// share Rc identity with the slot's inner `SaveState` — a
+    /// wholesale `apply` would swap that `SaveState` for a different
+    /// one, leaving the aliases pointing at orphaned cells. In-place
+    /// updates preserve the shared-handle invariant. The SaveSlot's
+    /// dirty flag is flipped so the next save attempt actually writes.
     pub fn apply(&self, state: SaveState) {
+        // Pull values out of the loaded state's cells (which the
+        // SaveStateWire deserializer just constructed) and copy them
+        // into our own. The loaded SaveState's Rcs are dropped at the
+        // end of the call.
         {
             let mut p = self.player.borrow_mut();
-            p.x = state.player_x;
-            p.y = state.player_y;
-            p.won = state.won;
-            p.cash = state.cash;
+            *p = *state.player.borrow();
         }
-        *self.flags.borrow_mut() = state.flags;
-        *self.inventory.borrow_mut() = state.inventory;
-        *self.map_name.borrow_mut() = state.map_name;
+        *self.flags.borrow_mut() = state.flags.borrow().clone();
+        *self.inventory.borrow_mut() = state.inventory.borrow().clone();
+        *self.map_name.borrow_mut() = state.map_name.borrow().clone();
+        // Mark the slot dirty so a "save on dirty" loop persists the
+        // applied state (e.g. on the next clean Quit). See `reset` for
+        // the matching rationale.
+        let _ = self.save.borrow_mut();
     }
 }
 
@@ -411,13 +558,20 @@ mod tests {
     fn save_state_serializes_to_json_and_back() {
         // Round-trip through the same `serde_json` path
         // `write_atomic`/`read_save` use. Catches accidental
-        // `#[serde(skip)]` / rename drift before it ships.
-        let mut state = SaveState::default();
-        state.player_x = 43;
-        state.player_y = 4;
-        state.won = true;
-        state.flags.insert("heard_rumor".into());
-        state.inventory.insert("brass_key".into());
+        // `#[serde(skip)]` / rename drift before it ships. SPEC_v2_1
+        // §Task 5a moved the field-level handles behind `Rc<RefCell<_>>`
+        // and a flat `SaveStateWire` adapter; this test keeps the
+        // behavioural assertion (round-trip equal) but writes through
+        // the new shape.
+        let state = SaveState::default();
+        {
+            let mut p = state.player.borrow_mut();
+            p.x = 43;
+            p.y = 4;
+            p.won = true;
+        }
+        state.flags.borrow_mut().insert("heard_rumor".into());
+        state.inventory.borrow_mut().insert("brass_key".into());
         let json = serde_json::to_string(&state).expect("serialise");
         let parsed: SaveState = serde_json::from_str(&json).expect("parse");
         assert_eq!(state, parsed);
@@ -485,8 +639,12 @@ mod tests {
             "inventory": []
         }"#;
         let parsed: SaveState = serde_json::from_str(v1_json).expect("v1 save parses");
-        assert_eq!(parsed.map_name, "lobby");
-        assert_eq!(parsed.cash, 0, "missing cash field also defaults");
+        assert_eq!(parsed.map_name.borrow().as_str(), "lobby");
+        assert_eq!(
+            parsed.player.borrow().cash,
+            0,
+            "missing cash field also defaults"
+        );
     }
 
     #[test]
@@ -495,10 +653,10 @@ mod tests {
         // `write_atomic`/`read_save` use — so a future serde rename
         // surfaces as a failed round-trip rather than a silent reset
         // to the lobby.
-        let mut state = SaveState::default();
-        state.map_name = "room_7".to_string();
+        let state = SaveState::default();
+        *state.map_name.borrow_mut() = "room_7".to_string();
         let json = serde_json::to_string(&state).expect("serialise");
         let parsed: SaveState = serde_json::from_str(&json).expect("parse");
-        assert_eq!(parsed.map_name, "room_7");
+        assert_eq!(parsed.map_name.borrow().as_str(), "room_7");
     }
 }
