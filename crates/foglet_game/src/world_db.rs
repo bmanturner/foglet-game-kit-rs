@@ -261,13 +261,25 @@ impl WorldDb {
     /// Apply a single [`WorldMigration`], recording its version in
     /// `world_migrations` on success.
     ///
-    /// Task 4b implements the *happy path* only: one migration is
-    /// executed and one row is recorded. Idempotency (re-applying the
-    /// same version is a no-op) lands in Task 4c, and the
-    /// "failed-migration leaves no row" guarantee lands in Task 4d. The
-    /// SQL body and the bookkeeping insert run inside a single SQLite
-    /// transaction so 4d can keep the failure semantics tight without
-    /// having to revisit this code path.
+    /// Task 4b implemented the happy path; Task 4c (this iteration) layers
+    /// **idempotency** on top: if the migration's `version` is already
+    /// recorded in `world_migrations`, the call is a no-op — the SQL body
+    /// is *not* re-run and no second row is written. This matches the
+    /// `external_pty` relaunch dance in SPEC §7: every door re-exec walks
+    /// the same migration list, so any other contract would either
+    /// duplicate rows (PK violation today) or re-run mutating SQL on every
+    /// startup (data corruption tomorrow).
+    ///
+    /// Idempotency is keyed on `version` alone, *not* `(version, name)`.
+    /// SPEC §4.3 makes `version` the unique identity of a migration; the
+    /// `name` is operator-facing prose. Authors are free to rename a
+    /// migration ("init" → "v1_init") between releases without the runtime
+    /// thinking the renamed migration is a new one to apply.
+    ///
+    /// Task 4d will harden the "failed migration leaves no row" guarantee.
+    /// The SQL body and the bookkeeping insert already run inside a single
+    /// SQLite transaction so 4d can keep that work tight without
+    /// revisiting this code path.
     ///
     /// `&mut self` is required because [`Connection::transaction`] needs
     /// a unique borrow. The runtime layer (Task 10) wraps the world DB
@@ -276,6 +288,17 @@ impl WorldDb {
     /// the mutable signature here matches the call shape that's coming.
     pub fn apply_migration(&mut self, migration: &WorldMigration) -> Result<(), WorldDbError> {
         let WorldMigration { version, name, sql } = migration;
+
+        // Idempotency check: if the version is already recorded, the
+        // migration ran in a previous process and re-running the SQL
+        // body would either duplicate a CREATE (without IF NOT EXISTS)
+        // or, worse, replay a data-mutating step. Querying
+        // `world_migrations` rather than (say) `sqlite_master` keeps
+        // the contract centred on the bookkeeping table — a future
+        // migration that *only* writes data would still be tracked.
+        if migration_recorded(&self.conn, *version)? {
+            return Ok(());
+        }
 
         let tx = self
             .conn
@@ -376,6 +399,39 @@ fn apply_journal_mode(conn: &Connection, requested: &str) -> Result<String, Worl
         })?;
 
     Ok(active)
+}
+
+/// Returns `true` when a migration with `version` is already recorded
+/// in the `world_migrations` bookkeeping table.
+///
+/// Pulled out of [`WorldDb::apply_migration`] so the idempotency check
+/// (Task 4c) is named and individually testable. Lookup by primary key
+/// is an index seek — cheap enough to do unconditionally on every
+/// `apply_migration` call, which is what the relaunch path requires.
+///
+/// Errors are mapped to [`WorldDbError::ApplyMigration`] so a failure
+/// here surfaces with the same operator-facing wording as the rest of
+/// the migration apply path; the caller doesn't need to special-case
+/// "the pre-check itself blew up".
+fn migration_recorded(conn: &Connection, version: i64) -> Result<bool, WorldDbError> {
+    // `SELECT 1 ... LIMIT 1` over the PK column is the canonical
+    // existence probe in SQLite. We use `query_row` + `optional()` to
+    // distinguish "row exists" (`Some`) from "row missing" (`None`)
+    // without paying for an extra round-trip.
+    use rusqlite::OptionalExtension;
+    let row: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM world_migrations WHERE version = ?1",
+            rusqlite::params![version],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|source| WorldDbError::ApplyMigration {
+            version,
+            name: String::new(),
+            source,
+        })?;
+    Ok(row.is_some())
 }
 
 /// Create the `world_migrations` bookkeeping table if it isn't already
@@ -866,6 +922,105 @@ mod tests {
             table_count, 1,
             "migration SQL body must have executed against the connection"
         );
+    }
+
+    /// SPEC_v2 §Task 4c acceptance: applying the same migration twice
+    /// records exactly one row and leaves the schema valid.
+    ///
+    /// The second call deliberately uses a SQL body that *would* fail
+    /// if it were re-executed — `CREATE TABLE demo (...)` without
+    /// `IF NOT EXISTS` against an already-present table — so this test
+    /// also proves the idempotency check short-circuits *before* the SQL
+    /// body runs. A regression that records the row but still re-executes
+    /// the body (or vice versa) would flunk one or the other assertion.
+    #[test]
+    fn apply_migration_is_idempotent_across_repeat_calls() {
+        let dir = tempdir().expect("tempdir creates");
+        let db_path = dir.path().join("world.sqlite");
+        let mut world = WorldDb::open(&db_path).expect("open succeeds");
+
+        let migration = WorldMigration {
+            version: 1,
+            name: "create_demo_table",
+            sql: "CREATE TABLE demo (id INTEGER PRIMARY KEY, label TEXT NOT NULL);",
+        };
+
+        world
+            .apply_migration(&migration)
+            .expect("first application succeeds");
+        world
+            .apply_migration(&migration)
+            .expect("second application is a no-op, not an error");
+
+        // Exactly one bookkeeping row for this version.
+        let row_count: i64 = world
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM world_migrations WHERE version = ?1",
+                rusqlite::params![1_i64],
+                |row| row.get(0),
+            )
+            .expect("count query runs");
+        assert_eq!(
+            row_count, 1,
+            "repeat application must not duplicate the bookkeeping row"
+        );
+
+        // Schema is still valid: the `demo` table exists and is usable.
+        // Inserting a row exercises the CHECK that the table wasn't
+        // dropped/recreated by an accidental re-run of the SQL body.
+        world
+            .connection()
+            .execute(
+                "INSERT INTO demo (label) VALUES (?1)",
+                rusqlite::params!["smoke"],
+            )
+            .expect("demo table is intact and writable after repeat apply");
+    }
+
+    /// Idempotency keys on `version`, not `(version, name)`. Renaming a
+    /// migration between releases (e.g. `init` → `v1_init`) is a
+    /// documentation tweak, not a new migration to apply — the runtime
+    /// must treat the second call as a no-op rather than re-running the
+    /// body. Without this guard, an author tidying up names would silently
+    /// re-execute every migration on the next `external_pty` relaunch.
+    #[test]
+    fn apply_migration_idempotency_keys_on_version_not_name() {
+        let dir = tempdir().expect("tempdir creates");
+        let db_path = dir.path().join("world.sqlite");
+        let mut world = WorldDb::open(&db_path).expect("open succeeds");
+
+        world
+            .apply_migration(&WorldMigration {
+                version: 1,
+                name: "init",
+                sql: "CREATE TABLE demo (id INTEGER PRIMARY KEY);",
+            })
+            .expect("first application succeeds");
+
+        // Same version, new name, same body — should be a no-op even
+        // though the name disagrees with the recorded row.
+        world
+            .apply_migration(&WorldMigration {
+                version: 1,
+                name: "v1_init",
+                sql: "CREATE TABLE demo (id INTEGER PRIMARY KEY);",
+            })
+            .expect("rename of an applied migration is a no-op");
+
+        // The recorded name reflects the *first* application — we did not
+        // overwrite bookkeeping on the rename. This is the conservative
+        // choice; if a future requirement needs to update names in place
+        // it can do so explicitly rather than as a side effect of apply.
+        let recorded_name: String = world
+            .connection()
+            .query_row(
+                "SELECT name FROM world_migrations WHERE version = ?1",
+                rusqlite::params![1_i64],
+                |row| row.get(0),
+            )
+            .expect("recorded name is queryable");
+        assert_eq!(recorded_name, "init");
     }
 
     /// SPEC_v2 §Task 3b acceptance: a nested `world/world.sqlite`
