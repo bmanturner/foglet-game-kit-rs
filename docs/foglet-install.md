@@ -90,6 +90,31 @@ Substitute the actual user/group Foglet runs under on your host. If
 you use `FGK_SAVE_DIR` to override the save root, point it at a
 directory with the same ownership.
 
+### 3.1 Shared-world directory (v2 world-enabled games)
+
+If `[world].enabled = true` in `assets/game.toml`, the package ships a
+`world/` directory at the install root (SPEC_v2 §6.1). The runtime
+opens (and on first launch creates) the SQLite file at
+`<install-dir>/world/world.sqlite` — by default `world/world.sqlite`
+relative to the binary, or whatever absolute/relative path
+`[world].path` points at. The directory MUST be writable by the same
+identity that owns `saves/`, because SQLite needs to write the DB file
+itself plus `-wal` and `-shm` siblings when WAL journaling is enabled
+(SPEC_v2 §6, default `journal_mode = "wal"`).
+
+Pre-create the directory with the same ownership as `saves/`:
+
+```bash
+sudo install -d -m 0755 -o foglet -g foglet \
+  /srv/foglet/doors/<slug>/world
+```
+
+`run.sh` never deletes or recreates `world/world.sqlite` (SPEC_v2
+§6.1), and `fgk package` does not pre-populate it — the database is
+authored by the game on first launch, then evolves through the
+migrations declared in `assets/world/migrations/`. Treat the file as
+durable game state, not a build artifact.
+
 ## 4. Install the manifest
 
 Foglet reads operator manifests from its configured manifest directory.
@@ -129,11 +154,65 @@ entirely by the Foglet manifest and host deployment (SPEC §13.3):
 - File permissions: `0755` on the binary and `run.sh`, `0644` on the
   manifest, `0755` on `assets/` and its contents. Save files are
   created `0644` by default; tighten with umask if your deployment
-  requires it.
+  requires it. For world-enabled games, `world/` is `0755` and
+  `world/world.sqlite` (plus `-wal` / `-shm` when WAL is on) is `0644`
+  — both owned by the door runtime user. Sandboxed deployments must
+  ensure the sandbox identity retains write access to `world/`, or the
+  shared world will fail to open and the door will exit with a
+  controlled error after terminal restoration (SPEC_v2 §8).
 
 The kit refuses to read inherited host environment beyond the
 documented `FOGLET_*` variables, and save files contain only
 game-defined state — never the Foglet context (SPEC §5.6, §12).
+
+### 5.1 Backing up the shared world
+
+The shared-world SQLite file is the *only* place v2 game state like
+the player registry, turn ledger, event log, and leaderboards lives.
+It is not reconstructible from saves. Back it up on a schedule that
+matches your tolerance for losing in-game state.
+
+Two safe backup strategies (SPEC_v2 §8 mandates that backups use one
+of these):
+
+1. **Stop-the-door copy.** Stop Foglet (or at least make the door
+   un-launchable so no new processes open the DB), then copy the
+   files:
+
+   ```bash
+   sudo systemctl stop foglet
+   sudo cp -a /srv/foglet/doors/<slug>/world \
+       /var/backups/foglet/<slug>/world-$(date +%Y%m%dT%H%M%S)
+   sudo systemctl start foglet
+   ```
+
+   Copy the whole `world/` directory, not just `world.sqlite` —
+   under WAL journaling the `-wal` and `-shm` files are part of the
+   committed state until the next checkpoint.
+
+2. **Online SQLite backup API.** Use `sqlite3 .backup` while the
+   door is live; it cooperates with WAL and produces a consistent
+   snapshot:
+
+   ```bash
+   sudo -u foglet sqlite3 \
+     /srv/foglet/doors/<slug>/world/world.sqlite \
+     ".backup '/var/backups/foglet/<slug>/world-$(date +%Y%m%dT%H%M%S).sqlite'"
+   ```
+
+   The output is a single file you can restore by stopping the door
+   and copying it back into place as `world/world.sqlite` (deleting
+   any stale `-wal`/`-shm` siblings first).
+
+**Do not** `cp world.sqlite` while a door process is live — under WAL
+that produces a torn snapshot. **Do not** rely on filesystem
+snapshots alone unless your snapshot tool is consistent across the
+DB file and its `-wal`/`-shm` siblings at the same instant.
+
+The kit does not migrate world data for you. If a migration in
+`assets/world/migrations/` is destructive, take a backup first; world
+migrations run idempotently on launch (SPEC_v2 §4) but the schema
+they leave behind is binding.
 
 ## 6. Foglet QA standards
 
@@ -190,6 +269,16 @@ saves for you.
   restoration (SPEC §7.3). Check that `assets/` shipped alongside the
   binary — the runtime resolves asset paths from `--assets`, which
   `run.sh` points at the install directory's `assets/`.
+- **Shared world fails to open / SQLite `database is locked`.**
+  Confirm `/srv/foglet/doors/<slug>/world/` is writable by the door
+  runtime user, including write access for the `-wal` and `-shm`
+  siblings SQLite creates next to `world.sqlite`. Stale lock files
+  from a crashed process clear themselves on the next clean open;
+  if they persist, stop the door, confirm no `<slug>` processes are
+  alive, and remove only the `-wal` / `-shm` files (never
+  `world.sqlite` itself). The runtime opens the DB during startup
+  and surfaces failures as a controlled error after terminal
+  restoration (SPEC_v2 §8).
 - **Saves not persisting across launches.** Confirm
   `/srv/foglet/doors/<slug>/saves/` is writable by the user Foglet
   runs the door under. Atomic writes go through a temp file in the
