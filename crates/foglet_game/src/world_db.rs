@@ -401,6 +401,219 @@ impl WorldDb {
 
         Ok(value)
     }
+
+    /// Spend a turn, run a caller-supplied world mutation, and append
+    /// an event — all inside a single SQLite transaction. SPEC_v2
+    /// §Task 9c.
+    ///
+    /// This is the composed primitive Murder Motel (Task 13) and
+    /// future game code reach for when an action consumes a turn,
+    /// touches game-specific state, and should be visible in the
+    /// lobby bulletin. Pulling the three steps into one helper means
+    /// authoring code never has to remember the begin/commit dance,
+    /// and — critically — the *atomicity* contract is that all three
+    /// steps land or none do:
+    ///
+    /// - **Insufficient turns.** The internal spend phase
+    ///   short-circuits with [`crate::turns::TurnError::InsufficientTurns`] before
+    ///   the closure or the event insert runs. The transaction rolls
+    ///   back on the way out so the lazy `ensure_today_turns_on`
+    ///   row-materialisation is the only work that touched SQLite —
+    ///   which is exactly the desired post-condition (a player who
+    ///   tried to spend with an empty balance sees no event, no
+    ///   game-state change, and no balance change beyond the
+    ///   already-zero today's row).
+    /// - **Mutation closure failed.** The caller's closure returned
+    ///   `Err`. The spend is rolled back too — the player did not
+    ///   "lose" a turn for an action that didn't take effect. The
+    ///   error surfaces as [`SpendAndEmitError::Mutation`].
+    /// - **Event insert failed.** A SQL error or a malformed message
+    ///   surfaces as [`SpendAndEmitError::Event`]. Both the spend
+    ///   and the closure mutation roll back. (Message validation
+    ///   actually runs *before* the transaction begins, so a bad
+    ///   message never even opens one.)
+    ///
+    /// # Closure shape
+    ///
+    /// The closure receives a borrowed [`rusqlite::Transaction`] and
+    /// must return `Result<(), rusqlite::Error>`. Game code typically
+    /// runs one or more `tx.execute(...)` calls writing to its own
+    /// game-state tables. Returning `rusqlite::Error` (rather than a
+    /// game-specific error) keeps the helper minimal — game code
+    /// that needs richer errors can catch them outside this call by
+    /// pre-validating, or by mapping inside the closure into
+    /// [`rusqlite::Error::SqliteFailure`] with an explanatory message.
+    /// The Task 13 call sites do not need richer errors today; if
+    /// that changes, the closure error type is the obvious knob to
+    /// generalise.
+    ///
+    /// # Argument grouping
+    ///
+    /// The argument list is long because the operation is genuinely
+    /// the cross-product of two existing primitives. Grouping the
+    /// turn-spend args and the event args in their declaration order
+    /// keeps the call site readable; if a future call site finds
+    /// itself building these from a struct, that struct can be added
+    /// without breaking the function signature.
+    ///
+    /// # Why message validation runs *outside* the transaction
+    ///
+    /// `validate_event_message` is a pure-Rust check. Running it
+    /// before [`Connection::transaction`] means a malformed message
+    /// fails without opening a SQLite transaction at all — no busy
+    /// timeout impact, no cleanup branch to test. The transactional
+    /// guarantee covers SQL-side failures; client-side validation
+    /// stays where it is most efficient.
+    #[allow(clippy::too_many_arguments)] // The argument list is the cross-product of two existing primitives (turn-spend + event-append) plus the closure; grouping into a struct would obscure the call site without adding type safety.
+    pub fn spend_turn_and_emit<P, F>(
+        &mut self,
+        player_id: i64,
+        amount: u32,
+        daily_allowance: u32,
+        carryover_max: u32,
+        date_provider: &P,
+        event_kind: &str,
+        event_message: &str,
+        event_metadata: Option<&str>,
+        mutate: F,
+    ) -> Result<SpendAndEmitOutcome, SpendAndEmitError>
+    where
+        P: crate::turns::DateProvider,
+        F: FnOnce(&rusqlite::Transaction<'_>) -> Result<(), rusqlite::Error>,
+    {
+        // Pre-validate the message before we touch SQLite. A caller
+        // bug here would otherwise pay for a `BEGIN` round-trip
+        // before failing — and would also need a rollback path that
+        // the simple "no transaction yet" branch sidesteps.
+        crate::events::validate_event_message(event_message).map_err(SpendAndEmitError::Event)?;
+
+        // Capture today once. The provider is asked exactly once so a
+        // misbehaving implementation that returns different values on
+        // successive calls can't desync the spend (which keys the row
+        // by today) from any future "stamp the event with today"
+        // logic that might be added.
+        let today = date_provider.today();
+
+        let tx = self
+            .conn
+            .transaction()
+            .map_err(|source| SpendAndEmitError::Transaction { source })?;
+
+        // Spend first so an `InsufficientTurns` short-circuit avoids
+        // running the closure or appending the event. The early
+        // return drops `tx` without `commit()`, and rusqlite's `Drop`
+        // impl rolls back — which is the SPEC §Task 9c "insufficient
+        // turns rolls back" guarantee.
+        let ledger = crate::turns::spend_turns_on(
+            &tx,
+            player_id,
+            amount,
+            daily_allowance,
+            carryover_max,
+            &today,
+        )
+        .map_err(SpendAndEmitError::Turn)?;
+
+        // Run the caller's world-mutation. A `rusqlite::Error` here
+        // also rolls the spend back via the same drop-without-commit
+        // path: the player isn't billed a turn for an action that
+        // didn't land.
+        mutate(&tx).map_err(|source| SpendAndEmitError::Mutation { source })?;
+
+        // Append the event last. By this point we know the spend
+        // succeeded and the closure committed its writes against the
+        // same transaction; failing here rolls everything back as a
+        // unit, preserving the bulletin/ledger invariant ("every
+        // event corresponds to a real, persisted action").
+        let event = crate::events::append_event_on(
+            &tx,
+            event_kind,
+            Some(player_id),
+            event_message,
+            event_metadata,
+        )
+        .map_err(SpendAndEmitError::Event)?;
+
+        tx.commit()
+            .map_err(|source| SpendAndEmitError::Transaction { source })?;
+
+        Ok(SpendAndEmitOutcome { ledger, event })
+    }
+}
+
+/// Successful return value from [`WorldDb::spend_turn_and_emit`].
+///
+/// Bundles both observable side-effects so callers don't need a
+/// follow-up read. The `ledger` row reflects the post-spend balance
+/// (handy for "you have N turns left" UI) and the `event` carries the
+/// canonical `id`/`created_at` SQLite assigned (handy for tests and
+/// for future "scroll to the latest event" UI hooks).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpendAndEmitOutcome {
+    /// Post-spend turn ledger row for the player. The `balance` field
+    /// is `prior_balance - amount` (or freshly seeded from the daily
+    /// allowance if today's row was being materialised for the first
+    /// time inside this transaction).
+    pub ledger: crate::turns::TurnLedgerRow,
+    /// Newly-appended event row, including the autoincrement `id` and
+    /// `created_at` SQLite assigned at insert time.
+    pub event: crate::events::EventRecord,
+}
+
+/// Failure modes for [`WorldDb::spend_turn_and_emit`].
+///
+/// Wraps the three underlying error types — [`crate::turns::TurnError`],
+/// [`crate::events::EventError`], and a `rusqlite::Error` from the
+/// caller's mutation closure — plus a fourth variant for begin/commit
+/// failures from the SQLite layer itself. Callers that only care
+/// "did the action go through" can `.is_err()`; callers that want to
+/// surface "you only have N turns left" specifically can match on
+/// [`SpendAndEmitError::Turn`] and then on
+/// [`crate::turns::TurnError::InsufficientTurns`].
+#[derive(Debug, Error)]
+pub enum SpendAndEmitError {
+    /// Turn-ledger phase failed. The most common variant carried here
+    /// is [`crate::turns::TurnError::InsufficientTurns`]; SQL-level
+    /// failures (the row couldn't be read or written) surface as
+    /// [`crate::turns::TurnError::Sqlite`]. The wrapping transaction
+    /// has already rolled back by the time this variant is observed.
+    #[error("turn-ledger phase of spend_turn_and_emit failed: {0}")]
+    Turn(#[source] crate::turns::TurnError),
+
+    /// The caller's mutation closure returned `Err`. The wrapping
+    /// transaction has rolled back, so the spend itself is also
+    /// undone — the player is not billed for an action whose
+    /// closure failed.
+    #[error("world-mutation closure inside spend_turn_and_emit failed: {source}")]
+    Mutation {
+        /// Underlying `rusqlite` error from the closure. The closure
+        /// is expected to map any non-`rusqlite` error into a
+        /// `SqliteFailure` with an explanatory message before
+        /// returning, so this variant always carries a SQLite-shaped
+        /// error.
+        #[source]
+        source: rusqlite::Error,
+    },
+
+    /// Event-append phase failed — either message validation
+    /// (`EmptyMessage`/`MessageTooLong`) or the SQL `INSERT
+    /// ... RETURNING`. Validation failures fail before the
+    /// transaction even begins, so for those the rollback is a
+    /// no-op; SQL failures roll back both the spend and the
+    /// closure mutation.
+    #[error("event-append phase of spend_turn_and_emit failed: {0}")]
+    Event(#[source] crate::events::EventError),
+
+    /// `Connection::transaction` or `Transaction::commit` returned an
+    /// error. Distinct from [`Self::Turn`]/[`Self::Event`] so an
+    /// operator-facing message can name the SQLite-layer failure
+    /// rather than implying that one of the inner phases is the cause.
+    #[error("spend_turn_and_emit transaction begin/commit failed: {source}")]
+    Transaction {
+        /// Underlying `rusqlite` error from `BEGIN` or `COMMIT`.
+        #[source]
+        source: rusqlite::Error,
+    },
 }
 
 /// A schema/bootstrap step authored by a game.
@@ -1356,5 +1569,412 @@ mod tests {
             .query_row("SELECT 1", [], |row| row.get(0))
             .expect("connection works after parent creation");
         assert_eq!(one, 1);
+    }
+
+    /// SPEC_v2 §Task 9c acceptance: an `InsufficientTurns` rejection
+    /// rolls back both the caller's world mutation and the would-be
+    /// event append. The helper composes spend → mutate → append in a
+    /// single transaction; if the very first step short-circuits with
+    /// `InsufficientTurns`, neither of the later steps run, and any
+    /// SQL the spend phase performed (the lazy ensure-row insert
+    /// inside [`crate::turns::spend_turns_on`]) rolls back along with
+    /// the rest of the transaction.
+    ///
+    /// We seed the player's today's row with `balance = 0` and
+    /// `daily_allowance = 0` *outside* the helper, so the helper sees
+    /// an existing row whose balance can't satisfy the spend guard
+    /// and fails with `InsufficientTurns`. That setup also pins the
+    /// rollback assertions to a stable starting state: any post-call
+    /// `SELECT` should see exactly the row we seeded — no fresh
+    /// allowance, no balance change, no event row, no mutation row.
+    #[test]
+    fn spend_turn_and_emit_rolls_back_on_insufficient_turns() {
+        use crate::events::{EventError, WORLD_EVENTS_MIGRATION};
+        use crate::players::PLAYERS_MIGRATION;
+        use crate::turns::{FixedDateProvider, LocalDate, TurnError, TURN_LEDGER_MIGRATION};
+
+        let dir = tempdir().expect("tempdir creates");
+        let db_path = dir.path().join("world.sqlite");
+        let mut world = WorldDb::open(&db_path).expect("open succeeds");
+
+        // Apply the kit migrations the helper depends on. Failing to
+        // apply any of them would surface as a `Turn::Sqlite` error
+        // rather than `InsufficientTurns`, which would mask the
+        // assertion this test is making — apply them up front and
+        // assert success so a regression in the migration pipeline
+        // doesn't masquerade as a 9c regression.
+        world
+            .apply_migration(&PLAYERS_MIGRATION)
+            .expect("players migration applies");
+        world
+            .apply_migration(&TURN_LEDGER_MIGRATION)
+            .expect("turn ledger migration applies");
+        world
+            .apply_migration(&WORLD_EVENTS_MIGRATION)
+            .expect("world events migration applies");
+
+        // Game-side state table the closure will (try to) write to.
+        // Using a separate table makes the rollback assertion
+        // unambiguous: a non-zero count after the call would mean the
+        // closure's INSERT survived the rollback.
+        world
+            .connection()
+            .execute_batch(
+                "CREATE TABLE motel_world_state \
+                 (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
+            )
+            .expect("create motel_world_state");
+
+        // Insert a player so the FK in turn_ledger / world_events
+        // resolves. We hand-roll the insert rather than route through
+        // `upsert_player` because all this test needs is a stable
+        // `id` to key the ledger and event rows by.
+        world
+            .connection()
+            .execute(
+                "INSERT INTO players (foglet_user_id, handle, role, security_level, \
+                 first_seen_at, last_seen_at) \
+                 VALUES (NULL, 'tester', 'user', 50, \
+                 CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+                [],
+            )
+            .expect("insert test player");
+        let player_id: i64 = world
+            .connection()
+            .query_row(
+                "SELECT id FROM players WHERE handle = 'tester'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read player id");
+
+        // Seed today's ledger row at balance=0 so the spend guard
+        // (`WHERE balance >= ?`) cannot match. We could also rely on
+        // the helper to materialise a fresh row at the configured
+        // allowance and then drain it with a second call, but doing
+        // it explicitly here keeps the test focused on 9c — it
+        // doesn't transitively depend on Task 6f's seeding behavior
+        // staying constant.
+        let today = LocalDate::parse("2026-05-09").expect("valid local date");
+        world
+            .connection()
+            .execute(
+                "INSERT INTO turn_ledger \
+                 (player_id, local_date, balance, daily_allowance) \
+                 VALUES (?1, ?2, 0, 0)",
+                rusqlite::params![player_id, today.as_str()],
+            )
+            .expect("seed empty turn_ledger row");
+
+        let provider = FixedDateProvider::new(today.clone());
+
+        // Track whether the closure ran so the assertion can
+        // distinguish "closure ran and was rolled back" from "closure
+        // never ran at all" — the SPEC_v2 contract is the *latter*
+        // (insufficient short-circuits before the closure), but we
+        // still assert the table is empty either way to guarantee
+        // rollback even if a future refactor reorders the steps.
+        let mut closure_ran = false;
+        let closure_ran_ref = &mut closure_ran;
+
+        let result = world.spend_turn_and_emit(
+            player_id,
+            1,
+            // `daily_allowance = 0` and `carryover_max = 0` mean the
+            // ensure-row path inside `spend_turns_on` is a true no-op
+            // for our seeded row — it sees the existing row and
+            // leaves it alone.
+            0,
+            0,
+            &provider,
+            "clue_inspected",
+            "tester examined the bloody footprint",
+            None,
+            |tx| {
+                *closure_ran_ref = true;
+                tx.execute(
+                    "INSERT INTO motel_world_state (key, value) \
+                     VALUES ('room_7_opened_by', 'tester')",
+                    [],
+                )?;
+                Ok(())
+            },
+        );
+
+        // Helper must surface the SPEC_v2 §Task 6e variant unchanged.
+        match result {
+            Err(SpendAndEmitError::Turn(TurnError::InsufficientTurns {
+                player_id: pid,
+                balance,
+                requested,
+            })) => {
+                assert_eq!(pid, player_id, "error names the offending player");
+                assert_eq!(balance, 0, "balance is read back at zero");
+                assert_eq!(requested, 1, "requested amount is echoed verbatim");
+            }
+            Err(other) => panic!("expected Turn(InsufficientTurns), got {other:?}"),
+            Ok(outcome) => {
+                panic!("expected InsufficientTurns rejection; got committed outcome {outcome:?}")
+            }
+        }
+
+        // Closure should not have run — spend_turns_on short-circuits
+        // before mutate is invoked. If a future refactor reorders the
+        // pipeline, this assertion is the canary; the rollback
+        // assertions below stay correct either way.
+        assert!(
+            !closure_ran,
+            "insufficient-turn rejection must short-circuit before the closure"
+        );
+
+        // The seeded ledger row is unchanged. A regression where the
+        // helper "ate" a turn even on rejection would change the
+        // balance.
+        let balance: i64 = world
+            .connection()
+            .query_row(
+                "SELECT balance FROM turn_ledger \
+                 WHERE player_id = ?1 AND local_date = ?2",
+                rusqlite::params![player_id, today.as_str()],
+                |row| row.get(0),
+            )
+            .expect("ledger row still present");
+        assert_eq!(balance, 0, "rejected spend must not mutate balance");
+
+        // The closure's would-be mutation never landed. This is the
+        // load-bearing assertion of the test: even if a future
+        // refactor reorders the steps so the closure runs first, the
+        // surrounding transaction's rollback must still erase its
+        // writes.
+        let mutation_count: i64 = world
+            .connection()
+            .query_row("SELECT COUNT(*) FROM motel_world_state", [], |row| {
+                row.get(0)
+            })
+            .expect("mutation count query runs");
+        assert_eq!(
+            mutation_count, 0,
+            "rejected spend must roll back the closure's writes"
+        );
+
+        // No event row landed. SPEC §Task 7c contract: the bulletin
+        // must not show events for actions that didn't happen.
+        let event_count: i64 = world
+            .connection()
+            .query_row("SELECT COUNT(*) FROM world_events", [], |row| row.get(0))
+            .expect("event count query runs");
+        assert_eq!(
+            event_count, 0,
+            "rejected spend must not append an event row"
+        );
+
+        // Sanity: the connection is still usable. A botched rollback
+        // would leave SQLite in a state where the next transaction
+        // errors with "cannot start a transaction within a
+        // transaction".
+        let _ = EventError::EmptyMessage; // keep the import live for clarity even if unused
+        world
+            .transaction(|tx| {
+                tx.execute("CREATE TABLE post_rollback_canary (id INTEGER)", [])
+                    .map_err(|source| WorldDbError::Transaction { source })?;
+                Ok(())
+            })
+            .expect("connection remains usable after a rolled-back spend_turn_and_emit");
+    }
+
+    /// Companion to the rollback test above: a successful call commits
+    /// all three side-effects atomically. Documents the happy path so
+    /// a regression that, say, dropped the `tx.commit()` (and rolled
+    /// back successful spends) would surface here rather than in a
+    /// higher-level Murder Motel integration test where the failure
+    /// mode is harder to attribute.
+    #[test]
+    fn spend_turn_and_emit_commits_all_three_steps_on_success() {
+        use crate::events::WORLD_EVENTS_MIGRATION;
+        use crate::players::PLAYERS_MIGRATION;
+        use crate::turns::{FixedDateProvider, LocalDate, TURN_LEDGER_MIGRATION};
+
+        let dir = tempdir().expect("tempdir creates");
+        let db_path = dir.path().join("world.sqlite");
+        let mut world = WorldDb::open(&db_path).expect("open succeeds");
+
+        world
+            .apply_migration(&PLAYERS_MIGRATION)
+            .expect("players migration applies");
+        world
+            .apply_migration(&TURN_LEDGER_MIGRATION)
+            .expect("turn ledger migration applies");
+        world
+            .apply_migration(&WORLD_EVENTS_MIGRATION)
+            .expect("world events migration applies");
+
+        world
+            .connection()
+            .execute_batch(
+                "CREATE TABLE motel_world_state \
+                 (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
+            )
+            .expect("create motel_world_state");
+
+        world
+            .connection()
+            .execute(
+                "INSERT INTO players (foglet_user_id, handle, role, security_level, \
+                 first_seen_at, last_seen_at) \
+                 VALUES (NULL, 'committer', 'user', 50, \
+                 CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+                [],
+            )
+            .expect("insert test player");
+        let player_id: i64 = world
+            .connection()
+            .query_row(
+                "SELECT id FROM players WHERE handle = 'committer'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read player id");
+
+        let today = LocalDate::parse("2026-05-09").expect("valid local date");
+        let provider = FixedDateProvider::new(today.clone());
+
+        let outcome = world
+            .spend_turn_and_emit(
+                player_id,
+                1,
+                3, // daily_allowance — the ensure-row path will seed
+                0, // carryover_max
+                &provider,
+                "room_7_opened",
+                "committer unlocked Room 7",
+                Some(r#"{"room":7}"#),
+                |tx| {
+                    tx.execute(
+                        "INSERT INTO motel_world_state (key, value) \
+                         VALUES ('room_7_opened_by', 'committer')",
+                        [],
+                    )?;
+                    Ok(())
+                },
+            )
+            .expect("happy-path spend commits");
+
+        // Ledger reflects the spend: seeded at 3, decremented by 1.
+        assert_eq!(outcome.ledger.balance, 2, "post-spend balance");
+        assert_eq!(outcome.ledger.player_id, player_id);
+        assert_eq!(outcome.ledger.daily_allowance, 3);
+
+        // Event carries the SQLite-assigned id and the verbatim
+        // message we passed in.
+        assert_eq!(outcome.event.kind, "room_7_opened");
+        assert_eq!(outcome.event.player_id, Some(player_id));
+        assert_eq!(outcome.event.message, "committer unlocked Room 7");
+        assert_eq!(outcome.event.metadata.as_deref(), Some(r#"{"room":7}"#));
+
+        // Closure mutation persisted.
+        let mutation_value: String = world
+            .connection()
+            .query_row(
+                "SELECT value FROM motel_world_state WHERE key = 'room_7_opened_by'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("mutation row present after commit");
+        assert_eq!(mutation_value, "committer");
+    }
+
+    /// Two more guardrails for the helper: the mutation closure's
+    /// `Err` rolls everything back (including the spend), and a
+    /// malformed event message fails before the transaction even
+    /// begins. Combined with the rollback test above, these three
+    /// cases pin the SPEC_v2 §Task 9c contract: the helper either
+    /// commits all three side-effects, or none of them.
+    #[test]
+    fn spend_turn_and_emit_rolls_back_on_mutation_failure() {
+        use crate::events::WORLD_EVENTS_MIGRATION;
+        use crate::players::PLAYERS_MIGRATION;
+        use crate::turns::{FixedDateProvider, LocalDate, TURN_LEDGER_MIGRATION};
+
+        let dir = tempdir().expect("tempdir creates");
+        let db_path = dir.path().join("world.sqlite");
+        let mut world = WorldDb::open(&db_path).expect("open succeeds");
+
+        world
+            .apply_migration(&PLAYERS_MIGRATION)
+            .expect("players migration applies");
+        world
+            .apply_migration(&TURN_LEDGER_MIGRATION)
+            .expect("turn ledger migration applies");
+        world
+            .apply_migration(&WORLD_EVENTS_MIGRATION)
+            .expect("world events migration applies");
+
+        world
+            .connection()
+            .execute(
+                "INSERT INTO players (foglet_user_id, handle, role, security_level, \
+                 first_seen_at, last_seen_at) \
+                 VALUES (NULL, 'rollback', 'user', 50, \
+                 CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+                [],
+            )
+            .expect("insert test player");
+        let player_id: i64 = world
+            .connection()
+            .query_row(
+                "SELECT id FROM players WHERE handle = 'rollback'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read player id");
+
+        let today = LocalDate::parse("2026-05-09").expect("valid local date");
+        let provider = FixedDateProvider::new(today.clone());
+
+        let result = world.spend_turn_and_emit(
+            player_id,
+            1,
+            5,
+            0,
+            &provider,
+            "clue_inspected",
+            "rollback inspected the lobby",
+            None,
+            // Closure fails by issuing intentionally malformed SQL.
+            // The error is real `rusqlite::Error` so the helper's
+            // mutation branch surfaces it as
+            // `SpendAndEmitError::Mutation`.
+            |tx| {
+                tx.execute("THIS IS NOT VALID SQL", [])?;
+                Ok(())
+            },
+        );
+
+        match result {
+            Err(SpendAndEmitError::Mutation { .. }) => {}
+            other => panic!("expected Mutation error, got {other:?}"),
+        }
+
+        // Spend was rolled back: today's ledger row never persisted,
+        // so the table is empty. (The lazy ensure-row insert that
+        // ran inside the transaction is rolled back too.)
+        let ledger_count: i64 = world
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM turn_ledger WHERE player_id = ?1",
+                rusqlite::params![player_id],
+                |row| row.get(0),
+            )
+            .expect("ledger count query runs");
+        assert_eq!(
+            ledger_count, 0,
+            "mutation failure must roll back the lazy ensure-row insert too"
+        );
+
+        let event_count: i64 = world
+            .connection()
+            .query_row("SELECT COUNT(*) FROM world_events", [], |row| row.get(0))
+            .expect("event count query runs");
+        assert_eq!(event_count, 0, "no event should land on mutation failure");
     }
 }

@@ -485,90 +485,13 @@ impl WorldDb {
         date_provider: &P,
     ) -> Result<TurnLedgerRow, TurnError> {
         let today = date_provider.today();
-
-        // Cast `u32 → i64` once: SQLite stores INTEGER as 64-bit
-        // signed, and the cast cannot overflow because `u32::MAX <
-        // i64::MAX`. Doing it here keeps the bind sites below from
-        // sprouting `as i64` noise.
-        let allowance = i64::from(daily_allowance);
-        let cap = i64::from(carryover_max);
-
-        // Look up the most recent prior row for this player so we
-        // can compute today's seed balance. `LIMIT 1` against the
-        // composite primary key is a single index seek; a missing
-        // row (`None`) means the player hasn't played before today,
-        // so there's nothing to carry over.
-        //
-        // We deliberately query "any prior date" rather than
-        // strictly "yesterday": if a player skips a day, SPEC §4.6
-        // still wants their unspent balance carried, capped. The
-        // cap itself prevents a long absence from banking turns
-        // beyond `carryover_max`.
-        let prior_balance: Option<i64> = self
-            .connection()
-            .query_row(
-                "SELECT balance FROM turn_ledger \
-                 WHERE player_id = ?1 AND local_date < ?2 \
-                 ORDER BY local_date DESC LIMIT 1",
-                rusqlite::params![player_id, today.as_str()],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(|source| TurnError::Sqlite { source })?;
-
-        // `min(prior, cap)` clamps a high prior balance down to the
-        // configured maximum; `max(0)` defends against a negative
-        // `prior` slipping through (the schema doesn't permit it,
-        // but a defensive clamp here means a future schema change
-        // can't quietly turn carryover into a balance subtraction).
-        // `carryover_max = 0` collapses both branches to zero.
-        let carry = prior_balance.unwrap_or(0).min(cap).max(0);
-        let starting_balance = allowance + carry;
-
-        // INSERT OR IGNORE: if today's row is already present
-        // (because we ran earlier today, or a sibling render path
-        // raced in front of us), this is a no-op and the follow-up
-        // SELECT returns whichever row is now there — preserving
-        // any spend that landed in between. The carryover lookup
-        // above is therefore only *applied* once per player per
-        // day; on the no-op branch its result is computed and
-        // discarded, which is harmless because we're not changing
-        // the persisted balance.
-        //
-        // The `daily_allowance` column stores the configured
-        // allowance (without the carry), keeping the column
-        // self-describing for operators reading the ledger cold.
-        self.connection()
-            .execute(
-                "INSERT OR IGNORE INTO turn_ledger \
-                 (player_id, local_date, balance, daily_allowance) \
-                 VALUES (?1, ?2, ?3, ?4)",
-                rusqlite::params![player_id, today.as_str(), starting_balance, allowance],
-            )
-            .map_err(|source| TurnError::Sqlite { source })?;
-
-        // SELECT today's row. We read both `balance` and
-        // `daily_allowance` rather than assuming `balance ==
-        // allowance`: on the no-op branch above the balance may
-        // already be lower than `daily_allowance`, and the stored
-        // allowance is whatever was configured when *this* row was
-        // created (not whatever the caller passed in just now).
-        let (balance, stored_allowance): (i64, i64) = self
-            .connection()
-            .query_row(
-                "SELECT balance, daily_allowance FROM turn_ledger \
-                 WHERE player_id = ?1 AND local_date = ?2",
-                rusqlite::params![player_id, today.as_str()],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .map_err(|source| TurnError::Sqlite { source })?;
-
-        Ok(TurnLedgerRow {
+        ensure_today_turns_on(
+            self.connection(),
             player_id,
-            local_date: today,
-            balance,
-            daily_allowance: stored_allowance,
-        })
+            daily_allowance,
+            carryover_max,
+            &today,
+        )
     }
 
     /// Atomically decrement today's balance for `player_id` by
@@ -656,93 +579,159 @@ impl WorldDb {
         carryover_max: u32,
         date_provider: &P,
     ) -> Result<TurnLedgerRow, TurnError> {
-        // Materialise today's row first (no-op if it already exists).
-        // Capturing the returned row gives us the canonical date the
-        // provider reported, so the subsequent UPDATE binds the same
-        // string the row was keyed under — no risk of the provider
-        // returning a different value between calls in a misbehaving
-        // implementation. `carryover_max` is plumbed through so the
-        // first spend of a new day seeds the ledger with the capped
-        // carry from the player's most recent prior row (Task 6f).
-        let row =
-            self.ensure_today_turns(player_id, daily_allowance, carryover_max, date_provider)?;
+        let today = date_provider.today();
+        spend_turns_on(
+            self.connection(),
+            player_id,
+            amount,
+            daily_allowance,
+            carryover_max,
+            &today,
+        )
+    }
+}
 
-        // Cast amount once — SQLite stores INTEGER as 64-bit signed,
-        // u32 → i64 is infallible.
-        let delta = i64::from(amount);
+/// Free-function form of [`WorldDb::ensure_today_turns`] that operates
+/// on any `&Connection` — including the `&Transaction` handed to a
+/// closure inside [`WorldDb::transaction`] (since `rusqlite::Transaction`
+/// derefs to `Connection`).
+///
+/// Pulled out so the SPEC_v2 §Task 9c spend-turn + mutate + append-event
+/// helper can run the same SQL inside a single transaction without
+/// re-borrowing the [`WorldDb`] (which the in-flight transaction
+/// already borrows mutably). The body is identical to the documented
+/// behavior on the method version — see those docs for the why.
+pub(crate) fn ensure_today_turns_on(
+    conn: &rusqlite::Connection,
+    player_id: i64,
+    daily_allowance: u32,
+    carryover_max: u32,
+    today: &LocalDate,
+) -> Result<TurnLedgerRow, TurnError> {
+    // Cast `u32 → i64` once: SQLite stores INTEGER as 64-bit signed,
+    // and the cast cannot overflow because `u32::MAX < i64::MAX`.
+    let allowance = i64::from(daily_allowance);
+    let cap = i64::from(carryover_max);
 
-        // Single atomic UPDATE: `balance = balance - ?`. The WHERE
-        // clause matches exactly one row via the composite primary
-        // key, so this is the per-row atomic decrement SPEC §4.6
-        // requires. `updated_at = CURRENT_TIMESTAMP` keeps the audit
-        // column meaningful — operators reading the table cold see
-        // when the last spend landed.
-        //
-        // The `balance >= ?1` guard is the SPEC_v2 §Task 6e
-        // insufficient-turn check. Folding it into the same UPDATE
-        // (rather than checking `row.balance` from
-        // `ensure_today_turns` and branching in Rust) lets SQLite
-        // serialise the read-and-write atomically — even with a
-        // sibling connection racing through its own busy-timeout
-        // queue, only one of the two spends can satisfy the guard.
-        // A zero-amount spend still matches because `balance >= 0`
-        // is trivially true; the existing 6d "zero amount is a
-        // no-op" contract is preserved.
-        let updated = self
-            .connection()
-            .execute(
-                "UPDATE turn_ledger \
-                 SET balance = balance - ?1, updated_at = CURRENT_TIMESTAMP \
-                 WHERE player_id = ?2 AND local_date = ?3 AND balance >= ?1",
-                rusqlite::params![delta, player_id, row.local_date.as_str()],
-            )
-            .map_err(|source| TurnError::Sqlite { source })?;
+    // Most-recent prior row for the player, if any. `LIMIT 1` against
+    // the composite primary key is a single index seek; `None` means
+    // the player has never had a ledger row, so there's nothing to
+    // carry over. We query "any prior date" rather than strictly
+    // yesterday so a player who skipped a day still receives their
+    // capped unspent balance — see SPEC §4.6.
+    let prior_balance: Option<i64> = conn
+        .query_row(
+            "SELECT balance FROM turn_ledger \
+             WHERE player_id = ?1 AND local_date < ?2 \
+             ORDER BY local_date DESC LIMIT 1",
+            rusqlite::params![player_id, today.as_str()],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|source| TurnError::Sqlite { source })?;
 
-        // Zero rows updated ⇒ the guard rejected the spend. The row
-        // exists (ensure_today_turns just materialised it), so a
-        // miss can only mean `balance < amount`. Re-read the
-        // canonical balance for the error payload rather than
-        // trusting `row.balance` — a sibling spend could have landed
-        // between ensure and update, and we want the error to report
-        // what the next caller will actually see.
-        if updated == 0 {
-            let current_balance: i64 = self
-                .connection()
-                .query_row(
-                    "SELECT balance FROM turn_ledger \
-                     WHERE player_id = ?1 AND local_date = ?2",
-                    rusqlite::params![player_id, row.local_date.as_str()],
-                    |r| r.get(0),
-                )
-                .map_err(|source| TurnError::Sqlite { source })?;
-            return Err(TurnError::InsufficientTurns {
-                player_id,
-                balance: current_balance,
-                requested: delta,
-            });
-        }
+    // Clamp prior balance to the configured cap (and floor at 0 as a
+    // defensive belt-and-braces against a future schema change).
+    // `carryover_max = 0` collapses both branches to zero.
+    let carry = prior_balance.unwrap_or(0).min(cap).max(0);
+    let starting_balance = allowance + carry;
 
-        // Read back the row so the caller sees the post-spend
-        // balance. The stored `daily_allowance` is unchanged by the
-        // spend; we re-read it anyway so the returned struct is a
-        // straightforward "what's in the DB right now" snapshot.
-        let (balance, stored_allowance): (i64, i64) = self
-            .connection()
+    // INSERT OR IGNORE keeps "row already exists" a no-op rather than a
+    // typed error; the follow-up SELECT returns whichever row is now
+    // there, which preserves any spend that landed between calls.
+    conn.execute(
+        "INSERT OR IGNORE INTO turn_ledger \
+             (player_id, local_date, balance, daily_allowance) \
+             VALUES (?1, ?2, ?3, ?4)",
+        rusqlite::params![player_id, today.as_str(), starting_balance, allowance],
+    )
+    .map_err(|source| TurnError::Sqlite { source })?;
+
+    let (balance, stored_allowance): (i64, i64) = conn
+        .query_row(
+            "SELECT balance, daily_allowance FROM turn_ledger \
+             WHERE player_id = ?1 AND local_date = ?2",
+            rusqlite::params![player_id, today.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(|source| TurnError::Sqlite { source })?;
+
+    Ok(TurnLedgerRow {
+        player_id,
+        local_date: today.clone(),
+        balance,
+        daily_allowance: stored_allowance,
+    })
+}
+
+/// Free-function form of [`WorldDb::spend_turns`] that operates on any
+/// `&Connection`. Mirrors [`ensure_today_turns_on`]: pulled out so the
+/// Task 9c `spend_turn_and_emit` helper can compose the spend, the
+/// caller's world mutation, and the event append inside a single
+/// transaction without re-borrowing the [`WorldDb`].
+///
+/// The behavior — atomic decrement with a `WHERE balance >= ?` guard,
+/// canonical readback for the error payload — is identical to the
+/// method version. See [`WorldDb::spend_turns`] for the full rationale.
+pub(crate) fn spend_turns_on(
+    conn: &rusqlite::Connection,
+    player_id: i64,
+    amount: u32,
+    daily_allowance: u32,
+    carryover_max: u32,
+    today: &LocalDate,
+) -> Result<TurnLedgerRow, TurnError> {
+    let row = ensure_today_turns_on(conn, player_id, daily_allowance, carryover_max, today)?;
+
+    let delta = i64::from(amount);
+
+    // Atomic decrement with the SPEC §Task 6e insufficient-turn guard
+    // folded into the same UPDATE so two racing spenders can't both
+    // satisfy `balance >= ?` against the same starting balance.
+    let updated = conn
+        .execute(
+            "UPDATE turn_ledger \
+             SET balance = balance - ?1, updated_at = CURRENT_TIMESTAMP \
+             WHERE player_id = ?2 AND local_date = ?3 AND balance >= ?1",
+            rusqlite::params![delta, player_id, row.local_date.as_str()],
+        )
+        .map_err(|source| TurnError::Sqlite { source })?;
+
+    if updated == 0 {
+        // Re-read the canonical balance for the error payload — a
+        // sibling spend may have landed between ensure and update,
+        // and we want the error to reflect what the next caller will
+        // actually see.
+        let current_balance: i64 = conn
             .query_row(
-                "SELECT balance, daily_allowance FROM turn_ledger \
+                "SELECT balance FROM turn_ledger \
                  WHERE player_id = ?1 AND local_date = ?2",
                 rusqlite::params![player_id, row.local_date.as_str()],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| r.get(0),
             )
             .map_err(|source| TurnError::Sqlite { source })?;
-
-        Ok(TurnLedgerRow {
+        return Err(TurnError::InsufficientTurns {
             player_id,
-            local_date: row.local_date,
-            balance,
-            daily_allowance: stored_allowance,
-        })
+            balance: current_balance,
+            requested: delta,
+        });
     }
+
+    let (balance, stored_allowance): (i64, i64) = conn
+        .query_row(
+            "SELECT balance, daily_allowance FROM turn_ledger \
+             WHERE player_id = ?1 AND local_date = ?2",
+            rusqlite::params![player_id, row.local_date.as_str()],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .map_err(|source| TurnError::Sqlite { source })?;
+
+    Ok(TurnLedgerRow {
+        player_id,
+        local_date: row.local_date,
+        balance,
+        daily_allowance: stored_allowance,
+    })
 }
 
 #[cfg(test)]

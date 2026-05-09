@@ -310,31 +310,7 @@ impl WorldDb {
         message: &str,
         metadata: Option<&str>,
     ) -> Result<EventRecord, EventError> {
-        // `RETURNING` echoes every column in the same order the
-        // migration declares them so [`row_to_event_record`] can be
-        // shared with future read helpers (Tasks 7c, 7d) without each
-        // one redeclaring the column list. A regression that reorders
-        // the migration columns will flunk the schema test in this
-        // module before this decoder even runs.
-        // Validate before reaching SQL. A bad message is a caller bug,
-        // not a database problem — surfacing it as `EmptyMessage` /
-        // `MessageTooLong` is more actionable than the raw `rusqlite`
-        // error a CHECK constraint would emit, and it avoids paying for
-        // a round-trip on input that was always going to be rejected.
-        validate_event_message(message)?;
-
-        const SQL: &str = "\
-INSERT INTO world_events (kind, player_id, message, metadata) \
-VALUES (?1, ?2, ?3, ?4) \
-RETURNING id, created_at, kind, player_id, message, metadata";
-
-        self.connection()
-            .query_row(
-                SQL,
-                rusqlite::params![kind, player_id, message, metadata],
-                row_to_event_record,
-            )
-            .map_err(|source| EventError::Sqlite { source })
+        append_event_on(self.connection(), kind, player_id, message, metadata)
     }
 
     /// Return the `limit` most recently appended events, newest first
@@ -452,6 +428,39 @@ LIMIT ?2";
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(|source| EventError::Sqlite { source })
     }
+}
+
+/// Free-function form of [`WorldDb::append_event`] that operates on
+/// any `&Connection` — including the `&Transaction` handed to a
+/// closure inside [`WorldDb::transaction`] (since `rusqlite::Transaction`
+/// derefs to `Connection`).
+///
+/// Pulled out so the SPEC_v2 §Task 9c spend-turn + mutate + append-event
+/// helper can compose the validated event insert into a single
+/// transaction with the turn spend without re-borrowing the
+/// [`WorldDb`]. Validation runs first so a malformed message is rejected
+/// before any SQL round-trip — and, when called from the 9c helper,
+/// before the wrapping transaction has done any work.
+pub(crate) fn append_event_on(
+    conn: &rusqlite::Connection,
+    kind: &str,
+    player_id: Option<i64>,
+    message: &str,
+    metadata: Option<&str>,
+) -> Result<EventRecord, EventError> {
+    validate_event_message(message)?;
+
+    const SQL: &str = "\
+INSERT INTO world_events (kind, player_id, message, metadata) \
+VALUES (?1, ?2, ?3, ?4) \
+RETURNING id, created_at, kind, player_id, message, metadata";
+
+    conn.query_row(
+        SQL,
+        rusqlite::params![kind, player_id, message, metadata],
+        row_to_event_record,
+    )
+    .map_err(|source| EventError::Sqlite { source })
 }
 
 /// Decode a `world_events` row into [`EventRecord`].
