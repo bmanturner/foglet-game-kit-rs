@@ -633,6 +633,104 @@ impl<T> ChoicePrompt<T> {
     pub fn validate(&self) -> Result<(), PromptError> {
         validate_choices(&self.choices)
     }
+
+    /// Move the navigation cursor to the previous enabled choice
+    /// (SPEC_v1_1.md §4.5, "Up/Down selection movement when arrow mode
+    /// is enabled").
+    ///
+    /// # Policy
+    ///
+    /// - **Direct-key mode** (`selected == None`): no-op. Up/Down only
+    ///   participate when navigation was opted into via
+    ///   [`ChoicePrompt::navigable`]; a stray arrow press on a hotkey
+    ///   prompt must not silently spawn a cursor.
+    /// - **Disabled rows are skipped.** The cursor walks backwards from
+    ///   the current index, ignoring `enabled == false` rows, until it
+    ///   lands on the next enabled one. SPEC §4.1 keeps disabled rows
+    ///   visible (and their hotkeys reserved) precisely because they
+    ///   are non-pickable; the cursor honours that by refusing to
+    ///   highlight them.
+    /// - **Wrap, don't clamp.** Going Up from the topmost enabled choice
+    ///   moves to the bottommost enabled choice. Door-game menus are
+    ///   short (SPEC §4.4 ~5 typical) and wrapping matches what
+    ///   players already expect from BBS-era door UIs; clamping would
+    ///   require an extra Down press to reach the bottom of a
+    ///   four-item menu, which is the exact "feels broken" failure
+    ///   mode SPEC §4.5 calls out by listing the cursor at all.
+    /// - **All-disabled / single-enabled** lists are stable: the cursor
+    ///   stays where it is rather than spinning forever or being
+    ///   nudged to a disabled row.
+    ///
+    /// Mirrors [`ChoicePrompt::move_down`] in shape so authors can pair
+    /// them with their own keymap (`Up`/`k` → `move_up`, `Down`/`j` →
+    /// `move_down`, see Task 4d).
+    pub fn move_up(&mut self) {
+        self.step_selection(Direction::Up);
+    }
+
+    /// Move the navigation cursor to the next enabled choice
+    /// (SPEC_v1_1.md §4.5).
+    ///
+    /// Mirror of [`ChoicePrompt::move_up`]; see that doc-comment for the
+    /// full skip-disabled / wrap-around / no-op policy. The two methods
+    /// share an internal helper to guarantee they cannot drift.
+    pub fn move_down(&mut self) {
+        self.step_selection(Direction::Down);
+    }
+
+    /// Shared driver for [`ChoicePrompt::move_up`] and
+    /// [`ChoicePrompt::move_down`]. Walks the `choices` ring starting
+    /// after the current cursor position, skipping disabled rows, and
+    /// returns at the first enabled row found. If the only enabled row
+    /// is the one already selected (or none exist), the cursor stays
+    /// put — both because the externally visible behaviour is
+    /// "movement", and because spinning the loop for `len()` steps
+    /// without a destination would just hand the player back the same
+    /// index anyway.
+    fn step_selection(&mut self, direction: Direction) {
+        let Some(current) = self.selected else {
+            // Direct-key mode: ignore arrow input at the prompt layer
+            // entirely. The runtime will route the arrow event to
+            // whatever screen wraps the prompt.
+            return;
+        };
+        let len = self.choices.len();
+        // `selected = Some(i)` carries the invariant `i < len`, so an
+        // empty `choices` list cannot happen here. The check is cheap
+        // insurance against a future builder method dropping a row
+        // without resyncing `selected`.
+        if len == 0 {
+            return;
+        }
+        // Walk at most `len - 1` neighbour positions. We deliberately
+        // skip distance 0 (the current row) so a single Up on a
+        // one-enabled-choice prompt is a no-op rather than re-selecting
+        // the same row. `len - 1` is the largest meaningful step: one
+        // more would land back on `current`.
+        for step in 1..len {
+            let idx = match direction {
+                Direction::Up => (current + len - step) % len,
+                Direction::Down => (current + step) % len,
+            };
+            if self.choices[idx].enabled {
+                self.selected = Some(idx);
+                return;
+            }
+        }
+        // No other enabled choice exists. Leave `selected` untouched so
+        // the caller's render still has a valid cursor; Task 4c's Enter
+        // handler will continue to fire on the current (still-enabled)
+        // row.
+    }
+}
+
+/// Internal direction marker for [`ChoicePrompt::step_selection`].
+/// Kept private — the public surface is the two `move_up`/`move_down`
+/// methods, so callers never have to construct a direction value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Direction {
+    Up,
+    Down,
 }
 
 impl<T: Clone> ChoicePrompt<T> {
@@ -1676,6 +1774,138 @@ mod tests {
         // Enter currently has no navigation-confirm wiring — should
         // still collapse to `None` until Task 4c.
         assert_eq!(prompt.handle(Input::Enter), PromptAction::None);
+    }
+
+    #[test]
+    fn move_down_advances_to_next_enabled_choice() {
+        let mut prompt: ChoicePrompt<LootAction> = ChoicePrompt::new()
+            .choice('e', LootAction::Equip, "Equip")
+            .choice('t', LootAction::Take, "Take")
+            .navigable(true);
+        assert_eq!(prompt.selected, Some(0));
+        prompt.move_down();
+        assert_eq!(prompt.selected, Some(1));
+    }
+
+    #[test]
+    fn move_up_walks_back_to_previous_enabled_choice() {
+        let mut prompt: ChoicePrompt<LootAction> = ChoicePrompt::new()
+            .choice('e', LootAction::Equip, "Equip")
+            .choice('t', LootAction::Take, "Take")
+            .choice('p', LootAction::Pass, "Pass")
+            .navigable(true);
+        prompt.move_down();
+        prompt.move_down();
+        assert_eq!(prompt.selected, Some(2));
+        prompt.move_up();
+        assert_eq!(prompt.selected, Some(1));
+    }
+
+    #[test]
+    fn move_down_skips_disabled_rows() {
+        // Middle choice is disabled — Down from the top must land on
+        // index 2, not on the disabled index 1.
+        let mut prompt: ChoicePrompt<LootAction> = ChoicePrompt::new()
+            .choice('e', LootAction::Equip, "Equip")
+            .choice('t', LootAction::Take, "Take")
+            .disabled_if(true, "no slot")
+            .choice('p', LootAction::Pass, "Pass")
+            .navigable(true);
+        assert_eq!(prompt.selected, Some(0));
+        prompt.move_down();
+        assert_eq!(prompt.selected, Some(2));
+    }
+
+    #[test]
+    fn move_up_skips_disabled_rows() {
+        // Same shape; Up from the bottom must skip the disabled middle
+        // row and land on the top.
+        let mut prompt: ChoicePrompt<LootAction> = ChoicePrompt::new()
+            .choice('e', LootAction::Equip, "Equip")
+            .choice('t', LootAction::Take, "Take")
+            .disabled_if(true, "no slot")
+            .choice('p', LootAction::Pass, "Pass")
+            .navigable(true);
+        // Seed the cursor on the bottom row by stepping past the
+        // disabled middle.
+        prompt.move_down();
+        assert_eq!(prompt.selected, Some(2));
+        prompt.move_up();
+        assert_eq!(prompt.selected, Some(0));
+    }
+
+    #[test]
+    fn move_down_wraps_from_last_enabled_to_first_enabled() {
+        // SPEC §4.5 leaves wrap-vs-clamp to the implementation; this
+        // pins the kit's chosen wrap policy so a future regression to
+        // clamping fails loudly.
+        let mut prompt: ChoicePrompt<LootAction> = ChoicePrompt::new()
+            .choice('e', LootAction::Equip, "Equip")
+            .choice('t', LootAction::Take, "Take")
+            .navigable(true);
+        prompt.move_down();
+        assert_eq!(prompt.selected, Some(1));
+        prompt.move_down();
+        assert_eq!(prompt.selected, Some(0));
+    }
+
+    #[test]
+    fn move_up_wraps_from_first_enabled_to_last_enabled() {
+        let mut prompt: ChoicePrompt<LootAction> = ChoicePrompt::new()
+            .choice('e', LootAction::Equip, "Equip")
+            .choice('t', LootAction::Take, "Take")
+            .choice('p', LootAction::Pass, "Pass")
+            .navigable(true);
+        assert_eq!(prompt.selected, Some(0));
+        prompt.move_up();
+        assert_eq!(prompt.selected, Some(2));
+    }
+
+    #[test]
+    fn wrap_skips_disabled_trailing_row() {
+        // Last choice is disabled — Down from index 1 must wrap past
+        // the disabled tail row and land on index 0, not on index 2.
+        let mut prompt: ChoicePrompt<LootAction> = ChoicePrompt::new()
+            .choice('e', LootAction::Equip, "Equip")
+            .choice('t', LootAction::Take, "Take")
+            .choice('p', LootAction::Pass, "Pass")
+            .disabled_if(true, "out of stock")
+            .navigable(true);
+        prompt.move_down();
+        assert_eq!(prompt.selected, Some(1));
+        prompt.move_down();
+        assert_eq!(prompt.selected, Some(0));
+    }
+
+    #[test]
+    fn move_is_noop_when_only_one_enabled_choice() {
+        // One enabled, several disabled — cursor stays put on every
+        // direction press (no spinning, no landing on a disabled row).
+        let mut prompt: ChoicePrompt<LootAction> = ChoicePrompt::new()
+            .choice('e', LootAction::Equip, "Equip")
+            .choice('t', LootAction::Take, "Take")
+            .disabled_if(true, "no slot")
+            .choice('p', LootAction::Pass, "Pass")
+            .disabled_if(true, "vendor closed")
+            .navigable(true);
+        assert_eq!(prompt.selected, Some(0));
+        prompt.move_down();
+        assert_eq!(prompt.selected, Some(0));
+        prompt.move_up();
+        assert_eq!(prompt.selected, Some(0));
+    }
+
+    #[test]
+    fn move_is_noop_in_direct_key_mode() {
+        // Without `.navigable(true)` the cursor is `None` and arrow
+        // movement at the prompt layer must not invent one.
+        let mut prompt: ChoicePrompt<LootAction> = ChoicePrompt::new()
+            .choice('e', LootAction::Equip, "Equip")
+            .choice('t', LootAction::Take, "Take");
+        assert_eq!(prompt.selected, None);
+        prompt.move_down();
+        prompt.move_up();
+        assert_eq!(prompt.selected, None);
     }
 
     #[test]
