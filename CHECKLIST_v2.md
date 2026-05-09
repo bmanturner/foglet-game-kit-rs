@@ -60,7 +60,7 @@ One unchecked item per iteration. Dependencies in `[brackets]` must be checked o
 - [x] **8b** — Implement `set_score`. Test: first write creates a row. [8a]
 - [x] **8c** — Implement `increment_score`. Test: increments existing score and creates missing score. [8b]
 - [x] **8d** — Implement `top_scores(name, n)`. Test: deterministic tie ordering by score then updated/player id. [8c]
-- [ ] **8e** — Implement `player_rank(name, player_id)`. Test: rank reflects tie ordering. [8d]
+- [x] **8e** — Implement `player_rank(name, player_id)`. Test: rank reflects tie ordering. [8d]
 
 ### Task 9 — Transaction helper
 

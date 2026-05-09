@@ -7,10 +7,12 @@
 //!   `(board, player_id)` row to an absolute value.
 //! - 8c adds [`WorldDb::increment_score`] for delta updates that don't
 //!   require the caller to know the prior score.
-//! - 8d (this iteration) adds [`WorldDb::top_scores`] for the
-//!   leaderboard render — `Desc`/`Asc` sort with deterministic
-//!   `(updated_at, player_id)` tie ordering.
-//! - 8e will add `player_rank(name, player_id)` for "you are #N".
+//! - 8d adds [`WorldDb::top_scores`] for the leaderboard render —
+//!   `Desc`/`Asc` sort with deterministic `(updated_at, player_id)`
+//!   tie ordering.
+//! - 8e (this iteration) adds [`WorldDb::player_rank`] for "you are
+//!   #N", reusing the same tie ordering as [`WorldDb::top_scores`] so
+//!   a player's rank line agrees with their row in the leaderboard.
 //!
 //! Splitting the schema commit from the helper commits keeps the
 //! bisect signal sharp: a regression that drops a column or an index
@@ -518,6 +520,152 @@ LIMIT ?2";
             .map_err(|source| LeaderboardError::Sqlite { source })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(|source| LeaderboardError::Sqlite { source })
+    }
+
+    /// Return one player's 1-based rank on a named board, or `None` if
+    /// the player has no score on that board (SPEC_v2 §4.8 / §Task 8e).
+    ///
+    /// The contract is "given the same `sort` direction
+    /// [`Self::top_scores`] would use, what position would this
+    /// player's row occupy?". Rank `1` is the head of the leaderboard,
+    /// rank `N` is the tail (where `N` is the total row count on the
+    /// board). A player with no row on the board returns `Ok(None)`
+    /// rather than an error: an unranked player is a normal UI state
+    /// (the leaderboard render shows "—" or "unranked"), not a caller
+    /// bug. Distinguishing "no row" from "rank 0" with `Option`
+    /// prevents callers from rendering a misleading "rank 0" line.
+    ///
+    /// # Tie ordering — same chain as [`Self::top_scores`]
+    ///
+    /// Rank counts how many rows would appear *ahead* of the player in
+    /// `top_scores`'s ordering, plus one. The tiebreaker chain is
+    /// identical so the two helpers can never disagree:
+    ///
+    /// 1. Primary: `score` in the requested direction (`Desc` → higher
+    ///    is better; `Asc` → lower is better).
+    /// 2. Secondary: `updated_at ASC` — earlier writer wins a score
+    ///    tie.
+    /// 3. Tertiary: `player_id ASC` — final monotone tiebreaker.
+    ///
+    /// A player who is the only row at their score still gets a sane
+    /// rank because the count of "rows ahead" is well-defined for any
+    /// total order.
+    ///
+    /// # Why one query, not two
+    ///
+    /// A naive implementation would `SELECT score, updated_at FROM
+    /// leaderboard_scores WHERE board = ? AND player_id = ?` and then
+    /// `SELECT COUNT(*) FROM leaderboard_scores WHERE …`. That's two
+    /// round-trips and a TOCTOU window where another writer could
+    /// shift the rank between calls. We fold both into one statement
+    /// using a correlated subquery on `me`, which gives a consistent
+    /// snapshot and halves the wire cost. The `(board, score,
+    /// player_id)` index from the migration covers the inner count.
+    ///
+    /// # Parameters
+    ///
+    /// `board` is validated by the shared `validate_board_name`
+    /// guard, same contract as the other leaderboard verbs: empty or
+    /// whitespace-only inputs fail fast with
+    /// [`LeaderboardError::EmptyBoardName`].
+    ///
+    /// `sort` must match the board's configured direction — passing
+    /// the wrong direction silently returns the rank in the *other*
+    /// ordering. The kit cannot infer it from the board name alone
+    /// because the leaderboard config is owned by the game-author;
+    /// callers that hold a [`crate::config::LeaderboardSection`]
+    /// should pass its `sort` field straight through, mirroring
+    /// [`Self::top_scores`].
+    ///
+    /// # Concurrency
+    ///
+    /// Takes `&self`: a single read statement under the configured
+    /// busy timeout, same as [`Self::top_scores`]. The runtime layer
+    /// (Task 10) will call this from the leaderboard render path
+    /// (Task 13f) to render "you are #N" alongside the top-scores
+    /// table.
+    pub fn player_rank(
+        &self,
+        board: &str,
+        sort: LeaderboardSort,
+        player_id: i64,
+    ) -> Result<Option<u64>, LeaderboardError> {
+        // Same blank-board contract as the other leaderboard verbs.
+        // Failing fast keeps an unreachable-board query from running.
+        validate_board_name(board)?;
+
+        // Two SQL strings — one per sort direction — for the same
+        // reason as `top_scores`: the comparison operator is part of
+        // the SQL grammar, not a bindable parameter, and the closed
+        // [`LeaderboardSort`] enum makes string-formatting needless.
+        //
+        // The correlated subquery counts rows on the same board that
+        // would appear *ahead* of `me` in the `top_scores` ordering.
+        // For `Desc`, "ahead" means strictly higher score, *or* tied
+        // score with an earlier `updated_at`, *or* tied
+        // (score, updated_at) with a smaller `player_id`. Adding one
+        // converts that count to a 1-based rank.
+        //
+        // `me` self-joins via the `WHERE` clause (`me.board = ?1 AND
+        // me.player_id = ?2`). If no such row exists, the outer query
+        // returns zero rows, which we surface as `Ok(None)` — the
+        // "unranked" state.
+        const SQL_DESC: &str = "\
+SELECT 1 + (\
+    SELECT COUNT(*) FROM leaderboard_scores other \
+    WHERE other.board = me.board \
+      AND ( \
+        other.score > me.score \
+        OR (other.score = me.score AND other.updated_at < me.updated_at) \
+        OR (other.score = me.score AND other.updated_at = me.updated_at \
+            AND other.player_id < me.player_id) \
+      ) \
+) AS rank \
+FROM leaderboard_scores me \
+WHERE me.board = ?1 AND me.player_id = ?2";
+        const SQL_ASC: &str = "\
+SELECT 1 + (\
+    SELECT COUNT(*) FROM leaderboard_scores other \
+    WHERE other.board = me.board \
+      AND ( \
+        other.score < me.score \
+        OR (other.score = me.score AND other.updated_at < me.updated_at) \
+        OR (other.score = me.score AND other.updated_at = me.updated_at \
+            AND other.player_id < me.player_id) \
+      ) \
+) AS rank \
+FROM leaderboard_scores me \
+WHERE me.board = ?1 AND me.player_id = ?2";
+        let sql = match sort {
+            LeaderboardSort::Desc => SQL_DESC,
+            LeaderboardSort::Asc => SQL_ASC,
+        };
+
+        // `query_row` returns `QueryReturnedNoRows` when the player
+        // has no row on this board. That is the "unranked" state, not
+        // an error — translate it to `Ok(None)` so callers can render
+        // it as a normal UI affordance. Any other rusqlite error is a
+        // genuine SQL failure and gets the standard mapping.
+        match self
+            .connection()
+            .query_row(sql, rusqlite::params![board, player_id], |row| {
+                row.get::<_, i64>(0)
+            }) {
+            Ok(rank) => {
+                // SQLite returns `INTEGER` as `i64`; the rank is
+                // logically a count + 1, so it cannot be negative
+                // unless something has gone deeply wrong with the
+                // query. Cast to `u64` via `try_into` so a negative
+                // value would surface as a SQL error rather than a
+                // panic, but in practice this branch is unreachable.
+                let rank: u64 = rank.try_into().map_err(|_| LeaderboardError::Sqlite {
+                    source: rusqlite::Error::IntegralValueOutOfRange(0, rank),
+                })?;
+                Ok(Some(rank))
+            }
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(source) => Err(LeaderboardError::Sqlite { source }),
+        }
     }
 }
 
@@ -1374,5 +1522,301 @@ mod tests {
             count, 0,
             "rejected increment_score calls must not write any rows"
         );
+    }
+
+    /// SPEC_v2 §Task 8e acceptance: `player_rank` reports the 1-based
+    /// position the player would occupy in [`WorldDb::top_scores`] on
+    /// a `Desc` board. The single best score is rank 1; the second
+    /// best is rank 2; the worst is rank N. A regression that started
+    /// counting from 0, or that returned the count of rows behind
+    /// instead of ahead, would flunk here.
+    #[test]
+    fn player_rank_desc_basic_ordering() {
+        let dir = tempdir().expect("tempdir creates");
+        let world = open_world_with_leaderboards(&dir);
+
+        let alice = world
+            .upsert_player(&ctx_with(Some("u-alice"), Some("alice")))
+            .expect("alice upsert");
+        let bob = world
+            .upsert_player(&ctx_with(Some("u-bob"), Some("bob")))
+            .expect("bob upsert");
+        let carol = world
+            .upsert_player(&ctx_with(Some("u-carol"), Some("carol")))
+            .expect("carol upsert");
+
+        world
+            .set_score("investigators", alice.id, 5)
+            .expect("alice score");
+        world
+            .set_score("investigators", bob.id, 12)
+            .expect("bob score");
+        world
+            .set_score("investigators", carol.id, 8)
+            .expect("carol score");
+
+        // Bob is best (12), Carol middle (8), Alice last (5) — same
+        // order as `top_scores` would return.
+        assert_eq!(
+            world
+                .player_rank("investigators", LeaderboardSort::Desc, bob.id)
+                .expect("rank query"),
+            Some(1)
+        );
+        assert_eq!(
+            world
+                .player_rank("investigators", LeaderboardSort::Desc, carol.id)
+                .expect("rank query"),
+            Some(2)
+        );
+        assert_eq!(
+            world
+                .player_rank("investigators", LeaderboardSort::Desc, alice.id)
+                .expect("rank query"),
+            Some(3)
+        );
+    }
+
+    /// `Asc` boards rank lowest score first. A regression that
+    /// hard-coded `Desc` semantics would put alice (highest score) at
+    /// rank 1 instead of last.
+    #[test]
+    fn player_rank_asc_basic_ordering() {
+        let dir = tempdir().expect("tempdir creates");
+        let world = open_world_with_leaderboards(&dir);
+
+        let alice = world
+            .upsert_player(&ctx_with(Some("u-alice"), Some("alice")))
+            .expect("alice upsert");
+        let bob = world
+            .upsert_player(&ctx_with(Some("u-bob"), Some("bob")))
+            .expect("bob upsert");
+
+        world.set_score("speedrun", alice.id, 90).expect("alice");
+        world.set_score("speedrun", bob.id, 45).expect("bob");
+
+        assert_eq!(
+            world
+                .player_rank("speedrun", LeaderboardSort::Asc, bob.id)
+                .expect("rank query"),
+            Some(1),
+            "lower score wins on Asc"
+        );
+        assert_eq!(
+            world
+                .player_rank("speedrun", LeaderboardSort::Asc, alice.id)
+                .expect("rank query"),
+            Some(2)
+        );
+    }
+
+    /// SPEC §4.8 mandates that `player_rank`'s tie ordering matches
+    /// `top_scores`. When two players share a score *and* an
+    /// `updated_at`, the smaller `player_id` ranks ahead — pinning
+    /// this invariant prevents the two helpers from drifting apart
+    /// such that a player's rank line would disagree with their row
+    /// in the top-scores table.
+    #[test]
+    fn player_rank_ties_match_top_scores_ordering() {
+        let dir = tempdir().expect("tempdir creates");
+        let world = open_world_with_leaderboards(&dir);
+
+        let alice = world
+            .upsert_player(&ctx_with(Some("u-alice"), Some("alice")))
+            .expect("alice upsert");
+        let bob = world
+            .upsert_player(&ctx_with(Some("u-bob"), Some("bob")))
+            .expect("bob upsert");
+        let carol = world
+            .upsert_player(&ctx_with(Some("u-carol"), Some("carol")))
+            .expect("carol upsert");
+
+        // All three identical scores; pin updated_at so the chain
+        // falls through to player_id (matching top_scores' tie test).
+        world
+            .set_score("investigators", carol.id, 7)
+            .expect("carol");
+        world
+            .set_score("investigators", alice.id, 7)
+            .expect("alice");
+        world.set_score("investigators", bob.id, 7).expect("bob");
+        world
+            .connection()
+            .execute(
+                "UPDATE leaderboard_scores SET updated_at = '2026-05-08T12:00:00' \
+                 WHERE board = 'investigators'",
+                [],
+            )
+            .expect("pin updated_at");
+
+        // Cross-check: the order returned by `top_scores` is the same
+        // sequence of player_ids as the ranks 1..=3 here.
+        let top = world
+            .top_scores("investigators", LeaderboardSort::Desc, 10)
+            .expect("top_scores");
+        let top_ids: Vec<i64> = top.iter().map(|r| r.player_id).collect();
+        assert_eq!(
+            top_ids,
+            vec![alice.id, bob.id, carol.id],
+            "sanity: top_scores ordering"
+        );
+
+        assert_eq!(
+            world
+                .player_rank("investigators", LeaderboardSort::Desc, alice.id)
+                .expect("rank"),
+            Some(1)
+        );
+        assert_eq!(
+            world
+                .player_rank("investigators", LeaderboardSort::Desc, bob.id)
+                .expect("rank"),
+            Some(2)
+        );
+        assert_eq!(
+            world
+                .player_rank("investigators", LeaderboardSort::Desc, carol.id)
+                .expect("rank"),
+            Some(3)
+        );
+    }
+
+    /// Earlier `updated_at` beats later `updated_at` on a score tie —
+    /// same primary tiebreaker as `top_scores`. A regression that
+    /// swapped the tiebreaker order in the rank query (e.g. running
+    /// `player_id` ahead of `updated_at`) would flunk here.
+    #[test]
+    fn player_rank_updated_at_beats_player_id_on_tie() {
+        let dir = tempdir().expect("tempdir creates");
+        let world = open_world_with_leaderboards(&dir);
+
+        let alice = world
+            .upsert_player(&ctx_with(Some("u-alice"), Some("alice")))
+            .expect("alice upsert");
+        let bob = world
+            .upsert_player(&ctx_with(Some("u-bob"), Some("bob")))
+            .expect("bob upsert");
+
+        world
+            .set_score("investigators", alice.id, 7)
+            .expect("alice");
+        world.set_score("investigators", bob.id, 7).expect("bob");
+
+        // Backdate bob so he's the earlier writer despite having the
+        // larger player_id. With player_id-first tiebreaking he'd be
+        // rank 2; with updated_at-first tiebreaking he's rank 1.
+        world
+            .connection()
+            .execute(
+                "UPDATE leaderboard_scores SET updated_at = '2026-01-01T00:00:00' \
+                 WHERE board = 'investigators' AND player_id = ?1",
+                rusqlite::params![bob.id],
+            )
+            .expect("backdate bob");
+        world
+            .connection()
+            .execute(
+                "UPDATE leaderboard_scores SET updated_at = '2026-05-08T12:00:00' \
+                 WHERE board = 'investigators' AND player_id = ?1",
+                rusqlite::params![alice.id],
+            )
+            .expect("future-date alice");
+
+        assert_eq!(
+            world
+                .player_rank("investigators", LeaderboardSort::Desc, bob.id)
+                .expect("rank"),
+            Some(1),
+            "earlier updated_at must rank ahead of later"
+        );
+        assert_eq!(
+            world
+                .player_rank("investigators", LeaderboardSort::Desc, alice.id)
+                .expect("rank"),
+            Some(2)
+        );
+    }
+
+    /// A player with no row on the board is unranked: `Ok(None)`. This
+    /// is the normal UI state for a new arrival before they post a
+    /// score; surfacing it as `Option::None` (rather than `Some(0)` or
+    /// an error) lets the leaderboard render distinguish "no entry
+    /// yet" from "rank 0", which would be nonsense.
+    #[test]
+    fn player_rank_unranked_player_returns_none() {
+        let dir = tempdir().expect("tempdir creates");
+        let world = open_world_with_leaderboards(&dir);
+
+        let alice = world
+            .upsert_player(&ctx_with(Some("u-alice"), Some("alice")))
+            .expect("alice upsert");
+        let bob = world
+            .upsert_player(&ctx_with(Some("u-bob"), Some("bob")))
+            .expect("bob upsert");
+        // Only alice scores.
+        world
+            .set_score("investigators", alice.id, 1)
+            .expect("alice");
+
+        assert_eq!(
+            world
+                .player_rank("investigators", LeaderboardSort::Desc, bob.id)
+                .expect("rank query"),
+            None,
+            "player with no row must return Ok(None)"
+        );
+    }
+
+    /// `player_rank` only counts rows on the requested board. Another
+    /// board's writes must not influence the rank — a regression that
+    /// dropped the `WHERE board = ?` filter on either the outer query
+    /// or the correlated subquery would flunk here.
+    #[test]
+    fn player_rank_filters_by_board() {
+        let dir = tempdir().expect("tempdir creates");
+        let world = open_world_with_leaderboards(&dir);
+
+        let alice = world
+            .upsert_player(&ctx_with(Some("u-alice"), Some("alice")))
+            .expect("alice upsert");
+        let bob = world
+            .upsert_player(&ctx_with(Some("u-bob"), Some("bob")))
+            .expect("bob upsert");
+
+        // On `investigators`, alice is alone with a low score → rank 1.
+        // On `speedrun`, bob has a much better Desc score; if the
+        // filter leaks, alice's investigators rank could shift.
+        world.set_score("investigators", alice.id, 1).expect("a-i");
+        world.set_score("speedrun", bob.id, 999).expect("b-s");
+
+        assert_eq!(
+            world
+                .player_rank("investigators", LeaderboardSort::Desc, alice.id)
+                .expect("rank"),
+            Some(1),
+            "other-board writes must not influence rank"
+        );
+    }
+
+    /// SPEC §4.8's blank-board rule applies to every leaderboard verb.
+    /// Pin that `player_rank` runs through [`validate_board_name`].
+    #[test]
+    fn player_rank_rejects_empty_board_name() {
+        let dir = tempdir().expect("tempdir creates");
+        let world = open_world_with_leaderboards(&dir);
+
+        let alice = world
+            .upsert_player(&ctx_with(Some("u-alice"), Some("alice")))
+            .expect("alice upsert");
+
+        for blank in ["", "   ", "\n\t"] {
+            let err = world
+                .player_rank(blank, LeaderboardSort::Desc, alice.id)
+                .expect_err("blank board name must be rejected");
+            assert!(
+                matches!(err, LeaderboardError::EmptyBoardName),
+                "expected EmptyBoardName for {blank:?}, got {err:?}"
+            );
+        }
     }
 }
