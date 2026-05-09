@@ -44,6 +44,7 @@ pub mod save;
 pub mod screen;
 pub mod terminal;
 pub mod widgets;
+pub mod world_db;
 
 pub use config::{
     ConfigError, GameConfig, GameSection, LeaderboardSection, LeaderboardSort, ManifestSection,
@@ -91,6 +92,7 @@ pub use widgets::{
     render_inventory_list, render_menu_list, render_message_line, InventoryList, MenuList,
     MessageKind, MessageLine,
 };
+pub use world_db::{WorldDb, WorldDbError};
 
 /// Crate version string, sourced from `Cargo.toml` at build time.
 ///

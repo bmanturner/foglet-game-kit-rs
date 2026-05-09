@@ -63,6 +63,12 @@ tempfile   = { workspace = true }
 # `serde_json` from the workspace pin lets the save manager serialize
 # arbitrary author-defined save state to JSON via `serde_json::to_writer`
 # / `from_reader`. Already declared above for the context loader.
+#
+# SPEC_v2 §Task 3 (world DB open/bootstrap) — rusqlite with bundled
+# SQLite. See DECISIONS.md ADR 2026-05-08. The `bundled` feature vendors
+# the SQLite C amalgamation so operators do not need a system
+# libsqlite3 to run a packaged Foglet door.
+rusqlite   = { workspace = true }
 
 [dev-dependencies]
 # (Tests reuse `tempfile` from `[dependencies]` above — no extra entry
