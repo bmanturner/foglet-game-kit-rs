@@ -254,4 +254,18 @@ mod tests {
             "README should not have unsubstituted `{{name}}` tokens"
         );
     }
+
+    /// Regression guard for v1.1 Task 9d: the scaffolded README must
+    /// surface the prompt primitives so authors know they're available
+    /// without spelunking the kit's API docs.
+    #[test]
+    fn readme_template_mentions_prompt_primitives() {
+        let body = rendered("README.md");
+        for needle in ["ChoicePrompt", "ConfirmPrompt", "AnyKeyPrompt"] {
+            assert!(
+                body.contains(needle),
+                "README should mention `{needle}` so authors discover the prompt API"
+            );
+        }
+    }
 }

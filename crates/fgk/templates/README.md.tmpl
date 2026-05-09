@@ -12,6 +12,28 @@ The default `main.rs` displays a title screen. Press `Esc` or `Q` to
 quit. Edit `src/main.rs` to add screens (menu, map, dialog, …) and
 `assets/game.toml` to update door metadata.
 
+## Prompt primitives
+
+`foglet_game` ships text-interface primitives for the kinds of
+modal interactions doors lean on most often — loot pickups, vendor
+menus, confirmations, and "press any key" pauses. They are pure
+reducers that you compose inside your own `Screen` (or via the
+optional `PromptScreen<T>` adapter) so the runtime, save flow, and
+terminal-safety guarantees still apply.
+
+- `ChoicePrompt<T>` — direct hotkey choices like `(K) Take Room 7 key`
+  with case-insensitive matching, optional Up/Down/Enter navigation,
+  and visible disabled rows that carry a reason string.
+- `ConfirmPrompt` — yes/no confirmations with an optional Enter
+  default.
+- `AnyKeyPrompt` — "Press any key to continue…" pauses that ignore
+  resize and other non-meaningful events.
+- `FeedbackLine` — info/success/error message line for results like
+  `Moved Room 7 key to inventory.`, monochrome-readable by default.
+
+See the `text-interface` docs in the kit for end-to-end loot and
+vendor walkthroughs.
+
 ## Layout
 
 ```
