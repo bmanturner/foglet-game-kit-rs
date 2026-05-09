@@ -1182,6 +1182,74 @@ pub fn lost_and_found_drawer_prompt() -> ChoicePrompt<LostAndFoundChoice> {
         .choice('L', LostAndFoundChoice::Leave, "Leave it alone")
 }
 
+/// Result of applying a [`LostAndFoundChoice`] against shared player
+/// state (SPEC_v1_1.md §9 step 5).
+///
+/// Mirrors the prompt's variants one-for-one so callers can branch on
+/// what just happened without re-deriving it from the choice. Task 10e
+/// pairs each variant with the player-facing feedback line; Task 10d
+/// will introduce a separate disabled-`(K)` branch (the prompt itself
+/// will return [`foglet_game::PromptAction::Disabled`] in that case, so
+/// this enum stays narrowly scoped to *successful* applications).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LostAndFoundOutcome {
+    /// Room 7 key was added to the player's inventory.
+    TookRoom7Key,
+    /// The cracked matchbook was added to the player's inventory.
+    /// Inventory is a `BTreeSet`, so pocketing twice is idempotent —
+    /// the player never ends the scene with two matchbooks even if the
+    /// lobby pickup also fired.
+    PocketedMatchbook,
+    /// The `receipt_read` narrative flag is now set.
+    ReadReceipt,
+    /// Player walked away; no state mutated.
+    Left,
+}
+
+/// Apply the player's [`LostAndFoundChoice`] to shared runtime state
+/// (SPEC_v1_1.md §9 steps 2–3, 5).
+///
+/// Mutates `slots` directly because every consumer in the example
+/// already holds an [`Rc<RefCell<_>>`] handle, so threading a `&mut`
+/// view through the call site would just shadow the existing
+/// borrow-checked sharing. Returns the typed [`LostAndFoundOutcome`]
+/// so the caller (a future scene controller) can drive the post-action
+/// feedback line in Task 10e without re-matching on the input choice.
+///
+/// Task 10c keeps this handler unconditional: pressing `(K)` always
+/// inserts the Room 7 key. Task 10d wraps the prompt with the
+/// `disabled_if(...)` branch so the disabled press never reaches this
+/// function in the first place.
+pub fn apply_lost_and_found_choice(
+    slots: &SharedSlots,
+    choice: LostAndFoundChoice,
+) -> LostAndFoundOutcome {
+    match choice {
+        LostAndFoundChoice::TakeRoom7Key => {
+            slots
+                .inventory
+                .borrow_mut()
+                .insert(MapScreen::ROOM_7_KEY_ID.to_string());
+            LostAndFoundOutcome::TookRoom7Key
+        }
+        LostAndFoundChoice::PocketMatchbook => {
+            slots
+                .inventory
+                .borrow_mut()
+                .insert(MapScreen::MATCHBOOK_ID.to_string());
+            LostAndFoundOutcome::PocketedMatchbook
+        }
+        LostAndFoundChoice::ReadReceipt => {
+            slots
+                .flags
+                .borrow_mut()
+                .insert(MapScreen::RECEIPT_READ_FLAG.to_string());
+            LostAndFoundOutcome::ReadReceipt
+        }
+        LostAndFoundChoice::Leave => LostAndFoundOutcome::Left,
+    }
+}
+
 impl Screen for MapScreen {
     fn render(&mut self, _ctx: &mut GameContext<'_>, frame: &mut Frame<'_>) {
         // Centre the map inside the frame. The +2 accounts for the
@@ -3755,5 +3823,147 @@ mod tests {
                 "missing label {label:?} in rendered prompt:\n{rendered}"
             );
         }
+    }
+
+    // ---- Lost-and-Found Drawer action handler (SPEC §9 Task 10c) -----
+
+    #[test]
+    fn lost_and_found_lowercase_and_uppercase_hotkeys_match() {
+        // SPEC §9 step 7: "lowercase and uppercase hotkeys select the
+        // same action". Drive the prompt's reducer with each case and
+        // assert the typed `Selected(...)` payload is identical, then
+        // apply both through `apply_lost_and_found_choice` against fresh
+        // slots and assert the resulting state matches.
+        use foglet_game::PromptAction;
+
+        let prompt = lost_and_found_drawer_prompt();
+        for (lower, upper, expected) in [
+            ('k', 'K', LostAndFoundChoice::TakeRoom7Key),
+            ('m', 'M', LostAndFoundChoice::PocketMatchbook),
+            ('r', 'R', LostAndFoundChoice::ReadReceipt),
+            ('l', 'L', LostAndFoundChoice::Leave),
+        ] {
+            let lower_action = prompt.handle(Input::Char(lower));
+            let upper_action = prompt.handle(Input::Char(upper));
+            assert!(
+                matches!(lower_action, PromptAction::Selected(v) if v == expected),
+                "lowercase {lower} must select {expected:?}, got {lower_action:?}"
+            );
+            assert!(
+                matches!(upper_action, PromptAction::Selected(v) if v == expected),
+                "uppercase {upper} must select {expected:?}, got {upper_action:?}"
+            );
+
+            // Apply both through the action handler from independent
+            // slots and snapshot the result. Equal snapshots prove the
+            // case folding is end-to-end, not just a `PromptKey`
+            // cosmetic match.
+            let lower_slots = SharedSlots::default();
+            lower_slots.reset(0, 0);
+            let upper_slots = SharedSlots::default();
+            upper_slots.reset(0, 0);
+            let lower_outcome = apply_lost_and_found_choice(&lower_slots, expected);
+            let upper_outcome = apply_lost_and_found_choice(&upper_slots, expected);
+            assert_eq!(
+                lower_outcome, upper_outcome,
+                "outcome must not depend on hotkey case"
+            );
+            assert_eq!(
+                lower_slots.snapshot(),
+                upper_slots.snapshot(),
+                "post-apply state must not depend on hotkey case for {expected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn lost_and_found_apply_take_key_inserts_room_7_key() {
+        // Direct unit on the action handler so a regression in
+        // `TakeRoom7Key` points here, not at the higher-level
+        // case-folding test. Starts from a fresh `reset` baseline so
+        // the assertion isolates the mutation.
+        let slots = SharedSlots::default();
+        slots.reset(0, 0);
+        assert!(!slots.inventory.borrow().contains(MapScreen::ROOM_7_KEY_ID));
+
+        let outcome = apply_lost_and_found_choice(&slots, LostAndFoundChoice::TakeRoom7Key);
+
+        assert_eq!(outcome, LostAndFoundOutcome::TookRoom7Key);
+        assert!(
+            slots.inventory.borrow().contains(MapScreen::ROOM_7_KEY_ID),
+            "TakeRoom7Key must add ROOM_7_KEY_ID to inventory"
+        );
+        // Other slots stay untouched — the handler is single-purpose.
+        assert!(!slots.inventory.borrow().contains(MapScreen::MATCHBOOK_ID));
+        assert!(!slots.flags.borrow().contains(MapScreen::RECEIPT_READ_FLAG));
+    }
+
+    #[test]
+    fn lost_and_found_apply_pocket_matchbook_inserts_matchbook() {
+        let slots = SharedSlots::default();
+        slots.reset(0, 0);
+        let outcome = apply_lost_and_found_choice(&slots, LostAndFoundChoice::PocketMatchbook);
+        assert_eq!(outcome, LostAndFoundOutcome::PocketedMatchbook);
+        assert!(
+            slots.inventory.borrow().contains(MapScreen::MATCHBOOK_ID),
+            "PocketMatchbook must add MATCHBOOK_ID to inventory"
+        );
+    }
+
+    #[test]
+    fn lost_and_found_apply_pocket_matchbook_is_idempotent() {
+        // SPEC §9 comment on `LostAndFoundChoice::PocketMatchbook`: the
+        // drawer and the lobby map share `MATCHBOOK_ID`, so pocketing
+        // twice (or pocketing after lobby pickup) MUST NOT duplicate
+        // the keepsake. `BTreeSet::insert` enforces this; the test
+        // pins the contract so a future `Vec`-based refactor cannot
+        // silently break it.
+        let slots = SharedSlots::default();
+        slots.reset(0, 0);
+        slots
+            .inventory
+            .borrow_mut()
+            .insert(MapScreen::MATCHBOOK_ID.to_string());
+        apply_lost_and_found_choice(&slots, LostAndFoundChoice::PocketMatchbook);
+        let count = slots
+            .inventory
+            .borrow()
+            .iter()
+            .filter(|id| id.as_str() == MapScreen::MATCHBOOK_ID)
+            .count();
+        assert_eq!(count, 1, "matchbook must remain unique in inventory");
+    }
+
+    #[test]
+    fn lost_and_found_apply_read_receipt_sets_flag() {
+        let slots = SharedSlots::default();
+        slots.reset(0, 0);
+        let outcome = apply_lost_and_found_choice(&slots, LostAndFoundChoice::ReadReceipt);
+        assert_eq!(outcome, LostAndFoundOutcome::ReadReceipt);
+        assert!(
+            slots.flags.borrow().contains(MapScreen::RECEIPT_READ_FLAG),
+            "ReadReceipt must set RECEIPT_READ_FLAG"
+        );
+        // Reading the receipt is purely a flag mutation; inventory
+        // stays empty so a future scene can't conflate "read" with
+        // "took the receipt as an item".
+        assert!(slots.inventory.borrow().is_empty());
+    }
+
+    #[test]
+    fn lost_and_found_apply_leave_is_a_noop() {
+        // SPEC §9 step 2: "(L) Leave it alone" exits the prompt without
+        // mutating state. Snapshot before/after equality is the
+        // strongest possible assertion that no slot was touched.
+        let slots = SharedSlots::default();
+        slots.reset(7, 3);
+        let before = slots.snapshot();
+        let outcome = apply_lost_and_found_choice(&slots, LostAndFoundChoice::Leave);
+        assert_eq!(outcome, LostAndFoundOutcome::Left);
+        assert_eq!(
+            slots.snapshot(),
+            before,
+            "Leave must not mutate inventory, flags, or player state"
+        );
     }
 }
