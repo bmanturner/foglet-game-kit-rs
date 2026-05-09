@@ -1057,12 +1057,17 @@ impl Screen for MapScreen {
 ///   model stays minimal; [`MapScreen::try_move`] gates passage on the
 ///   brass key being in inventory, while render styles the cell red
 ///   until unlocked)
+/// - `>` → stairs up to Room 7 (Custom; gated on the
+///   [`MapScreen::ROOM_7_KEY_ID`] inventory item, then a step onto the
+///   cell emits [`ScreenCommand::Replace`] with a fresh
+///   [`crate::room_7::Room7Screen`])
 fn lobby_legend() -> TileLegend {
     TileLegend::from_pairs([
         ("#", "wall"),
         (" ", "floor"),
         ("+", "door"),
         ("L", "locked_door"),
+        (">", "stairs_up"),
     ])
     .expect("static lobby legend parses")
 }

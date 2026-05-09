@@ -1,11 +1,13 @@
 //! `players` — shared-world player registry (SPEC_v2 §Task 5).
 //!
-//! Task 5a shipped the `players` table migration. Task 5b (this
-//! iteration) layers the typed [`PlayerRecord`] read model and the
-//! [`WorldDb::upsert_player`] write path on top, scoped to the
-//! Foglet-user-id case. Subsequent sub-tasks fill in the rest:
+//! Task 5a shipped the `players` table migration. Task 5b layered the
+//! typed [`PlayerRecord`] read model and the [`WorldDb::upsert_player`]
+//! write path on top, scoped to the Foglet-user-id case. Task 5c (this
+//! iteration) extends the upsert path to the local-dev fallback so a
+//! [`FogletContext`] with no `user_id` lands on a stable
+//! `local_dev_key`-keyed row instead of erroring. Subsequent sub-tasks
+//! fill in the rest:
 //!
-//! - 5c — Local-dev fallback identity for missing `user_id`.
 //! - 5d — `last_seen_at` refresh on repeat upsert.
 //! - 5e — `FogletRole` parsing and `security_level` mapping.
 //! - 5f — Persist normalized role/security metadata at upsert time.
@@ -34,6 +36,52 @@ use crate::world_db::{WorldDb, WorldMigration};
 /// unremarkable — the on-screen affordance is "we couldn't find a
 /// handle for this session" and the operator can fix it upstream.
 const DEFAULT_HANDLE: &str = "guest";
+
+/// Prefix on every synthesised `local_dev_key` value (Task 5c).
+///
+/// SPEC §4.4 demands that the local-dev key "does not collide with
+/// real Foglet users". Foglet-issued user ids are opaque tokens that
+/// the loader writes into the dedicated `foglet_user_id` column, so
+/// the two namespaces are already separated at the schema layer (one
+/// partial unique index per column). The prefix is belt-and-braces:
+/// even if a future migration ever merges the columns, every
+/// kit-synthesised value starts with `local-dev:` and is recognisable
+/// at a glance in the `sqlite3` CLI. It also makes the `local-dev`
+/// origin auditable from a raw row dump without consulting the rest
+/// of the schema.
+const LOCAL_DEV_KEY_PREFIX: &str = "local-dev:";
+
+/// Synthesise the `local_dev_key` for a [`FogletContext`] that has no
+/// `user_id`.
+///
+/// SPEC §4.4 rule: "If `user_id` is absent, the runtime MUST
+/// synthesize a local key that does not collide with real Foglet
+/// users." The key has to be **stable** for a given local-dev session
+/// (so a second launch of the same dev user lands on the same
+/// `players.id`) and **distinct** between different local-dev users
+/// (so two-player Murder Motel smoke tests don't fork into one row).
+///
+/// We key on `ctx.username`, normalised by [`str::trim`] and falling
+/// back to [`DEFAULT_HANDLE`] when missing or whitespace-only. Username
+/// is the only identity bit a `--local-dev-user alice` invocation can
+/// influence (Task 9d's CLI flag will set this), so it's the natural
+/// pivot. `door_id` is also stable per launch but identical across the
+/// two-player smoke test (both sessions run the same door binary), so
+/// it cannot disambiguate by itself.
+///
+/// Two callers with the same trimmed handle deliberately collapse onto
+/// the same row — that's the price of supporting an "I forgot to set a
+/// handle" workflow without inventing fake entropy. Operators who want
+/// independent rows pass distinct handles.
+fn synthesize_local_dev_key(handle: &str) -> String {
+    let trimmed = handle.trim();
+    let key_body = if trimmed.is_empty() {
+        DEFAULT_HANDLE
+    } else {
+        trimmed
+    };
+    format!("{LOCAL_DEV_KEY_PREFIX}{key_body}")
+}
 
 /// Schema for the shared-world player registry — SPEC_v2 §4.4.
 ///
@@ -166,18 +214,6 @@ pub struct PlayerRecord {
 /// message stays a single sentence.
 #[derive(Debug, Error)]
 pub enum PlayerError {
-    /// The supplied [`FogletContext`] had no `user_id`. Task 5c lifts
-    /// this restriction by synthesising a `local_dev_key`; until then
-    /// callers either receive a Foglet-issued context (which always
-    /// carries `user_id` in production) or pre-call
-    /// [`crate::foglet::synthesize_local_dev`]. Surfacing the
-    /// constraint as a typed variant — instead of papering over it
-    /// with a placeholder row — keeps the 5c follow-up honest: a
-    /// regression that "fixes" 5b by inserting a guest row would
-    /// silently fork every local-dev player's history.
-    #[error("FogletContext.user_id is required to upsert a player (local-dev fallback lands in Task 5c)")]
-    MissingIdentity,
-
     /// The `INSERT … ON CONFLICT … RETURNING` round-trip failed.
     /// Wrapping `rusqlite::Error` keeps the upsert call site readable
     /// (one error type, one mapping) while preserving the underlying
@@ -201,16 +237,16 @@ impl WorldDb {
     /// the conflict refreshes `handle` so a user who renames in
     /// Foglet sees the new label without us creating a duplicate row.
     ///
-    /// Today this method covers the **Foglet-user-id case only**:
+    /// Two identity paths are supported, both keyed by a partial
+    /// unique index in [`PLAYERS_MIGRATION`]:
     ///
     /// - `ctx.user_id = Some(_)` → upsert keyed on `foglet_user_id`.
-    /// - `ctx.user_id = None`    → [`PlayerError::MissingIdentity`].
+    /// - `ctx.user_id = None`    → upsert keyed on a synthesised
+    ///   `local_dev_key` (Task 5c) derived from `ctx.username`.
     ///
-    /// Task 5c will broaden the second branch to synthesise a
-    /// `local_dev_key`; Task 5d will refresh `last_seen_at` on every
-    /// call; Task 5e/5f will write normalized `role` and
-    /// `security_level`. Until then the `players` row picks up SQL
-    /// defaults for those columns.
+    /// Task 5d will refresh `last_seen_at` on every call; Task 5e/5f
+    /// will write normalized `role` and `security_level`. Until then
+    /// the `players` row picks up SQL defaults for those columns.
     ///
     /// # Concurrency
     ///
@@ -219,15 +255,36 @@ impl WorldDb {
     /// we need. `&mut self` would fight the runtime layer (Task 10)
     /// where `GameContext` borrows the world DB once per tick.
     pub fn upsert_player(&self, ctx: &FogletContext) -> Result<PlayerRecord, PlayerError> {
-        let Some(user_id) = ctx.user_id.as_deref() else {
-            return Err(PlayerError::MissingIdentity);
-        };
-
         // `username` is optional on the wire (SPEC §5.1). Falling back
-        // to `DEFAULT_HANDLE` keeps the `NOT NULL` constraint
+        // to `DEFAULT_HANDLE` keeps the `NOT NULL` `handle` constraint
         // satisfied without burying the choice in the SQL string.
         let handle = ctx.username.as_deref().unwrap_or(DEFAULT_HANDLE);
 
+        match ctx.user_id.as_deref() {
+            Some(user_id) => self.upsert_by_foglet_user_id(user_id, handle),
+            None => {
+                // SPEC §4.4 mandates a synthesised local key that does
+                // not collide with real Foglet users. The dedicated
+                // `local_dev_key` column + partial unique index gives
+                // us that namespace separation at the schema layer;
+                // [`synthesize_local_dev_key`] picks the value.
+                let key = synthesize_local_dev_key(handle);
+                self.upsert_by_local_dev_key(&key, handle)
+            }
+        }
+    }
+
+    /// Foglet-user-id branch of [`Self::upsert_player`]. Pulled out so
+    /// the local-dev branch can mirror its structure without sharing
+    /// SQL — the two `ON CONFLICT` targets reference different partial
+    /// indexes, and a single statement that tried to handle both
+    /// would have to special-case nullability in ways SQLite does not
+    /// support cleanly.
+    fn upsert_by_foglet_user_id(
+        &self,
+        user_id: &str,
+        handle: &str,
+    ) -> Result<PlayerRecord, PlayerError> {
         // Partial unique indexes require the `WHERE` clause to be
         // restated in the `ON CONFLICT` target; SQLite refuses to
         // match against a partial index otherwise. `excluded.handle`
@@ -249,6 +306,31 @@ RETURNING id, foglet_user_id, handle, role, security_level, \
 
         self.connection()
             .query_row(SQL, rusqlite::params![user_id, handle], row_to_record)
+            .map_err(|source| PlayerError::Sqlite { source })
+    }
+
+    /// Local-dev branch of [`Self::upsert_player`] (Task 5c).
+    ///
+    /// Mirrors [`Self::upsert_by_foglet_user_id`] but conflicts on the
+    /// `idx_players_local_dev_key` partial index. `foglet_user_id`
+    /// stays NULL so the partial index over `foglet_user_id` does not
+    /// engage — the two namespaces remain disjoint at the schema
+    /// layer, which is the property SPEC §4.4 calls out.
+    fn upsert_by_local_dev_key(
+        &self,
+        local_dev_key: &str,
+        handle: &str,
+    ) -> Result<PlayerRecord, PlayerError> {
+        const SQL: &str = "\
+INSERT INTO players (local_dev_key, handle) \
+VALUES (?1, ?2) \
+ON CONFLICT(local_dev_key) WHERE local_dev_key IS NOT NULL \
+DO UPDATE SET handle = excluded.handle \
+RETURNING id, foglet_user_id, handle, role, security_level, \
+          first_seen_at, last_seen_at, local_dev_key";
+
+        self.connection()
+            .query_row(SQL, rusqlite::params![local_dev_key, handle], row_to_record)
             .map_err(|source| PlayerError::Sqlite { source })
     }
 }
@@ -402,12 +484,14 @@ mod tests {
         assert!(record.local_dev_key.is_none());
     }
 
-    /// A context without `user_id` is rejected with a typed error
-    /// rather than silently inserting a placeholder. Task 5c lifts
-    /// this restriction by synthesising a `local_dev_key`; locking
-    /// the contract in now keeps that follow-up honest.
+    /// SPEC_v2 §Task 5c acceptance: two local-dev sessions with
+    /// distinct handles synthesise distinct `local_dev_key` values and
+    /// land on distinct rows — they MUST NOT collide. Without this,
+    /// the two-player Murder Motel smoke test (alice + bob) would
+    /// share one player record and fork every per-player ledger,
+    /// event, and leaderboard entry into a single shared identity.
     #[test]
-    fn upsert_player_rejects_missing_user_id() {
+    fn upsert_player_with_distinct_local_dev_handles_creates_distinct_rows() {
         let dir = tempdir().expect("tempdir creates");
         let db_path = dir.path().join("world.sqlite");
         let mut world = WorldDb::open(&db_path).expect("open succeeds");
@@ -415,10 +499,123 @@ mod tests {
             .apply_migration(&PLAYERS_MIGRATION)
             .expect("players migration applies");
 
-        let err = world
-            .upsert_player(&ctx_with(None, Some("orphan")))
-            .expect_err("missing user_id must error");
-        assert!(matches!(err, PlayerError::MissingIdentity));
+        let alice = world
+            .upsert_player(&ctx_with(None, Some("alice")))
+            .expect("alice local-dev upsert succeeds");
+        let bob = world
+            .upsert_player(&ctx_with(None, Some("bob")))
+            .expect("bob local-dev upsert succeeds");
+
+        assert_ne!(alice.id, bob.id, "local-dev handles must not collide");
+        assert!(
+            alice.foglet_user_id.is_none() && bob.foglet_user_id.is_none(),
+            "local-dev rows leave foglet_user_id NULL"
+        );
+        assert_eq!(alice.local_dev_key.as_deref(), Some("local-dev:alice"));
+        assert_eq!(bob.local_dev_key.as_deref(), Some("local-dev:bob"));
+        assert_eq!(alice.handle, "alice");
+        assert_eq!(bob.handle, "bob");
+    }
+
+    /// Repeat upserts with the same local-dev handle resolve to the
+    /// same `players.id`. The mirror of the user-id stability test —
+    /// without it, a dev relaunching `cargo run --example murder_motel`
+    /// would keep forking new player rows on every invocation.
+    #[test]
+    fn upsert_player_with_same_local_dev_handle_is_stable_across_repeats() {
+        let dir = tempdir().expect("tempdir creates");
+        let db_path = dir.path().join("world.sqlite");
+        let mut world = WorldDb::open(&db_path).expect("open succeeds");
+        world
+            .apply_migration(&PLAYERS_MIGRATION)
+            .expect("players migration applies");
+
+        let first = world
+            .upsert_player(&ctx_with(None, Some("alice")))
+            .expect("first local-dev upsert succeeds");
+        let second = world
+            .upsert_player(&ctx_with(None, Some("alice")))
+            .expect("repeat local-dev upsert succeeds");
+        assert_eq!(first.id, second.id);
+
+        let count: i64 = world
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM players WHERE local_dev_key = ?1",
+                rusqlite::params!["local-dev:alice"],
+                |row| row.get(0),
+            )
+            .expect("count query runs");
+        assert_eq!(count, 1, "stable local-dev key must not duplicate the row");
+    }
+
+    /// Local-dev and Foglet-user-id rows occupy disjoint namespaces —
+    /// a Foglet user "alice" and a local-dev "alice" must end up on
+    /// separate `players` rows. SPEC §4.4 calls this out explicitly:
+    /// "synthesize a local key that does not collide with real Foglet
+    /// users".
+    #[test]
+    fn local_dev_and_foglet_namespaces_do_not_collide() {
+        let dir = tempdir().expect("tempdir creates");
+        let db_path = dir.path().join("world.sqlite");
+        let mut world = WorldDb::open(&db_path).expect("open succeeds");
+        world
+            .apply_migration(&PLAYERS_MIGRATION)
+            .expect("players migration applies");
+
+        let foglet_alice = world
+            .upsert_player(&ctx_with(Some("u-alice"), Some("alice")))
+            .expect("foglet alice upsert succeeds");
+        let local_alice = world
+            .upsert_player(&ctx_with(None, Some("alice")))
+            .expect("local-dev alice upsert succeeds");
+
+        assert_ne!(foglet_alice.id, local_alice.id);
+        assert_eq!(foglet_alice.foglet_user_id.as_deref(), Some("u-alice"));
+        assert!(foglet_alice.local_dev_key.is_none());
+        assert!(local_alice.foglet_user_id.is_none());
+        assert_eq!(
+            local_alice.local_dev_key.as_deref(),
+            Some("local-dev:alice")
+        );
+    }
+
+    /// Local-dev fallback also works when `username` is missing — a
+    /// context with neither identity field shouldn't crash, it
+    /// collapses onto the default-handle row. Documented as a soft
+    /// collapse in [`synthesize_local_dev_key`]: operators who want
+    /// independent rows pass a handle.
+    #[test]
+    fn upsert_player_with_no_identity_uses_default_local_dev_key() {
+        let dir = tempdir().expect("tempdir creates");
+        let db_path = dir.path().join("world.sqlite");
+        let mut world = WorldDb::open(&db_path).expect("open succeeds");
+        world
+            .apply_migration(&PLAYERS_MIGRATION)
+            .expect("players migration applies");
+
+        let record = world
+            .upsert_player(&ctx_with(None, None))
+            .expect("no-identity upsert succeeds");
+        assert_eq!(record.handle, DEFAULT_HANDLE);
+        assert_eq!(
+            record.local_dev_key.as_deref(),
+            Some("local-dev:guest"),
+            "missing username falls back to the default handle in the key"
+        );
+    }
+
+    /// Whitespace-only handles trim down to the default. Without this
+    /// guard, two `--local-dev-user "   "` invocations would each pin
+    /// a distinct `local_dev_key` byte sequence (one with leading
+    /// spaces, one without) and split a single sloppy operator's
+    /// history across rows.
+    #[test]
+    fn synthesize_local_dev_key_trims_and_falls_back_on_whitespace() {
+        assert_eq!(synthesize_local_dev_key("alice"), "local-dev:alice");
+        assert_eq!(synthesize_local_dev_key("  alice  "), "local-dev:alice");
+        assert_eq!(synthesize_local_dev_key(""), "local-dev:guest");
+        assert_eq!(synthesize_local_dev_key("   "), "local-dev:guest");
     }
 
     /// SPEC_v2 §Task 5a acceptance: applying [`PLAYERS_MIGRATION`]
