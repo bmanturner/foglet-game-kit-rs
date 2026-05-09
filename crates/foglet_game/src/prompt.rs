@@ -476,6 +476,18 @@ pub struct ChoicePrompt<T> {
     /// case as "no selection possible", and an out-of-bounds `Some(0)`
     /// on an empty prompt would just be a panic waiting to happen.
     pub selected: Option<usize>,
+    /// Optional Vim-style `j`/`k` navigation (SPEC_v1_1.md §4.5 alt
+    /// keymap). Default `false`, meaning only `Up`/`Down` arrows drive
+    /// the cursor. Set via [`ChoicePrompt::vim_navigation`]; consumed by
+    /// [`ChoicePrompt::step_from_input`] which treats `j` as Down and
+    /// `k` as Up when this flag is on.
+    ///
+    /// The flag is independent of [`ChoicePrompt::selected`]: turning it
+    /// on without `.navigable(true)` is harmless (no cursor → no
+    /// movement), and turning it off does not clear the cursor. The two
+    /// configs compose so authors can ship a default-arrow build and a
+    /// "Vim mode" build from the same prompt definition.
+    pub vim_navigation: bool,
 }
 
 impl<T> Default for ChoicePrompt<T> {
@@ -505,6 +517,11 @@ impl<T> ChoicePrompt<T> {
             // *after* the choices are added, since the seeding logic
             // needs to scan them for the first enabled row.
             selected: None,
+            // SPEC §4.5 lists `j`/`k` as an *alternative* keymap, not a
+            // default — pure-arrow players (and prompts whose authors
+            // bound `j` or `k` as a choice hotkey) get the safer
+            // behaviour for free; opt in via `.vim_navigation(true)`.
+            vim_navigation: false,
         }
     }
 
@@ -620,6 +637,114 @@ impl<T> ChoicePrompt<T> {
             None
         };
         self
+    }
+
+    /// Toggle the optional Vim-style `j`/`k` navigation alt keymap
+    /// (SPEC_v1_1.md §4.5).
+    ///
+    /// When `enabled` is `true`, [`ChoicePrompt::step_from_input`] maps
+    /// `Input::Char('j')` to [`ChoicePrompt::move_down`] and
+    /// `Input::Char('k')` to [`ChoicePrompt::move_up`], in addition to
+    /// the always-on `Input::Up`/`Input::Down` arrows. When `false` (the
+    /// default) those characters are not movement keys, leaving them
+    /// free to be used as choice hotkeys.
+    ///
+    /// # Setter form, not a marker
+    ///
+    /// Mirrors [`ChoicePrompt::cancellable`] and
+    /// [`ChoicePrompt::navigable`] in shape so dynamic chains like
+    /// `.vim_navigation(player.prefers_vim_keys())` compile without an
+    /// `if/else` arm.
+    ///
+    /// # Precedence over choice hotkeys
+    ///
+    /// `step_from_input` is the movement entry point; `handle` is the
+    /// selection entry point. They are separate by design — authors
+    /// route navigation inputs through `step_from_input` first, then
+    /// fall through to `handle` for anything it did not consume. With
+    /// `vim_navigation = true`, `j`/`k` are consumed by `step_from_input`
+    /// and never reach `handle`. The kit does **not** validate against
+    /// authors binding `j`/`k` as choice hotkeys while Vim mode is on:
+    /// that combination is a config bug, not a representable runtime
+    /// state, and the prompt-validation pipeline (Task 2c) intentionally
+    /// reasons only about the `choices` list. If you ship Vim mode,
+    /// reserve `j` and `k` for movement.
+    pub fn vim_navigation(mut self, enabled: bool) -> Self {
+        self.vim_navigation = enabled;
+        self
+    }
+
+    /// Try to consume `input` as cursor movement and return `true` if
+    /// it was. The caller's normal flow is "movement first, then
+    /// selection":
+    ///
+    /// ```ignore
+    /// if !prompt.step_from_input(input) {
+    ///     match prompt.handle(input) { /* … */ }
+    /// }
+    /// ```
+    ///
+    /// # Inputs consumed
+    ///
+    /// - `Input::Up` → [`ChoicePrompt::move_up`]
+    /// - `Input::Down` → [`ChoicePrompt::move_down`]
+    /// - `Input::Char('j')` → [`ChoicePrompt::move_down`] *iff*
+    ///   [`ChoicePrompt::vim_navigation`] is `true`
+    /// - `Input::Char('k')` → [`ChoicePrompt::move_up`] *iff*
+    ///   `vim_navigation` is `true`
+    ///
+    /// Anything else returns `false` without mutating the prompt.
+    ///
+    /// # Direct-key mode short-circuit
+    ///
+    /// When [`ChoicePrompt::selected`] is `None` (no cursor active) the
+    /// method returns `false` without touching `move_up`/`move_down`,
+    /// matching their existing no-op-in-direct-key-mode policy. The
+    /// caller's `handle` arm can then dispatch the same input as a
+    /// regular hotkey — Vim mode does not silently swallow `j`/`k` on a
+    /// direct-key prompt.
+    ///
+    /// # Why a separate method, not folded into `handle`
+    ///
+    /// `handle` is `&self` by design (see its doc comment). Movement
+    /// must mutate the cursor, so it cannot share that signature. A
+    /// separate `&mut self` entry point keeps the two reducer surfaces
+    /// honest about what they touch and lets games preview "would this
+    /// key select something?" without paying the mutation cost.
+    pub fn step_from_input(&mut self, input: Input) -> bool {
+        // Direct-key prompts have no cursor; movement is undefined.
+        // Returning early (rather than calling `move_up`/`move_down`
+        // which would also no-op) makes the caller's "fall through to
+        // handle" path obviously correct — pressing `j` on a direct-key
+        // prompt with Vim mode on stays available as a hotkey.
+        if self.selected.is_none() {
+            return false;
+        }
+        match input {
+            Input::Up => {
+                self.move_up();
+                true
+            }
+            Input::Down => {
+                self.move_down();
+                true
+            }
+            // Vim alt-keymap. `PromptKey::char` lowercases on storage,
+            // so we match the lowercase form here and let the Input
+            // layer's verbatim `Char` carry through; uppercase `J`/`K`
+            // arrive as `Char('J')`/`Char('K')` and would only fire if
+            // the player held Shift, which is conventionally a
+            // different action — leaving them out matches Vim itself.
+            Input::Char('j') if self.vim_navigation => {
+                self.move_down();
+                true
+            }
+            Input::Char('k') if self.vim_navigation => {
+                self.move_up();
+                true
+            }
+            _ => false,
+        }
     }
 
     /// Run SPEC §4.1 hotkey validation against the current choice
@@ -1628,6 +1753,7 @@ mod tests {
             footer: None,
             cancellable: false,
             selected: None,
+            vim_navigation: false,
         };
 
         assert_eq!(
@@ -1988,6 +2114,126 @@ mod tests {
         prompt.move_down();
         prompt.move_up();
         assert_eq!(prompt.selected, None);
+    }
+
+    #[test]
+    fn vim_navigation_defaults_off() {
+        // SPEC §4.5 lists `j`/`k` as opt-in. A freshly built prompt must
+        // leave the alt keymap disabled so authors who bound `j` or `k`
+        // as a choice hotkey are not surprised.
+        let prompt: ChoicePrompt<LootAction> = ChoicePrompt::new();
+        assert!(!prompt.vim_navigation);
+    }
+
+    #[test]
+    fn vim_navigation_setter_round_trips_both_ways() {
+        // Mirrors the cancellable/navigable round-trip contract so
+        // dynamic chains like `.vim_navigation(prefs.vim)` compile.
+        let on: ChoicePrompt<LootAction> = ChoicePrompt::new().vim_navigation(true);
+        let off: ChoicePrompt<LootAction> = ChoicePrompt::new()
+            .vim_navigation(true)
+            .vim_navigation(false);
+        assert!(on.vim_navigation);
+        assert!(!off.vim_navigation);
+    }
+
+    #[test]
+    fn step_from_input_arrows_drive_cursor_without_vim_flag() {
+        // Up/Down are the always-on movement keys — the Vim flag only
+        // adds `j`/`k`, it never gates the arrows.
+        let mut prompt: ChoicePrompt<LootAction> = ChoicePrompt::new()
+            .choice('e', LootAction::Equip, "Equip")
+            .choice('t', LootAction::Take, "Take")
+            .navigable(true);
+        assert_eq!(prompt.selected, Some(0));
+        assert!(prompt.step_from_input(Input::Down));
+        assert_eq!(prompt.selected, Some(1));
+        assert!(prompt.step_from_input(Input::Up));
+        assert_eq!(prompt.selected, Some(0));
+    }
+
+    #[test]
+    fn step_from_input_ignores_j_and_k_when_vim_disabled() {
+        // Default config: `j`/`k` are not movement keys. The cursor
+        // must stay on row 0 and `step_from_input` must report the
+        // input as unconsumed so the caller can route it to `handle`.
+        let mut prompt: ChoicePrompt<LootAction> = ChoicePrompt::new()
+            .choice('e', LootAction::Equip, "Equip")
+            .choice('t', LootAction::Take, "Take")
+            .navigable(true);
+        assert!(!prompt.vim_navigation);
+        assert!(!prompt.step_from_input(Input::Char('j')));
+        assert_eq!(prompt.selected, Some(0));
+        assert!(!prompt.step_from_input(Input::Char('k')));
+        assert_eq!(prompt.selected, Some(0));
+    }
+
+    #[test]
+    fn step_from_input_maps_j_and_k_when_vim_enabled() {
+        // SPEC §4.5 alt keymap: `j` → Down, `k` → Up. Both presses must
+        // mirror the equivalent arrow press exactly.
+        let mut prompt: ChoicePrompt<LootAction> = ChoicePrompt::new()
+            .choice('e', LootAction::Equip, "Equip")
+            .choice('t', LootAction::Take, "Take")
+            .choice('p', LootAction::Pass, "Pass")
+            .navigable(true)
+            .vim_navigation(true);
+        assert_eq!(prompt.selected, Some(0));
+        assert!(prompt.step_from_input(Input::Char('j')));
+        assert_eq!(prompt.selected, Some(1));
+        assert!(prompt.step_from_input(Input::Char('j')));
+        assert_eq!(prompt.selected, Some(2));
+        assert!(prompt.step_from_input(Input::Char('k')));
+        assert_eq!(prompt.selected, Some(1));
+    }
+
+    #[test]
+    fn step_from_input_returns_false_in_direct_key_mode() {
+        // Without `.navigable(true)` the cursor is `None`. Even with
+        // `vim_navigation` on, `j`/`k` must not invent a cursor; the
+        // caller is expected to dispatch them through `handle` as
+        // potential direct hotkeys.
+        let mut prompt: ChoicePrompt<LootAction> = ChoicePrompt::new()
+            .choice('e', LootAction::Equip, "Equip")
+            .choice('t', LootAction::Take, "Take")
+            .vim_navigation(true);
+        assert_eq!(prompt.selected, None);
+        assert!(!prompt.step_from_input(Input::Up));
+        assert!(!prompt.step_from_input(Input::Down));
+        assert!(!prompt.step_from_input(Input::Char('j')));
+        assert!(!prompt.step_from_input(Input::Char('k')));
+        assert_eq!(prompt.selected, None);
+    }
+
+    #[test]
+    fn step_from_input_does_not_consume_unrelated_keys() {
+        // Anything other than the configured movement keys must report
+        // unconsumed so the caller's `handle` arm can pick it up. Resize
+        // is the SPEC §7 canonical "ignored" input; Enter is the
+        // navigation-mode confirm key handled by `handle`, not here.
+        let mut prompt: ChoicePrompt<LootAction> = ChoicePrompt::new()
+            .choice('e', LootAction::Equip, "Equip")
+            .choice('t', LootAction::Take, "Take")
+            .navigable(true)
+            .vim_navigation(true);
+        for input in [
+            Input::Enter,
+            Input::Esc,
+            Input::Char('e'),
+            Input::Char('J'), // uppercase: Vim itself does not move on Shift+j
+            Input::Char('K'),
+            Input::Resize {
+                width: 80,
+                height: 24,
+            },
+            Input::Unknown,
+        ] {
+            assert!(
+                !prompt.step_from_input(input),
+                "step_from_input should not consume {input:?}",
+            );
+            assert_eq!(prompt.selected, Some(0));
+        }
     }
 
     #[test]
