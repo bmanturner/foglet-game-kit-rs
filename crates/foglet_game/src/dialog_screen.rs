@@ -64,13 +64,16 @@ use ratatui::style::{Color, Style};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::Frame;
 
-use crate::dialog::{dialog_choice_prompt, Dialog, DialogState, FlagSet};
+use crate::dialog::{
+    dialog_choice_prompt, dialog_handle_prompt_input, Dialog, DialogState, FlagSet,
+    DIALOG_PROMPT_MAX_CHOICES,
+};
+use crate::input::Input;
+use crate::prompt::PromptAction;
 use crate::screen::{GameContext, Screen, ScreenCommand};
 
-// Task 2d (handle_input) and 2e (accessors) still pull additional
-// items from `crate::dialog` (`dialog_handle_prompt_input`) and
-// `crate::input` (`Input`); those land alongside their own commits to
-// keep `-D warnings` clean.
+// Task 2e (accessors) will pull a couple more items in alongside its
+// own commit; this module's import set otherwise stabilises here.
 
 /// Boxed callback type translating a [`DialogAction`] outcome into a
 /// [`ScreenCommand`]. Aliased so the field type stays readable in
@@ -194,12 +197,6 @@ pub enum DialogAction {
 /// drop one layer down to
 /// [`crate::dialog::dialog_handle_prompt_input`] inside a custom
 /// [`crate::screen::Screen`] impl.
-// Fields are read by Tasks 2c (render), 2d (input), and 2e
-// (accessors). Task 2b lands the storage shape only; the
-// `dead_code` lint correctly flags that there is not yet a non-test
-// reader, but adding the trait impls here would balloon the commit
-// past the one-task budget. The `allow` is removed when 2c–2e land.
-#[allow(dead_code)]
 pub struct DialogScreen {
     /// The parsed, validated dialog graph the screen is walking.
     /// Owned (not borrowed) so a `DialogScreen` can outlive whatever
@@ -435,6 +432,230 @@ impl Screen for DialogScreen {
                     .style(Style::default().fg(Color::DarkGray)),
                 hint_area,
             );
+        }
+    }
+
+    /// Drive the dialog forward in response to a single [`Input`] and
+    /// translate the outcome into a [`ScreenCommand`] via the
+    /// configured `on_action` callback (Task 2d / SPEC_v2_1.md §4.2).
+    ///
+    /// # Routing rules
+    ///
+    /// 1. **`Esc`** always emits [`DialogAction::Cancelled`]. The
+    ///    adapter does not gate cancellation on a `cancellable` flag —
+    ///    every Murder Motel dialog has historically allowed Esc to
+    ///    walk away, and games that want to forbid it can simply
+    ///    return [`ScreenCommand::None`] from their callback for the
+    ///    `Cancelled` arm.
+    /// 2. **Finished state.** When [`DialogState::is_finished`] is
+    ///    true, `Enter` emits [`DialogAction::Finished`] and any other
+    ///    non-`Esc` key is absorbed silently — the SPEC §4.2 contract
+    ///    is "the dialog has nothing more to say," so we don't react
+    ///    to stray input.
+    /// 3. **Line-pumping mode.** While [`DialogState::current_line`]
+    ///    yields `Some`, `Enter` calls
+    ///    [`DialogState::advance`]. If that advance walks off the
+    ///    end of the graph (terminal node, no further lines or
+    ///    choices) the same press promotes to
+    ///    [`DialogAction::Finished`] without forcing the player to
+    ///    press Enter twice — the v2 example's hand-rolled scene
+    ///    behaved the same way and the refactor MUST preserve that.
+    /// 4. **Choice mode.** `Up`/`Down` move `choice_cursor`,
+    ///    clamped to `0..min(visible, DIALOG_PROMPT_MAX_CHOICES)`.
+    ///    `Enter` synthesises the matching numeric hotkey
+    ///    (`'1'..'9'`) and routes it through
+    ///    [`dialog_handle_prompt_input`], so this adapter never
+    ///    re-implements the SPEC §8 selection / flag-application
+    ///    pipeline. A literal `Char('1'..'9')` press goes straight
+    ///    through the same helper for parity with hand-rolled
+    ///    scenes.
+    ///
+    /// # Why synthesise a digit for Enter rather than call
+    /// [`DialogState::choose`] directly
+    ///
+    /// SPEC_v2_1.md §4.2 mandates that the adapter "MUST use
+    /// `dialog_choice_prompt` and `dialog_handle_prompt_input`
+    /// internally rather than re-implementing dialog mechanics." The
+    /// helper applies the picked choice's `set:` flags, advances the
+    /// state machine, and returns the typed [`PromptAction`]
+    /// outcome — the exact pipeline a hand-rolled `Enter` handler
+    /// would otherwise duplicate. Synthesising a digit keeps the
+    /// adapter as a thin keyboard router on top of the existing
+    /// helper rather than a parallel implementation that could drift
+    /// from it.
+    ///
+    /// # Cursor cap
+    ///
+    /// The cursor is bounded by both the live visible-choices count
+    /// and [`DIALOG_PROMPT_MAX_CHOICES`] (currently 9) because the
+    /// helper's prompt only assigns numeric hotkeys for `1..=9`.
+    /// Task 2f extends this to a deterministic scroll for >9-choice
+    /// nodes; today, a 10th branch is unreachable through the
+    /// adapter and authors must split the dialog. The render path
+    /// already clamps the cursor for display, so cursor drift here
+    /// is non-fatal.
+    ///
+    /// # Borrow discipline
+    ///
+    /// Every `RefCell` borrow on `flags` is short-lived: we drop the
+    /// immutable preview borrow before opening the `&mut` borrow the
+    /// helper requires, and drop the mutable borrow before invoking
+    /// `on_action` (callbacks routinely close over their own
+    /// `Rc<RefCell<_>>` state and must be free to re-borrow `flags`
+    /// indirectly). Forgetting either drop would deadlock the very
+    /// next frame.
+    fn handle_input(&mut self, _ctx: &mut GameContext<'_>, input: Input) -> ScreenCommand {
+        // 1. Esc — uniform cancellation across every body mode. Routed
+        // first so a finished dialog can still be left, and so a
+        // line-pumping screen with no remaining choices doesn't
+        // accidentally trap the player.
+        if input == Input::Esc {
+            return (self.on_action)(DialogAction::Cancelled);
+        }
+
+        // 2. Finished — only Enter is meaningful (the screen renders
+        // "(They turn away.)"). Anything else is absorbed.
+        if self.state.is_finished() {
+            if input == Input::Enter {
+                return (self.on_action)(DialogAction::Finished);
+            }
+            return ScreenCommand::None;
+        }
+
+        // 3. Line-pumping mode — walk the cursor forward one line per
+        // Enter. Other keys are ignored so the player cannot, e.g.,
+        // accidentally pick a hotkey before reading the setup text.
+        if self.state.current_line(&self.dialog).is_some() {
+            if input == Input::Enter {
+                {
+                    let mut flags = self.flags.borrow_mut();
+                    // `advance` only errors on a finished dialog, which
+                    // we already excluded above. Treat any future error
+                    // surface as a no-op rather than panicking — the
+                    // adapter's job is to keep the runtime alive even
+                    // when an asset is malformed.
+                    let _ = self.state.advance(&self.dialog, &mut flags);
+                }
+                if self.state.is_finished() {
+                    return (self.on_action)(DialogAction::Finished);
+                }
+            }
+            return ScreenCommand::None;
+        }
+
+        // 4. Choice mode. Compute the live visible-choices count once
+        // up-front so navigation, hotkey routing, and the synthesised
+        // Enter path all agree on the same boundary. Cap at
+        // DIALOG_PROMPT_MAX_CHOICES so the cursor never points past
+        // the helper's hotkey range.
+        let visible = {
+            let flags = self.flags.borrow();
+            self.state
+                .available_choices(&self.dialog, &flags)
+                .len()
+                .min(DIALOG_PROMPT_MAX_CHOICES)
+        };
+        if visible == 0 {
+            // Nothing to pick. The render path shows a leave hint, so
+            // anything other than Esc (handled above) is absorbed.
+            return ScreenCommand::None;
+        }
+
+        match input {
+            Input::Up => {
+                // Saturating decrement keeps the cursor at 0 rather
+                // than wrapping — matches what
+                // `ChoicePrompt::step_from_input` does on the standard
+                // navigation path, and is the convention every Murder
+                // Motel scene already used.
+                if self.choice_cursor > 0 {
+                    self.choice_cursor -= 1;
+                }
+                ScreenCommand::None
+            }
+            Input::Down => {
+                if self.choice_cursor + 1 < visible {
+                    self.choice_cursor += 1;
+                }
+                ScreenCommand::None
+            }
+            Input::Enter => {
+                let cursor = self.choice_cursor.min(visible - 1);
+                // Capture the picked choice's `goto` *before*
+                // applying — once the helper advances the state,
+                // `current_node` reflects the destination and the
+                // pre-advance metadata is gone.
+                let target_node = {
+                    let flags = self.flags.borrow();
+                    self.state
+                        .available_choices(&self.dialog, &flags)
+                        .get(cursor)
+                        .map(|c| c.goto.clone())
+                        .unwrap_or_default()
+                };
+                // Synthesise the matching numeric hotkey (`'1'..='9'`).
+                // The cap above guarantees `cursor + 1 <= 9`, so the
+                // digit conversion is total.
+                let digit = char::from_digit((cursor as u32) + 1, 10)
+                    .expect("cursor < DIALOG_PROMPT_MAX_CHOICES (=9) by clamp");
+                let synth = Input::Char(digit);
+                let action = {
+                    let mut flags = self.flags.borrow_mut();
+                    dialog_handle_prompt_input(&mut self.state, &self.dialog, &mut flags, synth)
+                };
+                // Reset cursor unconditionally — the next frame's
+                // filtered choice list may be smaller (a `set:` flag
+                // could have hidden a previously-visible branch), and
+                // landing back at index 0 is the conservative default.
+                self.choice_cursor = 0;
+                match action {
+                    Ok(PromptAction::Selected(idx)) => {
+                        (self.on_action)(DialogAction::ChoicePicked {
+                            choice_index: idx,
+                            target_node,
+                        })
+                    }
+                    // The helper returns Ok for non-Selected outcomes
+                    // (None / Disabled / Cancelled). None of those are
+                    // reachable from a synthesised numeric hotkey on a
+                    // visible choice, but we surface them as no-ops
+                    // rather than panicking so a future change to the
+                    // helper's contract can't crash the runtime.
+                    _ => ScreenCommand::None,
+                }
+            }
+            Input::Char(c) if c.is_ascii_digit() && c != '0' => {
+                // Direct numeric hotkey — players who learned to type
+                // `2` instead of arrow-arrow-Enter keep that muscle
+                // memory. Capture target_node before applying so the
+                // callback can carry the pre-advance metadata.
+                let digit = c.to_digit(10).expect("ascii_digit") as usize;
+                let target_node = if digit >= 1 {
+                    let flags = self.flags.borrow();
+                    self.state
+                        .available_choices(&self.dialog, &flags)
+                        .get(digit - 1)
+                        .map(|c| c.goto.clone())
+                        .unwrap_or_default()
+                } else {
+                    String::new()
+                };
+                let action = {
+                    let mut flags = self.flags.borrow_mut();
+                    dialog_handle_prompt_input(&mut self.state, &self.dialog, &mut flags, input)
+                };
+                self.choice_cursor = 0;
+                match action {
+                    Ok(PromptAction::Selected(idx)) => {
+                        (self.on_action)(DialogAction::ChoicePicked {
+                            choice_index: idx,
+                            target_node,
+                        })
+                    }
+                    _ => ScreenCommand::None,
+                }
+            }
+            _ => ScreenCommand::None,
         }
     }
 }
@@ -866,6 +1087,246 @@ nodes:
             dump.contains("turn away"),
             "finished dialog must render the leave hint; got:\n{dump}"
         );
+    }
+
+    // ---------- Task 2d handle_input tests ----------
+    //
+    // The handle_input impl has four routing rules (Esc, finished,
+    // line-pumping, choice). The tests below pin each — and in the
+    // choice case, both navigation and selection — so a refactor that
+    // collapses the body modes can be caught by a single test run
+    // rather than only surfacing in the example's behavioural-parity
+    // suite (Tasks 5–8). `GameContext` is required by the trait method
+    // signature even though `handle_input` ignores it; we build the
+    // same fixture the render tests use.
+
+    /// Drive a single `Input` through the screen with a fresh
+    /// `GameContext` and return the resulting [`ScreenCommand`].
+    /// Wrapping the boilerplate keeps each test focused on the rule it
+    /// is pinning rather than on context construction.
+    fn dispatch(screen: &mut DialogScreen, input: Input) -> ScreenCommand {
+        let cfg = fixture_config();
+        let fc = fixture_context();
+        let mut ctx = GameContext::new(&cfg, &fc, (60, 12));
+        screen.handle_input(&mut ctx, input)
+    }
+
+    /// Build a `(dialog, flags, state)` triple from the branching
+    /// fixture, advanced past the script line so the choice list is
+    /// the live body mode. Returns the triple without constructing the
+    /// screen — tests that want a custom callback build it themselves.
+    fn fixture_in_choice_mode() -> (Dialog, Rc<RefCell<FlagSet>>, DialogState) {
+        let dialog = load_dialog(fixture_branching_yaml()).expect("fixture parses");
+        let flags = Rc::new(RefCell::new(FlagSet::new()));
+        let mut state = {
+            let mut borrowed = flags.borrow_mut();
+            DialogState::start(&dialog, &mut borrowed)
+        };
+        {
+            let mut borrowed = flags.borrow_mut();
+            state.advance(&dialog, &mut borrowed).expect("advance line");
+        }
+        (dialog, flags, state)
+    }
+
+    #[test]
+    fn handle_input_up_down_moves_choice_cursor() {
+        // Two visible choices in the branching fixture (the third is
+        // gated by `heard_rumor`). Down should walk 0 → 1, then Down
+        // again should clamp at 1 rather than walking off the end.
+        // Up should walk back 1 → 0, then clamp at 0.
+        let (dialog, flags, state) = fixture_in_choice_mode();
+        let mut screen = DialogScreen::new(dialog, state, flags, |_| ScreenCommand::None);
+        assert_eq!(screen.choice_cursor, 0, "starts at first choice");
+
+        let cmd = dispatch(&mut screen, Input::Down);
+        assert!(matches!(cmd, ScreenCommand::None));
+        assert_eq!(screen.choice_cursor, 1);
+
+        let _ = dispatch(&mut screen, Input::Down);
+        assert_eq!(
+            screen.choice_cursor, 1,
+            "cursor must clamp at last visible choice, not wrap"
+        );
+
+        let _ = dispatch(&mut screen, Input::Up);
+        assert_eq!(screen.choice_cursor, 0);
+
+        let _ = dispatch(&mut screen, Input::Up);
+        assert_eq!(screen.choice_cursor, 0, "cursor must clamp at zero");
+    }
+
+    #[test]
+    fn handle_input_enter_picks_current_choice_and_fires_callback() {
+        // Move cursor to the second choice ("I heard about the
+        // murder.") then press Enter. The callback must receive
+        // `ChoicePicked { choice_index: 1, target_node: "end" }` and
+        // the `set: [heard_rumor]` flag application must be visible
+        // through the shared `Rc<RefCell<FlagSet>>`.
+        let (dialog, flags, state) = fixture_in_choice_mode();
+        let recorded: Rc<RefCell<Vec<DialogAction>>> = Rc::new(RefCell::new(Vec::new()));
+        let recorded_writer = recorded.clone();
+        let mut screen = DialogScreen::new(dialog, state, flags.clone(), move |a| {
+            recorded_writer.borrow_mut().push(a);
+            ScreenCommand::Pop
+        });
+
+        let _ = dispatch(&mut screen, Input::Down);
+        let cmd = dispatch(&mut screen, Input::Enter);
+        // The callback's return value flows out as the
+        // ScreenCommand — pin it so a future refactor that swallowed
+        // the value would surface here.
+        assert!(matches!(cmd, ScreenCommand::Pop));
+
+        let actions = recorded.borrow();
+        assert_eq!(actions.len(), 1, "exactly one ChoicePicked emitted");
+        match &actions[0] {
+            DialogAction::ChoicePicked {
+                choice_index,
+                target_node,
+            } => {
+                assert_eq!(*choice_index, 1);
+                assert_eq!(target_node, "end");
+            }
+            other => panic!("expected ChoicePicked, got {other:?}"),
+        }
+
+        // Branch flag application — the second choice's `set:` list
+        // adds `heard_rumor`. The shared flag handle must reflect that.
+        assert!(
+            flags.borrow().contains("heard_rumor"),
+            "picking the second choice must apply its `set:` flags"
+        );
+    }
+
+    #[test]
+    fn handle_input_filters_gated_choices_via_predicates() {
+        // The third branch (`requires: heard_rumor`) is hidden until
+        // the flag is set. Pressing Down twice from the start should
+        // still leave the cursor at index 1 because `visible` only
+        // sees two choices. After the flag is set externally, the
+        // gated branch becomes pickable and Down can walk to index 2.
+        let (dialog, flags, state) = fixture_in_choice_mode();
+        let mut screen = DialogScreen::new(dialog, state, flags.clone(), |_| ScreenCommand::None);
+
+        // Pre-flag: only two choices visible, cursor clamps at 1.
+        let _ = dispatch(&mut screen, Input::Down);
+        let _ = dispatch(&mut screen, Input::Down);
+        assert_eq!(
+            screen.choice_cursor, 1,
+            "gated third choice must not be reachable via cursor"
+        );
+
+        // Flip the gate flag and walk again — now the third choice
+        // is visible, so Down can reach index 2.
+        flags.borrow_mut().insert("heard_rumor".to_string());
+        let _ = dispatch(&mut screen, Input::Down);
+        assert_eq!(
+            screen.choice_cursor, 2,
+            "flag flip must unlock the gated choice for cursor navigation"
+        );
+    }
+
+    #[test]
+    fn handle_input_esc_emits_cancelled() {
+        // Esc must always emit `Cancelled`, regardless of body mode.
+        // Test it from the choice-mode fixture; the other modes route
+        // through the same first-line check.
+        let (dialog, flags, state) = fixture_in_choice_mode();
+        let recorded: Rc<RefCell<Vec<DialogAction>>> = Rc::new(RefCell::new(Vec::new()));
+        let recorded_writer = recorded.clone();
+        let mut screen = DialogScreen::new(dialog, state, flags, move |a| {
+            recorded_writer.borrow_mut().push(a);
+            ScreenCommand::Pop
+        });
+
+        let cmd = dispatch(&mut screen, Input::Esc);
+        assert!(matches!(cmd, ScreenCommand::Pop));
+        assert_eq!(recorded.borrow().len(), 1);
+        assert_eq!(recorded.borrow()[0], DialogAction::Cancelled);
+    }
+
+    #[test]
+    fn handle_input_enter_advances_lines() {
+        // Line-pumping mode: Enter walks the line cursor one step.
+        // Use the simple fixture (one line, then `goto: end`); after
+        // a single Enter the dialog should be finished, which fires
+        // `Finished` automatically (no second Enter needed) — pinning
+        // the SPEC §4.2 "advance through terminals on the same press"
+        // contract that the v2 example relied on.
+        let dialog = load_dialog(fixture_dialog_yaml()).expect("fixture parses");
+        let flags = Rc::new(RefCell::new(FlagSet::new()));
+        let start = {
+            let mut borrowed = flags.borrow_mut();
+            DialogState::start(&dialog, &mut borrowed)
+        };
+        let recorded: Rc<RefCell<Vec<DialogAction>>> = Rc::new(RefCell::new(Vec::new()));
+        let recorded_writer = recorded.clone();
+        let mut screen = DialogScreen::new(dialog, start, flags, move |a| {
+            recorded_writer.borrow_mut().push(a);
+            ScreenCommand::None
+        });
+
+        let _ = dispatch(&mut screen, Input::Enter);
+        // Dialog should now be finished and Finished must have fired.
+        assert!(screen.state.is_finished());
+        assert_eq!(recorded.borrow().len(), 1);
+        assert_eq!(recorded.borrow()[0], DialogAction::Finished);
+    }
+
+    #[test]
+    fn handle_input_numeric_hotkey_picks_choice_directly() {
+        // Pressing `2` should pick the second visible choice without
+        // touching the cursor. Mirrors the SPEC §4.1 numeric-hotkey
+        // path that the helper already supports.
+        let (dialog, flags, state) = fixture_in_choice_mode();
+        let recorded: Rc<RefCell<Vec<DialogAction>>> = Rc::new(RefCell::new(Vec::new()));
+        let recorded_writer = recorded.clone();
+        let mut screen = DialogScreen::new(dialog, state, flags.clone(), move |a| {
+            recorded_writer.borrow_mut().push(a);
+            ScreenCommand::Pop
+        });
+
+        let cmd = dispatch(&mut screen, Input::Char('2'));
+        assert!(matches!(cmd, ScreenCommand::Pop));
+        let actions = recorded.borrow();
+        assert_eq!(actions.len(), 1);
+        match &actions[0] {
+            DialogAction::ChoicePicked { choice_index, .. } => {
+                assert_eq!(*choice_index, 1, "digit `2` picks index 1");
+            }
+            other => panic!("expected ChoicePicked, got {other:?}"),
+        }
+        assert!(flags.borrow().contains("heard_rumor"));
+    }
+
+    #[test]
+    fn handle_input_finished_state_enter_emits_finished() {
+        // A dialog that is already finished should emit Finished on
+        // the next Enter. Drive the simple fixture to its terminal
+        // (the helper's auto-chase advances through the goto on the
+        // same call) and pin the rule.
+        let dialog = load_dialog(fixture_dialog_yaml()).expect("fixture parses");
+        let flags = Rc::new(RefCell::new(FlagSet::new()));
+        let mut start = {
+            let mut borrowed = flags.borrow_mut();
+            DialogState::start(&dialog, &mut borrowed)
+        };
+        {
+            let mut borrowed = flags.borrow_mut();
+            start.advance(&dialog, &mut borrowed).expect("advance");
+        }
+        assert!(start.is_finished());
+        let recorded: Rc<RefCell<Vec<DialogAction>>> = Rc::new(RefCell::new(Vec::new()));
+        let recorded_writer = recorded.clone();
+        let mut screen = DialogScreen::new(dialog, start, flags, move |a| {
+            recorded_writer.borrow_mut().push(a);
+            ScreenCommand::None
+        });
+
+        let _ = dispatch(&mut screen, Input::Enter);
+        assert_eq!(recorded.borrow().len(), 1);
+        assert_eq!(recorded.borrow()[0], DialogAction::Finished);
     }
 
     #[test]
