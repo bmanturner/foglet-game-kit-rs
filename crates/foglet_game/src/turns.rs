@@ -49,7 +49,7 @@ use std::fmt;
 
 use thiserror::Error;
 
-use crate::world_db::WorldMigration;
+use crate::world_db::{WorldDb, WorldMigration};
 
 /// Schema for the daily turn ledger — SPEC_v2 §4.6 / §Task 6a.
 ///
@@ -231,9 +231,11 @@ impl fmt::Display for LocalDate {
 /// Library-internal turn-ledger errors — SPEC_v2 §Task 6.
 ///
 /// `thiserror`-derived per the architecture tenet "thiserror inside
-/// libraries". Variants are added as Tasks 6c–6f land. Task 6b only
-/// needs the validation variant for [`LocalDate::parse`].
-#[derive(Debug, Error, PartialEq, Eq)]
+/// libraries". Variants are added as Tasks 6c–6f land. Task 6b
+/// introduced the validation variant for [`LocalDate::parse`]; Task 6c
+/// adds [`TurnError::Sqlite`] for failures coming out of the SQLite
+/// driver while reading or writing today's row.
+#[derive(Debug, Error)]
 pub enum TurnError {
     /// A date string was handed to [`LocalDate::parse`] that did not
     /// match `YYYY-MM-DD`. Surfaces the offending input verbatim so
@@ -243,6 +245,16 @@ pub enum TurnError {
     InvalidLocalDate {
         /// The string that failed validation.
         input: String,
+    },
+    /// The SQLite round-trip backing a turn-ledger read or write failed.
+    /// Wraps `rusqlite::Error` rather than re-wording it so `tracing`
+    /// and the operator-facing `anyhow` boundary in Task 10 keep the
+    /// underlying SQLite reason intact.
+    #[error("turn ledger SQLite operation failed: {source}")]
+    Sqlite {
+        /// Underlying `rusqlite` error from the offending statement.
+        #[source]
+        source: rusqlite::Error,
     },
 }
 
@@ -328,6 +340,157 @@ impl FixedDateProvider {
 impl DateProvider for FixedDateProvider {
     fn today(&self) -> LocalDate {
         self.date.clone()
+    }
+}
+
+/// Snapshot of a single `turn_ledger` row — what every Task 6
+/// operation hands back to the caller.
+///
+/// The struct is intentionally a flat data carrier rather than a handle
+/// onto the database. Once the caller has a [`TurnLedgerRow`] the
+/// connection is free for the next statement; the runtime layer
+/// (Task 10) needs that property because screen renders display
+/// remaining turns without keeping a write lock open.
+///
+/// Field types mirror the SQLite columns: `i64` for the integer
+/// counters (matches `INTEGER` storage class without a narrowing cast)
+/// and a [`LocalDate`] for the calendar day so consumers downstream
+/// keep the validated shape rather than a bare string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TurnLedgerRow {
+    /// Foreign key into `players.id` — the player this row belongs to.
+    pub player_id: i64,
+    /// The local calendar date this row tracks (`YYYY-MM-DD`).
+    pub local_date: LocalDate,
+    /// Remaining turns for `(player_id, local_date)`. Equal to
+    /// `daily_allowance` immediately after Task 6c creates the row;
+    /// Task 6d's spend path will decrement it.
+    pub balance: i64,
+    /// Snapshot of `[turns].daily_allowance` at the moment this row
+    /// was created. Preserved across the day so an operator who
+    /// edits the config mid-day doesn't retroactively shrink the
+    /// balance the player already saw.
+    pub daily_allowance: i64,
+}
+
+impl WorldDb {
+    /// Return today's [`TurnLedgerRow`] for `player_id`, creating the
+    /// row from `daily_allowance` on its first read of the day —
+    /// SPEC_v2 §Task 6c "initial daily allowance creation".
+    ///
+    /// Two callers in v2:
+    ///
+    /// 1. The screen-render path that displays "remaining turns"
+    ///    needs to know how many turns the player has *right now*.
+    ///    On the first call of a given day the row doesn't exist
+    ///    yet, so this function lazily writes it from the configured
+    ///    allowance.
+    /// 2. The spend path (Task 6d) reads today's balance before
+    ///    decrementing. Its preflight is the same "make sure today's
+    ///    row exists" question, which is exactly what this method
+    ///    answers — Task 6d will compose with this rather than open-
+    ///    coding the ensure-then-spend dance.
+    ///
+    /// # Why `INSERT OR IGNORE` then `SELECT`
+    ///
+    /// The function must be safe under contention: two screens
+    /// rendering for the same player at boot must not both insert
+    /// the row. `INSERT OR IGNORE` makes "row already exists" a
+    /// no-op at the SQLite layer rather than a typed error, and the
+    /// follow-up `SELECT` returns whichever row is now there —
+    /// either the one we wrote or the one a sibling writer beat us
+    /// to. That keeps a stale or in-progress balance from being
+    /// clobbered with a fresh `daily_allowance`, which is the bug
+    /// `INSERT … ON CONFLICT DO UPDATE` would silently introduce.
+    ///
+    /// We deliberately *don't* wrap the two statements in a
+    /// transaction. The `INSERT` is atomic on its own, the `SELECT`
+    /// is read-only, and the busy timeout configured at open time
+    /// (SPEC §3) handles the only contention story. Adding a
+    /// transaction here would buy nothing while making the function
+    /// require `&mut self`, which would fight the runtime layer's
+    /// borrow shape (Task 10 holds the world DB by shared reference
+    /// from the screen render path).
+    ///
+    /// # Why the date provider rather than a `&LocalDate`
+    ///
+    /// Taking `&P: DateProvider` matches the shape Tasks 6d–6f will
+    /// reach for: every ledger operation asks "what's today?" at the
+    /// moment of the call. A `&LocalDate` parameter would force the
+    /// caller to query the provider, which is fine for one call site
+    /// but turns into noise once spend, reset, and carryover all
+    /// thread the same provider through.
+    ///
+    /// Generic dispatch is monomorphized — the production
+    /// system-clock provider and the test [`FixedDateProvider`] both
+    /// inline the call without a `Box<dyn …>` indirection.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TurnError::Sqlite`] if either the insert-or-ignore
+    /// or the follow-up select fails (table missing, FK violation
+    /// when foreign keys are enabled, IO error). The variant wraps
+    /// the original `rusqlite::Error` so the operator-facing message
+    /// in Task 10 keeps SQLite's wording.
+    ///
+    /// # Idempotency
+    ///
+    /// Calling twice on the same `(player_id, local_date)` returns
+    /// the same row both times — including any spend that landed
+    /// between the two calls (Task 6d). The function therefore
+    /// doubles as a "read today's balance" query for callers that
+    /// don't care whether the row was just created or already
+    /// existed.
+    pub fn ensure_today_turns<P: DateProvider>(
+        &self,
+        player_id: i64,
+        daily_allowance: u32,
+        date_provider: &P,
+    ) -> Result<TurnLedgerRow, TurnError> {
+        let today = date_provider.today();
+
+        // Cast `u32 → i64` once: SQLite stores INTEGER as 64-bit
+        // signed, and the cast cannot overflow because `u32::MAX <
+        // i64::MAX`. Doing it here keeps the bind sites below from
+        // sprouting `as i64` noise.
+        let allowance = i64::from(daily_allowance);
+
+        // INSERT OR IGNORE: if the (player_id, local_date) pair is
+        // already present (because we ran earlier today, or a
+        // sibling render path raced in front of us), this is a
+        // no-op. The follow-up SELECT then returns whichever row is
+        // there — preserving any spend that landed in between.
+        self.connection()
+            .execute(
+                "INSERT OR IGNORE INTO turn_ledger \
+                 (player_id, local_date, balance, daily_allowance) \
+                 VALUES (?1, ?2, ?3, ?3)",
+                rusqlite::params![player_id, today.as_str(), allowance],
+            )
+            .map_err(|source| TurnError::Sqlite { source })?;
+
+        // SELECT today's row. We read both `balance` and
+        // `daily_allowance` rather than assuming `balance ==
+        // allowance`: on the no-op branch above the balance may
+        // already be lower than `daily_allowance`, and the stored
+        // allowance is whatever was configured when *this* row was
+        // created (not whatever the caller passed in just now).
+        let (balance, stored_allowance): (i64, i64) = self
+            .connection()
+            .query_row(
+                "SELECT balance, daily_allowance FROM turn_ledger \
+                 WHERE player_id = ?1 AND local_date = ?2",
+                rusqlite::params![player_id, today.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(|source| TurnError::Sqlite { source })?;
+
+        Ok(TurnLedgerRow {
+            player_id,
+            local_date: today,
+            balance,
+            daily_allowance: stored_allowance,
+        })
     }
 }
 
@@ -547,7 +710,9 @@ mod tests {
         for input in bad {
             let err =
                 LocalDate::parse(input).expect_err(&format!("expected {input:?} to be rejected"));
-            let TurnError::InvalidLocalDate { input: got } = &err;
+            let TurnError::InvalidLocalDate { input: got } = &err else {
+                panic!("expected InvalidLocalDate variant, got {err:?}");
+            };
             assert_eq!(
                 got, input,
                 "InvalidLocalDate should preserve the offending input verbatim"
@@ -605,5 +770,221 @@ mod tests {
         let provider =
             FixedDateProvider::new(LocalDate::parse("2026-05-08").expect("fixture date parses"));
         assert_eq!(read(&provider), "2026-05-08");
+    }
+
+    /// Stand up a fresh world DB with the players + turn_ledger
+    /// migrations already applied and one seeded player. Centralises
+    /// the boilerplate the Task 6c–6f tests share so the assertions
+    /// in each test stay focused on the behavior under test rather
+    /// than the setup ceremony.
+    fn world_with_player(dir: &tempfile::TempDir) -> (WorldDb, i64) {
+        let db_path = dir.path().join("world.sqlite");
+        let mut world = WorldDb::open(&db_path).expect("open succeeds");
+        world
+            .apply_migration(&PLAYERS_MIGRATION)
+            .expect("players migration applies");
+        world
+            .apply_migration(&TURN_LEDGER_MIGRATION)
+            .expect("turn_ledger migration applies");
+        // Seed a player directly via SQL — the players module's
+        // upsert path is covered by Task 5 tests; here we only need
+        // a stable id to attach the ledger to.
+        world
+            .connection()
+            .execute("INSERT INTO players (id, handle) VALUES (1, 'alice')", [])
+            .expect("seed player");
+        (world, 1)
+    }
+
+    /// SPEC_v2 §Task 6c headline: a player who has no row for today
+    /// receives one with `balance == daily_allowance`. The test seeds
+    /// only the schema and a player record — no ledger row — and
+    /// asserts the first call materialises the row at the configured
+    /// allowance.
+    #[test]
+    fn ensure_today_turns_creates_row_at_configured_allowance_for_new_player() {
+        let dir = tempdir().expect("tempdir creates");
+        let (world, player_id) = world_with_player(&dir);
+        let provider =
+            FixedDateProvider::new(LocalDate::parse("2026-05-08").expect("fixture date parses"));
+
+        let row = world
+            .ensure_today_turns(player_id, 30, &provider)
+            .expect("first ensure creates the row");
+
+        assert_eq!(row.player_id, player_id);
+        assert_eq!(row.local_date.as_str(), "2026-05-08");
+        assert_eq!(
+            row.balance, 30,
+            "new player's balance must equal the configured daily allowance"
+        );
+        assert_eq!(
+            row.daily_allowance, 30,
+            "stored allowance snapshot must match the value passed in"
+        );
+
+        // Belt-and-braces: the row really exists in the DB, not just
+        // in the returned struct. A regression that returned a
+        // synthesised row without persisting it would slip past the
+        // struct-only assertion above.
+        let count: i64 = world
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM turn_ledger \
+                 WHERE player_id = ?1 AND local_date = ?2",
+                rusqlite::params![player_id, "2026-05-08"],
+                |row| row.get(0),
+            )
+            .expect("count query runs");
+        assert_eq!(count, 1, "exactly one ledger row must be persisted");
+    }
+
+    /// Calling `ensure_today_turns` twice on the same `(player,
+    /// date)` is a no-op on the second call — the existing balance
+    /// is preserved verbatim. This is the contract Task 6d's spend
+    /// path relies on: a render that calls `ensure_today_turns` to
+    /// display "remaining turns" must not undo a spend that landed
+    /// earlier in the same day.
+    ///
+    /// We simulate "a spend already happened" by writing a lower
+    /// balance directly via SQL after the first ensure, then call
+    /// ensure again and assert the lower balance is what comes back.
+    #[test]
+    fn ensure_today_turns_is_idempotent_and_preserves_existing_balance() {
+        let dir = tempdir().expect("tempdir creates");
+        let (world, player_id) = world_with_player(&dir);
+        let provider =
+            FixedDateProvider::new(LocalDate::parse("2026-05-08").expect("fixture date parses"));
+
+        let first = world
+            .ensure_today_turns(player_id, 30, &provider)
+            .expect("first ensure creates the row");
+        assert_eq!(first.balance, 30);
+
+        // Stand in for Task 6d's spend: drop the balance directly.
+        world
+            .connection()
+            .execute(
+                "UPDATE turn_ledger SET balance = ?1 \
+                 WHERE player_id = ?2 AND local_date = ?3",
+                rusqlite::params![25_i64, player_id, "2026-05-08"],
+            )
+            .expect("simulated spend");
+
+        let second = world
+            .ensure_today_turns(player_id, 30, &provider)
+            .expect("second ensure is a no-op");
+        assert_eq!(
+            second.balance, 25,
+            "ensure must not reset a balance that's already been spent down"
+        );
+        assert_eq!(
+            second.daily_allowance, 30,
+            "stored allowance is preserved across repeat calls"
+        );
+    }
+
+    /// Two distinct players with the same date get two distinct
+    /// rows. Without this the composite primary key would behave like
+    /// a single-row cache and one player's balance would clobber
+    /// another's.
+    #[test]
+    fn ensure_today_turns_creates_separate_rows_per_player() {
+        let dir = tempdir().expect("tempdir creates");
+        let (world, alice_id) = world_with_player(&dir);
+        // Add a second player so the second ensure has a valid id.
+        world
+            .connection()
+            .execute("INSERT INTO players (id, handle) VALUES (2, 'bob')", [])
+            .expect("seed second player");
+        let bob_id = 2_i64;
+
+        let provider =
+            FixedDateProvider::new(LocalDate::parse("2026-05-08").expect("fixture date parses"));
+
+        let alice = world
+            .ensure_today_turns(alice_id, 30, &provider)
+            .expect("alice row");
+        let bob = world
+            .ensure_today_turns(bob_id, 30, &provider)
+            .expect("bob row");
+
+        assert_eq!(alice.player_id, alice_id);
+        assert_eq!(bob.player_id, bob_id);
+        assert_eq!(alice.balance, 30);
+        assert_eq!(bob.balance, 30);
+
+        let total: i64 = world
+            .connection()
+            .query_row("SELECT COUNT(*) FROM turn_ledger", [], |row| row.get(0))
+            .expect("count query runs");
+        assert_eq!(total, 2, "each (player, date) pair must occupy its own row");
+    }
+
+    /// Same player, two different dates → two rows. Confirms the
+    /// composite primary key actually keys on the date and that
+    /// advancing the [`FixedDateProvider`] yields a fresh row at the
+    /// new date — the bedrock Task 6f's reset behavior will build on.
+    #[test]
+    fn ensure_today_turns_creates_separate_rows_per_date() {
+        let dir = tempdir().expect("tempdir creates");
+        let (world, player_id) = world_with_player(&dir);
+        let mut provider =
+            FixedDateProvider::new(LocalDate::parse("2026-05-08").expect("first date parses"));
+
+        let day_one = world
+            .ensure_today_turns(player_id, 30, &provider)
+            .expect("day one row");
+        assert_eq!(day_one.local_date.as_str(), "2026-05-08");
+        assert_eq!(day_one.balance, 30);
+
+        provider.set(LocalDate::parse("2026-05-09").expect("second date parses"));
+        let day_two = world
+            .ensure_today_turns(player_id, 30, &provider)
+            .expect("day two row");
+        assert_eq!(day_two.local_date.as_str(), "2026-05-09");
+        assert_eq!(
+            day_two.balance, 30,
+            "Task 6c writes a fresh allowance for the new date — \
+             carryover (Task 6f) is a separate concern"
+        );
+
+        let total: i64 = world
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM turn_ledger WHERE player_id = ?1",
+                rusqlite::params![player_id],
+                |row| row.get(0),
+            )
+            .expect("count query runs");
+        assert_eq!(total, 2, "one row per (player, date) pair");
+    }
+
+    /// SQLite errors propagate as [`TurnError::Sqlite`]. We force a
+    /// failure by skipping the `turn_ledger` migration entirely so
+    /// the INSERT hits a missing-table error. A regression that
+    /// `unwrap()`ed on the `rusqlite::Error` would panic instead of
+    /// returning a typed error, which the operator-facing layer
+    /// (Task 10) wouldn't be able to wrap into `anyhow`.
+    #[test]
+    fn ensure_today_turns_returns_typed_sqlite_error_on_missing_table() {
+        let dir = tempdir().expect("tempdir creates");
+        let db_path = dir.path().join("world.sqlite");
+        let world = WorldDb::open(&db_path).expect("open succeeds");
+        // Deliberately do NOT apply the turn_ledger migration.
+        let provider =
+            FixedDateProvider::new(LocalDate::parse("2026-05-08").expect("fixture date parses"));
+
+        let err = world
+            .ensure_today_turns(1, 30, &provider)
+            .expect_err("missing turn_ledger table must surface as a typed error");
+        let TurnError::Sqlite { source } = &err else {
+            panic!("expected Sqlite variant, got {err:?}");
+        };
+        let msg = source.to_string().to_lowercase();
+        assert!(
+            msg.contains("turn_ledger") || msg.contains("no such table"),
+            "underlying SQLite error should mention the missing table, got: {msg}"
+        );
     }
 }
