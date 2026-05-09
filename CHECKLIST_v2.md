@@ -84,7 +84,7 @@ One unchecked item per iteration. Dependencies in `[brackets]` must be checked o
 
 ### Task 12 — Murder Motel shared Room 7
 
-- [ ] **12a** — Add Murder Motel migration for `motel_world_state` key/value table. [4b]
+- [x] **12a** — Add Murder Motel migration for `motel_world_state` key/value table. [4b]
 - [ ] **12b** — Record `room_7_opened_at` and opener player id when first player unlocks Room 7. [12a, 5b]
 - [ ] **12c** — Show later players that Room 7 was already opened by someone else. [12b]
 - [ ] **12d** — Add two-player test: Alice opens Room 7, Bob sees shared evidence. [12c]

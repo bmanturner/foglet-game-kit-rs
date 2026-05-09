@@ -54,6 +54,7 @@ mod room_7;
 mod scenes;
 mod state;
 mod title_menu;
+mod world;
 
 #[cfg(test)]
 mod test_support;
