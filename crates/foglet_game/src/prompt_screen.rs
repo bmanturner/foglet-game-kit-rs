@@ -20,6 +20,10 @@
 //! to peek at runtime data while choosing their `ScreenCommand` should
 //! drop one layer down to `ChoicePrompt::handle` directly.
 //!
+//! See `docs/prompt-screens.md` for the full authoring rule of thumb on
+//! choosing between this adapter and a hand-rolled [`Screen`] that
+//! composes [`ChoicePrompt`] manually.
+//!
 //! # Why a callback, not a return-value-only design
 //!
 //! [`ScreenCommand`] is the SPEC §5.5 vocabulary the runtime understands;
