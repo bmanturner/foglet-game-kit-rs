@@ -1559,6 +1559,93 @@ pub fn night_clerk_vendor_prompt(cash: u32) -> ChoicePrompt<NightClerkVendorChoi
         .choice('N', NightClerkVendorChoice::NoThanks, "No thanks")
 }
 
+/// Result of applying a [`NightClerkVendorChoice`] against shared
+/// player state (SPEC_v1_1.md §9 step 4, Task 11c).
+///
+/// Mirrors the prompt's variants one-for-one *only as they get wired
+/// up* — Task 11c lands [`Self::BoughtCoffee`], Task 11e adds the
+/// no-thanks path, and Task 11d will route the `(T)` row through a
+/// disabled-prompt branch (so it never reaches this enum). Keeping the
+/// enum narrowly scoped to *successful, state-mutating* outcomes mirrors
+/// [`LostAndFoundOutcome`] and lets the feedback helper return a single
+/// [`FeedbackLine`] without juggling `Option<Option<…>>`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NightClerkVendorOutcome {
+    /// `(B)` succeeded: the coffee price was deducted from the player's
+    /// wallet and the success feedback line should be surfaced. Task
+    /// 11c is the *only* path that produces this variant — Task 11f's
+    /// any-key continuation pipes it through unchanged.
+    BoughtCoffee,
+}
+
+/// Player-facing line emitted after a successful `(B)` press
+/// (SPEC_v1_1.md §9 step 4, Task 11c).
+///
+/// Centralised so the renderer, the test that pins the contract, and
+/// any future transcript log share one source. Wording bakes in the
+/// price so the player sees the deduction confirmed in the same line
+/// — handy when the wallet field is off-screen during the prompt
+/// dismissal.
+pub const BOUGHT_COFFEE_FEEDBACK: &str = "Bought a black coffee for 25g.";
+
+/// Apply the player's [`NightClerkVendorChoice`] to shared runtime state
+/// (SPEC_v1_1.md §9 step 4, Task 11c).
+///
+/// Returns `Some(outcome)` for the *implemented* mutating paths and
+/// `None` for the still-unscoped rows so future tasks (11d, 11e) can
+/// fill in their behaviour without rewriting this signature. Task 11c
+/// lands `BuyCoffee`: cash decrements by [`COFFEE_PRICE`] and the caller
+/// surfaces the success feedback. The other variants intentionally
+/// return `None` for now — Task 11d disables `(T)` upstream (so it
+/// never reaches this handler) and Task 11e wires `(N)` to a
+/// no-state-change exit.
+///
+/// Mutates `slots` directly to mirror [`apply_lost_and_found_choice`]'s
+/// shape — every consumer already holds [`SharedSlots`] handles, so a
+/// `&mut`-style API would just shadow the existing `RefCell` sharing.
+///
+/// Cash is decremented with plain `-=` (not `saturating_sub`) so an
+/// unexpected underflow is a loud panic in debug builds rather than a
+/// silent wrap to zero. Task 11d's disabled-`(T)` branch is the
+/// gatekeeper for tip affordability; Task 11c's coffee at 25g is
+/// always within reach of the 40g [`PlayerSlot::STARTING_CASH`] floor,
+/// so no separate `(B)` gate exists.
+pub fn apply_night_clerk_vendor_choice(
+    slots: &SharedSlots,
+    choice: NightClerkVendorChoice,
+) -> Option<NightClerkVendorOutcome> {
+    match choice {
+        NightClerkVendorChoice::BuyCoffee => {
+            let mut player = slots.player.borrow_mut();
+            player.cash -= COFFEE_PRICE;
+            Some(NightClerkVendorOutcome::BoughtCoffee)
+        }
+        // Task 11d gates `(T)` at the prompt layer (disabled row), so
+        // it should never reach the apply handler. Task 11e will add
+        // the `(N)` no-state-change exit. Returning `None` keeps the
+        // match exhaustive without pretending to mutate state.
+        NightClerkVendorChoice::TipForRumor | NightClerkVendorChoice::NoThanks => None,
+    }
+}
+
+/// Map a [`NightClerkVendorOutcome`] to the player-facing feedback line
+/// the scene should display next (SPEC_v1_1.md §9 step 4, Task 11c).
+///
+/// Uses [`FeedbackLine::success`] (not `info`) because the coffee
+/// purchase is an unambiguous transactional win — the SPEC explicitly
+/// reserves the success register for the vendor scene to distinguish
+/// it from the Lost-and-Found Drawer's descriptive narration. Returns
+/// `Option` so the type stays parallel with
+/// [`lost_and_found_feedback`], leaving room for a future no-narration
+/// variant without re-shaping the call sites.
+pub fn night_clerk_vendor_feedback(outcome: NightClerkVendorOutcome) -> Option<FeedbackLine> {
+    match outcome {
+        NightClerkVendorOutcome::BoughtCoffee => {
+            Some(FeedbackLine::success(BOUGHT_COFFEE_FEEDBACK))
+        }
+    }
+}
+
 impl Screen for MapScreen {
     fn render(&mut self, _ctx: &mut GameContext<'_>, frame: &mut Frame<'_>) {
         // Centre the map inside the frame. The +2 accounts for the
@@ -4330,6 +4417,73 @@ mod tests {
             ],
             "flush wallet should render `You have: 123g` on both priced rows",
         );
+    }
+
+    // ---- Night-clerk vendor: buy coffee (SPEC §9 Task 11c) -----------
+
+    #[test]
+    fn night_clerk_buy_coffee_decrements_cash_and_emits_success_feedback() {
+        // SPEC §9 step 4 / CHECKLIST Task 11c: "Implement buying coffee
+        // for 25g. Test: cash decrements and success feedback renders."
+        // Run the apply handler against a freshly reset slot bundle so
+        // the assertion pins the *delta* (one COFFEE_PRICE deduction)
+        // rather than a hardcoded post-balance. The success-style
+        // feedback contract is the second half of the SPEC's note that
+        // the vendor scene reads as a transactional win — pinning the
+        // style role here guards against a regression that swaps it
+        // back to `info` (the Lost-and-Found register).
+        let slots = SharedSlots::default();
+        slots.reset(0, 0);
+        let starting_cash = slots.player.borrow().cash;
+        assert_eq!(
+            starting_cash,
+            PlayerSlot::STARTING_CASH,
+            "fresh reset should boot at the documented starting balance"
+        );
+
+        let outcome = apply_night_clerk_vendor_choice(&slots, NightClerkVendorChoice::BuyCoffee);
+
+        assert_eq!(outcome, Some(NightClerkVendorOutcome::BoughtCoffee));
+        assert_eq!(
+            slots.player.borrow().cash,
+            starting_cash - COFFEE_PRICE,
+            "BuyCoffee must deduct exactly COFFEE_PRICE from the player's wallet"
+        );
+
+        let line = night_clerk_vendor_feedback(NightClerkVendorOutcome::BoughtCoffee)
+            .expect("BoughtCoffee must surface a feedback line");
+        assert_eq!(line.text(), BOUGHT_COFFEE_FEEDBACK);
+        assert_eq!(
+            line.kind(),
+            foglet_game::FeedbackKind::Success,
+            "coffee purchase must use the success style register"
+        );
+    }
+
+    #[test]
+    fn night_clerk_buy_coffee_lowercase_and_uppercase_match() {
+        // SPEC §9 step 7 (mirrored from the Lost-and-Found contract):
+        // direct-key prompts must treat lowercase/uppercase identically.
+        // Drive the prompt itself — not just the apply handler — so the
+        // test pins both halves of the case-folding chain end-to-end.
+        for upper in [false, true] {
+            let slots = SharedSlots::default();
+            slots.reset(0, 0);
+            let starting = slots.player.borrow().cash;
+            let prompt = night_clerk_vendor_prompt(starting);
+            let key = if upper { 'B' } else { 'b' };
+            let action = prompt.handle(Input::Char(key));
+            match action {
+                PromptAction::Selected(NightClerkVendorChoice::BuyCoffee) => {}
+                other => panic!("expected BuyCoffee for `{key}`, got {other:?}"),
+            }
+            apply_night_clerk_vendor_choice(&slots, NightClerkVendorChoice::BuyCoffee);
+            assert_eq!(
+                slots.player.borrow().cash,
+                starting - COFFEE_PRICE,
+                "case-folded `{key}` must produce the same wallet delta",
+            );
+        }
     }
 
     // ---- Lost-and-Found Drawer action handler (SPEC §9 Task 10c) -----
