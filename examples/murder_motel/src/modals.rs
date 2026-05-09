@@ -11,8 +11,8 @@ use std::collections::BTreeSet;
 use std::rc::Rc;
 
 use foglet_game::{
-    render_inventory_list, EventRecord, GameContext, Input, InventoryList, Screen, ScreenCommand,
-    WorldDb,
+    render_inventory_list, EventRecord, GameContext, Input, InventoryList, LeaderboardSort,
+    ScoreRecord, Screen, ScreenCommand, WorldDb,
 };
 use ratatui::layout::{Alignment, Rect};
 use ratatui::style::{Color, Style};
@@ -465,6 +465,218 @@ impl Screen for BulletinScreen {
             }
             Input::Down | Input::Char('j') | Input::Char('J') => {
                 if !self.events.is_empty() && self.selected + 1 < self.events.len() {
+                    self.selected += 1;
+                }
+                ScreenCommand::None
+            }
+            _ => ScreenCommand::None,
+        }
+    }
+}
+
+/// Investigators leaderboard screen reachable from the main menu
+/// (SPEC_v2 §Task 13f).
+///
+/// Snapshots the top [`LeaderboardScreen::TOP_N`] rows of the
+/// `investigators` board (SPEC_v2 §Task 13e) at construction time and
+/// renders them as a numbered list `<rank>. <handle>  <score>`. The
+/// query happens on push, never per-frame, because SPEC §Task 10d
+/// forbids blocking world queries on the render path. Mirrors
+/// [`BulletinScreen`]: same modal shape, same close affordances, same
+/// log-and-swallow behaviour around transient SQLite errors.
+///
+/// ## Render contract
+///
+/// - One row per score, prefixed with the 1-based rank.
+/// - Handles are looked up via [`WorldDb::player_handle`]; an unknown
+///   id (deleted out from under us by an operator cleanup) renders as
+///   [`Self::UNKNOWN_HANDLE`] so the row stays useful instead of
+///   silently disappearing.
+/// - When the world DB is absent or the board has no rows, the screen
+///   shows [`Self::EMPTY_HINT`] — same affordance as the bulletin.
+///
+/// ## Input contract
+///
+/// - `Up`/`Down` (and `j`/`k`) move the highlight cursor.
+/// - `Esc` / `Backspace` / `l` / `L` pop back to the main menu.
+/// - `Q` / `Ctrl-C` still hard-quit, matching every other screen.
+pub struct LeaderboardScreen {
+    /// Pre-resolved rows: each top-scores entry is paired with the
+    /// handle string we'll render, so the render path makes no DB
+    /// calls. Empty when the board is empty *or* the world DB is
+    /// absent — both reach the same empty-state hint.
+    rows: Vec<LeaderboardRow>,
+    /// Highlighted row. Clamped at render time against the live row
+    /// count so an empty board never points the cursor past zero.
+    selected: usize,
+}
+
+/// One rendered leaderboard row: the kit-side score plus the handle
+/// the screen will display. Resolving the handle once at construction
+/// keeps the render path free of DB calls and lets tests build screens
+/// from synthetic data without standing up a `players` table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeaderboardRow {
+    /// The score record as returned by [`WorldDb::top_scores`]. Stored
+    /// verbatim so future render tweaks (e.g. show `updated_at`) can
+    /// reach the original SQLite columns without re-querying.
+    pub score: ScoreRecord,
+    /// Display string for the player. Resolved via
+    /// [`WorldDb::player_handle`] at construction; falls back to
+    /// [`LeaderboardScreen::UNKNOWN_HANDLE`] when the lookup misses.
+    pub handle: String,
+}
+
+impl LeaderboardScreen {
+    /// Block title rendered on the bordered modal.
+    pub const TITLE: &'static str = "Investigators Leaderboard";
+    /// Empty-state hint shown when the leaderboard holds no rows.
+    pub const EMPTY_HINT: &'static str = "(no investigators ranked yet)";
+    /// Placeholder rendered when [`WorldDb::player_handle`] returns
+    /// `Ok(None)` for an id pulled out of `top_scores`. Pulled out as a
+    /// constant so tests can pin the wording.
+    pub const UNKNOWN_HANDLE: &'static str = "unknown";
+    /// Maximum rows fetched from `top_scores` on open. 10 fits an 80x24
+    /// modal comfortably and matches the typical "top ten" leaderboard
+    /// idiom; the kit's `top_scores` accepts any `u32` so a future tweak
+    /// only edits this constant.
+    pub const TOP_N: u32 = 10;
+
+    /// Build a leaderboard screen by querying `world` for the top
+    /// [`Self::TOP_N`] rows of the `investigators` board. `None` (or a
+    /// DB that returns an error) yields an empty leaderboard — the
+    /// screen renders the empty-state hint and the player can still
+    /// close it cleanly.
+    ///
+    /// Errors from `top_scores` / `player_handle` are deliberately
+    /// swallowed for the same terminal-safety reason
+    /// [`BulletinScreen::from_world_db`] swallows its read errors: a
+    /// transient SQLite hiccup must not soft-lock the player at the
+    /// menu, and `tracing` already records the underlying error.
+    pub fn from_world_db(world: Option<&WorldDb>) -> Self {
+        let rows = world
+            .and_then(|w| {
+                let scores = w
+                    .top_scores(
+                        crate::world::INVESTIGATORS_LEADERBOARD_NAME,
+                        LeaderboardSort::Desc,
+                        Self::TOP_N,
+                    )
+                    .ok()?;
+                Some(
+                    scores
+                        .into_iter()
+                        .map(|score| {
+                            // `Ok(None)` and any error path collapse to
+                            // the placeholder: the leaderboard row stays
+                            // visible either way, and operators can use
+                            // the rank/score to chase down the missing
+                            // player record offline if they need to.
+                            let handle = w
+                                .player_handle(score.player_id)
+                                .ok()
+                                .flatten()
+                                .unwrap_or_else(|| Self::UNKNOWN_HANDLE.to_string());
+                            LeaderboardRow { score, handle }
+                        })
+                        .collect(),
+                )
+            })
+            .unwrap_or_default();
+        Self { rows, selected: 0 }
+    }
+
+    /// Construct directly from a row vector. Used by the tests so they
+    /// can drive the screen without standing up a `WorldDb`; also the
+    /// building block [`Self::from_world_db`] funnels through.
+    pub fn from_rows(rows: Vec<LeaderboardRow>) -> Self {
+        Self { rows, selected: 0 }
+    }
+
+    /// Format one leaderboard row for display. Pulled out of `render`
+    /// so the format contract is unit-testable. Format is
+    /// `<rank>. <handle>  <score>` with a 2-space gutter so the score
+    /// column lines up regardless of handle width.
+    pub fn format_row(rank: usize, row: &LeaderboardRow) -> String {
+        format!("{:>2}. {}  {}", rank, row.handle, row.score.score)
+    }
+}
+
+impl Screen for LeaderboardScreen {
+    fn render(&mut self, _ctx: &mut GameContext<'_>, frame: &mut Frame<'_>) {
+        // Same modal shape as [`BulletinScreen`]: a centred 60x14 box
+        // with a one-row hint band at the bottom. 14 rows hold the top
+        // ten plus borders + hint comfortably under the SPEC §13.1
+        // 80x24 floor.
+        let outer = frame.area();
+        let area = centred_rect(60, 14, outer);
+
+        let hint_h = 1.min(area.height);
+        let body_h = area.height.saturating_sub(hint_h);
+        let body = Rect {
+            x: area.x,
+            y: area.y,
+            width: area.width,
+            height: body_h,
+        };
+        let hint = Rect {
+            x: area.x,
+            y: area.y + body_h,
+            width: area.width,
+            height: hint_h,
+        };
+
+        if self.rows.is_empty() {
+            let widget = Paragraph::new(Self::EMPTY_HINT)
+                .alignment(Alignment::Center)
+                .style(Style::default().fg(Color::DarkGray))
+                .block(Block::default().borders(Borders::ALL).title(Self::TITLE));
+            frame.render_widget(widget, body);
+        } else {
+            let selected = self.selected.min(self.rows.len() - 1);
+            let items: Vec<ListItem<'_>> = self
+                .rows
+                .iter()
+                .enumerate()
+                .map(|(idx, row)| {
+                    let mut line = Line::from(Self::format_row(idx + 1, row));
+                    if idx == selected {
+                        line = line.style(Style::default().fg(Color::Black).bg(Color::White));
+                    }
+                    ListItem::new(line)
+                })
+                .collect();
+            let list =
+                List::new(items).block(Block::default().borders(Borders::ALL).title(Self::TITLE));
+            frame.render_widget(list, body);
+        }
+        if hint_h > 0 {
+            let widget = Paragraph::new("[Up/Down] scroll    [Esc/L] close")
+                .alignment(Alignment::Center)
+                .style(Style::default().fg(Color::DarkGray));
+            frame.render_widget(widget, hint);
+        }
+    }
+
+    fn handle_input(&mut self, _ctx: &mut GameContext<'_>, input: Input) -> ScreenCommand {
+        match input {
+            // Always-on hard-quit affordances.
+            Input::Char('q') | Input::Char('Q') | Input::Ctrl('c') => ScreenCommand::Quit,
+            // Esc / Backspace / `l` close the modal — `l` toggles so
+            // the same key that opens the leaderboard from the menu
+            // also closes it from inside, matching the bulletin's `e`
+            // and inventory's `i` toggle pattern.
+            Input::Esc | Input::Backspace | Input::Char('l') | Input::Char('L') => {
+                ScreenCommand::Pop
+            }
+            Input::Up | Input::Char('k') | Input::Char('K') => {
+                if self.selected > 0 {
+                    self.selected -= 1;
+                }
+                ScreenCommand::None
+            }
+            Input::Down | Input::Char('j') | Input::Char('J') => {
+                if !self.rows.is_empty() && self.selected + 1 < self.rows.len() {
                     self.selected += 1;
                 }
                 ScreenCommand::None
@@ -1058,5 +1270,268 @@ mod tests {
         // appended second, so it should land at index 0.
         assert_eq!(screen.events[0].kind, "clue_found");
         assert_eq!(screen.events[1].kind, "room_7_opened");
+    }
+
+    // ---- LeaderboardScreen (SPEC_v2 §Task 13f) -------------------------
+
+    /// Build a synthetic leaderboard row vector for tests that don't
+    /// need to stand up a real `WorldDb`.
+    fn leaderboard_rows(rows: &[(&str, i64)]) -> Vec<LeaderboardRow> {
+        rows.iter()
+            .enumerate()
+            .map(|(idx, (handle, score))| LeaderboardRow {
+                score: ScoreRecord {
+                    board: "investigators".to_string(),
+                    player_id: idx as i64 + 1,
+                    score: *score,
+                    updated_at: "2026-05-09 00:00:00".to_string(),
+                },
+                handle: (*handle).to_string(),
+            })
+            .collect()
+    }
+
+    /// Dispatch one input to a fresh leaderboard screen with no rows.
+    fn dispatch_leaderboard(input: Input) -> ScreenCommand {
+        let cfg = fixture_config();
+        let fc = fixture_context();
+        let mut ctx = GameContext::new(&cfg, &fc, (80, 24));
+        LeaderboardScreen::from_rows(Vec::new()).handle_input(&mut ctx, input)
+    }
+
+    #[test]
+    fn leaderboard_esc_pops() {
+        // Esc closes the modal back to the menu beneath it — same Pop
+        // contract every other modal honors so an accidental Esc never
+        // drops the player out of the program.
+        assert!(matches!(
+            dispatch_leaderboard(Input::Esc),
+            ScreenCommand::Pop
+        ));
+    }
+
+    #[test]
+    fn leaderboard_l_toggles_close() {
+        // `l` opens the leaderboard from the menu; the same key closes
+        // it from inside, mirroring the bulletin's `e` toggle.
+        for input in [Input::Char('l'), Input::Char('L'), Input::Backspace] {
+            assert!(
+                matches!(dispatch_leaderboard(input), ScreenCommand::Pop),
+                "{input:?} should pop the leaderboard"
+            );
+        }
+    }
+
+    #[test]
+    fn leaderboard_q_still_quits() {
+        // Hard-quit affordances stay live even inside the modal so a
+        // player who lands here by accident can always get out.
+        assert!(matches!(
+            dispatch_leaderboard(Input::Char('q')),
+            ScreenCommand::Quit
+        ));
+        assert!(matches!(
+            dispatch_leaderboard(Input::Ctrl('c')),
+            ScreenCommand::Quit
+        ));
+    }
+
+    #[test]
+    fn leaderboard_empty_renders_hint() {
+        let cfg = fixture_config();
+        let fc = fixture_context();
+        let mut ctx = GameContext::new(&cfg, &fc, (80, 24));
+        let mut screen = LeaderboardScreen::from_rows(Vec::new());
+        let mut term = Terminal::new(TestBackend::new(80, 24)).expect("test backend");
+        term.draw(|frame| screen.render(&mut ctx, frame))
+            .expect("draw");
+        let buf = term.backend().buffer().clone();
+        let mut found = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                found.push_str(buf.cell((x, y)).expect("cell").symbol());
+            }
+            found.push('\n');
+        }
+        assert!(
+            found.contains(LeaderboardScreen::EMPTY_HINT),
+            "empty leaderboard must render the hint; buffer was:\n{found}"
+        );
+    }
+
+    #[test]
+    fn leaderboard_renders_rows_with_handles_and_scores() {
+        let rows = leaderboard_rows(&[("alice", 5), ("bob", 3)]);
+        let cfg = fixture_config();
+        let fc = fixture_context();
+        let mut ctx = GameContext::new(&cfg, &fc, (80, 24));
+        let mut screen = LeaderboardScreen::from_rows(rows);
+        let mut term = Terminal::new(TestBackend::new(80, 24)).expect("test backend");
+        term.draw(|frame| screen.render(&mut ctx, frame))
+            .expect("draw");
+        let buf = term.backend().buffer().clone();
+        let mut found = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                found.push_str(buf.cell((x, y)).expect("cell").symbol());
+            }
+            found.push('\n');
+        }
+        assert!(found.contains(LeaderboardScreen::TITLE));
+        // Format is "<rank>. <handle>  <score>" — checking the rank
+        // prefix together with the handle prevents a future regression
+        // that decoupled the two.
+        assert!(
+            found.contains(" 1. alice"),
+            "alice must render at rank 1; buffer was:\n{found}"
+        );
+        assert!(
+            found.contains(" 2. bob"),
+            "bob must render at rank 2; buffer was:\n{found}"
+        );
+        assert!(found.contains('5'));
+    }
+
+    #[test]
+    fn leaderboard_format_row_pads_rank_and_separates_columns() {
+        let rows = leaderboard_rows(&[("alice", 7)]);
+        let line = LeaderboardScreen::format_row(1, &rows[0]);
+        // Right-aligned 2-wide rank keeps the score column flush even
+        // when the leaderboard exceeds nine entries — pinning the
+        // format here catches a future tweak that flips alignment.
+        assert_eq!(line, " 1. alice  7");
+    }
+
+    #[test]
+    fn leaderboard_down_advances_cursor() {
+        let rows = leaderboard_rows(&[("alice", 5), ("bob", 3), ("cleo", 1)]);
+        let cfg = fixture_config();
+        let fc = fixture_context();
+        let mut ctx = GameContext::new(&cfg, &fc, (80, 24));
+        let mut screen = LeaderboardScreen::from_rows(rows);
+        screen.handle_input(&mut ctx, Input::Down);
+        assert_eq!(screen.selected, 1);
+        screen.handle_input(&mut ctx, Input::Char('j'));
+        assert_eq!(screen.selected, 2);
+        // Past the end clamps rather than wraps — same contract as the
+        // bulletin so muscle memory transfers.
+        screen.handle_input(&mut ctx, Input::Down);
+        assert_eq!(screen.selected, 2);
+    }
+
+    #[test]
+    fn leaderboard_from_world_db_reads_top_scores_with_handles() {
+        // End-to-end: seed two players + scores into a real `WorldDb`,
+        // then prove the screen surfaces them with the right handles
+        // and the right rank order. Locks in the `top_scores` →
+        // `player_handle` plumbing and the descending-sort default.
+        use foglet_game::{LEADERBOARD_SCORES_MIGRATION, PLAYERS_MIGRATION};
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut world = WorldDb::open(dir.path().join("world.sqlite")).expect("open");
+        world
+            .apply_migration(&PLAYERS_MIGRATION)
+            .expect("players migration");
+        world
+            .apply_migration(&LEADERBOARD_SCORES_MIGRATION)
+            .expect("leaderboard migration");
+        world
+            .connection()
+            .execute(
+                "INSERT INTO players (foglet_user_id, handle, role, security_level, \
+                 first_seen_at, last_seen_at) VALUES \
+                 ('u1','alice','user',50,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP),\
+                 ('u2','bob','user',50,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+                [],
+            )
+            .expect("seed players");
+        let (alice_id, bob_id): (i64, i64) = world
+            .connection()
+            .query_row(
+                "SELECT \
+                 (SELECT id FROM players WHERE handle='alice'), \
+                 (SELECT id FROM players WHERE handle='bob')",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("read ids");
+        world
+            .increment_score(crate::world::INVESTIGATORS_LEADERBOARD_NAME, alice_id, 5)
+            .expect("score alice");
+        world
+            .increment_score(crate::world::INVESTIGATORS_LEADERBOARD_NAME, bob_id, 3)
+            .expect("score bob");
+
+        let screen = LeaderboardScreen::from_world_db(Some(&world));
+        assert_eq!(
+            screen.rows.len(),
+            2,
+            "both players should land on the board"
+        );
+        assert_eq!(screen.rows[0].handle, "alice");
+        assert_eq!(screen.rows[0].score.score, 5);
+        assert_eq!(screen.rows[1].handle, "bob");
+        assert_eq!(screen.rows[1].score.score, 3);
+    }
+
+    #[test]
+    fn leaderboard_from_world_db_with_none_yields_empty_screen() {
+        // No `[world]` section, no DB — the screen must still construct
+        // and surface the empty-state hint instead of panicking.
+        let screen = LeaderboardScreen::from_world_db(None);
+        assert!(screen.rows.is_empty());
+    }
+
+    #[test]
+    fn leaderboard_from_world_db_uses_unknown_handle_for_orphan_player_id() {
+        // If a leaderboard row references a player id whose row was
+        // wiped (operator cleanup, partial restore), the screen should
+        // still render the rank — handle just falls back to the
+        // documented "unknown" placeholder.
+        use foglet_game::{LEADERBOARD_SCORES_MIGRATION, PLAYERS_MIGRATION};
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut world = WorldDb::open(dir.path().join("world.sqlite")).expect("open");
+        world
+            .apply_migration(&PLAYERS_MIGRATION)
+            .expect("players migration");
+        world
+            .apply_migration(&LEADERBOARD_SCORES_MIGRATION)
+            .expect("leaderboard migration");
+        // Seed a player + score, then drop the player row directly.
+        // The kit configures `PRAGMA foreign_keys = ON`, so we toggle it
+        // off for the manual delete to simulate the "operator wiped the
+        // players row out from under us" scenario the screen has to
+        // tolerate. This is a test-only escape hatch — production code
+        // never bypasses the FK.
+        world
+            .connection()
+            .execute(
+                "INSERT INTO players (foglet_user_id, handle, role, security_level, \
+                 first_seen_at, last_seen_at) VALUES \
+                 ('orphan','ghost','user',50,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+                [],
+            )
+            .expect("seed orphan player");
+        let orphan_id: i64 = world
+            .connection()
+            .query_row("SELECT id FROM players WHERE handle='ghost'", [], |r| {
+                r.get(0)
+            })
+            .expect("read orphan id");
+        world
+            .increment_score(crate::world::INVESTIGATORS_LEADERBOARD_NAME, orphan_id, 4)
+            .expect("score orphan");
+        world
+            .connection()
+            .execute("PRAGMA foreign_keys = OFF", [])
+            .expect("disable fk for orphan test");
+        world
+            .connection()
+            .execute("DELETE FROM players WHERE id = ?1", [orphan_id])
+            .expect("delete orphan player");
+
+        let screen = LeaderboardScreen::from_world_db(Some(&world));
+        assert_eq!(screen.rows.len(), 1);
+        assert_eq!(screen.rows[0].handle, LeaderboardScreen::UNKNOWN_HANDLE);
+        assert_eq!(screen.rows[0].score.score, 4);
     }
 }

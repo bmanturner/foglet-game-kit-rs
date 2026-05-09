@@ -98,7 +98,7 @@ One unchecked item per iteration. Dependencies in `[brackets]` must be checked o
   - [x] **13c-ii** — Append a `clue_found` (or per-item) event when the player takes a major clue from the Lost-and-Found Drawer. [13c-i, 7b]
 - [x] **13d** — Add lobby bulletin/ledger screen that lists recent events. [7c]
 - [x] **13e** — Increment `investigators` leaderboard when clues are found. [8c]
-- [ ] **13f** — Add leaderboard screen reachable from the main menu. [8d]
+- [x] **13f** — Add leaderboard screen reachable from the main menu. [8d]
 - [ ] **13g** — Add deterministic test for daily reset restoring Murder Motel clue turns. [6f, 13a]
 - [ ] **13h** — Add Murder Motel role/security display proof: sysop/mod/user synthetic contexts show distinct labels/security levels, with copy making clear these are in-game/advisory only. [5f]
 

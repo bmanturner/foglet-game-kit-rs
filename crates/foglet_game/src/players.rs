@@ -404,6 +404,42 @@ RETURNING id, foglet_user_id, handle, role, security_level, \
             )
             .map_err(|source| PlayerError::Sqlite { source })
     }
+
+    /// Look up the display `handle` for a `players.id`.
+    ///
+    /// Returns `Ok(None)` for an id that does not exist — a missing row
+    /// is a normal UI state (the leaderboard render shows `"player #N"`
+    /// or `"unknown"` rather than soft-locking) and not an error
+    /// condition. Errors are reserved for genuine SQLite failures.
+    ///
+    /// Added for the SPEC_v2 §Task 13f leaderboard screen, which renders
+    /// `top_scores` results as `<rank>. <handle>  <score>` and therefore
+    /// needs to convert each `ScoreRecord.player_id` back into the
+    /// display string. Lives next to [`Self::upsert_player`] because the
+    /// `players` table is the single source of truth for handles.
+    ///
+    /// # Concurrency
+    ///
+    /// Takes `&self`: a single read statement under the configured busy
+    /// timeout, same shape as [`crate::WorldDb::top_scores`]. The runtime
+    /// layer (Task 10) calls this from the leaderboard render path so
+    /// keeping the borrow shared lets `GameContext` thread one world-DB
+    /// reference across screens.
+    pub fn player_handle(&self, id: i64) -> Result<Option<String>, PlayerError> {
+        // `SELECT handle … LIMIT 1` keeps the wire shape minimal: the
+        // leaderboard render only needs the display string. Returning
+        // the full `PlayerRecord` would cost an extra column read per
+        // row for no caller-visible gain.
+        const SQL: &str = "SELECT handle FROM players WHERE id = ?1 LIMIT 1";
+        match self
+            .connection()
+            .query_row(SQL, rusqlite::params![id], |row| row.get::<_, String>(0))
+        {
+            Ok(handle) => Ok(Some(handle)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(source) => Err(PlayerError::Sqlite { source }),
+        }
+    }
 }
 
 /// Decode a `players` row into [`PlayerRecord`].
@@ -1097,5 +1133,44 @@ mod tests {
             .expect("query succeeds");
         assert_eq!(role, "user");
         assert_eq!(security_level, 50);
+    }
+
+    /// SPEC_v2 §Task 13f: the leaderboard render path needs to look up a
+    /// handle from a `players.id`. An upsert followed by `player_handle`
+    /// must round-trip the display string verbatim.
+    #[test]
+    fn player_handle_returns_handle_for_existing_id() {
+        let dir = tempdir().expect("tempdir creates");
+        let mut world = WorldDb::open(dir.path().join("world.sqlite")).expect("open");
+        world
+            .apply_migration(&PLAYERS_MIGRATION)
+            .expect("migration applies");
+
+        let player = world
+            .upsert_player(&ctx_with(Some("u1"), Some("Alice")))
+            .expect("upsert");
+        let handle = world
+            .player_handle(player.id)
+            .expect("lookup succeeds")
+            .expect("row exists");
+        assert_eq!(handle, "Alice");
+    }
+
+    /// `Ok(None)` for a missing id keeps the leaderboard UI honest — an
+    /// id pulled from `top_scores` that was deleted out from under us
+    /// (an operator-driven cleanup, say) renders as `"unknown"` rather
+    /// than failing the screen.
+    #[test]
+    fn player_handle_returns_none_for_unknown_id() {
+        let dir = tempdir().expect("tempdir creates");
+        let mut world = WorldDb::open(dir.path().join("world.sqlite")).expect("open");
+        world
+            .apply_migration(&PLAYERS_MIGRATION)
+            .expect("migration applies");
+
+        assert!(world
+            .player_handle(424_242)
+            .expect("lookup succeeds")
+            .is_none());
     }
 }
