@@ -407,6 +407,110 @@ mod tests {
         assert_eq!(buf[(0, 11)].symbol(), "└");
     }
 
+    /// Minimal in-memory event source mimicking the runtime loop's
+    /// `poll → handle_input` cadence without any terminal I/O. SPEC §13
+    /// requires runtime tests stay off the live TUI; a `VecDeque` of
+    /// `Input` values is the simplest "fake event source" that still
+    /// exercises the same code path the production loop uses (one
+    /// `handle_input` call per polled event).
+    struct FakeEventSource {
+        events: std::collections::VecDeque<Input>,
+    }
+
+    impl FakeEventSource {
+        fn new<I: IntoIterator<Item = Input>>(events: I) -> Self {
+            Self {
+                events: events.into_iter().collect(),
+            }
+        }
+
+        fn next(&mut self) -> Option<Input> {
+            self.events.pop_front()
+        }
+    }
+
+    #[test]
+    fn fake_event_source_drives_screen_to_selection() {
+        // End-to-end check that mirrors how the runtime would feed a
+        // `PromptScreen` from its event poll. We script a short input
+        // sequence (an ignored `Resize`, a navigation `Down` on a
+        // navigable prompt, a final lowercase hotkey) and assert both
+        // the captured `PromptAction`s *and* the `ScreenCommand`
+        // emitted at each step. This is the contract Task 7b is meant
+        // to lock in: a fake event source can drive `PromptScreen`
+        // through `Screen::handle_input` and observe the same outcomes
+        // the real runtime would.
+        let captured: Rc<RefCell<Vec<PromptAction<DrawerChoice>>>> =
+            Rc::new(RefCell::new(Vec::new()));
+        let captured_writer = captured.clone();
+        let prompt = drawer_prompt().navigable(true);
+        let mut screen = PromptScreen::new(prompt, move |action| {
+            captured_writer.borrow_mut().push(action.clone());
+            match action {
+                PromptAction::Selected(DrawerChoice::TakeKey) => ScreenCommand::Pop,
+                PromptAction::Selected(DrawerChoice::Leave) => ScreenCommand::None,
+                PromptAction::Cancelled => ScreenCommand::Pop,
+                _ => ScreenCommand::None,
+            }
+        });
+
+        let cfg = fixture_config();
+        let fc = fixture_context();
+        let mut ctx = GameContext::new(&cfg, &fc, (80, 24));
+
+        let mut events = FakeEventSource::new([
+            Input::Resize {
+                width: 80,
+                height: 24,
+            },
+            Input::Down,
+            Input::Char('k'),
+        ]);
+
+        let mut commands = Vec::new();
+        while let Some(ev) = events.next() {
+            commands.push(screen.handle_input(&mut ctx, ev));
+        }
+
+        // Three events in → three `ScreenCommand`s out. Resize and
+        // navigation produce `None`; only the final hotkey transitions.
+        assert_eq!(commands.len(), 3);
+        assert!(matches!(commands[0], ScreenCommand::None));
+        assert!(matches!(commands[1], ScreenCommand::None));
+        assert!(matches!(commands[2], ScreenCommand::Pop));
+
+        // The callback must only have fired for events the prompt
+        // actually translated into a `PromptAction` — not for the
+        // navigation step (consumed by `step_from_input`) and not for
+        // the `Resize` (returns `PromptAction::None`, but still routed
+        // through the callback per `handle_input`'s contract). We pin
+        // both: exactly one `Selected(TakeKey)` at the end, preceded by
+        // one `None` from the resize.
+        let actions = captured.borrow().clone();
+        assert_eq!(actions.len(), 2);
+        assert_eq!(actions[0], PromptAction::None);
+        assert_eq!(actions[1], PromptAction::Selected(DrawerChoice::TakeKey));
+    }
+
+    #[test]
+    fn fake_event_source_routes_cancellation_through_screen_command() {
+        // Pairs with the test above: a fake source can also drive the
+        // cancellation arm to a `ScreenCommand`. Using `Esc` here is
+        // the canonical "back out of the prompt" gesture (SPEC §4.4).
+        let mut screen = PromptScreen::new(drawer_prompt(), |action| match action {
+            PromptAction::Cancelled => ScreenCommand::Pop,
+            _ => ScreenCommand::None,
+        });
+        let cfg = fixture_config();
+        let fc = fixture_context();
+        let mut ctx = GameContext::new(&cfg, &fc, (80, 24));
+
+        let mut events = FakeEventSource::new([Input::Esc]);
+        let cmd = screen.handle_input(&mut ctx, events.next().expect("scripted event"));
+        assert!(matches!(cmd, ScreenCommand::Pop));
+        assert!(events.next().is_none());
+    }
+
     #[test]
     fn screen_is_object_safe_via_box_dyn() {
         // PromptScreen has to fit through `Box<dyn Screen>` for it to be
