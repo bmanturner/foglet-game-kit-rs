@@ -40,6 +40,7 @@ pub mod map;
 pub mod players;
 pub mod prompt;
 pub mod prompt_screen;
+pub mod roles;
 pub mod runtime;
 pub mod save;
 pub mod screen;
@@ -74,6 +75,7 @@ pub use prompt::{
     Theme,
 };
 pub use prompt_screen::{PromptLayout, PromptScreen};
+pub use roles::{FogletRole, MOD_SECURITY_LEVEL, SYSOP_SECURITY_LEVEL, USER_SECURITY_LEVEL};
 pub use runtime::{
     run_built, run_with_io, BuiltGame, CrosstermEventSource, EventSource, Game, GameError,
     GameResult, SavePolicy, TICK_INTERVAL,
