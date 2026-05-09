@@ -34,3 +34,32 @@ timeout_ms = 1800000
 idle_timeout_ms = 300000
 visibility = "members"
 auth_scope = "site"
+
+# SPEC v2 §5: opt the SPEC §13 acceptance fixture into the shared-world
+# stack so Tasks 3–13 have a real config to drive against. The defaults
+# (`world/world.sqlite`, 5 s busy timeout, WAL journal) are the
+# documented SPEC v2 §5 values; we re-state them explicitly here so an
+# operator inspecting the packaged door does not need to consult the
+# schema to learn where the database lives or how it was tuned.
+[world]
+enabled = true
+path = "world/world.sqlite"
+busy_timeout_ms = 5000
+journal_mode = "wal"
+
+# SPEC v2 §4.6 / §5: a daily turn ledger with no carryover. Three turns
+# per day matches the Murder Motel design intent (Task 13a will spend
+# one turn per clue inspection); `carryover_max = 0` keeps the pacing
+# intentional — a player who skips a day does not bank turns for
+# tomorrow.
+[turns]
+daily_allowance = 3
+reset = "local_midnight"
+carryover_max = 0
+
+# SPEC v2 §5: register the `investigators` board so Tasks 8 / 13e have a
+# stable name to write into. `desc` (highest score first) is the Murder
+# Motel scoring direction — more clues found = higher rank.
+[[leaderboards]]
+name = "investigators"
+sort = "desc"

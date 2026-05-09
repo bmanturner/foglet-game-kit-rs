@@ -12,7 +12,7 @@ One unchecked item per iteration. Dependencies in `[brackets]` must be checked o
 - [x] **2a** — Extend `GameConfig` with optional `[world]` fields: `enabled`, `path`, `busy_timeout_ms`, and `journal_mode`. Tests: absent section defaults to disabled. [Task 1]
 - [x] **2b** — Parse `[turns]` config with `daily_allowance`, `reset`, and `carryover_max`. Tests: valid config parses; negative/zero allowance fails clearly. [2a]
 - [x] **2c** — Parse `[[leaderboards]]` config with `name` and `sort`. Tests: duplicate leaderboard names are rejected. [2a]
-- [ ] **2d** — Add a config fixture for `examples/murder_motel/assets/game.toml` enabling world, turns, and `investigators` leaderboard. [2a, 2b, 2c]
+- [x] **2d** — Add a config fixture for `examples/murder_motel/assets/game.toml` enabling world, turns, and `investigators` leaderboard. [2a, 2b, 2c]
 
 ### Task 3 — World DB open/bootstrap
 

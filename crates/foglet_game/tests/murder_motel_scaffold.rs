@@ -28,7 +28,7 @@
 
 use std::path::PathBuf;
 
-use foglet_game::{GameConfig, SaveStrategy};
+use foglet_game::{GameConfig, LeaderboardSort, SaveStrategy, TurnReset};
 
 /// Resolve a path relative to this crate's manifest dir. Examples and
 /// the test runner can be invoked from anywhere; this keeps every disk
@@ -63,6 +63,53 @@ fn scaffold_game_toml_parses_into_game_config() {
         SaveStrategy::PerFogletUser,
         "Task 13h plugs persistence into the per-user strategy; the scaffold \
          must opt in from day one"
+    );
+}
+
+#[test]
+fn scaffold_game_toml_enables_v2_shared_world_sections() {
+    // Task 2d: the SPEC §13 fixture must opt into the v2 shared-world
+    // stack so Tasks 3–13 have a real config to drive against. We assert
+    // the *intent* of each section (world enabled, turn ledger present,
+    // `investigators` board registered) rather than every default value
+    // — the config layer's own tests cover defaulting, and re-asserting
+    // them here would just couple the fixture to schema details.
+    let path = workspace_path("../../examples/murder_motel/assets/game.toml");
+    let cfg = GameConfig::load(&path)
+        .unwrap_or_else(|err| panic!("scaffold game.toml at {path:?} failed to load: {err}"));
+
+    assert!(
+        cfg.world.enabled,
+        "[world].enabled must be true so Task 3 onward has a real DB to open"
+    );
+
+    let turns = cfg
+        .turns
+        .as_ref()
+        .expect("[turns] section is required by Task 2d so the daily ledger has an allowance");
+    assert!(
+        turns.daily_allowance > 0,
+        "[turns].daily_allowance must be > 0; the config validator rejects zero, \
+         but we restate it here so a future edit that lowers the value is caught \
+         by this fixture-level assertion before it reaches the runtime"
+    );
+    assert_eq!(
+        turns.reset,
+        TurnReset::LocalMidnight,
+        "v2 ships only `local_midnight`; pinning it here flags any silent reset \
+         change while the closed enum is still narrow"
+    );
+
+    let investigators = cfg
+        .leaderboards
+        .iter()
+        .find(|board| board.name == "investigators")
+        .expect("Task 13e increments the `investigators` board; the fixture must register it");
+    assert_eq!(
+        investigators.sort,
+        LeaderboardSort::Desc,
+        "Murder Motel ranks highest score first; `desc` is the SPEC v2 §5 default \
+         but pinning it guards against a future edit flipping the direction"
     );
 }
 
