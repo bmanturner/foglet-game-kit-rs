@@ -290,6 +290,65 @@ pub fn shared_room_7_arrival_feedback(
     )))
 }
 
+/// Event-log `kind` label written when the *first* player unlocks Room 7
+/// (SPEC_v2 §Task 13c). Centralised as a constant so the bulletin
+/// renderer (Task 13d) and the test that pins the contract here both
+/// reference one source — the kit imposes no namespace on `kind`, so the
+/// game owns the string.
+pub const ROOM_7_OPENED_EVENT_KIND: &str = "room_7_opened";
+
+/// Player-facing message stored on the [`ROOM_7_OPENED_EVENT_KIND`] row.
+///
+/// Phrased without the opener's handle on purpose: the kit has no
+/// id→handle lookup yet (see [`shared_room_7_arrival_feedback`]'s docs)
+/// and SPEC §4.5 keeps identities advisory, so the bulletin entry
+/// surfaces the *fact* of the opening without leaking another player's
+/// handle through a side channel. The opener's `players.id` rides along
+/// in the row's `player_id` column for renderers that later resolve it
+/// against a future handle table.
+pub const ROOM_7_OPENED_EVENT_MESSAGE: &str = "Room 7 was unlocked.";
+
+/// Append a `world_events` row recording the *first* opening of Room 7
+/// (SPEC_v2 §Task 13c — Room 7 half).
+///
+/// Idempotent at the bulletin level: only the [`Room7Opening`] returned
+/// by the inserting [`record_room_7_opening`] call (i.e. the one whose
+/// `first_opening` flag is `true`) produces an event. Subsequent
+/// openings — including the read-only [`room_7_opening`] path — are
+/// no-ops, so the bulletin shows exactly one "Room 7 was unlocked." row
+/// regardless of how many later players step onto the stairs. This
+/// pairs with [`record_room_7_opening`]'s SQL-level "first-writer-wins"
+/// contract: that helper tells us *who* won the race; this helper logs
+/// the win.
+///
+/// Returns `true` when a row was appended. Returns `false` when:
+/// - `opening.first_opening` is `false` (a later opener), or
+/// - the underlying `append_event` call failed.
+///
+/// The bool collapses both the "no-op" and "swallowed error" branches
+/// into one so the call site (the lobby's stairs handler) can stay a
+/// single `if append_room_7_opened_event(...)` with no error routing.
+/// Errors are intentionally not propagated for the same reason
+/// [`record_room_7_opening`]'s docs lay out: the kit's terminal-safety
+/// contract forbids panicking out of `handle_input`, the screen stack
+/// is mid-transition, and a transient SQLite hiccup must not soft-lock
+/// the Room 7 transition. The forthcoming kit-side `tracing` boundary
+/// (called out in `record_room_7_opening`'s comments) will pick the
+/// failure up; until then, log-and-continue is the documented contract.
+pub fn append_room_7_opened_event(world: &WorldDb, opening: &Room7Opening) -> bool {
+    if !opening.first_opening {
+        return false;
+    }
+    world
+        .append_event(
+            ROOM_7_OPENED_EVENT_KIND,
+            Some(opening.opened_by_player_id),
+            ROOM_7_OPENED_EVENT_MESSAGE,
+            None,
+        )
+        .is_ok()
+}
+
 /// Number of daily turns one clue-inspection action consumes — SPEC_v2
 /// §7 ("Daily clue turns: examining clue hotspots spends turns") and
 /// §Task 13a. Centralised so the helper, the lobby's X-press handler,
@@ -731,6 +790,214 @@ mod tests {
         assert!(
             text.contains("2026-05-09 12:34:56"),
             "banner must include the original opening timestamp: {text}"
+        );
+    }
+
+    // ---- SPEC_v2 §Task 13c Room 7 event log ------------------------
+
+    /// Stand up a world DB with the migrations the Room 7 event helper
+    /// needs: `players` (FK target for `world_events.player_id`),
+    /// `world_events` (the row we're writing), and the example's
+    /// `motel_world_state` (so a paired `record_room_7_opening` call
+    /// has somewhere to land in the same test).
+    fn world_with_event_stack(dir: &tempfile::TempDir) -> WorldDb {
+        let db_path = dir.path().join("world.sqlite");
+        let mut world = WorldDb::open(&db_path).expect("open world db");
+        world
+            .apply_migration(&foglet_game::PLAYERS_MIGRATION)
+            .expect("apply players migration");
+        world
+            .apply_migration(&foglet_game::WORLD_EVENTS_MIGRATION)
+            .expect("apply world_events migration");
+        world
+            .apply_migration(&MOTEL_WORLD_STATE_MIGRATION)
+            .expect("apply motel_world_state migration");
+        world
+    }
+
+    /// First opener appends exactly one `room_7_opened` event row, with
+    /// the canonical kind, message, and `player_id` attribution.
+    #[test]
+    fn append_room_7_opened_event_logs_first_opening() {
+        let dir = tempdir().expect("tempdir");
+        let world = world_with_event_stack(&dir);
+
+        // Insert the opener row directly so we have a real `players.id`
+        // to satisfy the world_events FK without dragging the full
+        // FogletContext upsert into this focused test.
+        // Seed the opener row directly through the shared `&Connection`
+        // accessor: we just need a real `players.id` to satisfy the
+        // `world_events` FK, and the kit's `transaction` wrapper requires
+        // `&mut self` (which would force this whole test to use `mut`
+        // and pull the borrow shape away from how the runtime actually
+        // calls these helpers).
+        world
+            .connection()
+            .execute(
+                "INSERT INTO players (foglet_user_id, handle, role, security_level, \
+                 first_seen_at, last_seen_at) \
+                 VALUES (NULL, 'alice', 'user', 50, \
+                         CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+                [],
+            )
+            .expect("seed alice");
+        let alice_id: i64 = world
+            .connection()
+            .query_row("SELECT id FROM players WHERE handle = 'alice'", [], |r| {
+                r.get(0)
+            })
+            .expect("read alice id");
+
+        let opening =
+            record_room_7_opening(&world, alice_id).expect("record alice's first opening");
+        assert!(opening.first_opening, "alice must be the first opener");
+
+        let appended = append_room_7_opened_event(&world, &opening);
+        assert!(
+            appended,
+            "first opener must produce a world_events row (returned false)"
+        );
+
+        let events = world
+            .recent_events(10)
+            .expect("read back recent events for assertion");
+        assert_eq!(
+            events.len(),
+            1,
+            "exactly one row should land for the first opening"
+        );
+        let row = &events[0];
+        assert_eq!(row.kind, ROOM_7_OPENED_EVENT_KIND);
+        assert_eq!(row.message, ROOM_7_OPENED_EVENT_MESSAGE);
+        assert_eq!(
+            row.player_id,
+            Some(alice_id),
+            "event must attribute the opening to the first-writer player id"
+        );
+        assert!(
+            row.metadata.is_none(),
+            "Room 7 opening event has no metadata payload (player_id covers attribution)"
+        );
+    }
+
+    /// Second-and-later openers must not duplicate the bulletin row —
+    /// the SQL-layer first-writer-wins contract on
+    /// [`record_room_7_opening`] tells us "this isn't your row", and the
+    /// event helper short-circuits to a no-op so the lobby ledger keeps
+    /// exactly one "Room 7 was unlocked." entry forever.
+    #[test]
+    fn append_room_7_opened_event_is_noop_for_later_opener() {
+        let dir = tempdir().expect("tempdir");
+        let world = world_with_event_stack(&dir);
+
+        world
+            .connection()
+            .execute(
+                "INSERT INTO players (foglet_user_id, handle, role, security_level, \
+                 first_seen_at, last_seen_at) \
+                 VALUES (NULL, 'alice', 'user', 50, \
+                         CURRENT_TIMESTAMP, CURRENT_TIMESTAMP), \
+                        (NULL, 'bob', 'user', 50, \
+                         CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+                [],
+            )
+            .expect("seed alice + bob");
+        let alice_id: i64 = world
+            .connection()
+            .query_row("SELECT id FROM players WHERE handle = 'alice'", [], |r| {
+                r.get(0)
+            })
+            .expect("alice id");
+        let bob_id: i64 = world
+            .connection()
+            .query_row("SELECT id FROM players WHERE handle = 'bob'", [], |r| {
+                r.get(0)
+            })
+            .expect("bob id");
+
+        // Alice opens first and logs the event.
+        let alice_opening = record_room_7_opening(&world, alice_id).expect("alice opens");
+        assert!(append_room_7_opened_event(&world, &alice_opening));
+
+        // Bob arrives later; the SQL-layer record reports
+        // `first_opening: false`, so the event helper must refuse.
+        let bob_opening = record_room_7_opening(&world, bob_id).expect("bob arrives");
+        assert!(
+            !bob_opening.first_opening,
+            "second caller must observe first_opening=false (precondition for this test)"
+        );
+        let bob_appended = append_room_7_opened_event(&world, &bob_opening);
+        assert!(
+            !bob_appended,
+            "later opener must not append a second bulletin row"
+        );
+
+        let events = world.recent_events(10).expect("read events");
+        assert_eq!(
+            events.len(),
+            1,
+            "lobby bulletin must show exactly one Room 7 opening across all players"
+        );
+        assert_eq!(
+            events[0].player_id,
+            Some(alice_id),
+            "the single event must remain attributed to the first opener"
+        );
+    }
+
+    /// The read-only [`room_7_opening`] path also returns
+    /// `first_opening: false`, so feeding *its* return value into the
+    /// event helper is a no-op too. Pins the "the read path is
+    /// observational, not productive" semantics so a future caller that
+    /// composes `room_7_opening(...)?` with the event helper cannot
+    /// accidentally double-log on every render.
+    #[test]
+    fn append_room_7_opened_event_is_noop_for_read_only_observation() {
+        let dir = tempdir().expect("tempdir");
+        let world = world_with_event_stack(&dir);
+
+        world
+            .connection()
+            .execute(
+                "INSERT INTO players (foglet_user_id, handle, role, security_level, \
+                 first_seen_at, last_seen_at) \
+                 VALUES (NULL, 'alice', 'user', 50, \
+                         CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+                [],
+            )
+            .expect("seed alice");
+        let alice_id: i64 = world
+            .connection()
+            .query_row("SELECT id FROM players WHERE handle = 'alice'", [], |r| {
+                r.get(0)
+            })
+            .expect("alice id");
+
+        // Seed the canonical opening + event via the writer path.
+        let writer_opening = record_room_7_opening(&world, alice_id).expect("alice opens");
+        assert!(append_room_7_opened_event(&world, &writer_opening));
+
+        // Now feed the *read-only* observation into the helper. The
+        // read path always reports first_opening=false (see the
+        // `room_7_opening_returns_recorded_pair_after_first_open` test
+        // above), so this must not insert a second event row.
+        let observation = room_7_opening(&world)
+            .expect("read succeeds")
+            .expect("row exists after writer landed");
+        assert!(
+            !observation.first_opening,
+            "read path always reports first_opening=false (precondition for this test)"
+        );
+        let appended = append_room_7_opened_event(&world, &observation);
+        assert!(
+            !appended,
+            "feeding a read-only observation in must never produce an event row"
+        );
+
+        let count = world.recent_events(10).expect("read events").len();
+        assert_eq!(
+            count, 1,
+            "bulletin must still show exactly one Room 7 event after the read-path probe"
         );
     }
 

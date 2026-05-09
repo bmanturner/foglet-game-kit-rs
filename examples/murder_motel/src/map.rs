@@ -851,6 +851,15 @@ impl MapScreen {
                 if let Ok(opening) = crate::world::record_room_7_opening(world, player.id) {
                     arrival_feedback =
                         crate::world::shared_room_7_arrival_feedback(&opening, player.id);
+                    // SPEC_v2 §Task 13c: log the Room 7 opening into
+                    // `world_events` so the upcoming bulletin (Task
+                    // 13d) can render "Room 7 was unlocked." in the
+                    // lobby ledger. The helper internally short-
+                    // circuits to a no-op when this player isn't the
+                    // first opener and swallows DB errors for the same
+                    // mid-transition terminal-safety reasons the
+                    // surrounding `let _` branches cite.
+                    let _ = crate::world::append_room_7_opened_event(world, &opening);
                 }
             }
         }
