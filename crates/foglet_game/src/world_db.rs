@@ -9,10 +9,10 @@
 //!
 //! # What lands here, and when
 //!
-//! Task 3d (this commit) extends the open path to apply the
-//! `[world].journal_mode` config alongside the busy timeout introduced
-//! in Task 3c. It still deliberately does not run any migrations —
-//! that's Task 4.
+//! Task 4a (this commit) extends the open path to bootstrap the
+//! `world_migrations` bookkeeping table. The table itself is empty —
+//! Task 4b records the first row and Task 4c hardens idempotency around
+//! repeat applications.
 //!
 //! Keeping each behavior in its own iteration means the test that
 //! ships with this commit covers exactly one promise ("the file opens
@@ -230,6 +230,8 @@ impl WorldDb {
 
         let journal_mode = apply_journal_mode(&conn, &options.journal_mode)?;
 
+        bootstrap_migrations_table(&conn)?;
+
         Ok(Self { conn, journal_mode })
     }
 
@@ -287,6 +289,40 @@ fn apply_journal_mode(conn: &Connection, requested: &str) -> Result<String, Worl
         })?;
 
     Ok(active)
+}
+
+/// Create the `world_migrations` bookkeeping table if it isn't already
+/// present.
+///
+/// Called from every successful open path so a fresh database has the
+/// table ready for Task 4b (recording an applied migration) and a
+/// previously-bootstrapped database is unaffected — `IF NOT EXISTS`
+/// keeps the call idempotent across the relaunches that happen on every
+/// `external_pty` re-exec (SPEC §7).
+///
+/// The schema is intentionally minimal for Task 4a: later sub-tasks
+/// (4b–4d) populate `name`/`checksum` and write rows. Columns:
+///
+/// - `version` — `INTEGER PRIMARY KEY` so rows are unique on the
+///   monotonic version contract from SPEC §4.3 and queries that ask
+///   "what's the highest applied version" are an index lookup.
+/// - `name` — human-friendly label echoed back in errors and operator
+///   tooling. `NOT NULL` because every migration ships with one.
+/// - `checksum` — nullable, populated only for file-backed migrations
+///   per SPEC §4.3 ("if practical").
+/// - `applied_at` — UTC timestamp of when the migration was recorded,
+///   defaulted to `CURRENT_TIMESTAMP` so callers don't have to thread
+///   a clock through to bookkeeping inserts.
+fn bootstrap_migrations_table(conn: &Connection) -> Result<(), WorldDbError> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS world_migrations (\n\
+            version    INTEGER PRIMARY KEY,\n\
+            name       TEXT NOT NULL,\n\
+            checksum   TEXT,\n\
+            applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP\n\
+         )",
+    )
+    .map_err(|source| WorldDbError::BootstrapMigrationsTable { source })
 }
 
 /// Errors raised while opening or operating on a [`WorldDb`].
@@ -349,6 +385,18 @@ pub enum WorldDbError {
         /// Normalized mode we attempted to apply.
         requested: String,
         /// Underlying `rusqlite` error.
+        #[source]
+        source: rusqlite::Error,
+    },
+
+    /// `CREATE TABLE IF NOT EXISTS world_migrations` failed during the
+    /// open-time bootstrap. Distinct variant so an operator-facing error
+    /// can name "migration bookkeeping" specifically — a generic
+    /// [`Self::Open`] would mislead, since by this point the file is
+    /// open and the connection is configured.
+    #[error("failed to bootstrap world_migrations table: {source}")]
+    BootstrapMigrationsTable {
+        /// Underlying `rusqlite` error from the `CREATE TABLE` batch.
         #[source]
         source: rusqlite::Error,
     },
@@ -579,6 +627,88 @@ mod tests {
             }
             other => panic!("expected InvalidJournalMode, got {other:?}"),
         }
+    }
+
+    /// SPEC_v2 §Task 4a acceptance: a freshly-opened world DB has the
+    /// `world_migrations` bookkeeping table in place. Task 4b builds on
+    /// this by recording rows; this test only verifies the table exists
+    /// and matches the documented column shape so a future regression
+    /// renaming a column flunks here rather than in a higher-level test
+    /// where the failure mode is harder to attribute.
+    #[test]
+    fn open_creates_world_migrations_table() {
+        let dir = tempdir().expect("tempdir creates");
+        let db_path = dir.path().join("world.sqlite");
+
+        let world = WorldDb::open(&db_path).expect("open succeeds");
+
+        // sqlite_master is the canonical "does this table exist" probe.
+        // Asserting on the count rather than `Option<String>` keeps the
+        // assertion trivial even if SQLite ever stores the table name in
+        // mixed case.
+        let count: i64 = world
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master \
+                 WHERE type = 'table' AND name = 'world_migrations'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("sqlite_master query runs");
+        assert_eq!(count, 1, "world_migrations table must exist after open");
+
+        // Spot-check the columns so a future schema drift (e.g.
+        // dropping `checksum` because Task 4b/4c forgot it was on the
+        // contract) flunks here. `pragma_table_info` returns one row per
+        // column with `name` in column index 1.
+        let mut stmt = world
+            .connection()
+            .prepare("SELECT name FROM pragma_table_info('world_migrations') ORDER BY cid")
+            .expect("pragma_table_info preparable");
+        let columns: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .expect("query_map runs")
+            .collect::<Result<_, _>>()
+            .expect("rows decode");
+        assert_eq!(
+            columns,
+            vec![
+                "version".to_string(),
+                "name".to_string(),
+                "checksum".to_string(),
+                "applied_at".to_string(),
+            ],
+            "world_migrations schema must match the documented shape"
+        );
+    }
+
+    /// Reopening the same DB file must not error or duplicate the
+    /// migrations table — `IF NOT EXISTS` is the only thing standing
+    /// between the relaunch path (SPEC §7 `external_pty` re-exec) and a
+    /// loud `table already exists` failure on every restart.
+    #[test]
+    fn reopening_existing_db_keeps_migrations_table_idempotent() {
+        let dir = tempdir().expect("tempdir creates");
+        let db_path = dir.path().join("world.sqlite");
+
+        // First open writes the table; drop the handle to release the
+        // file so the second open mirrors a real process restart.
+        drop(WorldDb::open(&db_path).expect("first open succeeds"));
+        let world = WorldDb::open(&db_path).expect("reopen succeeds");
+
+        let count: i64 = world
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master \
+                 WHERE type = 'table' AND name = 'world_migrations'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("sqlite_master query runs");
+        assert_eq!(
+            count, 1,
+            "reopen must leave exactly one world_migrations table"
+        );
     }
 
     /// SPEC_v2 §Task 3b acceptance: a nested `world/world.sqlite`
