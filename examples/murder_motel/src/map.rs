@@ -151,6 +151,17 @@ impl MapScreen {
     /// Title rendered on the bordered block surrounding the map.
     pub const TITLE: &'static str = "Murder Motel — Lobby";
 
+    /// Identifier this screen writes into [`SharedSlots::map_name`] on
+    /// construction. Read by the title screen's Continue path to
+    /// dispatch a resumed run back to the lobby. Symmetric with
+    /// [`crate::room_7::Room7Screen::MAP_NAME`].
+    pub const MAP_NAME: &'static str = "lobby";
+
+    /// Cell the player lands on when arriving from Room 7. One step
+    /// west of [`Self::STAIRS_UP_POS`] so the first directional input
+    /// after arrival doesn't bump the player straight back upstairs.
+    pub const LOBBY_ARRIVAL_POS: (u16, u16) = (43, 1);
+
     /// Glyph used to draw the player on top of the underlying floor.
     /// Pulled from [`foglet_game::PLAYER_GLYPH`] so the convention
     /// stays in lockstep with the kit-wide constant.
@@ -292,6 +303,19 @@ impl MapScreen {
     /// unlocked siblings.
     pub const UNLOCKED_DOOR_GLYPH: char = '+';
 
+    /// Position of the stairs that lead up to Room 7. Inside Room 4,
+    /// behind the brass-key gate, so the natural play chain is: brass
+    /// key → walk into Room 4 → climb the stairs (only possible after
+    /// the Lost-and-Found Drawer hands the player the
+    /// [`Self::ROOM_7_KEY_ID`]). A step onto this cell with the room
+    /// key in inventory swaps the screen for a fresh
+    /// [`crate::room_7::Room7Screen`] via [`ScreenCommand::Replace`].
+    pub const STAIRS_UP_POS: (u16, u16) = (44, 1);
+
+    /// Glyph painted on [`Self::STAIRS_UP_POS`]. `>` matches the
+    /// roguelike convention for "stairs going up away from this level."
+    pub const STAIRS_UP_GLYPH: char = '>';
+
     /// Position of the win tile — the spot the player must stand on,
     /// after asking the Night Clerk about the murder, to solve the
     /// case (Task 13g). Inside Room 4, which is itself only reachable
@@ -380,6 +404,11 @@ impl MapScreen {
         let map =
             parse_map(LOBBY_MAP_TEXT, &legend).expect("embedded lobby map parses against legend");
         let screen = Self { map, slots };
+        // Mark the slots as "we are now on the lobby" so a save
+        // snapshot taken before the next transition records the right
+        // map identifier. Symmetric with
+        // [`crate::room_7::Room7Screen::with_shared`].
+        *screen.slots.map_name.borrow_mut() = Self::MAP_NAME.to_string();
         // Decide the spawn cell. If the slots arrived empty (e.g. a
         // brand-new game) we honour the caller's `(start_x, start_y)`;
         // otherwise the slots already carry the loaded player position
@@ -450,6 +479,14 @@ impl MapScreen {
         // model itself treats `Custom` tiles as walkable — the lock
         // is a screen-level concern, parallel to NPC blocking below.
         if self.is_locked_door_blocking(target_x, target_y) {
+            return false;
+        }
+        // Stairs-up gate. Symmetric with the locked-door gate above —
+        // a player without the Room 7 key bumps the cell as if it
+        // were a wall. Once the key is in inventory the cell is
+        // walkable; the post-move handler emits Replace as soon as
+        // the player completes a step onto it.
+        if self.is_stairs_blocking(target_x, target_y) {
             return false;
         }
         // NPCs are solid: walking into one is converted to "stand
@@ -634,6 +671,30 @@ impl MapScreen {
         Self::is_locked_door_at(x, y) && !self.has_locked_door_key()
     }
 
+    /// Whether the cell at `(x, y)` is the lobby's stairs-up cell.
+    /// Mirror of [`Self::is_locked_door_at`] — same one-call shape so
+    /// every read site (renderer, movement gate, post-move handler)
+    /// consults a single source of truth.
+    pub fn is_stairs_at(x: u16, y: u16) -> bool {
+        (x, y) == Self::STAIRS_UP_POS
+    }
+
+    /// Whether the player currently holds the Room 7 key — the gate
+    /// keeping the stairs up to Room 7 closed. Pulled out so render
+    /// (which paints the `>` glyph in different styles depending on
+    /// whether the player has earned the climb) and the movement
+    /// gate share one predicate.
+    pub fn has_room_7_key(&self) -> bool {
+        self.is_collected(Self::ROOM_7_KEY_ID)
+    }
+
+    /// Whether a step into `(x, y)` should be blocked by the stairs
+    /// gate. True only for the stairs cell while the player is
+    /// missing the Room 7 key — every other case returns false.
+    pub fn is_stairs_blocking(&self, x: u16, y: u16) -> bool {
+        Self::is_stairs_at(x, y) && !self.has_room_7_key()
+    }
+
     /// Whether the win condition has already fired. Exposed so tests
     /// can assert the latch without poking at private state and so the
     /// renderer can drop the win-tile glyph after the modal triggers.
@@ -668,6 +729,58 @@ impl MapScreen {
             ScreenCommand::Push(Box::new(WinScreen))
         } else {
             ScreenCommand::None
+        }
+    }
+
+    /// If the player just completed a step onto [`Self::STAIRS_UP_POS`],
+    /// build the [`ScreenCommand::Replace`] that swaps this lobby
+    /// screen for a fresh [`crate::room_7::Room7Screen`] sharing the
+    /// same slots. Sets the player position to
+    /// [`crate::room_7::Room7Screen::ARRIVAL_POS`] before constructing
+    /// the new screen so Room 7's `with_shared` constructor — which
+    /// honours the slots' saved coordinates when they're walkable on
+    /// its map — drops the player at the canonical arrival cell
+    /// instead of wherever the lobby left them. The transition is
+    /// gated by [`Self::is_stairs_blocking`] in `try_move`, so this
+    /// helper only fires when the player legitimately stood on the
+    /// stairs cell with the Room 7 key in hand.
+    fn maybe_take_stairs(&mut self) -> ScreenCommand {
+        let on_stairs = {
+            let p = self.slots.player.borrow();
+            (p.x, p.y) == Self::STAIRS_UP_POS
+        };
+        if !on_stairs {
+            return ScreenCommand::None;
+        }
+        // Defensive: the gate in `try_move` should already prevent
+        // ever standing here without the key, but we re-check rather
+        // than trust callers.
+        if !self.has_room_7_key() {
+            return ScreenCommand::None;
+        }
+        {
+            let mut p = self.slots.player.borrow_mut();
+            p.x = crate::room_7::Room7Screen::ARRIVAL_POS.0;
+            p.y = crate::room_7::Room7Screen::ARRIVAL_POS.1;
+        }
+        // Clear any stale lobby feedback so Room 7 opens with a clean
+        // narration slot — the body's flavour line is the only thing
+        // that should appear there until the player triggers another
+        // prompt.
+        *self.slots.feedback.borrow_mut() = None;
+        ScreenCommand::Replace(Box::new(crate::room_7::Room7Screen::with_shared(
+            self.slots.clone(),
+        )))
+    }
+
+    /// Combine the post-move transition checks: stairs first (Replace
+    /// the screen), then the win-tile latch (Push a modal). Order
+    /// matters — taking the stairs is a hard transition and shouldn't
+    /// be silently overridden by a stale win-tile read.
+    fn after_move(&mut self) -> ScreenCommand {
+        match self.maybe_take_stairs() {
+            ScreenCommand::None => self.maybe_win_command(),
+            cmd => cmd,
         }
     }
 
@@ -907,6 +1020,17 @@ impl Screen for MapScreen {
                     x += 1;
                     continue;
                 }
+                // Stairs-up cell. Same cyan+bold register as the
+                // drawer and room labels so the affordance reads as
+                // "important UI furniture." Painted unconditionally —
+                // a player without the Room 7 key bumps the cell like
+                // a wall, the same feedback model the locked door
+                // uses.
+                if Self::is_stairs_at(x as u16, y as u16) {
+                    spans.push(Span::styled(Self::STAIRS_UP_GLYPH.to_string(), label_style));
+                    x += 1;
+                    continue;
+                }
                 // Room label?
                 if let Some((label, _)) = labels_for_row.iter().find(|(_, lx)| (*lx as usize) == x)
                 {
@@ -972,19 +1096,19 @@ impl Screen for MapScreen {
             // move fails — the lack of motion is the feedback.
             Input::Up | Input::Char('k') | Input::Char('K') => {
                 self.try_move(0, -1);
-                self.maybe_win_command()
+                self.after_move()
             }
             Input::Down | Input::Char('j') | Input::Char('J') => {
                 self.try_move(0, 1);
-                self.maybe_win_command()
+                self.after_move()
             }
             Input::Left | Input::Char('h') => {
                 self.try_move(-1, 0);
-                self.maybe_win_command()
+                self.after_move()
             }
             Input::Right | Input::Char('l') | Input::Char('L') => {
                 self.try_move(1, 0);
-                self.maybe_win_command()
+                self.after_move()
             }
             // Talk affordance: Enter (or `t`) when the player is
             // adjacent to an NPC opens that NPC's dialog. With no
@@ -1701,6 +1825,101 @@ pub(crate) mod tests {
             cell,
             MapScreen::UNLOCKED_DOOR_GLYPH,
             "unlocked door must paint as `+`"
+        );
+    }
+
+    // ---- Stairs / Room 7 transition ----------------------------------
+
+    #[test]
+    fn lobby_with_shared_writes_lobby_into_map_name_slot() {
+        // Symmetric with the Room 7 constructor: every map screen
+        // tags the slots with its identifier so a quit-then-Continue
+        // round-trip lands the player back on the right map.
+        let slots = SharedSlots::default();
+        let _screen = MapScreen::with_shared(22, 4, slots.clone());
+        assert_eq!(slots.map_name.borrow().as_str(), MapScreen::MAP_NAME);
+    }
+
+    #[test]
+    fn stairs_block_player_without_room_7_key() {
+        // The stairs-up cell is gated by the Room 7 key, just like the
+        // locked door is gated by the brass key. Walking eastward
+        // across Room 4 toward (44, 1) must clamp the player at (43, 1)
+        // — one cell west of the stairs — when the inventory is empty.
+        let cfg = fixture_config();
+        let fc = fixture_context();
+        let mut ctx = GameContext::new(&cfg, &fc, (80, 24));
+        let mut map = fresh_map_screen();
+        // Brass key first so the locked door doesn't pre-empt the
+        // stairs gate; the test is about the *stairs* gate.
+        walk_to(&mut map, &mut ctx, 6, 5);
+        assert!(map.has_locked_door_key());
+        // Now route to (43, 1) and try to step further east.
+        walk_to(&mut map, &mut ctx, 43, 1);
+        assert_eq!(map.player(), (43, 1));
+        assert!(
+            !map.has_room_7_key(),
+            "test precondition: room 7 key must not yet be in inventory"
+        );
+        map.handle_input(&mut ctx, Input::Right);
+        assert_eq!(
+            map.player(),
+            (43, 1),
+            "stairs gate must clamp the eastward step at x=43"
+        );
+    }
+
+    #[test]
+    fn stairs_emit_replace_when_player_has_room_7_key() {
+        // With the Room 7 key in inventory, stepping onto the stairs
+        // cell must emit ScreenCommand::Replace so the runtime swaps
+        // the lobby for Room 7. The post-move handler also re-points
+        // the slots' player position at Room 7's ARRIVAL_POS *before*
+        // returning Replace, so by the time the caller reads
+        // `map.player()` the slots already reflect the destination's
+        // arrival cell — that's the contract the destination's
+        // `with_shared` constructor relies on to honour
+        // saved-coords-as-spawn correctly.
+        let cfg = fixture_config();
+        let fc = fixture_context();
+        let mut ctx = GameContext::new(&cfg, &fc, (80, 24));
+        let mut map = fresh_map_screen();
+        walk_to(&mut map, &mut ctx, 6, 5);
+        // Grant the Room 7 key directly to keep the test focused on
+        // the transition rather than driving the drawer prompt that
+        // normally sets it.
+        map.inventory()
+            .borrow_mut()
+            .insert(MapScreen::ROOM_7_KEY_ID.to_string());
+        walk_to(&mut map, &mut ctx, 43, 1);
+        assert_eq!(map.player(), (43, 1));
+        let cmd = map.handle_input(&mut ctx, Input::Right);
+        assert!(
+            matches!(cmd, ScreenCommand::Replace(_)),
+            "stairs step with Room 7 key must emit Replace; got {cmd:?}"
+        );
+        assert_eq!(
+            map.player(),
+            crate::room_7::Room7Screen::ARRIVAL_POS,
+            "post-transition slots must point at Room 7's arrival cell"
+        );
+    }
+
+    #[test]
+    fn stairs_render_paints_glyph_at_stairs_pos() {
+        // Pin the rendered glyph so a future copy edit (or a glyph
+        // collision with another tile) surfaces as a failed test.
+        let map = fresh_map_screen();
+        let rows = map.rendered_rows();
+        let (sx, sy) = MapScreen::STAIRS_UP_POS;
+        let cell = rows[sy as usize]
+            .chars()
+            .nth(sx as usize)
+            .expect("stairs cell renders");
+        assert_eq!(
+            cell,
+            MapScreen::STAIRS_UP_GLYPH,
+            "stairs cell must paint the documented glyph"
         );
     }
 

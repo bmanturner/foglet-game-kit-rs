@@ -13,6 +13,7 @@ use ratatui::Frame;
 use crate::layout::centred_rect;
 use crate::map::MapScreen;
 use crate::modals::HelpScreen;
+use crate::room_7::Room7Screen;
 use crate::state::SharedSlots;
 
 /// First screen the player sees on launch.
@@ -144,11 +145,22 @@ impl MainMenuItem {
             // Continue keeps whatever state the slots already carry —
             // either the loaded save (if `main` populated them at
             // startup) or the same default-zero state New Game would
-            // otherwise have built. The walkability fallback inside
-            // `MapScreen::with_shared` keeps an empty-default Continue
-            // safe even when no save was loaded.
+            // otherwise have built. We dispatch on the slots'
+            // `map_name` so a player who saved inside Room 7 resumes
+            // there instead of always landing in the lobby. Any
+            // unrecognised value (older saves, hand-edited JSON) falls
+            // back to the lobby — the safer default since every game
+            // begins there.
             Self::Continue => {
-                ScreenCommand::Push(Box::new(MapScreen::with_shared(sx, sy, slots.clone())))
+                let map_name = slots.map_name.borrow().clone();
+                match map_name.as_str() {
+                    Room7Screen::MAP_NAME => {
+                        ScreenCommand::Push(Box::new(Room7Screen::with_shared(slots.clone())))
+                    }
+                    _ => {
+                        ScreenCommand::Push(Box::new(MapScreen::with_shared(sx, sy, slots.clone())))
+                    }
+                }
             }
             Self::Help => ScreenCommand::Push(Box::new(HelpScreen)),
             Self::Quit => ScreenCommand::Quit,

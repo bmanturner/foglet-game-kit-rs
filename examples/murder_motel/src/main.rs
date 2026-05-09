@@ -50,6 +50,7 @@
 mod layout;
 mod map;
 mod modals;
+mod room_7;
 mod scenes;
 mod state;
 mod title_menu;

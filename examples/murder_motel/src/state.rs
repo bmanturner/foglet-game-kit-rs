@@ -350,4 +350,71 @@ mod tests {
         slots.reset(0, 0);
         assert!(slots.feedback.borrow().is_none());
     }
+
+    #[test]
+    fn shared_slots_round_trip_preserves_map_name() {
+        // `map_name` joined SaveState alongside the Room 7 addition; the
+        // snapshot/apply pair must round-trip the field or a player who
+        // saves inside Room 7 resumes in the lobby. Covered separately
+        // from the broader round-trip test so a future failure points at
+        // exactly the new field.
+        let original = SharedSlots::default();
+        *original.map_name.borrow_mut() = "room_7".to_string();
+        let restored = SharedSlots::default();
+        restored.apply(original.snapshot());
+        assert_eq!(restored.map_name.borrow().as_str(), "room_7");
+    }
+
+    #[test]
+    fn shared_slots_default_map_name_is_lobby() {
+        // The default constructor must seed `map_name` with the lobby
+        // identifier so a snapshot taken before any map screen has run
+        // (e.g. a player who quit straight from the title menu) still
+        // dispatches Continue onto the lobby instead of an unknown map.
+        let slots = SharedSlots::default();
+        assert_eq!(slots.map_name.borrow().as_str(), "lobby");
+    }
+
+    #[test]
+    fn shared_slots_reset_returns_map_name_to_lobby() {
+        // New Game always begins in the lobby; if a previously loaded
+        // save left `map_name = "room_7"` in the slots, `reset` must
+        // clobber it so the snapshot taken after the New Game's first
+        // quit doesn't mis-route a future Continue back into Room 7.
+        let slots = SharedSlots::default();
+        *slots.map_name.borrow_mut() = "room_7".to_string();
+        slots.reset(22, 4);
+        assert_eq!(slots.map_name.borrow().as_str(), "lobby");
+    }
+
+    #[test]
+    fn save_state_v1_without_map_name_deserialises_as_lobby() {
+        // Any save written before the Room 7 addition lacks the
+        // `map_name` field. `#[serde(default = "default_map_name")]`
+        // must populate it with `"lobby"` so existing saves keep
+        // working and Continue dispatches to the lobby.
+        let v1_json = r#"{
+            "player_x": 22,
+            "player_y": 4,
+            "won": false,
+            "flags": [],
+            "inventory": []
+        }"#;
+        let parsed: SaveState = serde_json::from_str(v1_json).expect("v1 save parses");
+        assert_eq!(parsed.map_name, "lobby");
+        assert_eq!(parsed.cash, 0, "missing cash field also defaults");
+    }
+
+    #[test]
+    fn save_state_round_trips_map_name_through_json() {
+        // Pin the on-disk shape of the field — the same path
+        // `write_atomic`/`read_save` use — so a future serde rename
+        // surfaces as a failed round-trip rather than a silent reset
+        // to the lobby.
+        let mut state = SaveState::default();
+        state.map_name = "room_7".to_string();
+        let json = serde_json::to_string(&state).expect("serialise");
+        let parsed: SaveState = serde_json::from_str(&json).expect("parse");
+        assert_eq!(parsed.map_name, "room_7");
+    }
 }
