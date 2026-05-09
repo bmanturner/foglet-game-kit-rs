@@ -568,16 +568,13 @@ impl Screen for BulletinScreen {
         };
 
         if self.events.is_empty() {
-            // Empty bulletin: render the hint inside the bordered
-            // block so the screen doesn't just look like a blank box.
-            // Players who arrive before any events fire (fresh world
-            // DB, single-player runs) see "(no bulletin entries yet)"
-            // rather than a void.
-            let widget = Paragraph::new(Self::EMPTY_HINT)
-                .alignment(Alignment::Center)
-                .style(Style::default().fg(Color::DarkGray))
-                .block(Block::default().borders(Borders::ALL).title(Self::TITLE));
-            frame.render_widget(widget, body);
+            // Empty bulletin: shared helper paints the bordered titled
+            // modal with EMPTY_HINT inside, so fresh-world / single-
+            // player runs see the empty-state line rather than a void.
+            // Trades the prior centred DarkGray styling for
+            // `render_modal`'s left-aligned default tint — a deliberate
+            // re-pin to the kit's shared shape (SPEC_v2_1 §Task 11b-ii).
+            render_modal(frame, body, Some(Self::TITLE), Self::EMPTY_HINT);
         } else {
             // Clamp the cursor against the live count so a row removed
             // between renders (impossible today — events are append-
