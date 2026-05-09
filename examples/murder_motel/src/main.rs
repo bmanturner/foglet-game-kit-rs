@@ -966,6 +966,19 @@ impl MapScreen {
         })
     }
 
+    /// Whether the player is positioned to interact with the Night
+    /// Clerk's vendor menu (Task 11g). Mirrors [`Self::nearby_npc`]
+    /// but filters by name so a future second NPC at an adjacent
+    /// cell — say, a passing maid — can never accidentally route the
+    /// `b`/`B` "buy" affordance into the wrong dialog. Diagonals are
+    /// excluded for the same reason `nearby_npc` rejects them: a
+    /// cardinal-only adjacency check matches the player's mental model
+    /// of "I'm standing next to the counter".
+    pub fn nearby_clerk(&self) -> bool {
+        self.nearby_npc()
+            .is_some_and(|npc| npc.name == "Night Clerk")
+    }
+
     /// Shared handle to the narrative-flag store. Cloned so the
     /// dialog screen and the map screen mutate the same `RefCell`.
     pub fn flags(&self) -> Rc<RefCell<FlagSet>> {
@@ -1769,6 +1782,75 @@ impl Screen for NightClerkContinuationScreen {
     }
 }
 
+/// Build the [`PromptScreen`] the lobby pushes when the player asks
+/// the Night Clerk to buy something (SPEC_v1_1.md §9 step 4, Task 11g).
+///
+/// Mirrors [`lost_and_found_drawer_screen`] in shape so the two SPEC §9
+/// proof scenes share an integration pattern: a factory that closes
+/// over [`SharedSlots`] and routes [`PromptAction`] outcomes to
+/// [`ScreenCommand`]s. Centralising the wiring here keeps the
+/// [`MapScreen`] handler one line per affordance and lets unit tests
+/// drive the same factory the runtime uses.
+///
+/// The closure clones the supplied [`SharedSlots`] handle so it can
+/// outlive each synchronous `handle_input` call: `PromptScreen` stores
+/// the callback across frames, and the captured slots reach into the
+/// same `RefCell`s the map screen reads.
+///
+/// Outcome routing per SPEC §9 step 4–6:
+///
+/// - `Selected(BuyCoffee)` decrements cash via
+///   [`apply_night_clerk_vendor_choice`], stores the success
+///   [`FeedbackLine`] in [`SharedSlots::feedback`], and
+///   [`ScreenCommand::Replace`]s itself with a
+///   [`NightClerkContinuationScreen`]. `Replace` (rather than `Pop`
+///   then `Push`) ensures the continuation does not stack *on top of*
+///   the vendor — when the player presses any key on the continuation,
+///   they pop straight back to the map, not to a leftover vendor
+///   prompt.
+/// - `Selected(NoThanks)` pops without state change. Task 11e nailed
+///   the no-mutation invariant; reusing the same path here keeps the
+///   exit cheap.
+/// - `Selected(TipForRumor)` is unreachable in practice — Task 11d
+///   gates the row at the prompt layer — but the match must stay
+///   exhaustive. We pop on this arm to preserve the "no leak" property
+///   if a future authoring mistake ever lets the choice through.
+/// - `Disabled { reason, .. }` writes the reason as an error feedback
+///   line and stays on the prompt. Same UX contract as the drawer's
+///   disabled-`(K)` path: the player learns *why* the press was
+///   rejected and can pick a different choice without re-opening the
+///   vendor menu.
+/// - `Cancelled` (Esc) and `None` follow SPEC §4.4: pop on cancel,
+///   stay put on no-op. The vendor prompt is built `cancellable(true)`
+///   so a player who opens it by accident can back out without
+///   spending gold or hunting for the `[N]` row.
+pub fn night_clerk_vendor_screen(slots: SharedSlots) -> PromptScreen<NightClerkVendorChoice> {
+    let cash = slots.player.borrow().cash;
+    let prompt = night_clerk_vendor_prompt(cash).cancellable(true);
+    let callback_slots = slots;
+    PromptScreen::new(prompt, move |action| match action {
+        PromptAction::Selected(NightClerkVendorChoice::BuyCoffee) => {
+            let outcome =
+                apply_night_clerk_vendor_choice(&callback_slots, NightClerkVendorChoice::BuyCoffee);
+            if let Some(line) = outcome.and_then(night_clerk_vendor_feedback) {
+                *callback_slots.feedback.borrow_mut() = Some(line);
+            }
+            ScreenCommand::Replace(Box::new(NightClerkContinuationScreen::new()))
+        }
+        PromptAction::Selected(NightClerkVendorChoice::NoThanks)
+        | PromptAction::Selected(NightClerkVendorChoice::TipForRumor) => ScreenCommand::Pop,
+        PromptAction::Disabled { reason, .. } => {
+            if let Some(reason) = reason {
+                *callback_slots.feedback.borrow_mut() = Some(FeedbackLine::error(reason));
+            }
+            ScreenCommand::None
+        }
+        PromptAction::Cancelled => ScreenCommand::Pop,
+        PromptAction::None | PromptAction::ConfirmRequested(_) => ScreenCommand::None,
+    })
+    .modal()
+}
+
 impl Screen for MapScreen {
     fn render(&mut self, _ctx: &mut GameContext<'_>, frame: &mut Frame<'_>) {
         // Centre the map inside the frame. The +2 accounts for the
@@ -1995,6 +2077,20 @@ impl Screen for MapScreen {
             // rejection, same model as bumping a wall). Keeps the prompt
             // reachable from normal lobby play without bolting it onto
             // a debug menu.
+            // Vendor affordance (Task 11g). When the player stands
+            // next to the Night Clerk, `b`/`B` ("buy") opens the SPEC
+            // §9 step 4 vendor prompt; everywhere else the key is
+            // inert. Mirrors the drawer's `x`/`X` route so both proof
+            // scenes share an interaction grammar — adjacency + verb
+            // key — and neither leaks into a debug menu.
+            Input::Char('b') | Input::Char('B') => {
+                if self.nearby_clerk() {
+                    *self.slots.feedback.borrow_mut() = None;
+                    ScreenCommand::Push(Box::new(night_clerk_vendor_screen(self.slots.clone())))
+                } else {
+                    ScreenCommand::None
+                }
+            }
             Input::Char('x') | Input::Char('X') => {
                 if self.nearby_lost_and_found() {
                     // Clear any prior feedback so a fresh interaction
@@ -2022,7 +2118,7 @@ impl MapScreen {
     /// Pulled out as a constant so tests can assert it appears in the
     /// rendered buffer without binding to the precise wording.
     pub const HINT_LINE: &'static str =
-        "Move: arrows/hjkl  Talk: Enter  Search: X  Inv: I  Back: Esc  Quit: Q";
+        "Move: arrows/hjkl  Talk: Enter  Buy: B  Search: X  Inv: I  Back: Esc  Quit: Q";
 }
 
 /// Modal dialog screen pushed when the player talks to an NPC.
@@ -5470,5 +5566,192 @@ mod tests {
             "hint line must advertise the search key; got {:?}",
             MapScreen::HINT_LINE
         );
+    }
+
+    // ---- Night-clerk vendor: reachable from play (Task 11g) ----------
+
+    #[test]
+    fn map_hint_advertises_buy_affordance() {
+        // Same rationale as the Search hint test: `b`/`B` is the only
+        // route to the SPEC §9 step 4 vendor prompt from gameplay.
+        // Drop the cue and the proof scene becomes invisible.
+        assert!(
+            MapScreen::HINT_LINE.contains("Buy: B"),
+            "hint line must advertise the buy key; got {:?}",
+            MapScreen::HINT_LINE
+        );
+    }
+
+    #[test]
+    fn nearby_clerk_only_true_when_adjacent_to_clerk() {
+        // The vendor affordance is gated by `nearby_clerk` rather than
+        // `nearby_npc` so an adjacent Bellhop/Maid never accidentally
+        // routes a `b` press into a vendor flow they do not own. Pin
+        // the contract: spawn returns false (no NPC at the four
+        // cardinals), one step right of the clerk returns true.
+        let map = fresh_map_screen();
+        assert!(
+            !map.nearby_clerk(),
+            "spawn must not be adjacent to the Night Clerk"
+        );
+
+        // Walk to (24, 3) — the cell directly south of the Night Clerk
+        // at (24, 2). Spawn is (22, 4); right twice + up once lands on
+        // it without crossing the clerk's blocking cell or the drawer
+        // at (25, 2).
+        let mut map = fresh_map_screen();
+        let cfg = fixture_config();
+        let fc = fixture_context();
+        let mut ctx = GameContext::new(&cfg, &fc, (80, 24));
+        for _ in 0..2 {
+            map.handle_input(&mut ctx, Input::Right);
+        }
+        map.handle_input(&mut ctx, Input::Up);
+        assert_eq!(map.player(), (24, 3));
+        assert!(
+            map.nearby_clerk(),
+            "cell south of clerk at (24, 3) must satisfy nearby_clerk"
+        );
+    }
+
+    #[test]
+    fn buy_key_pushes_vendor_prompt_when_adjacent_to_clerk() {
+        // `b` and `B` must both push the vendor screen — SPEC §9 step 7
+        // requires case-folded hotkeys, and the integration must mirror
+        // it. `B` is also the Bellhop's glyph; that is *not* a hotkey
+        // collision because input mapping happens at the screen level
+        // before any glyph lookup.
+        for key in [Input::Char('b'), Input::Char('B')] {
+            let mut map = fresh_map_screen();
+            let cfg = fixture_config();
+            let fc = fixture_context();
+            let mut ctx = GameContext::new(&cfg, &fc, (80, 24));
+            for _ in 0..2 {
+                map.handle_input(&mut ctx, Input::Right);
+            }
+            map.handle_input(&mut ctx, Input::Up);
+            assert_eq!(map.player(), (24, 3));
+            assert!(map.nearby_clerk());
+            let cmd = map.handle_input(&mut ctx, key);
+            assert!(
+                matches!(cmd, ScreenCommand::Push(_)),
+                "{key:?} adjacent to Night Clerk must push the vendor screen"
+            );
+        }
+    }
+
+    #[test]
+    fn buy_key_inert_when_not_adjacent_to_clerk() {
+        // From spawn the player is two rows below the clerk (no
+        // cardinal neighbour). Pressing `b` here must be silent — the
+        // SPEC §4.1 inert-key contract — so a player who taps the
+        // wrong key cannot open a vendor prompt mid-corridor.
+        let mut map = fresh_map_screen();
+        let cfg = fixture_config();
+        let fc = fixture_context();
+        let mut ctx = GameContext::new(&cfg, &fc, (80, 24));
+        assert!(!map.nearby_clerk());
+        let cmd = map.handle_input(&mut ctx, Input::Char('b'));
+        assert!(
+            matches!(cmd, ScreenCommand::None),
+            "buy key must be inert away from the clerk"
+        );
+    }
+
+    #[test]
+    fn vendor_screen_callback_buy_coffee_replaces_with_continuation() {
+        // SPEC §9 step 6 requires a "press any key" beat after a
+        // successful purchase. `Replace` (not `Pop`+`Push`) is the
+        // load-bearing detail: the continuation pops back to the *map*,
+        // not to a stale vendor prompt that would bounce the player
+        // into an infinite buy loop. The test pins both halves: cash
+        // decremented + Replace command emitted with the continuation
+        // screen on top.
+        let slots = SharedSlots::default();
+        slots.reset(0, 0);
+        let starting_cash = slots.player.borrow().cash;
+        let mut screen = night_clerk_vendor_screen(slots.clone());
+
+        let cfg = fixture_config();
+        let fc = fixture_context();
+        let mut ctx = GameContext::new(&cfg, &fc, (80, 24));
+        let cmd = screen.handle_input(&mut ctx, Input::Char('b'));
+        assert!(
+            matches!(cmd, ScreenCommand::Replace(_)),
+            "Buy Coffee must Replace the vendor with the continuation"
+        );
+        assert_eq!(
+            slots.player.borrow().cash,
+            starting_cash - COFFEE_PRICE,
+            "cash must decrement by COFFEE_PRICE on Buy Coffee"
+        );
+        let feedback = slots.feedback.borrow().clone().expect("feedback set");
+        assert_eq!(feedback.text(), BOUGHT_COFFEE_FEEDBACK);
+    }
+
+    #[test]
+    fn vendor_screen_callback_no_thanks_pops_without_state_change() {
+        // `[N]` is the explicit zero-cost exit. The integration must
+        // route through `Pop` (not `Replace`) so no continuation
+        // appears — SPEC §9 step 4 reserves the post-vendor pause for
+        // *transactional* outcomes, not polite refusal.
+        let slots = SharedSlots::default();
+        slots.reset(0, 0);
+        let before = slots.snapshot();
+        let mut screen = night_clerk_vendor_screen(slots.clone());
+
+        let cfg = fixture_config();
+        let fc = fixture_context();
+        let mut ctx = GameContext::new(&cfg, &fc, (80, 24));
+        let cmd = screen.handle_input(&mut ctx, Input::Char('n'));
+        assert!(matches!(cmd, ScreenCommand::Pop));
+        assert_eq!(slots.snapshot(), before);
+        assert!(slots.feedback.borrow().is_none());
+    }
+
+    #[test]
+    fn vendor_screen_callback_disabled_tip_writes_error_and_stays_open() {
+        // STARTING_CASH (40g) is below RUMOR_TIP_PRICE (50g), so the
+        // `(T)` row is built disabled. Pressing `t` must surface the
+        // SPEC §9 reason as an error feedback line and emit `None` so
+        // the prompt stays open for a different choice — same UX
+        // contract as the drawer's disabled-`(K)` path.
+        let slots = SharedSlots::default();
+        slots.reset(0, 0);
+        let before_cash = slots.player.borrow().cash;
+        assert!(before_cash < RUMOR_TIP_PRICE);
+        let mut screen = night_clerk_vendor_screen(slots.clone());
+
+        let cfg = fixture_config();
+        let fc = fixture_context();
+        let mut ctx = GameContext::new(&cfg, &fc, (80, 24));
+        let cmd = screen.handle_input(&mut ctx, Input::Char('t'));
+        assert!(matches!(cmd, ScreenCommand::None));
+        assert_eq!(slots.player.borrow().cash, before_cash);
+        let feedback = slots
+            .feedback
+            .borrow()
+            .clone()
+            .expect("disabled-tip press must surface a reason line");
+        assert_eq!(feedback.text(), NEED_RUMOR_TIP_REASON);
+    }
+
+    #[test]
+    fn vendor_screen_callback_cancel_pops_without_mutating_state() {
+        // The vendor prompt is built `cancellable(true)` so a curious
+        // player can back out without spending gold. Esc → `Pop` and
+        // every slot stays at its pre-press snapshot.
+        let slots = SharedSlots::default();
+        slots.reset(0, 0);
+        let before = slots.snapshot();
+        let mut screen = night_clerk_vendor_screen(slots.clone());
+
+        let cfg = fixture_config();
+        let fc = fixture_context();
+        let mut ctx = GameContext::new(&cfg, &fc, (80, 24));
+        let cmd = screen.handle_input(&mut ctx, Input::Esc);
+        assert!(matches!(cmd, ScreenCommand::Pop));
+        assert_eq!(slots.snapshot(), before);
+        assert!(slots.feedback.borrow().is_none());
     }
 }
