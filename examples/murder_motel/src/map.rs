@@ -2259,6 +2259,159 @@ pub(crate) mod tests {
         );
     }
 
+    /// SPEC_v2 §Task 12d — two-player end-to-end proof of the shared
+    /// Room 7 record. Two distinct Foglet contexts (Alice and Bob),
+    /// distinguished by `user_id`, walk fresh `MapScreen` instances to
+    /// the stairs while sharing one on-disk world DB. Alice goes first
+    /// and lands in Room 7 with no arrival banner; Bob follows with the
+    /// same key and must (a) observe the arrival banner naming a prior
+    /// opening, and (b) leave the canonical `motel_world_state` row
+    /// pointing at Alice's `players.id` rather than his own.
+    ///
+    /// This is the integration counterpart to the helper-level
+    /// `record_room_7_opening_is_first_writer_wins` test: it drives the
+    /// production `handle_input` path twice with two real upserted
+    /// players, so any future regression that swaps the post-move
+    /// recorder for a "always overwrite" or "current player wins"
+    /// implementation surfaces here.
+    #[test]
+    fn two_players_share_room_7_evidence() {
+        use crate::world::{room_7_opening, MOTEL_WORLD_STATE_MIGRATION};
+        use foglet_game::{ContextSource, FogletContext, WorldDb};
+        use tempfile::tempdir;
+
+        // One on-disk world DB shared across both players, exactly the
+        // way two Foglet sessions hitting the same install would see it.
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("world.sqlite");
+        let mut world = WorldDb::open(&db_path).expect("open world db");
+        world
+            .apply_migration(&foglet_game::PLAYERS_MIGRATION)
+            .expect("apply players migration");
+        world
+            .apply_migration(&MOTEL_WORLD_STATE_MIGRATION)
+            .expect("apply motel_world_state migration");
+
+        // Build two FogletContexts that differ only in identity. Going
+        // through the `Some(user_id)` branch of `upsert_player` (rather
+        // than the local-dev fallback) makes the test independent of
+        // the `synthesize_local_dev_key` hash — it directly mirrors a
+        // real Foglet handoff where each user has a stable id.
+        let make_ctx = |user_id: &str, username: &str| FogletContext {
+            door_id: "murder-motel".into(),
+            user_id: Some(user_id.into()),
+            username: Some(username.into()),
+            role: None,
+            session_id: Some("s-test".into()),
+            terminal_width: 80,
+            terminal_height: 24,
+            source: ContextSource::LocalDev,
+        };
+        let alice_ctx = make_ctx("u-alice", "alice");
+        let bob_ctx = make_ctx("u-bob", "bob");
+
+        let cfg = fixture_config();
+
+        // --- Alice: first opener -----------------------------------
+        let alice_player_id;
+        let alice_opened_at;
+        {
+            let mut alice_map = fresh_map_screen();
+            let mut ctx = GameContext::new(&cfg, &alice_ctx, (80, 24)).with_world_db(&world);
+            walk_to(&mut alice_map, &mut ctx, 6, 5);
+            alice_map
+                .inventory()
+                .borrow_mut()
+                .insert(MapScreen::ROOM_7_KEY_ID.to_string());
+            walk_to(&mut alice_map, &mut ctx, 43, 1);
+            let cmd = alice_map.handle_input(&mut ctx, Input::Right);
+            assert!(
+                matches!(cmd, ScreenCommand::Replace(_)),
+                "alice's stairs step must transition into Room 7; got {cmd:?}"
+            );
+            // Alice is the first opener — her arrival slot is cleared
+            // so Room 7's body line owns the feedback row.
+            assert!(
+                alice_map.slots().feedback.borrow().is_none(),
+                "first opener (alice) must arrive with a clean feedback slot"
+            );
+            // Capture the recorded opener id so the post-Bob assertion
+            // can prove the row still belongs to her. We read through
+            // the same helper the production lobby UI will use.
+            let opening = room_7_opening(&world)
+                .expect("read after alice's step")
+                .expect("alice's stairs step must have recorded an opening");
+            alice_player_id = opening.opened_by_player_id;
+            alice_opened_at = opening.opened_at;
+        }
+
+        // --- Bob: later opener -------------------------------------
+        // Fresh `MapScreen`, fresh inventory, fresh `GameContext` —
+        // exactly what a second Foglet session would build. The world
+        // DB handle is the only thing shared.
+        let mut bob_map = fresh_map_screen();
+        {
+            let mut ctx = GameContext::new(&cfg, &bob_ctx, (80, 24)).with_world_db(&world);
+            walk_to(&mut bob_map, &mut ctx, 6, 5);
+            bob_map
+                .inventory()
+                .borrow_mut()
+                .insert(MapScreen::ROOM_7_KEY_ID.to_string());
+            walk_to(&mut bob_map, &mut ctx, 43, 1);
+            let cmd = bob_map.handle_input(&mut ctx, Input::Right);
+            assert!(
+                matches!(cmd, ScreenCommand::Replace(_)),
+                "bob's stairs step must still transition into Room 7; got {cmd:?}"
+            );
+        }
+
+        // Bob is a later opener — his arrival slot must carry the
+        // Task 12c "another investigator" banner with Alice's
+        // timestamp. The handle is intentionally not surfaced (the
+        // kit has no id→handle lookup; identities are advisory).
+        let banner = bob_map
+            .slots()
+            .feedback
+            .borrow()
+            .clone()
+            .expect("bob (later opener) must see the shared-evidence banner");
+        let text = banner.rendered_text();
+        assert!(
+            text.contains("Another investigator"),
+            "banner must call out the prior opening: {text}"
+        );
+        assert!(
+            text.contains(&alice_opened_at),
+            "banner must echo alice's opening timestamp ({alice_opened_at}): {text}"
+        );
+
+        // The canonical record must still point at Alice. This is the
+        // shared-world invariant: "who opened Room 7" is one answer
+        // across all players, no matter who walks in afterwards.
+        let final_opening = room_7_opening(&world)
+            .expect("read after bob's step")
+            .expect("opening row must persist after bob's step");
+        assert_eq!(
+            final_opening.opened_by_player_id, alice_player_id,
+            "shared record must still credit alice ({alice_player_id}), not bob"
+        );
+        assert_eq!(
+            final_opening.opened_at, alice_opened_at,
+            "shared record must keep alice's original timestamp"
+        );
+
+        // Sanity: alice and bob did upsert as distinct players. If a
+        // future regression made the upsert collide on, say, `handle`
+        // alone, the "alice still owns the row" check above would
+        // succeed vacuously (because both contexts would map to the
+        // same id). Pin the distinctness explicitly here.
+        let bob_player = world.upsert_player(&bob_ctx).expect("bob upsert succeeds");
+        assert_ne!(
+            bob_player.id, alice_player_id,
+            "alice and bob must resolve to distinct players.id rows"
+        );
+    }
+
     #[test]
     fn stairs_render_paints_glyph_at_stairs_pos() {
         // Pin the rendered glyph so a future copy edit (or a glyph
