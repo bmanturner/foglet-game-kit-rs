@@ -37,6 +37,7 @@ pub mod foglet;
 pub mod input;
 pub mod manifest;
 pub mod map;
+pub mod prompt;
 pub mod runtime;
 pub mod save;
 pub mod screen;
