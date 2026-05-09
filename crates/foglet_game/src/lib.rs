@@ -77,7 +77,7 @@ pub use manifest::{
 pub use map::{
     parse_map, EntityPlacement, Map, MapError, Tile, TileKind, TileLegend, PLAYER_GLYPH,
 };
-pub use notices::{Notice, NoticeError, NOTICES_MIGRATION};
+pub use notices::{Notice, NoticeError, NOTICES_MIGRATION, NOTICE_SUBJECT_MAX_CHARS};
 pub use players::{PlayerError, PlayerRecord, PLAYERS_MIGRATION};
 pub use prompt::{
     AnyKeyOutcome, AnyKeyPrompt, ChoicePrompt, ConfirmAction, ConfirmOutcome, ConfirmPrompt,

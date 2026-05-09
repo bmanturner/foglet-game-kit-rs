@@ -216,20 +216,77 @@ pub struct Notice {
     pub metadata: Option<String>,
 }
 
+/// Kit-internal cap for the subject line of a player-authored notice.
+///
+/// SPEC_v3 §5.2 ships only `max_notice_body_chars` as configurable; the
+/// subject line is intentionally bounded by the kit instead of by game
+/// authors so every consuming game presents a uniform "short title" UI.
+/// 120 chars fits one 80-column line with room for a recipient prefix
+/// and a "(unread)" annotation in inbox views, and sits well below the
+/// 1 KB-ish soft limit at which SQLite text scanning stops being
+/// instantaneous on a modern disk.
+///
+/// Counted in Unicode scalar values (`str::chars().count()`), not bytes
+/// — SPEC §4.1 / §7 talk in *characters*, and a byte cap would let a
+/// single emoji eat four "chars" of budget. Length checks for the body
+/// (whose cap lives in `[multiplayer].max_notice_body_chars`) use the
+/// same scalar-count rule for consistency.
+pub const NOTICE_SUBJECT_MAX_CHARS: usize = 120;
+
 /// Failure modes for [`WorldDb::send_notice`].
 ///
 /// Library-internal `thiserror` shape — the runtime wraps these with
 /// `anyhow` at the process boundary. Mirrors [`crate::events::EventError`]
 /// so all world-DB write paths surface errors with the same shape.
 ///
-/// Task 3b only emits [`NoticeError::Sqlite`]; Task 3c will add
-/// length-validation variants (`EmptySubject`, `SubjectTooLong`,
-/// `BodyTooLong`, …) without disturbing the call signature — they slot
-/// in as additional `#[error]` arms before the `Sqlite` round-trip
-/// runs. Carving out the error type now means 3c is a non-breaking
-/// change to consumers.
+/// Task 3c added the four length-validation variants. They run *before*
+/// the SQL round-trip so a rejected notice never touches `world.sqlite`
+/// — that keeps `world_events` and the inbox indexes from being
+/// polluted by half-validated drafts and lets the caller re-render the
+/// authoring screen with the original input intact.
 #[derive(Debug, Error)]
 pub enum NoticeError {
+    /// Subject was empty (or whitespace-only collapsed to empty).
+    /// SPEC §4.1 lists `subject` as `NOT NULL`; the kit additionally
+    /// rejects an empty string here so the inbox never renders a row
+    /// with a blank title that the recipient can't tell apart from a
+    /// rendering bug.
+    #[error("notice subject must not be empty")]
+    EmptySubject,
+    /// Body was empty. Same rationale as [`Self::EmptySubject`]:
+    /// schema-level `NOT NULL` accepts `""`, but a notice with no body
+    /// is indistinguishable from a UI glitch in the recipient's inbox.
+    /// Player-authored "I just wanted to wave" notices belong in a
+    /// `kind` choice, not in the body.
+    #[error("notice body must not be empty")]
+    EmptyBody,
+    /// Subject exceeded [`NOTICE_SUBJECT_MAX_CHARS`]. Surfacing both the
+    /// limit and the actual length lets the authoring screen show
+    /// "120 / 137 characters" without re-counting.
+    #[error("notice subject exceeds {max}-character limit (got {actual})")]
+    SubjectTooLong {
+        /// Cap that was breached — currently always
+        /// [`NOTICE_SUBJECT_MAX_CHARS`], named so future per-game caps
+        /// (if ever introduced) don't break the error shape.
+        max: usize,
+        /// Actual `chars().count()` of the rejected subject. Reported in
+        /// scalar values, the same unit as `max`.
+        actual: usize,
+    },
+    /// Body exceeded the configured cap from
+    /// `[multiplayer].max_notice_body_chars`. Same field shape as
+    /// [`Self::SubjectTooLong`] so authoring screens can render both
+    /// failures with one helper.
+    #[error("notice body exceeds {max}-character limit (got {actual})")]
+    BodyTooLong {
+        /// Cap that was breached — sourced from
+        /// `MultiplayerSection::max_notice_body_chars` and threaded into
+        /// [`WorldDb::send_notice`] by the caller.
+        max: usize,
+        /// Actual `chars().count()` of the rejected body, in scalar
+        /// values.
+        actual: usize,
+    },
     /// The `INSERT … RETURNING` round-trip failed. Wrapping
     /// `rusqlite::Error` keeps the call site readable (one error type,
     /// one mapping) while preserving the underlying cause for
@@ -254,14 +311,6 @@ impl WorldDb {
     /// so a future schema or default-value change can't silently flip
     /// the lifecycle.
     ///
-    /// Length validation is intentionally **not** performed here —
-    /// SPEC_v3 §Task 3c owns the empty-subject / overlong-body guard
-    /// and lands in the next iteration. The schema's `NOT NULL`
-    /// constraints on `subject` and `body` are still in force, so a
-    /// caller who somehow passes a literal `""` will land a row with
-    /// an empty string (legal at the storage layer); 3c will reject
-    /// that case at the kit boundary before the SQL round-trip.
-    ///
     /// `kind`, `subject`, and `body` are required by the schema.
     /// `sender_player_id` is `Option<i64>` because system notices have
     /// no attributable sender (§4.1). `expires_at` is the only optional
@@ -269,6 +318,22 @@ impl WorldDb {
     /// always `NULL` at send time and get filled by their dedicated
     /// helpers. `metadata` is opaque text, same contract as
     /// [`crate::events::EventRecord::metadata`].
+    ///
+    /// `max_body_chars` comes from
+    /// `MultiplayerSection::max_notice_body_chars` — the SPEC v3 §5.2
+    /// configurable cap. It's threaded as an argument rather than
+    /// pulled from a global so the same `WorldDb` can serve a multi-
+    /// game door in the future without reaching for a singleton config.
+    /// The subject cap is fixed at [`NOTICE_SUBJECT_MAX_CHARS`]; see
+    /// that constant for why it's kit-internal.
+    ///
+    /// # Validation order
+    ///
+    /// Length checks (Task 3c) run **before** the SQL round-trip:
+    /// emptiness first, then over-cap, subject before body. A rejected
+    /// notice MUST NOT touch `world.sqlite` — that keeps `world_events`
+    /// and the inbox indexes free of half-validated drafts and lets the
+    /// authoring screen re-render the original text on failure.
     ///
     /// We use SQLite's `RETURNING` clause (≥ 3.35) to read the
     /// canonical row — `id`, the SQL-side `created_at`, plus every
@@ -280,7 +345,7 @@ impl WorldDb {
     /// Takes `&self`: a single insert statement under the configured
     /// busy timeout. `&mut self` would fight the runtime layer where
     /// `GameContext` borrows the world DB once per tick.
-    #[allow(clippy::too_many_arguments)] // Matches the SPEC §4.1 column shape one-for-one (sender, recipient, kind, subject, body, expires_at, metadata); bundling into a struct would force every call site through a builder dance without adding type safety, since each parameter is already strongly typed.
+    #[allow(clippy::too_many_arguments)] // Matches the SPEC §4.1 column shape one-for-one (sender, recipient, kind, subject, body, expires_at, metadata) plus the per-call body cap; bundling into a struct would force every call site through a builder dance without adding type safety, since each parameter is already strongly typed.
     pub fn send_notice(
         &self,
         sender_player_id: Option<i64>,
@@ -290,7 +355,38 @@ impl WorldDb {
         body: &str,
         expires_at: Option<&str>,
         metadata: Option<&str>,
+        max_body_chars: u32,
     ) -> Result<Notice, NoticeError> {
+        // Validation runs before the SQL round-trip so a rejected
+        // notice never produces a row, an autoincrement gap, or an
+        // event-log entry. Order: emptiness first (cheapest, catches
+        // the "blank submit" path), then over-cap. Subject before body
+        // so a notice that's both empty-subject and overlong-body
+        // surfaces the authoring screen's first input as the failure
+        // — that matches keyboard tab order in the planned UI.
+        if subject.is_empty() {
+            return Err(NoticeError::EmptySubject);
+        }
+        if body.is_empty() {
+            return Err(NoticeError::EmptyBody);
+        }
+        // Count Unicode scalar values, not bytes — SPEC §4.1/§7 talk
+        // in characters, and a byte cap would penalise non-ASCII text.
+        let subject_chars = subject.chars().count();
+        if subject_chars > NOTICE_SUBJECT_MAX_CHARS {
+            return Err(NoticeError::SubjectTooLong {
+                max: NOTICE_SUBJECT_MAX_CHARS,
+                actual: subject_chars,
+            });
+        }
+        let max_body = max_body_chars as usize;
+        let body_chars = body.chars().count();
+        if body_chars > max_body {
+            return Err(NoticeError::BodyTooLong {
+                max: max_body,
+                actual: body_chars,
+            });
+        }
         // `RETURNING` echoes the full row back — including the SQL-side
         // `CURRENT_TIMESTAMP` default for `created_at` and the `NULL`
         // values for `read_at` / `archived_at`. The column order here
@@ -601,6 +697,7 @@ mod tests {
                 "Stop by Room 7. There's a clue under the rug.",
                 None,
                 None,
+                1_000,
             )
             .expect("send_notice succeeds");
 
@@ -672,6 +769,7 @@ mod tests {
                 "The motel resets at midnight UTC.",
                 Some("2026-12-31T23:59:59Z"),
                 Some(r#"{"severity":"info"}"#),
+                1_000,
             )
             .expect("system send_notice succeeds");
 
@@ -687,5 +785,235 @@ mod tests {
             sent.read_at.is_none() && sent.archived_at.is_none(),
             "system notices must also start unread/unarchived"
         );
+    }
+
+    /// SPEC_v3 §Task 3c: an empty subject is rejected at the kit
+    /// boundary, before the SQL round-trip. The schema's `NOT NULL`
+    /// would accept `""`; the kit refuses so the inbox can never render
+    /// a row with a blank title that a recipient can't tell apart from
+    /// a render bug. Also pins that no row reaches `notices` on
+    /// rejection — a regression that validated *after* the insert
+    /// would flunk the count assertion.
+    #[test]
+    fn send_notice_rejects_empty_subject() {
+        let (_dir, world) = world_with_notices();
+        let alice = world.upsert_player(&ctx("u-a", "alice")).unwrap();
+        let bob = world.upsert_player(&ctx("u-b", "bob")).unwrap();
+
+        let err = world
+            .send_notice(
+                Some(alice.id),
+                bob.id,
+                "guestbook_note",
+                "",
+                "body",
+                None,
+                None,
+                1_000,
+            )
+            .expect_err("empty subject must be rejected");
+        assert!(matches!(err, NoticeError::EmptySubject), "got {err:?}");
+
+        let count: i64 = world
+            .connection()
+            .query_row("SELECT COUNT(*) FROM notices", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0, "rejected notice must not produce a row");
+    }
+
+    /// SPEC_v3 §Task 3c: an empty body is rejected for the same
+    /// reason as an empty subject — silent blank rendering would
+    /// be a UX hazard. Pinning this independently from
+    /// `send_notice_rejects_empty_subject` keeps the two failure
+    /// modes from masking each other.
+    #[test]
+    fn send_notice_rejects_empty_body() {
+        let (_dir, world) = world_with_notices();
+        let alice = world.upsert_player(&ctx("u-a", "alice")).unwrap();
+        let bob = world.upsert_player(&ctx("u-b", "bob")).unwrap();
+
+        let err = world
+            .send_notice(
+                Some(alice.id),
+                bob.id,
+                "guestbook_note",
+                "Hi",
+                "",
+                None,
+                None,
+                1_000,
+            )
+            .expect_err("empty body must be rejected");
+        assert!(matches!(err, NoticeError::EmptyBody), "got {err:?}");
+    }
+
+    /// Boundary: a subject of exactly [`NOTICE_SUBJECT_MAX_CHARS`]
+    /// scalar values MUST succeed. Pins the off-by-one; flips to
+    /// `<` instead of `<=` (or vice versa) would flunk this test
+    /// or the over-cap test below, never both at once.
+    #[test]
+    fn send_notice_accepts_subject_at_limit() {
+        let (_dir, world) = world_with_notices();
+        let alice = world.upsert_player(&ctx("u-a", "alice")).unwrap();
+        let bob = world.upsert_player(&ctx("u-b", "bob")).unwrap();
+        let subject: String = "a".repeat(NOTICE_SUBJECT_MAX_CHARS);
+
+        let sent = world
+            .send_notice(
+                Some(alice.id),
+                bob.id,
+                "guestbook_note",
+                &subject,
+                "body",
+                None,
+                None,
+                1_000,
+            )
+            .expect("subject exactly at the cap must be accepted");
+        assert_eq!(sent.subject.chars().count(), NOTICE_SUBJECT_MAX_CHARS);
+    }
+
+    /// Boundary: a subject of [`NOTICE_SUBJECT_MAX_CHARS`] + 1 scalar
+    /// values MUST be rejected with [`NoticeError::SubjectTooLong`],
+    /// and the error MUST report both the cap and the actual length so
+    /// authoring screens can render "120 / 121 characters" without
+    /// re-counting.
+    #[test]
+    fn send_notice_rejects_subject_over_limit() {
+        let (_dir, world) = world_with_notices();
+        let alice = world.upsert_player(&ctx("u-a", "alice")).unwrap();
+        let bob = world.upsert_player(&ctx("u-b", "bob")).unwrap();
+        let subject: String = "a".repeat(NOTICE_SUBJECT_MAX_CHARS + 1);
+
+        let err = world
+            .send_notice(
+                Some(alice.id),
+                bob.id,
+                "guestbook_note",
+                &subject,
+                "body",
+                None,
+                None,
+                1_000,
+            )
+            .expect_err("subject over the cap must be rejected");
+        match err {
+            NoticeError::SubjectTooLong { max, actual } => {
+                assert_eq!(max, NOTICE_SUBJECT_MAX_CHARS);
+                assert_eq!(actual, NOTICE_SUBJECT_MAX_CHARS + 1);
+            }
+            other => panic!("expected SubjectTooLong, got {other:?}"),
+        }
+    }
+
+    /// Boundary: a body of exactly `max_body_chars` scalar values MUST
+    /// succeed. Uses a small cap (8) to keep the test text readable;
+    /// the production cap is 1000 but the off-by-one is the same.
+    #[test]
+    fn send_notice_accepts_body_at_limit() {
+        let (_dir, world) = world_with_notices();
+        let alice = world.upsert_player(&ctx("u-a", "alice")).unwrap();
+        let bob = world.upsert_player(&ctx("u-b", "bob")).unwrap();
+
+        let body: String = "x".repeat(8);
+        let sent = world
+            .send_notice(
+                Some(alice.id),
+                bob.id,
+                "guestbook_note",
+                "Hi",
+                &body,
+                None,
+                None,
+                8,
+            )
+            .expect("body exactly at the cap must be accepted");
+        assert_eq!(sent.body.chars().count(), 8);
+    }
+
+    /// SPEC_v3 §Task 3c headline test: an overlong body fails clearly.
+    /// Asserts the error names both the cap and the actual length, in
+    /// scalar values (Unicode scalars, not bytes — see
+    /// [`NOTICE_SUBJECT_MAX_CHARS`] doc comment for why). Uses a
+    /// non-ASCII body to prove byte-vs-char correctness: 5 emoji =
+    /// 5 chars (passes a cap of 5) but 20 bytes (would fail a byte
+    /// cap). The intent here is the over-limit case; we assert
+    /// rejection at cap+1 chars.
+    #[test]
+    fn send_notice_rejects_overlong_body() {
+        let (_dir, world) = world_with_notices();
+        let alice = world.upsert_player(&ctx("u-a", "alice")).unwrap();
+        let bob = world.upsert_player(&ctx("u-b", "bob")).unwrap();
+
+        let body: String = "x".repeat(9);
+        let err = world
+            .send_notice(
+                Some(alice.id),
+                bob.id,
+                "guestbook_note",
+                "Hi",
+                &body,
+                None,
+                None,
+                8,
+            )
+            .expect_err("body over the cap must be rejected");
+        match err {
+            NoticeError::BodyTooLong { max, actual } => {
+                assert_eq!(max, 8);
+                assert_eq!(actual, 9);
+            }
+            other => panic!("expected BodyTooLong, got {other:?}"),
+        }
+
+        // Sanity: the cap is in characters, not bytes. 4 emoji = 4
+        // scalar values but 16 bytes; under a char-cap of 4 this
+        // succeeds, proving a byte regression would be caught.
+        let emoji = "🦀🦀🦀🦀";
+        assert_eq!(emoji.chars().count(), 4);
+        assert_eq!(emoji.len(), 16);
+        world
+            .send_notice(
+                Some(alice.id),
+                bob.id,
+                "guestbook_note",
+                "Hi",
+                emoji,
+                None,
+                None,
+                4,
+            )
+            .expect("4-emoji body must pass a 4-char cap (chars, not bytes)");
+    }
+
+    /// SPEC_v3 §Task 3c: rejected notices MUST NOT produce a row.
+    /// Already covered for the empty-subject case in
+    /// `send_notice_rejects_empty_subject`; pin the same invariant for
+    /// the overlong-body path so a future change that "validated after
+    /// insert" can't slip past in either direction.
+    #[test]
+    fn rejected_overlong_notice_does_not_persist() {
+        let (_dir, world) = world_with_notices();
+        let alice = world.upsert_player(&ctx("u-a", "alice")).unwrap();
+        let bob = world.upsert_player(&ctx("u-b", "bob")).unwrap();
+
+        let _ = world
+            .send_notice(
+                Some(alice.id),
+                bob.id,
+                "guestbook_note",
+                "Hi",
+                &"x".repeat(50),
+                None,
+                None,
+                8,
+            )
+            .expect_err("overlong body must be rejected");
+
+        let count: i64 = world
+            .connection()
+            .query_row("SELECT COUNT(*) FROM notices", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0, "rejected notice must not produce a row");
     }
 }
