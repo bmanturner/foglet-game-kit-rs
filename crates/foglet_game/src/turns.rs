@@ -492,6 +492,129 @@ impl WorldDb {
             daily_allowance: stored_allowance,
         })
     }
+
+    /// Atomically decrement today's balance for `player_id` by
+    /// `amount` and return the resulting [`TurnLedgerRow`] —
+    /// SPEC_v2 §Task 6d "atomic turn spend".
+    ///
+    /// Composes with [`WorldDb::ensure_today_turns`]: if today's row
+    /// does not yet exist (first action of the day), it is materialised
+    /// at the configured `daily_allowance` *before* the spend lands.
+    /// Game code therefore only needs one call to "burn a turn" — the
+    /// lazy initialisation that Task 6c set up is plumbed in here so
+    /// callers don't have to remember the two-step dance.
+    ///
+    /// # Atomicity
+    ///
+    /// The decrement is a single SQL `UPDATE` of the form
+    /// `SET balance = balance - ?`. SQLite serialises writes per
+    /// connection, and the `WHERE player_id = ? AND local_date = ?`
+    /// clause matches exactly the one row keyed by the composite
+    /// primary key — no cursor walks, no read-then-write race. Two
+    /// concurrent spenders queued on the busy timeout therefore see
+    /// the second decrement applied to the *result* of the first,
+    /// rather than both reading the same balance and clobbering each
+    /// other. SPEC §4.6 calls that property out as a hard requirement
+    /// for the ledger; the single-statement form delivers it without
+    /// an explicit transaction.
+    ///
+    /// # What this method does *not* do (yet)
+    ///
+    /// - **Insufficient-turn rejection.** SPEC_v2 §Task 6e is a
+    ///   separate sub-task: it adds the `WHERE balance >= ?` guard
+    ///   plus a typed [`TurnError`] variant for callers to surface to
+    ///   the player. Until that lands, this method will happily
+    ///   decrement past zero. Callers in v2 that care (Murder Motel's
+    ///   clue inspection, Task 13a) gate on the returned balance via
+    ///   a preceding `ensure_today_turns` read, which already returns
+    ///   the current value. The TODO is recorded explicitly so a
+    ///   future reviewer doesn't mistake the gap for a bug.
+    /// - **New-day reset / carryover.** Task 6f. The spend path
+    ///   always operates on *today's* row as reported by the
+    ///   `date_provider`; if the date has rolled over since the last
+    ///   spend, `ensure_today_turns` materialises a fresh row at full
+    ///   allowance and the decrement applies to it. Carryover from
+    ///   yesterday's leftover balance is layered on in 6f.
+    ///
+    /// # Why a separate `SELECT` after the `UPDATE`
+    ///
+    /// We could use SQLite 3.35+'s `UPDATE … RETURNING` clause to
+    /// fold the decrement and the readback into one round-trip.
+    /// We don't, for two reasons:
+    ///
+    /// 1. The supported SQLite version floor is set by `rusqlite`'s
+    ///    bundled feature being **off** in our crate budget (ADR
+    ///    documented in `DECISIONS.md`). Relying on a newer SQL
+    ///    feature would silently break on hosts that ship an older
+    ///    system SQLite. A plain `SELECT` is portable to every
+    ///    SQLite version we support.
+    /// 2. The two-statement form keeps `ensure_today_turns`'s
+    ///    select-the-current-row code path the single source of
+    ///    truth for "what does a `TurnLedgerRow` look like coming
+    ///    out of the DB?". When 6e adds insufficient-turn rejection,
+    ///    or 6f adds carryover, the readback shape stays stable.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TurnError::Sqlite`] if any of the three round-trips
+    /// (ensure-row, update, readback) fails. The variant wraps the
+    /// underlying `rusqlite::Error` so the operator-facing layer
+    /// (Task 10) can surface SQLite's wording verbatim.
+    pub fn spend_turns<P: DateProvider>(
+        &self,
+        player_id: i64,
+        amount: u32,
+        daily_allowance: u32,
+        date_provider: &P,
+    ) -> Result<TurnLedgerRow, TurnError> {
+        // Materialise today's row first (no-op if it already exists).
+        // Capturing the returned row gives us the canonical date the
+        // provider reported, so the subsequent UPDATE binds the same
+        // string the row was keyed under — no risk of the provider
+        // returning a different value between calls in a misbehaving
+        // implementation.
+        let row = self.ensure_today_turns(player_id, daily_allowance, date_provider)?;
+
+        // Cast amount once — SQLite stores INTEGER as 64-bit signed,
+        // u32 → i64 is infallible.
+        let delta = i64::from(amount);
+
+        // Single atomic UPDATE: `balance = balance - ?`. The WHERE
+        // clause matches exactly one row via the composite primary
+        // key, so this is the per-row atomic decrement SPEC §4.6
+        // requires. `updated_at = CURRENT_TIMESTAMP` keeps the audit
+        // column meaningful — operators reading the table cold see
+        // when the last spend landed.
+        self.connection()
+            .execute(
+                "UPDATE turn_ledger \
+                 SET balance = balance - ?1, updated_at = CURRENT_TIMESTAMP \
+                 WHERE player_id = ?2 AND local_date = ?3",
+                rusqlite::params![delta, player_id, row.local_date.as_str()],
+            )
+            .map_err(|source| TurnError::Sqlite { source })?;
+
+        // Read back the row so the caller sees the post-spend
+        // balance. The stored `daily_allowance` is unchanged by the
+        // spend; we re-read it anyway so the returned struct is a
+        // straightforward "what's in the DB right now" snapshot.
+        let (balance, stored_allowance): (i64, i64) = self
+            .connection()
+            .query_row(
+                "SELECT balance, daily_allowance FROM turn_ledger \
+                 WHERE player_id = ?1 AND local_date = ?2",
+                rusqlite::params![player_id, row.local_date.as_str()],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .map_err(|source| TurnError::Sqlite { source })?;
+
+        Ok(TurnLedgerRow {
+            player_id,
+            local_date: row.local_date,
+            balance,
+            daily_allowance: stored_allowance,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -977,6 +1100,210 @@ mod tests {
 
         let err = world
             .ensure_today_turns(1, 30, &provider)
+            .expect_err("missing turn_ledger table must surface as a typed error");
+        let TurnError::Sqlite { source } = &err else {
+            panic!("expected Sqlite variant, got {err:?}");
+        };
+        let msg = source.to_string().to_lowercase();
+        assert!(
+            msg.contains("turn_ledger") || msg.contains("no such table"),
+            "underlying SQLite error should mention the missing table, got: {msg}"
+        );
+    }
+
+    /// SPEC_v2 §Task 6d headline: spending decrements today's balance.
+    /// The first call materialises today's row at the configured
+    /// allowance (composing with Task 6c) and then applies the
+    /// decrement; the returned [`TurnLedgerRow`] reflects the post-
+    /// spend balance. A regression that forgot to call the UPDATE
+    /// (or ran it against the wrong row) would leave the balance at
+    /// `daily_allowance` and flunk this assertion.
+    #[test]
+    fn spend_turns_decrements_balance_for_existing_player() {
+        let dir = tempdir().expect("tempdir creates");
+        let (world, player_id) = world_with_player(&dir);
+        let provider =
+            FixedDateProvider::new(LocalDate::parse("2026-05-08").expect("fixture date parses"));
+
+        let after = world
+            .spend_turns(player_id, 1, 30, &provider)
+            .expect("first spend succeeds");
+
+        assert_eq!(after.player_id, player_id);
+        assert_eq!(after.local_date.as_str(), "2026-05-08");
+        assert_eq!(
+            after.balance, 29,
+            "balance must drop by the spent amount (30 - 1)"
+        );
+        assert_eq!(
+            after.daily_allowance, 30,
+            "stored allowance is unchanged by a spend"
+        );
+
+        // Belt-and-braces: the persisted row matches the returned
+        // snapshot. A regression that returned a synthesised
+        // post-spend struct without writing the UPDATE would slip
+        // past the struct-only assertion above.
+        let persisted: i64 = world
+            .connection()
+            .query_row(
+                "SELECT balance FROM turn_ledger \
+                 WHERE player_id = ?1 AND local_date = ?2",
+                rusqlite::params![player_id, "2026-05-08"],
+                |row| row.get(0),
+            )
+            .expect("balance readback");
+        assert_eq!(persisted, 29, "DB row must reflect the decrement");
+    }
+
+    /// Repeated spends compose: balance after N spends of `amount`
+    /// is `daily_allowance - N * amount`. This pins the atomicity
+    /// contract — each UPDATE applies to the *current* balance, not
+    /// to a stale snapshot the method captured at entry.
+    #[test]
+    fn spend_turns_applies_repeatedly_against_current_balance() {
+        let dir = tempdir().expect("tempdir creates");
+        let (world, player_id) = world_with_player(&dir);
+        let provider =
+            FixedDateProvider::new(LocalDate::parse("2026-05-08").expect("fixture date parses"));
+
+        let first = world
+            .spend_turns(player_id, 5, 30, &provider)
+            .expect("first spend");
+        assert_eq!(first.balance, 25);
+
+        let second = world
+            .spend_turns(player_id, 5, 30, &provider)
+            .expect("second spend");
+        assert_eq!(
+            second.balance, 20,
+            "second spend must apply to the post-first balance, not the original allowance"
+        );
+
+        let third = world
+            .spend_turns(player_id, 7, 30, &provider)
+            .expect("third spend");
+        assert_eq!(third.balance, 13, "30 - 5 - 5 - 7 = 13");
+    }
+
+    /// Spending an amount of zero is a no-op on the balance — the
+    /// row is materialised if missing, but the UPDATE leaves the
+    /// counter alone. We don't reject it as an error because Task 6e
+    /// will own the typed-error story for "spend can't proceed";
+    /// for 6d we just need to confirm the decrement formula
+    /// (`balance - 0 == balance`) doesn't accidentally clobber the
+    /// row to some other value.
+    #[test]
+    fn spend_turns_zero_amount_leaves_balance_unchanged() {
+        let dir = tempdir().expect("tempdir creates");
+        let (world, player_id) = world_with_player(&dir);
+        let provider =
+            FixedDateProvider::new(LocalDate::parse("2026-05-08").expect("fixture date parses"));
+
+        let row = world
+            .spend_turns(player_id, 0, 30, &provider)
+            .expect("zero-amount spend is a successful no-op");
+
+        assert_eq!(row.balance, 30, "balance unchanged by a zero-amount spend");
+        assert_eq!(row.daily_allowance, 30);
+    }
+
+    /// One player's spend does not affect another player's balance.
+    /// A regression that dropped the `WHERE player_id = ?` clause
+    /// from the UPDATE would decrement every row and flunk here.
+    #[test]
+    fn spend_turns_isolates_balances_per_player() {
+        let dir = tempdir().expect("tempdir creates");
+        let (world, alice_id) = world_with_player(&dir);
+        world
+            .connection()
+            .execute("INSERT INTO players (id, handle) VALUES (2, 'bob')", [])
+            .expect("seed second player");
+        let bob_id = 2_i64;
+        let provider =
+            FixedDateProvider::new(LocalDate::parse("2026-05-08").expect("fixture date parses"));
+
+        // Materialise Bob's row first so we can assert it is left
+        // untouched by Alice's spend.
+        let bob_before = world
+            .ensure_today_turns(bob_id, 30, &provider)
+            .expect("bob row");
+        assert_eq!(bob_before.balance, 30);
+
+        let alice_after = world
+            .spend_turns(alice_id, 4, 30, &provider)
+            .expect("alice spend");
+        assert_eq!(alice_after.balance, 26);
+
+        let bob_after = world
+            .ensure_today_turns(bob_id, 30, &provider)
+            .expect("bob row readback");
+        assert_eq!(
+            bob_after.balance, 30,
+            "alice's spend must not touch bob's balance"
+        );
+    }
+
+    /// `spend_turns` calls today's lazy-init path internally, so a
+    /// brand-new player whose ledger row does not yet exist still gets
+    /// a correct post-spend balance. This is the shape callers in
+    /// Murder Motel (Task 13a) will use: they spend on the first
+    /// inspection of the day without first calling `ensure_today_turns`
+    /// themselves.
+    #[test]
+    fn spend_turns_creates_today_row_lazily_then_decrements() {
+        let dir = tempdir().expect("tempdir creates");
+        let (world, player_id) = world_with_player(&dir);
+        let provider =
+            FixedDateProvider::new(LocalDate::parse("2026-05-08").expect("fixture date parses"));
+
+        // Sanity: no ledger row exists yet for this player/day.
+        let before: i64 = world
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM turn_ledger \
+                 WHERE player_id = ?1 AND local_date = ?2",
+                rusqlite::params![player_id, "2026-05-08"],
+                |row| row.get(0),
+            )
+            .expect("count pre-spend");
+        assert_eq!(before, 0, "precondition: no ledger row yet");
+
+        let after = world
+            .spend_turns(player_id, 3, 30, &provider)
+            .expect("lazy-init spend");
+        assert_eq!(after.balance, 27, "30 (lazy) - 3 (spent) = 27");
+
+        let after_count: i64 = world
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM turn_ledger \
+                 WHERE player_id = ?1 AND local_date = ?2",
+                rusqlite::params![player_id, "2026-05-08"],
+                |row| row.get(0),
+            )
+            .expect("count post-spend");
+        assert_eq!(after_count, 1, "lazy init must persist exactly one row");
+    }
+
+    /// A SQLite failure during spend (here forced by skipping the
+    /// `turn_ledger` migration) surfaces as a typed
+    /// [`TurnError::Sqlite`] rather than a panic. This is the
+    /// contract Task 10's operator-facing layer relies on to wrap
+    /// world errors into `anyhow` without losing the underlying
+    /// SQLite reason.
+    #[test]
+    fn spend_turns_returns_typed_sqlite_error_on_missing_table() {
+        let dir = tempdir().expect("tempdir creates");
+        let db_path = dir.path().join("world.sqlite");
+        let world = WorldDb::open(&db_path).expect("open succeeds");
+        // Deliberately skip the turn_ledger migration so the inner
+        // ensure_today_turns call hits a missing-table error.
+        let provider =
+            FixedDateProvider::new(LocalDate::parse("2026-05-08").expect("fixture date parses"));
+
+        let err = world
+            .spend_turns(1, 1, 30, &provider)
             .expect_err("missing turn_ledger table must surface as a typed error");
         let TurnError::Sqlite { source } = &err else {
             panic!("expected Sqlite variant, got {err:?}");

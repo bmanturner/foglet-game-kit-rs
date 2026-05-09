@@ -541,9 +541,9 @@ impl MapScreen {
                 .borrow_mut()
                 .insert(item.id.to_string());
             if newly_added {
-                *self.slots.feedback.borrow_mut() = Some(
-                    foglet_game::FeedbackLine::success(format!("Picked up {}.", item.name)),
-                );
+                *self.slots.feedback.borrow_mut() = Some(foglet_game::FeedbackLine::success(
+                    format!("Picked up {}.", item.name),
+                ));
             }
         }
         true
@@ -1777,8 +1777,7 @@ pub(crate) mod tests {
         walk_to(&mut map, &mut ctx, 6, 5);
         // Stomp the feedback slot to a sentinel so we can detect
         // whether the second pass overwrites it.
-        *map.slots().feedback.borrow_mut() =
-            Some(foglet_game::FeedbackLine::info("sentinel"));
+        *map.slots().feedback.borrow_mut() = Some(foglet_game::FeedbackLine::info("sentinel"));
         // Step off then back onto the now-empty cell.
         map.handle_input(&mut ctx, Input::Up);
         map.handle_input(&mut ctx, Input::Down);
