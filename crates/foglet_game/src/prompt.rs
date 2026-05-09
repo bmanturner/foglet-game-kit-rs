@@ -890,46 +890,107 @@ impl<T> ChoicePrompt<T> {
     /// companion calls back into this method, so width handling stays
     /// in one place.
     pub fn rendered_lines(&self, width: u16) -> Vec<String> {
+        self.rendered_rows(width)
+            .into_iter()
+            .map(|(row, _)| row)
+            .collect()
+    }
+
+    /// Compute the prompt's visual rows alongside a per-row "is this
+    /// the selected choice?" flag, used by [`ChoicePrompt::render`] to
+    /// reverse-style the cursor row in arrow/Enter navigation mode
+    /// (Task 5d).
+    ///
+    /// The marker layer is character-based (`> ` prefix on the
+    /// selected row, two-space indent on every other choice row) so
+    /// SPEC §6's "MUST NOT require color support for comprehension"
+    /// holds — a strictly monochrome BBS terminal still shows the
+    /// cursor. The reverse-video style applied in `render` is layered
+    /// on top for color-capable terminals where the marker alone would
+    /// feel subtle.
+    ///
+    /// Direct-key prompts (no `.navigable(true)`) keep `selected =
+    /// None` and render exactly as before — no prefix, no reversed
+    /// row — so the SPEC §4.3 reference rendering and every Task 5b/5c
+    /// test continue to match byte-for-byte.
+    ///
+    /// When the available width is narrower than the 2-cell prefix
+    /// (`width < 3`), the indent is dropped and the choice rows
+    /// render unprefixed; the cursor disappears but the prompt is at
+    /// least readable. SPEC §6 forbids panicking on small areas; this
+    /// fallback honors that for the same reason `width == 0` returns
+    /// an empty `Vec`.
+    fn rendered_rows(&self, width: u16) -> Vec<(String, bool)> {
         if width == 0 {
             return Vec::new();
         }
-        let mut rows: Vec<String> = Vec::new();
+        let mut rows: Vec<(String, bool)> = Vec::new();
 
         // 1. Body — re-use `TextBlock`'s wrap so blank-line
         //    preservation, hard-break-on-overlong-word, and the
         //    deterministic-under-`TestBackend` contract carry through
         //    without a second implementation drifting from the first.
         let body = TextBlock::from_lines(self.body.iter().cloned());
-        rows.extend(body.wrapped_rows(width));
+        rows.extend(body.wrapped_rows(width).into_iter().map(|r| (r, false)));
 
         // 2. Body→choices gap.
         if !rows.is_empty() && !self.choices.is_empty() {
-            rows.push(String::new());
+            rows.push((String::new(), false));
         }
 
-        // 3. Choices.
-        for choice in &self.choices {
+        // 3. Choices. In navigation mode the choice rows reserve a
+        //    2-cell prefix on the left for the selected-row marker
+        //    (`> `) so the cursor never overflows the slot — wrap at
+        //    `width - 2` and prepend the prefix post-wrap, because
+        //    `wrap_line_into` collapses leading whitespace via
+        //    `split_whitespace`.
+        let nav_mode = self.selected.is_some();
+        let indent_choices = nav_mode && width >= 3;
+        let choice_wrap_width = if indent_choices { width - 2 } else { width };
+        for (i, choice) in self.choices.iter().enumerate() {
             let line = format_choice_row(choice);
-            // Wrap the choice line itself so a long label on a narrow
-            // terminal still fits without truncation. Going through
-            // `TextBlock::new` here (rather than a one-off wrap call)
-            // mirrors the body path so the wrap policy stays a single
-            // implementation.
-            rows.extend(TextBlock::new(&line).wrapped_rows(width));
+            let wrapped = TextBlock::new(&line).wrapped_rows(choice_wrap_width);
+            let is_selected = self.selected == Some(i);
+            for (row_idx, row) in wrapped.into_iter().enumerate() {
+                let prefixed = if indent_choices {
+                    // Marker on the first wrapped row only — continuation
+                    // rows keep the indent so the label column stays
+                    // aligned but do not stack `> ` markers.
+                    let prefix = if is_selected && row_idx == 0 {
+                        "> "
+                    } else {
+                        "  "
+                    };
+                    format!("{prefix}{row}")
+                } else {
+                    row
+                };
+                rows.push((prefixed, is_selected));
+            }
         }
 
         // 4. Footer.
         if let Some(footer) = self.footer.as_deref() {
             if !rows.is_empty() {
-                rows.push(String::new());
+                rows.push((String::new(), false));
             }
-            rows.extend(TextBlock::new(footer).wrapped_rows(width));
+            rows.extend(
+                TextBlock::new(footer)
+                    .wrapped_rows(width)
+                    .into_iter()
+                    .map(|r| (r, false)),
+            );
         }
 
         // 5. Prompt label.
         if !self.choices.is_empty() {
-            rows.push(String::new());
-            rows.extend(TextBlock::new(self.prompt_label_text()).wrapped_rows(width));
+            rows.push((String::new(), false));
+            rows.extend(
+                TextBlock::new(self.prompt_label_text())
+                    .wrapped_rows(width)
+                    .into_iter()
+                    .map(|r| (r, false)),
+            );
         }
 
         rows
@@ -941,24 +1002,33 @@ impl<T> ChoicePrompt<T> {
     ///
     /// Lines past the available height are silently clipped — SPEC §6
     /// forbids panicking on small areas, and overflow handling for the
-    /// bordered modal layout lives in Task 5e. Style application is a
-    /// Task 5f concern; today every cell is written with the buffer's
-    /// default style so `TestBackend` assertions read as plain ASCII.
+    /// bordered modal layout lives in Task 5e.
+    ///
+    /// In navigation mode (`.navigable(true)`) the row matching
+    /// `selected` is drawn with `Modifier::REVERSED`. The character
+    /// `> ` prefix added by the row-building helper is the
+    /// monochrome-safe carrier of the same information; the reversed
+    /// style is the color-capable layer on top. The full theme/style
+    /// system lands in Task 5f — today the cursor row is the only
+    /// styled cell; everything else writes with the buffer's default
+    /// style so `TestBackend` assertions stay deterministic.
     pub fn render(&self, area: Rect, buf: &mut Buffer) -> u16 {
         if area.width == 0 || area.height == 0 {
             return 0;
         }
-        let rows = self.rendered_lines(area.width);
+        let rows = self.rendered_rows(area.width);
         let drawn = rows.len().min(area.height as usize);
-        for (i, row) in rows.iter().take(drawn).enumerate() {
+        let selected_style =
+            ratatui::style::Style::default().add_modifier(ratatui::style::Modifier::REVERSED);
+        let default_style = ratatui::style::Style::default();
+        for (i, (row, is_selected)) in rows.iter().take(drawn).enumerate() {
             let y = area.y + i as u16;
-            buf.set_stringn(
-                area.x,
-                y,
-                row,
-                area.width as usize,
-                ratatui::style::Style::default(),
-            );
+            let style = if *is_selected {
+                selected_style
+            } else {
+                default_style
+            };
+            buf.set_stringn(area.x, y, row, area.width as usize, style);
         }
         drawn as u16
     }
@@ -3219,5 +3289,216 @@ mod tests {
             .disabled_if(true, "full");
         let rows = render_prompt_to_strings(&prompt, 40, 4);
         assert_eq!(rows[0], "- [M] Mana potions (full)");
+    }
+
+    // ---- Task 5d: selected-row marker + reverse-video for nav mode ----
+    //
+    // Two carriers of meaning per SPEC §6: a character marker (`> `
+    // prefix on the cursor row) so a strictly monochrome terminal
+    // still shows selection, AND a `Modifier::REVERSED` style for
+    // color-capable terminals. The tests below assert *both* layers
+    // independently so a future refactor cannot drop one and pass.
+
+    #[test]
+    fn rendered_lines_marks_selected_row_with_caret_in_nav_mode() {
+        // `.navigable(true)` seeds the cursor on the first enabled
+        // choice; that row gets `> `, the others get a `  ` indent so
+        // the label column stays aligned. Disabled rows in nav mode
+        // also receive the indent — they are not the cursor, but the
+        // alignment is what makes the marker scannable.
+        let prompt: ChoicePrompt<LootAction> = ChoicePrompt::new()
+            .choice('e', LootAction::Equip, "Equip")
+            .choice('t', LootAction::Take, "Take")
+            .navigable(true);
+        let rows = prompt.rendered_lines(40);
+        assert_eq!(rows[0], "> (E) Equip");
+        assert_eq!(rows[1], "  (T) Take");
+    }
+
+    #[test]
+    fn rendered_lines_marker_follows_cursor_after_move_down() {
+        // Pinning the marker to `selected` rather than "first row"
+        // protects the SPEC §4.5 contract that Up/Down moves the
+        // cursor visibly. After one `move_down` the marker MUST be
+        // on the second enabled choice.
+        let mut prompt: ChoicePrompt<LootAction> = ChoicePrompt::new()
+            .choice('e', LootAction::Equip, "Equip")
+            .choice('t', LootAction::Take, "Take")
+            .navigable(true);
+        prompt.move_down();
+        let rows = prompt.rendered_lines(40);
+        assert_eq!(rows[0], "  (E) Equip");
+        assert_eq!(rows[1], "> (T) Take");
+    }
+
+    #[test]
+    fn rendered_lines_no_marker_when_not_in_nav_mode() {
+        // Direct-key prompts (no `.navigable(true)`) keep `selected =
+        // None`, so the SPEC §4.3 reference rendering survives
+        // byte-for-byte. This is the regression guard for Task 5b's
+        // existing snapshot tests.
+        let prompt: ChoicePrompt<LootAction> = ChoicePrompt::new()
+            .choice('e', LootAction::Equip, "Equip")
+            .choice('t', LootAction::Take, "Take");
+        let rows = prompt.rendered_lines(40);
+        assert_eq!(rows[0], "(E) Equip");
+        assert_eq!(rows[1], "(T) Take");
+    }
+
+    #[test]
+    fn rendered_lines_marker_indents_disabled_row_in_nav_mode() {
+        // Disabled rows already carry the `- [K]` monochrome marker
+        // from Task 5c. In nav mode they additionally get the 2-cell
+        // indent so the cursor's `> ` and the disabled `- [` line up
+        // visually instead of jagging left.
+        let prompt: ChoicePrompt<LootAction> = ChoicePrompt::new()
+            .choice('e', LootAction::Equip, "Equip")
+            .choice('t', LootAction::Take, "Take")
+            .disabled_if(true, "bag full")
+            .navigable(true);
+        let rows = prompt.rendered_lines(60);
+        assert_eq!(rows[0], "> (E) Equip");
+        assert_eq!(rows[1], "  - [T] Take (bag full)");
+    }
+
+    #[test]
+    fn rendered_lines_marker_skips_unrelated_rows() {
+        // Body, footer, blank gaps, and the prompt label are not
+        // choices and MUST NOT receive the cursor marker — only the
+        // selected choice row does. This is the contract that lets
+        // `render` apply `REVERSED` to exactly one row.
+        let prompt: ChoicePrompt<LootAction> = ChoicePrompt::new()
+            .body("pick one")
+            .choice('e', LootAction::Equip, "Equip")
+            .footer("hint")
+            .navigable(true);
+        let rows = prompt.rendered_lines(40);
+        // body, blank, choice, blank, footer, blank, label
+        assert_eq!(rows[0], "pick one");
+        assert_eq!(rows[1], "");
+        assert_eq!(rows[2], "> (E) Equip");
+        assert_eq!(rows[3], "");
+        assert_eq!(rows[4], "hint");
+        assert_eq!(rows[5], "");
+        assert_eq!(rows[6], "Your choice:");
+    }
+
+    #[test]
+    fn rendered_lines_marker_only_on_first_wrapped_row_of_selected_choice() {
+        // A long label that wraps across multiple visual rows shows
+        // the `> ` marker only on the first row; continuation rows
+        // keep the 2-cell indent for column alignment. Stacking the
+        // marker on every wrapped row would make the cursor look like
+        // a multi-line selection, which it is not.
+        let prompt: ChoicePrompt<LootAction> = ChoicePrompt::new()
+            .choice(
+                'e',
+                LootAction::Equip,
+                "Equip the very long sword of overflow",
+            )
+            .navigable(true);
+        let rows = prompt.rendered_lines(20);
+        assert!(rows[0].starts_with("> "));
+        // At least one continuation row exists at this width and it
+        // must carry the indent, never another `> ` marker.
+        assert!(rows.len() >= 2);
+        assert!(rows[1].starts_with("  "));
+        assert!(!rows[1].starts_with("> "));
+    }
+
+    #[test]
+    fn rendered_lines_drops_indent_when_width_too_narrow_for_marker() {
+        // SPEC §6: MUST NOT panic on small areas. With width < 3 the
+        // 2-cell prefix would not fit; the marker layer drops out and
+        // the label re-occupies the slot. The reverse-video path in
+        // `render` still flags the row, so the cursor stays visible
+        // on color terminals even when the character marker cannot.
+        let prompt: ChoicePrompt<LootAction> = ChoicePrompt::new()
+            .choice('e', LootAction::Equip, "Equip")
+            .navigable(true);
+        let rows = prompt.rendered_lines(2);
+        // Width 2 wraps `(E) Equip` aggressively but never panics
+        // and never produces a row starting with `> ` (no room).
+        for row in &rows {
+            assert!(
+                !row.starts_with("> "),
+                "row {row:?} kept the marker at width 2"
+            );
+            assert!(row.chars().count() <= 2, "row {row:?} exceeded width 2");
+        }
+    }
+
+    #[test]
+    fn render_applies_reversed_modifier_to_selected_row() {
+        // Color-layer half of Task 5d. Drives `render` through
+        // `TestBackend` and asserts the buffer cell on the cursor
+        // row carries `Modifier::REVERSED`, while a non-selected
+        // choice row does not. Pinning the modifier (rather than a
+        // full `Style`) keeps this resilient to Task 5f's theme
+        // layer landing on top.
+        use ratatui::backend::TestBackend;
+        use ratatui::style::Modifier;
+        use ratatui::Terminal;
+        let prompt: ChoicePrompt<LootAction> = ChoicePrompt::new()
+            .choice('e', LootAction::Equip, "Equip")
+            .choice('t', LootAction::Take, "Take")
+            .navigable(true);
+        let backend = TestBackend::new(40, 4);
+        let mut term = Terminal::new(backend).expect("test backend");
+        term.draw(|frame| {
+            let area = frame.area();
+            prompt.render(area, frame.buffer_mut());
+        })
+        .expect("draw");
+        let buf = term.backend().buffer().clone();
+        // Row 0 is the selected `> (E) Equip` — every cell on that
+        // row that the renderer wrote MUST carry REVERSED. Checking
+        // the marker cell at x=0 is enough; if any cell on the row
+        // missed the style we have a bigger bug than this test
+        // describes.
+        assert!(
+            buf[(0, 0)]
+                .style()
+                .add_modifier
+                .contains(Modifier::REVERSED),
+            "selected row missing REVERSED modifier"
+        );
+        // Row 1 is the non-selected `  (T) Take` — MUST NOT be
+        // reverse-styled.
+        assert!(
+            !buf[(0, 1)]
+                .style()
+                .add_modifier
+                .contains(Modifier::REVERSED),
+            "non-selected row picked up REVERSED modifier"
+        );
+    }
+
+    #[test]
+    fn render_does_not_apply_reversed_when_not_in_nav_mode() {
+        // Direct-key prompts MUST render with the buffer's default
+        // style — a stray REVERSED on a direct-key prompt would
+        // wrongly imply a cursor exists. This is the regression guard
+        // for the Task 5b reference snapshot.
+        use ratatui::backend::TestBackend;
+        use ratatui::style::Modifier;
+        use ratatui::Terminal;
+        let prompt: ChoicePrompt<LootAction> =
+            ChoicePrompt::new().choice('e', LootAction::Equip, "Equip");
+        let backend = TestBackend::new(40, 4);
+        let mut term = Terminal::new(backend).expect("test backend");
+        term.draw(|frame| {
+            let area = frame.area();
+            prompt.render(area, frame.buffer_mut());
+        })
+        .expect("draw");
+        let buf = term.backend().buffer().clone();
+        assert!(
+            !buf[(0, 0)]
+                .style()
+                .add_modifier
+                .contains(Modifier::REVERSED),
+            "direct-key prompt picked up REVERSED on choice row"
+        );
     }
 }
