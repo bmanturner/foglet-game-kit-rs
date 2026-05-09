@@ -1384,6 +1384,114 @@ mod tests {
         );
     }
 
+    // ---- SPEC_v2 §Task 13g daily reset restores clue turns ----------
+
+    /// SPEC_v2 §Task 13g — when the calendar rolls forward a day, the
+    /// player's clue-inspection turns must be restored without any
+    /// player-visible action. This is the Murder-Motel-level proof of
+    /// the kit's `[turns].reset = local_midnight` contract: the lobby
+    /// drawer's chokepoint ([`spend_clue_inspection_turn`]) and the
+    /// status reader ([`read_remaining_turns`]) — *not* a raw
+    /// `WorldDb` test — are what gets exercised so a future refactor
+    /// of either helper that broke the reset story would surface here.
+    ///
+    /// Scenario:
+    /// 1. Day 1 (`2026-05-09`): drain the full `daily_allowance = 3`
+    ///    by inspecting clues until the helper rejects with
+    ///    `InsufficientTurns { balance: 0 }`.
+    /// 2. Advance the [`FixedDateProvider`] to day 2 (`2026-05-10`).
+    /// 3. Read remaining turns first — the lazy ensure-today-row write
+    ///    is what the lobby's `MapScreen::tick` triggers on the very
+    ///    first frame of the new day. It must report the full
+    ///    `daily_allowance` because `carryover_max = 0` in the
+    ///    scaffold's `game.toml`.
+    /// 4. Spend once on day 2 and observe `remaining: 2`, confirming
+    ///    the reset row is real (not a phantom read-only value).
+    #[test]
+    fn daily_reset_restores_clue_turns_for_murder_motel_player() {
+        let dir = tempdir().expect("tempdir");
+        let world = world_with_turn_stack(&dir);
+        let cfg = fixture_config();
+        let fc = fixture_context();
+
+        // Day 1: drive the helper through the full allowance plus one
+        // rejected attempt so we know the row is sitting at zero.
+        let mut date =
+            FixedDateProvider::new(LocalDate::parse("2026-05-09").expect("day 1 parses"));
+        for _ in 0..3 {
+            assert!(matches!(
+                spend_clue_inspection_turn(&world, &fc, &cfg, &date),
+                ClueInspectionOutcome::Spent { .. }
+            ));
+        }
+        assert_eq!(
+            spend_clue_inspection_turn(&world, &fc, &cfg, &date),
+            ClueInspectionOutcome::InsufficientTurns { balance: 0 },
+            "day 1 must end with a zero-balance rejection so day 2 has \
+             something concrete to reset"
+        );
+
+        // Advance the clock. Mutating in-place mirrors the production
+        // SystemDateProvider's "next call sees a new date" behaviour
+        // without needing a second provider instance.
+        date.set(LocalDate::parse("2026-05-10").expect("day 2 parses"));
+
+        // Read first — the status line is what the player sees on the
+        // first frame after the day rolls over. A broken reset would
+        // surface here as `remaining: 0` rather than the configured
+        // allowance.
+        let status = read_remaining_turns(&world, &fc, &cfg, &date)
+            .expect("turns configured ⇒ status populates");
+        assert_eq!(
+            status,
+            RemainingTurns {
+                remaining: 3,
+                daily_allowance: 3,
+            },
+            "carryover_max = 0 means day 2 reads the full allowance regardless \
+             of how day 1 ended"
+        );
+
+        // Then spend — confirms the new-day row is writable, not just
+        // a transient ensure_today_turns return value.
+        assert_eq!(
+            spend_clue_inspection_turn(&world, &fc, &cfg, &date),
+            ClueInspectionOutcome::Spent { remaining: 2 },
+            "first spend on day 2 must decrement the freshly-reset row to 2"
+        );
+    }
+
+    /// Companion proof that the reset is *per-day*, not "any time the
+    /// date provider changes". Re-spending on the same day after an
+    /// in-place `FixedDateProvider::set` to the *same* date must still
+    /// reject — otherwise the previous test could pass against a buggy
+    /// implementation that reset on every read.
+    #[test]
+    fn same_day_reset_does_not_restore_clue_turns() {
+        let dir = tempdir().expect("tempdir");
+        let world = world_with_turn_stack(&dir);
+        let cfg = fixture_config();
+        let fc = fixture_context();
+
+        let mut date = FixedDateProvider::new(LocalDate::parse("2026-05-09").expect("day parses"));
+        for _ in 0..3 {
+            assert!(matches!(
+                spend_clue_inspection_turn(&world, &fc, &cfg, &date),
+                ClueInspectionOutcome::Spent { .. }
+            ));
+        }
+
+        // Re-set to the same date to prove the reset is keyed on the
+        // calendar day, not on any "provider was touched" signal.
+        date.set(LocalDate::parse("2026-05-09").expect("day parses"));
+
+        assert_eq!(
+            spend_clue_inspection_turn(&world, &fc, &cfg, &date),
+            ClueInspectionOutcome::InsufficientTurns { balance: 0 },
+            "re-setting to today must not refill the allowance"
+        );
+    }
+
     // ---- SPEC_v2 §Task 13c-ii clue_found events ---------------------
 
     use crate::scenes::lost_and_found::LostAndFoundOutcome;
