@@ -4640,6 +4640,63 @@ mod tests {
         );
     }
 
+    // ---- Night-clerk vendor: no-thanks exit (SPEC §9 Task 11e) -------
+
+    #[test]
+    fn night_clerk_vendor_no_thanks_exits_without_state_change() {
+        // SPEC §9 step 4: "No thanks exits cleanly." CHECKLIST Task 11e
+        // pins the contract: pressing `n` resolves to a clean prompt
+        // exit with zero state mutations. The test drives both halves
+        // of the chain — the prompt reducer's case-folded selection
+        // (lowercase + uppercase per SPEC §9 step 7) and the apply
+        // handler's `None` return — and snapshots the slot bundle on
+        // either side of the press to prove no slot moved. A future
+        // regression that adds a `NoThanks` apply branch (e.g. a stray
+        // morale tick) would flip the snapshot equality and surface
+        // here, not deep in a downstream save-replay test.
+        use foglet_game::PromptAction;
+
+        for key in ['n', 'N'] {
+            let slots = SharedSlots::default();
+            slots.reset(0, 0);
+            let before = slots.snapshot();
+            let starting_cash = slots.player.borrow().cash;
+            let prompt = night_clerk_vendor_prompt(starting_cash);
+
+            let action = prompt.handle(Input::Char(key));
+            match action {
+                PromptAction::Selected(NightClerkVendorChoice::NoThanks) => {}
+                other => panic!("expected NoThanks for `{key}`, got {other:?}"),
+            }
+
+            // Apply handler must return `None` for the no-thanks path —
+            // there is no `NightClerkVendorOutcome` variant for a clean
+            // exit, which is what keeps the feedback helper from
+            // accidentally surfacing a misleading success line.
+            let outcome = apply_night_clerk_vendor_choice(&slots, NightClerkVendorChoice::NoThanks);
+            assert!(
+                outcome.is_none(),
+                "NoThanks must produce no outcome (got {outcome:?}) for `{key}`"
+            );
+
+            // Byte-identical snapshot proves nothing moved: not cash,
+            // not inventory, not flags, not coordinates. Pinning the
+            // full snapshot (rather than just `cash`) guards against a
+            // future no-thanks side-effect (e.g. an `npc_visited` flag)
+            // sneaking in without an explicit SPEC update.
+            assert_eq!(
+                slots.snapshot(),
+                before,
+                "NoThanks press for `{key}` must not mutate any slot"
+            );
+            assert_eq!(
+                slots.player.borrow().cash,
+                starting_cash,
+                "cash must be unchanged after a NoThanks press for `{key}`"
+            );
+        }
+    }
+
     // ---- Lost-and-Found Drawer action handler (SPEC §9 Task 10c) -----
 
     #[test]
