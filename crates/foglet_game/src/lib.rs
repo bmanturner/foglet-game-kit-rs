@@ -33,6 +33,7 @@
 
 pub mod config;
 pub mod dialog;
+pub mod dialog_screen;
 pub mod events;
 pub mod foglet;
 pub mod input;
