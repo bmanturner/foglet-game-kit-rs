@@ -556,7 +556,40 @@ pub fn open_world_db_if_enabled(config: &GameConfig) -> GameResult<Option<WorldD
 /// here returns `Ok(())` whereas the real path returns the save
 /// manager's result) but isolating it now keeps Task 7d focused on
 /// the loop wiring.
-pub fn run_built(mut built: BuiltGame) -> GameResult<()> {
+pub fn run_built(built: BuiltGame) -> GameResult<()> {
+    // Production wiring uses the canonical opener. The injectable
+    // [`run_built_with_opener`] variant exists so Task 10c can
+    // simulate a DB-open failure under test without standing up a
+    // real broken SQLite path.
+    run_built_with_opener(built, &open_world_db_if_enabled)
+}
+
+/// Type alias for the world-DB opener seam consumed by
+/// [`run_built_with_opener`].
+///
+/// A `&dyn Fn(...)` (rather than a generic) keeps the runtime API
+/// monomorphic — the opener only needs to be invoked once and the
+/// indirection cost is irrelevant against terminal I/O. Tests box a
+/// closure that returns a synthetic [`GameError::WorldOpen`] to
+/// exercise the failure ordering described by SPEC §7.1 / Task 10c.
+pub type WorldOpenerFn = dyn Fn(&GameConfig) -> GameResult<Option<WorldDb>>;
+
+/// Like [`run_built`] but with the world-DB opener supplied by the
+/// caller.
+///
+/// Task 10c: locks in the SPEC §7.1 invariant that DB-open MUST run
+/// **before** any terminal raw-mode toggle, so a DB-open failure
+/// trivially leaves the terminal in its original state — there is
+/// nothing to restore because nothing was changed. The injectable
+/// opener lets a unit test simulate a failing opener and assert both
+/// the propagated [`GameError::WorldOpen`] and that raw mode was
+/// never engaged, without needing a broken SQLite path on disk.
+///
+/// Production callers should use [`run_built`]; this variant is
+/// public so future work (e.g. wiring a process-wide opener override
+/// for staging environments) can plug in without re-implementing the
+/// SPEC §7.1 startup sequence.
+pub fn run_built_with_opener(mut built: BuiltGame, open_world: &WorldOpenerFn) -> GameResult<()> {
     // Required deps — checked before touching the terminal so a
     // misconfigured author gets a clear-error exit with no terminal
     // state changed. We `take()` the optionals out of `built` so the
@@ -566,12 +599,16 @@ pub fn run_built(mut built: BuiltGame) -> GameResult<()> {
     let foglet = built.foglet.take().ok_or(GameError::MissingContext)?;
 
     // Open the shared-world DB *before* engaging the terminal guard.
-    // Task 10b: when `[world].enabled = false` (or the section is
-    // missing entirely) this short-circuits to `None` and the runtime
-    // behaves exactly like a v1 game. A failure here surfaces as a
-    // plain `GameError::WorldOpen` with no terminal state to restore;
-    // Task 10c will harden the post-guard ordering separately.
-    let world_db = open_world_db_if_enabled(&config)?;
+    // SPEC §7.1 / Task 10c: this ordering is the load-bearing
+    // invariant — a DB-open failure here returns `Err` while the
+    // terminal is still in its untouched, cooked-mode state, so no
+    // restoration is required and any operator-facing error message
+    // prints to a normal terminal. Moving this call after the guard
+    // is constructed would re-introduce the "error message lost
+    // inside the alternate screen" hazard that SPEC §7.3 explicitly
+    // forbids. The opener is injected so tests can substitute a
+    // failing implementation without needing a real broken path.
+    let world_db = open_world(&config)?;
 
     // Live terminal size. crossterm::terminal::size works on a TTY
     // before raw mode is engaged; using it here keeps the size check
@@ -1650,6 +1687,71 @@ mod tests {
         assert!(
             matches!(err, GameError::WorldOpen(_)),
             "unexpected variant: {err:?}"
+        );
+    }
+
+    // -------------------------------------------------------------
+    // Task 10c — DB-open failure must not engage the terminal
+    // -------------------------------------------------------------
+
+    /// SPEC §7.1 / Task 10c invariant: when the world-DB opener
+    /// fails, `run_built_with_opener` MUST return the error before
+    /// any terminal state changes. The injected opener never touches
+    /// SQLite — it just returns a synthetic `WorldOpen` — which lets
+    /// us assert the runtime never reached the guard.
+    ///
+    /// Verification has two prongs:
+    ///
+    /// 1. The returned error matches `GameError::WorldOpen(_)` —
+    ///    proving the opener's error was the cause of exit, not some
+    ///    later step (e.g. a missing TTY in CI).
+    /// 2. `crossterm::terminal::is_raw_mode_enabled()` is unchanged
+    ///    across the call. If a regression ever moves DB-open after
+    ///    the guard, the guard's setup would flip raw mode to `true`;
+    ///    even if the guard's `Drop` later restored it, we would have
+    ///    momentarily owned the terminal. The before/after snapshot
+    ///    here is a coarse but durable witness that we never engaged.
+    #[test]
+    fn run_built_with_opener_does_not_engage_terminal_on_open_failure() {
+        let pre_raw = crossterm::terminal::is_raw_mode_enabled().unwrap_or(false);
+
+        // A scripted screen so `make_built` succeeds; we never reach
+        // this screen in this test, but `BuiltGame` requires at least
+        // one to construct.
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let screen = ScriptedScreen::new("never-reached", log, vec![], vec![], vec![]);
+        let mut built = make_built(Box::new(screen));
+        // `run_built_with_opener` requires both config and foglet to
+        // be present (it `take()`s them up front). The fixtures are
+        // the same ones every other 10x test uses.
+        built.config = Some(fixture_config());
+        built.foglet = Some(fixture_context());
+
+        // Synthetic failure — `InvalidJournalMode` is the cheapest
+        // `WorldDbError` to construct (no `rusqlite::Error` round-
+        // trip), and the variant is irrelevant to the assertion: we
+        // only care that the outer wrapper is `WorldOpen`.
+        let opener: Box<WorldOpenerFn> = Box::new(|_cfg| {
+            Err(GameError::WorldOpen(WorldDbError::InvalidJournalMode {
+                requested: "synthetic-test-failure".into(),
+            }))
+        });
+
+        let err =
+            run_built_with_opener(built, &*opener).expect_err("failing opener must surface as Err");
+
+        assert!(
+            matches!(err, GameError::WorldOpen(_)),
+            "expected WorldOpen, got: {err:?}"
+        );
+
+        // The guard would have flipped raw mode to `true` had we
+        // reached it. Equality with the pre-call snapshot is the
+        // load-bearing assertion.
+        let post_raw = crossterm::terminal::is_raw_mode_enabled().unwrap_or(false);
+        assert_eq!(
+            pre_raw, post_raw,
+            "raw mode state must be unchanged when opener fails before guard construction"
         );
     }
 
