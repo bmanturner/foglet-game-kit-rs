@@ -59,7 +59,7 @@ One unchecked item per iteration. Dependencies in `[brackets]` must be checked o
 - [x] **8a** — Add `leaderboard_scores` migration with named board, player id, score, updated_at. [5a]
 - [x] **8b** — Implement `set_score`. Test: first write creates a row. [8a]
 - [x] **8c** — Implement `increment_score`. Test: increments existing score and creates missing score. [8b]
-- [ ] **8d** — Implement `top_scores(name, n)`. Test: deterministic tie ordering by score then updated/player id. [8c]
+- [x] **8d** — Implement `top_scores(name, n)`. Test: deterministic tie ordering by score then updated/player id. [8c]
 - [ ] **8e** — Implement `player_rank(name, player_id)`. Test: rank reflects tie ordering. [8d]
 
 ### Task 9 — Transaction helper

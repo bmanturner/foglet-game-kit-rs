@@ -5,9 +5,11 @@
 //!
 //! - 8b adds [`WorldDb::set_score`] for upserting one
 //!   `(board, player_id)` row to an absolute value.
-//! - 8c (this iteration) adds [`WorldDb::increment_score`] for delta
-//!   updates that don't require the caller to know the prior score.
-//! - 8d will add `top_scores(name, n)` for the leaderboard render.
+//! - 8c adds [`WorldDb::increment_score`] for delta updates that don't
+//!   require the caller to know the prior score.
+//! - 8d (this iteration) adds [`WorldDb::top_scores`] for the
+//!   leaderboard render — `Desc`/`Asc` sort with deterministic
+//!   `(updated_at, player_id)` tie ordering.
 //! - 8e will add `player_rank(name, player_id)` for "you are #N".
 //!
 //! Splitting the schema commit from the helper commits keeps the
@@ -56,6 +58,7 @@
 
 use thiserror::Error;
 
+use crate::config::LeaderboardSort;
 use crate::world_db::{WorldDb, WorldMigration};
 
 /// Schema for the shared-world leaderboard table — SPEC_v2 §4.8 /
@@ -405,6 +408,115 @@ RETURNING board, player_id, score, updated_at";
                 rusqlite::params![board, player_id, delta],
                 row_to_score_record,
             )
+            .map_err(|source| LeaderboardError::Sqlite { source })
+    }
+
+    /// Return the top `limit` rows on a named board in the configured
+    /// sort direction (SPEC_v2 §4.8 / §Task 8d).
+    ///
+    /// "Top" means *best first* per the board's [`LeaderboardSort`]:
+    /// `Desc` boards (the typical case — investigators, kills, points)
+    /// rank highest score first; `Asc` boards (time trials, golf-style
+    /// scoring) rank lowest score first. Callers that own a
+    /// [`crate::config::LeaderboardSection`] pass its `sort` field
+    /// straight through; the helper will not invent a default because
+    /// "top by score" is ambiguous without a direction.
+    ///
+    /// # Tie ordering — deterministic by SPEC §4.8
+    ///
+    /// SPEC §4.8 mandates that tie ordering is deterministic. We resolve
+    /// ties in two stages so the order is total even when scores collide:
+    ///
+    /// 1. `updated_at ASC` — the *earlier* writer wins a score tie. This
+    ///    matches operator intuition for any "first to N" board: if two
+    ///    investigators each found 10 clues, the one who got there first
+    ///    is ahead. Stored as ISO text precisely so lexical ordering
+    ///    matches chronological ordering (see [`ScoreRecord`] docs).
+    /// 2. `player_id ASC` — final tiebreaker for the rare case where
+    ///    two rows share both a score and an `updated_at` (within the
+    ///    same SQLite-second). `player_id` is monotone per
+    ///    [`crate::players::PlayerRecord`], so this stage is total.
+    ///
+    /// The same secondary sort applies regardless of `sort`: only the
+    /// primary `score` direction flips. That keeps `Asc` and `Desc`
+    /// boards consistent — "earlier wins, lower id wins" reads the same
+    /// way to operators inspecting either kind of board.
+    ///
+    /// # Parameters
+    ///
+    /// `board` is validated by the shared `validate_board_name` guard,
+    /// same contract as [`Self::set_score`] / [`Self::increment_score`]:
+    /// empty or whitespace-only inputs fail fast with
+    /// [`LeaderboardError::EmptyBoardName`].
+    ///
+    /// `limit` is `u32` — same shape as [`Self::recent_events`] /
+    /// [`Self::player_events`]. `0` is legal and returns an empty vec; a
+    /// signed `i64` would force callers to think about negatives we
+    /// don't accept. SQLite's `LIMIT` parameter is `INTEGER` so we widen
+    /// to `i64` at the bind site.
+    ///
+    /// Querying a board that has no rows is *not* an error: the helper
+    /// returns an empty vec, which is the correct UI state for "no
+    /// scores yet" on a freshly-launched door.
+    ///
+    /// # Concurrency
+    ///
+    /// Takes `&self`: a single read statement under the configured busy
+    /// timeout, same as [`Self::recent_events`]. The runtime layer
+    /// (Task 10) will call this from the leaderboard render path
+    /// (Task 13f); keeping the borrow shared lets `GameContext` share
+    /// one world-DB reference across screens without a `RefCell` dance.
+    pub fn top_scores(
+        &self,
+        board: &str,
+        sort: LeaderboardSort,
+        limit: u32,
+    ) -> Result<Vec<ScoreRecord>, LeaderboardError> {
+        // Same blank-board contract as the write helpers — failing fast
+        // here keeps the SQL round-trip from running on input that was
+        // always going to return empty rows.
+        validate_board_name(board)?;
+
+        // Two SQL strings instead of interpolating a direction into one:
+        // SQLite parameters can bind values, not the `ASC`/`DESC` token
+        // itself, and string-formatting SQL would be both unsafe and
+        // pointless given the closed [`LeaderboardSort`] enum. The two
+        // strings differ only in the `score` direction; the secondary
+        // tiebreakers (`updated_at ASC, player_id ASC`) are identical so
+        // the deterministic-ordering contract stays the same regardless
+        // of sort. The `(board, score, player_id)` index from the
+        // migration covers the `WHERE board = ?` filter and the score
+        // sort; SQLite will read the small page of `updated_at` from the
+        // table heap to apply the secondary sort, which is fine for the
+        // small `limit` the leaderboard UI requests (typically ≤ 10).
+        const SQL_DESC: &str = "\
+SELECT board, player_id, score, updated_at \
+FROM leaderboard_scores \
+WHERE board = ?1 \
+ORDER BY score DESC, updated_at ASC, player_id ASC \
+LIMIT ?2";
+        const SQL_ASC: &str = "\
+SELECT board, player_id, score, updated_at \
+FROM leaderboard_scores \
+WHERE board = ?1 \
+ORDER BY score ASC, updated_at ASC, player_id ASC \
+LIMIT ?2";
+        let sql = match sort {
+            LeaderboardSort::Desc => SQL_DESC,
+            LeaderboardSort::Asc => SQL_ASC,
+        };
+
+        let mut stmt = self
+            .connection()
+            .prepare(sql)
+            .map_err(|source| LeaderboardError::Sqlite { source })?;
+        let rows = stmt
+            .query_map(
+                rusqlite::params![board, i64::from(limit)],
+                row_to_score_record,
+            )
+            .map_err(|source| LeaderboardError::Sqlite { source })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(|source| LeaderboardError::Sqlite { source })
     }
 }
@@ -920,6 +1032,313 @@ mod tests {
             after.score, -3,
             "negative delta must subtract from the prior score, including past zero"
         );
+    }
+
+    /// SPEC_v2 §Task 8d acceptance: `top_scores` on a `Desc` board
+    /// returns rows with the highest score first, capped at `limit`.
+    /// A regression that flipped the sort direction would flunk here —
+    /// the lowest score would appear at the head of the vec.
+    #[test]
+    fn top_scores_desc_returns_highest_first() {
+        let dir = tempdir().expect("tempdir creates");
+        let world = open_world_with_leaderboards(&dir);
+
+        let alice = world
+            .upsert_player(&ctx_with(Some("u-alice"), Some("alice")))
+            .expect("alice upsert succeeds");
+        let bob = world
+            .upsert_player(&ctx_with(Some("u-bob"), Some("bob")))
+            .expect("bob upsert succeeds");
+        let carol = world
+            .upsert_player(&ctx_with(Some("u-carol"), Some("carol")))
+            .expect("carol upsert succeeds");
+
+        world
+            .set_score("investigators", alice.id, 5)
+            .expect("alice set_score");
+        world
+            .set_score("investigators", bob.id, 12)
+            .expect("bob set_score");
+        world
+            .set_score("investigators", carol.id, 8)
+            .expect("carol set_score");
+
+        let top = world
+            .top_scores("investigators", LeaderboardSort::Desc, 10)
+            .expect("top_scores succeeds");
+
+        let ranked: Vec<(i64, i64)> = top.iter().map(|r| (r.player_id, r.score)).collect();
+        assert_eq!(
+            ranked,
+            vec![(bob.id, 12), (carol.id, 8), (alice.id, 5)],
+            "Desc board must rank highest score first"
+        );
+    }
+
+    /// `Asc` boards (time-trial, golf-style) rank lowest score first.
+    /// Pinning this here protects the SPEC §4.8 `Asc` direction so a
+    /// regression that hard-coded `DESC` in the SQL would flunk.
+    #[test]
+    fn top_scores_asc_returns_lowest_first() {
+        let dir = tempdir().expect("tempdir creates");
+        let world = open_world_with_leaderboards(&dir);
+
+        let alice = world
+            .upsert_player(&ctx_with(Some("u-alice"), Some("alice")))
+            .expect("alice upsert succeeds");
+        let bob = world
+            .upsert_player(&ctx_with(Some("u-bob"), Some("bob")))
+            .expect("bob upsert succeeds");
+
+        world
+            .set_score("speedrun", alice.id, 90)
+            .expect("alice set_score");
+        world
+            .set_score("speedrun", bob.id, 45)
+            .expect("bob set_score");
+
+        let top = world
+            .top_scores("speedrun", LeaderboardSort::Asc, 10)
+            .expect("top_scores succeeds");
+
+        let ranked: Vec<(i64, i64)> = top.iter().map(|r| (r.player_id, r.score)).collect();
+        assert_eq!(
+            ranked,
+            vec![(bob.id, 45), (alice.id, 90)],
+            "Asc board must rank lowest score first"
+        );
+    }
+
+    /// `limit` caps the returned row count. A regression that ignored
+    /// the parameter would return every row and flunk here.
+    #[test]
+    fn top_scores_respects_limit() {
+        let dir = tempdir().expect("tempdir creates");
+        let world = open_world_with_leaderboards(&dir);
+
+        for i in 0..5 {
+            let user = format!("u-{i}");
+            let name = format!("p{i}");
+            let player = world
+                .upsert_player(&ctx_with(Some(&user), Some(&name)))
+                .expect("upsert succeeds");
+            world
+                .set_score("investigators", player.id, i64::from(i) * 10)
+                .expect("set_score");
+        }
+
+        let top = world
+            .top_scores("investigators", LeaderboardSort::Desc, 3)
+            .expect("top_scores succeeds");
+        assert_eq!(top.len(), 3, "limit must cap the returned row count");
+        let scores: Vec<i64> = top.iter().map(|r| r.score).collect();
+        assert_eq!(
+            scores,
+            vec![40, 30, 20],
+            "limit must keep the best rows by sort direction"
+        );
+    }
+
+    /// SPEC §4.8 mandates deterministic tie ordering. When two players
+    /// share a score *and* the same `updated_at` timestamp (the common
+    /// case for back-to-back writes within one SQLite-second), the
+    /// helper must break the tie by `player_id ASC`. A regression that
+    /// fell through to SQLite's natural rowid ordering — which happens
+    /// to coincide here but is not contractually guaranteed — would
+    /// silently lose this property when the index changes.
+    #[test]
+    fn top_scores_ties_break_by_player_id() {
+        let dir = tempdir().expect("tempdir creates");
+        let world = open_world_with_leaderboards(&dir);
+
+        let alice = world
+            .upsert_player(&ctx_with(Some("u-alice"), Some("alice")))
+            .expect("alice upsert");
+        let bob = world
+            .upsert_player(&ctx_with(Some("u-bob"), Some("bob")))
+            .expect("bob upsert");
+        let carol = world
+            .upsert_player(&ctx_with(Some("u-carol"), Some("carol")))
+            .expect("carol upsert");
+
+        // Identical scores. Force identical `updated_at` so the tie-
+        // breaker chain falls through to `player_id`. CURRENT_TIMESTAMP
+        // already has one-second granularity, so back-to-back inserts
+        // usually share an `updated_at`, but pinning the value via UPDATE
+        // makes the test deterministic regardless of clock granularity
+        // on the host running cargo test.
+        world
+            .set_score("investigators", carol.id, 7)
+            .expect("carol set_score");
+        world
+            .set_score("investigators", alice.id, 7)
+            .expect("alice set_score");
+        world
+            .set_score("investigators", bob.id, 7)
+            .expect("bob set_score");
+        world
+            .connection()
+            .execute(
+                "UPDATE leaderboard_scores SET updated_at = '2026-05-08T12:00:00' \
+                 WHERE board = 'investigators'",
+                [],
+            )
+            .expect("pin updated_at");
+
+        let top = world
+            .top_scores("investigators", LeaderboardSort::Desc, 10)
+            .expect("top_scores succeeds");
+
+        // Player ids are issued monotonically by the players migration's
+        // INTEGER PRIMARY KEY, so alice < bob < carol here. The expected
+        // order is `player_id ASC` regardless of insertion order.
+        let ids: Vec<i64> = top.iter().map(|r| r.player_id).collect();
+        assert_eq!(
+            ids,
+            vec![alice.id, bob.id, carol.id],
+            "tie on (score, updated_at) must break by player_id ASC"
+        );
+    }
+
+    /// When two players share a score but have distinct `updated_at`
+    /// stamps, the *earlier* writer wins the tie — "first to N" intuition
+    /// for any leaderboard. This is the primary tiebreaker, ahead of
+    /// `player_id`. A regression that swapped the two tiebreakers (e.g.
+    /// `player_id` first) would flunk here: the later-by-time writer
+    /// with a smaller player_id would jump ahead of the earlier writer.
+    #[test]
+    fn top_scores_ties_break_by_updated_at_before_player_id() {
+        let dir = tempdir().expect("tempdir creates");
+        let world = open_world_with_leaderboards(&dir);
+
+        let alice = world
+            .upsert_player(&ctx_with(Some("u-alice"), Some("alice")))
+            .expect("alice upsert");
+        let bob = world
+            .upsert_player(&ctx_with(Some("u-bob"), Some("bob")))
+            .expect("bob upsert");
+
+        world
+            .set_score("investigators", alice.id, 7)
+            .expect("alice set_score");
+        world
+            .set_score("investigators", bob.id, 7)
+            .expect("bob set_score");
+
+        // Force bob's row to be older than alice's. With `player_id`-
+        // first tiebreaking, alice (smaller id) would still win — so an
+        // assertion that bob appears first proves `updated_at` runs
+        // ahead of `player_id` in the tie chain.
+        world
+            .connection()
+            .execute(
+                "UPDATE leaderboard_scores SET updated_at = '2026-01-01T00:00:00' \
+                 WHERE board = 'investigators' AND player_id = ?1",
+                rusqlite::params![bob.id],
+            )
+            .expect("backdate bob");
+        world
+            .connection()
+            .execute(
+                "UPDATE leaderboard_scores SET updated_at = '2026-05-08T12:00:00' \
+                 WHERE board = 'investigators' AND player_id = ?1",
+                rusqlite::params![alice.id],
+            )
+            .expect("future-date alice");
+
+        let top = world
+            .top_scores("investigators", LeaderboardSort::Desc, 10)
+            .expect("top_scores succeeds");
+        let ids: Vec<i64> = top.iter().map(|r| r.player_id).collect();
+        assert_eq!(
+            ids,
+            vec![bob.id, alice.id],
+            "earlier updated_at must beat later updated_at on a score tie"
+        );
+    }
+
+    /// Querying a board that has never been written to is not an error
+    /// — it returns an empty vec. Pinning this here protects the UI
+    /// path: a freshly-launched door must be able to render an empty
+    /// leaderboard without surfacing a SQL error.
+    #[test]
+    fn top_scores_empty_board_returns_empty_vec() {
+        let dir = tempdir().expect("tempdir creates");
+        let world = open_world_with_leaderboards(&dir);
+
+        let top = world
+            .top_scores("investigators", LeaderboardSort::Desc, 10)
+            .expect("top_scores succeeds on empty board");
+        assert!(
+            top.is_empty(),
+            "no rows means an empty result, not an error"
+        );
+    }
+
+    /// `limit = 0` is legal and returns an empty vec — same shape as
+    /// [`WorldDb::recent_events`]. Lets callers wire up UI plumbing
+    /// before the leaderboard pane is sized.
+    #[test]
+    fn top_scores_zero_limit_returns_empty_vec() {
+        let dir = tempdir().expect("tempdir creates");
+        let world = open_world_with_leaderboards(&dir);
+
+        let alice = world
+            .upsert_player(&ctx_with(Some("u-alice"), Some("alice")))
+            .expect("alice upsert");
+        world
+            .set_score("investigators", alice.id, 1)
+            .expect("alice set_score");
+
+        let top = world
+            .top_scores("investigators", LeaderboardSort::Desc, 0)
+            .expect("top_scores succeeds with zero limit");
+        assert!(top.is_empty(), "limit=0 must return no rows");
+    }
+
+    /// `top_scores` only sees rows on the requested board; another
+    /// board's writes must not leak into the result. A regression that
+    /// dropped the `WHERE board = ?` filter would flunk here.
+    #[test]
+    fn top_scores_filters_by_board() {
+        let dir = tempdir().expect("tempdir creates");
+        let world = open_world_with_leaderboards(&dir);
+
+        let alice = world
+            .upsert_player(&ctx_with(Some("u-alice"), Some("alice")))
+            .expect("alice upsert");
+        world
+            .set_score("investigators", alice.id, 99)
+            .expect("set on investigators");
+        world
+            .set_score("speedrun", alice.id, 1)
+            .expect("set on speedrun");
+
+        let top = world
+            .top_scores("investigators", LeaderboardSort::Desc, 10)
+            .expect("top_scores succeeds");
+        assert_eq!(top.len(), 1, "must only see rows for the requested board");
+        assert_eq!(top[0].board, "investigators");
+        assert_eq!(top[0].score, 99);
+    }
+
+    /// SPEC §4.8's blank-board rule applies to every leaderboard verb,
+    /// including reads. The shared [`validate_board_name`] guard is the
+    /// single source of truth; this test pins that `top_scores` uses it.
+    #[test]
+    fn top_scores_rejects_empty_board_name() {
+        let dir = tempdir().expect("tempdir creates");
+        let world = open_world_with_leaderboards(&dir);
+
+        for blank in ["", "   ", "\n\t"] {
+            let err = world
+                .top_scores(blank, LeaderboardSort::Desc, 10)
+                .expect_err("blank board name must be rejected");
+            assert!(
+                matches!(err, LeaderboardError::EmptyBoardName),
+                "expected EmptyBoardName for {blank:?}, got {err:?}"
+            );
+        }
     }
 
     /// SPEC §4.8's blank-board rule applies to every leaderboard verb,
