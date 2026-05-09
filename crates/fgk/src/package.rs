@@ -159,6 +159,14 @@ pub struct PackageOutputs {
     pub manifest: PathBuf,
     /// `<out>/assets/` — directory containing the project's assets.
     pub assets: PathBuf,
+    /// `<out>/<world-parent>/` — present only for world-enabled games
+    /// (SPEC v2 §5 + Task 11a). The world DB itself is created on
+    /// first launch by the runtime; we ship the parent directory with
+    /// a `.keep` sentinel so operators get a clearly-named writable
+    /// slot in the bundle and `tar` / `cp -r` don't drop an empty
+    /// directory. `None` for v1-style games without `[world]
+    /// enabled = true`.
+    pub world_dir: Option<PathBuf>,
     /// Slug derived from the project's `game.toml`, exposed so callers
     /// (the CLI summary line, future packagers) don't have to re-read
     /// the config.
@@ -234,14 +242,58 @@ pub fn assemble_bundle(inputs: PackageInputs<'_>, binary: &Path) -> PackageResul
     let src_assets = project_dir.join("assets");
     copy_dir_recursive(&src_assets, &dest_assets)?;
 
+    // World directory. SPEC v2 §5 says the runtime opens
+    // `<package_root>/<world.path>` (default `world/world.sqlite`) at
+    // startup and creates parent dirs lazily. But operators package the
+    // bundle with `tar` / `rsync` / `cp -r`, all of which drop empty
+    // directories, and they need to know where the writable slot lives
+    // before the door has been launched even once. So when the project
+    // opted into the shared world we materialize the parent directory
+    // here and drop a `.keep` sentinel inside it. If the configured path
+    // is just a bare filename (no parent component), there's nothing to
+    // create — the runtime would write the DB straight into the bundle
+    // root, and we keep packaging a no-op rather than inventing a
+    // directory the runtime won't use.
+    let world_dir = if config.world.enabled {
+        materialize_world_dir(out_dir, &config.world.path)?
+    } else {
+        None
+    };
+
     Ok(PackageOutputs {
         out_dir: out_dir.to_path_buf(),
         binary: dest_binary,
         run_sh: run_sh_path,
         manifest: manifest_path,
         assets: dest_assets,
+        world_dir,
         slug,
     })
+}
+
+/// Create `<out_dir>/<parent-of-world-path>/` and seed it with a
+/// `.keep` file so the empty directory survives archival.
+///
+/// Returns `Some(world_dir)` on success, or `None` if `world_path` has
+/// no parent component (e.g. an author who configured
+/// `path = "world.sqlite"` at the bundle root).
+fn materialize_world_dir(out_dir: &Path, world_path: &str) -> PackageResult<Option<PathBuf>> {
+    let parent = Path::new(world_path).parent();
+    let Some(parent) = parent else {
+        return Ok(None);
+    };
+    if parent.as_os_str().is_empty() {
+        return Ok(None);
+    }
+
+    let world_dir = out_dir.join(parent);
+    fs::create_dir_all(&world_dir).map_err(|source| PackageError::Io {
+        path: world_dir.clone(),
+        source,
+    })?;
+    let keep = world_dir.join(".keep");
+    write_file(&keep, b"")?;
+    Ok(Some(world_dir))
 }
 
 /// Render the SPEC §10.4 wrapper for a given slug.
@@ -678,6 +730,172 @@ auth_scope = "site"
         // Out dir must not have been created when validation fails
         // before we reach `ensure_out_dir`.
         assert!(!out.exists(), "out_dir created despite validation failure");
+    }
+
+    /// Verbatim §5 example so a future SPEC tweak surfaces here.
+    const SPEC_GAME_TOML_WITH_WORLD: &str = r#"
+[game]
+title = "Murder Motel"
+slug = "murder-motel"
+description = "A tiny BBS mystery built with foglet-game-kit."
+min_width = 80
+min_height = 24
+start_map = "lobby"
+start_x = 12
+start_y = 8
+
+[save]
+strategy = "per_foglet_user"
+
+[manifest]
+timeout_ms = 1800000
+idle_timeout_ms = 300000
+visibility = "members"
+auth_scope = "site"
+
+[world]
+enabled = true
+"#;
+
+    #[test]
+    fn assemble_skips_world_dir_for_v1_games() {
+        // Task 11a: a v1 project (no `[world]` section, world disabled
+        // by default) must NOT get a `world/` directory in its bundle —
+        // operators reading the layout shouldn't see a writable slot
+        // the runtime will never touch.
+        let project = project_with_assets(SPEC_GAME_TOML);
+        let bin_td = TempDir::new().unwrap();
+        let bin = fake_binary(&bin_td, "murder-motel");
+        let out_td = TempDir::new().unwrap();
+        let out = out_td.path().join("dist");
+
+        let outputs = assemble_bundle(
+            PackageInputs {
+                project_dir: project.path(),
+                out_dir: &out,
+                install_dir: Some("/srv/foglet/doors/murder-motel"),
+            },
+            &bin,
+        )
+        .unwrap();
+
+        assert!(outputs.world_dir.is_none(), "world_dir set for v1 game");
+        assert!(
+            !out.join("world").exists(),
+            "world/ directory created for v1 game"
+        );
+    }
+
+    #[test]
+    fn assemble_creates_world_keep_for_enabled_world() {
+        // Task 11a: world-enabled bundles must contain `world/.keep` so
+        // the writable directory survives `tar` / `rsync` archival even
+        // before the runtime has populated it with a SQLite file.
+        let project = project_with_assets(SPEC_GAME_TOML_WITH_WORLD);
+        let bin_td = TempDir::new().unwrap();
+        let bin = fake_binary(&bin_td, "murder-motel");
+        let out_td = TempDir::new().unwrap();
+        let out = out_td.path().join("dist");
+
+        let outputs = assemble_bundle(
+            PackageInputs {
+                project_dir: project.path(),
+                out_dir: &out,
+                install_dir: Some("/srv/foglet/doors/murder-motel"),
+            },
+            &bin,
+        )
+        .unwrap();
+
+        let world_dir = outputs.world_dir.expect("world_dir reported");
+        assert_eq!(world_dir, out.join("world"));
+        assert!(world_dir.is_dir(), "world/ must be a directory");
+        let keep = world_dir.join(".keep");
+        assert!(keep.is_file(), "world/.keep must exist");
+        // Sentinel is intentionally empty — its filesystem presence is
+        // the whole signal.
+        assert_eq!(fs::read(&keep).unwrap(), b"");
+    }
+
+    #[test]
+    fn assemble_honours_custom_world_path() {
+        // Authors may override `world.path` (e.g. `db/state/world.db`).
+        // The packager must mirror whatever directory the runtime will
+        // open, not the default.
+        let toml = r#"
+[game]
+title = "Custom World"
+slug = "custom-world"
+description = ""
+min_width = 80
+min_height = 24
+start_map = "lobby"
+start_x = 0
+start_y = 0
+
+[world]
+enabled = true
+path = "db/state/world.db"
+"#;
+        let project = project_with_assets(toml);
+        let bin_td = TempDir::new().unwrap();
+        let bin = fake_binary(&bin_td, "custom-world");
+        let out_td = TempDir::new().unwrap();
+        let out = out_td.path().join("dist");
+
+        let outputs = assemble_bundle(
+            PackageInputs {
+                project_dir: project.path(),
+                out_dir: &out,
+                install_dir: Some("/srv/foglet/doors/custom-world"),
+            },
+            &bin,
+        )
+        .unwrap();
+
+        let world_dir = outputs.world_dir.expect("world_dir reported");
+        assert_eq!(world_dir, out.join("db").join("state"));
+        assert!(world_dir.join(".keep").is_file());
+    }
+
+    #[test]
+    fn assemble_skips_world_dir_when_world_path_has_no_parent() {
+        // Defensive: an author who sets `path = "world.sqlite"` (bundle
+        // root) gives us nothing to materialize. The packager must
+        // succeed without inventing a directory.
+        let toml = r#"
+[game]
+title = "Bare World"
+slug = "bare-world"
+description = ""
+min_width = 80
+min_height = 24
+start_map = "lobby"
+start_x = 0
+start_y = 0
+
+[world]
+enabled = true
+path = "world.sqlite"
+"#;
+        let project = project_with_assets(toml);
+        let bin_td = TempDir::new().unwrap();
+        let bin = fake_binary(&bin_td, "bare-world");
+        let out_td = TempDir::new().unwrap();
+        let out = out_td.path().join("dist");
+
+        let outputs = assemble_bundle(
+            PackageInputs {
+                project_dir: project.path(),
+                out_dir: &out,
+                install_dir: Some("/srv/foglet/doors/bare-world"),
+            },
+            &bin,
+        )
+        .unwrap();
+
+        assert!(outputs.world_dir.is_none());
+        assert!(!out.join(".keep").exists());
     }
 
     /// Sanity-check that the produced wrapper is at least syntactically
