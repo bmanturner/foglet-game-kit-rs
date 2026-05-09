@@ -248,13 +248,36 @@ impl WorldDb {
         &self.journal_mode
     }
 
-    /// Borrow the underlying connection for crate-internal use.
+    /// Borrow the underlying SQLite [`Connection`] for game-authored
+    /// reads and writes against tables the *game* owns (i.e. tables
+    /// declared by a game-authored [`WorldMigration`] like Murder
+    /// Motel's `motel_world_state`). SPEC_v2 §Task 12 requires games
+    /// to query their own schema to back features like "did anyone
+    /// open Room 7 yet?", and the existing curated helpers
+    /// (`upsert_player`, `append_event`, leaderboards, turns) only
+    /// cover *kit-owned* tables. This method is the documented escape
+    /// hatch for the game half.
     ///
-    /// Crate-private on purpose: only sibling modules (Task 4
-    /// migrations onward) should reach in. External authors get the
-    /// curated helpers that ship with later tasks.
-    #[allow(dead_code)] // Used by Task 4+ once they land.
-    pub(crate) fn connection(&self) -> &Connection {
+    /// **Use only on tables your own migration created.** Touching
+    /// kit-owned tables (`players`, `turn_ledger`, `world_events`,
+    /// `leaderboard_scores`, `world_migrations`) through this borrow
+    /// is unsupported — kit invariants (e.g. partial unique indexes on
+    /// `players`, append-only ordering on `world_events`) live inside
+    /// the curated helpers, and bypassing them turns silent data
+    /// drift into the most likely failure mode. Use the curated
+    /// helpers for kit tables and reserve this entry point for
+    /// game-authored ones.
+    ///
+    /// Returns a shared (`&Connection`) borrow on purpose: it matches
+    /// the runtime contract where [`crate::screen::GameContext::world_db`]
+    /// hands screens an `Option<&WorldDb>`, so a game-authored read or
+    /// single-statement write inside `tick`/`handle_input` is reachable
+    /// without forcing the runtime to upgrade to a unique borrow.
+    /// Multi-statement transactions still go through
+    /// [`WorldDb::transaction`] and require `&mut self` — game code
+    /// that needs that should run it from a context that owns the
+    /// `WorldDb`, not from inside a screen callback.
+    pub fn connection(&self) -> &Connection {
         &self.conn
     }
 

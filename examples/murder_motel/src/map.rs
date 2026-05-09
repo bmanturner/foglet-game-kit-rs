@@ -770,7 +770,7 @@ impl MapScreen {
     /// gated by [`Self::is_stairs_blocking`] in `try_move`, so this
     /// helper only fires when the player legitimately stood on the
     /// stairs cell with the Room 7 key in hand.
-    fn maybe_take_stairs(&mut self) -> ScreenCommand {
+    fn maybe_take_stairs(&mut self, ctx: &mut GameContext<'_>) -> ScreenCommand {
         let on_stairs = {
             let p = self.slots.player.borrow();
             (p.x, p.y) == Self::STAIRS_UP_POS
@@ -783,6 +783,30 @@ impl MapScreen {
         // than trust callers.
         if !self.has_room_7_key() {
             return ScreenCommand::None;
+        }
+        // SPEC_v2 §Task 12b: stamp the shared-world record of "who
+        // opened Room 7, and when". Done before the screen swap so a
+        // freshly-loaded Room 7 screen (Task 12c onward) can read the
+        // canonical pair on its first frame. Failures are logged and
+        // swallowed: the player still transitions, the bulletin just
+        // misses an entry. The kit's terminal-safety contract forbids
+        // bubbling DB errors out of `handle_input` because the screen
+        // stack is mid-transition.
+        if let Some(world) = ctx.world_db {
+            // Errors are swallowed on purpose: the screen stack is
+            // mid-transition, the kit has no logging facility wired
+            // into the runtime yet (the workspace's `tracing` dep is
+            // not pulled into `foglet_game` — see Cargo.toml), and
+            // the transition itself is not gated on the recording
+            // landing. A failed write means the bulletin (Task 13d)
+            // misses one entry; the player still arrives in Room 7.
+            // Production diagnostics will land alongside the
+            // forthcoming kit-side `tracing` integration; until then
+            // a `let _` keeps the call paths honest about which
+            // failures are intentionally non-fatal.
+            if let Ok(player) = world.upsert_player(ctx.foglet) {
+                let _ = crate::world::record_room_7_opening(world, player.id);
+            }
         }
         {
             let mut p = self.slots.player.borrow_mut();
@@ -803,8 +827,8 @@ impl MapScreen {
     /// the screen), then the win-tile latch (Push a modal). Order
     /// matters — taking the stairs is a hard transition and shouldn't
     /// be silently overridden by a stale win-tile read.
-    fn after_move(&mut self) -> ScreenCommand {
-        match self.maybe_take_stairs() {
+    fn after_move(&mut self, ctx: &mut GameContext<'_>) -> ScreenCommand {
+        match self.maybe_take_stairs(ctx) {
             ScreenCommand::None => self.maybe_win_command(),
             cmd => cmd,
         }
@@ -1115,26 +1139,26 @@ impl Screen for MapScreen {
         }
     }
 
-    fn handle_input(&mut self, _ctx: &mut GameContext<'_>, input: Input) -> ScreenCommand {
+    fn handle_input(&mut self, ctx: &mut GameContext<'_>, input: Input) -> ScreenCommand {
         match input {
             // Cardinal movement, both arrow keys and vi-style aliases.
             // The screen does not announce a "blocked" state when a
             // move fails — the lack of motion is the feedback.
             Input::Up | Input::Char('k') | Input::Char('K') => {
                 self.try_move(0, -1);
-                self.after_move()
+                self.after_move(ctx)
             }
             Input::Down | Input::Char('j') | Input::Char('J') => {
                 self.try_move(0, 1);
-                self.after_move()
+                self.after_move(ctx)
             }
             Input::Left | Input::Char('h') => {
                 self.try_move(-1, 0);
-                self.after_move()
+                self.after_move(ctx)
             }
             Input::Right | Input::Char('l') | Input::Char('L') => {
                 self.try_move(1, 0);
-                self.after_move()
+                self.after_move(ctx)
             }
             // Talk affordance: Enter (or `t`) when the player is
             // adjacent to an NPC opens that NPC's dialog. With no
@@ -2031,6 +2055,95 @@ pub(crate) mod tests {
             map.player(),
             crate::room_7::Room7Screen::ARRIVAL_POS,
             "post-transition slots must point at Room 7's arrival cell"
+        );
+    }
+
+    /// SPEC_v2 §Task 12b — stepping onto the stairs with the Room 7
+    /// key in hand AND a `world_db` attached to the GameContext must
+    /// stamp `motel_world_state` with the opener's `players.id` and
+    /// the SQLite `CURRENT_TIMESTAMP`. Exercises the same path
+    /// `run_with_io` drives at runtime, but headless: build the map
+    /// screen, walk to the stairs, dispatch the final step with
+    /// `ctx.with_world_db(&world)` attached, then read the canonical
+    /// pair back via [`crate::world::room_7_opening`] and assert.
+    #[test]
+    fn stairs_step_records_room_7_opening_in_world_db() {
+        use crate::world::{record_room_7_opening, room_7_opening, MOTEL_WORLD_STATE_MIGRATION};
+        use foglet_game::WorldDb;
+        use tempfile::tempdir;
+
+        // Stand up a real on-disk world DB with the kit's players
+        // migration plus the motel migration. Going through the
+        // `WorldDb::open + apply_migration` path (rather than poking
+        // tables directly) is what the runtime does, so the test
+        // captures the production schema state at the moment the
+        // first opening lands.
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("world.sqlite");
+        let mut world = WorldDb::open(&db_path).expect("open world db");
+        world
+            .apply_migration(&foglet_game::PLAYERS_MIGRATION)
+            .expect("apply players migration");
+        world
+            .apply_migration(&MOTEL_WORLD_STATE_MIGRATION)
+            .expect("apply motel_world_state migration");
+        // Sanity: no opener recorded before the stairs step.
+        assert!(
+            room_7_opening(&world).expect("read").is_none(),
+            "precondition: no opener row before the player steps onto stairs"
+        );
+
+        let cfg = fixture_config();
+        let fc = fixture_context();
+        let mut map = fresh_map_screen();
+        // Drive to the stairs the same way `stairs_emit_replace_when_player_has_room_7_key`
+        // does, but every input dispatched through this `ctx` carries
+        // the world DB so the post-move handler can stamp the record.
+        {
+            let mut ctx = GameContext::new(&cfg, &fc, (80, 24)).with_world_db(&world);
+            walk_to(&mut map, &mut ctx, 6, 5);
+            map.inventory()
+                .borrow_mut()
+                .insert(MapScreen::ROOM_7_KEY_ID.to_string());
+            walk_to(&mut map, &mut ctx, 43, 1);
+            assert_eq!(map.player(), (43, 1));
+            let cmd = map.handle_input(&mut ctx, Input::Right);
+            assert!(
+                matches!(cmd, ScreenCommand::Replace(_)),
+                "stairs step must still emit Replace when world_db is attached"
+            );
+        }
+
+        // Read back through the same helper Tasks 12c/13d will use.
+        let opening = room_7_opening(&world)
+            .expect("read succeeds")
+            .expect("first opening must be recorded after the stairs step");
+        assert!(
+            !opening.opened_at.is_empty(),
+            "opened_at must be populated by CURRENT_TIMESTAMP"
+        );
+        assert!(
+            opening.opened_by_player_id > 0,
+            "opener id must be a positive player row id, got {}",
+            opening.opened_by_player_id
+        );
+
+        // Re-running the recorder with a different player must NOT
+        // overwrite the opener: this is the cross-player invariant
+        // Task 12c will hang the "someone got here first" surface
+        // off of, so pinning it at the integration level here
+        // catches regressions in the screen path that the helper-
+        // level `record_room_7_opening_is_first_writer_wins` test
+        // alone would miss.
+        let later = record_room_7_opening(&world, opening.opened_by_player_id + 999)
+            .expect("later call succeeds");
+        assert!(
+            !later.first_opening,
+            "subsequent call must report the row already existed"
+        );
+        assert_eq!(
+            later.opened_by_player_id, opening.opened_by_player_id,
+            "later call must observe the original opener id"
         );
     }
 

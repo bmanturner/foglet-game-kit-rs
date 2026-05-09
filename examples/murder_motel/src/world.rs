@@ -32,7 +32,8 @@
 //! migration tomorrow doesn't push game versions around — the kit and
 //! the game evolve in independent number bands.
 
-use foglet_game::WorldMigration;
+use foglet_game::{WorldDb, WorldMigration};
+use rusqlite::OptionalExtension;
 
 /// First version number a Murder Motel migration may use. Picked far
 /// above the kit's reserved 1–5 range so kit growth never collides
@@ -61,6 +62,192 @@ CREATE TABLE IF NOT EXISTS motel_world_state (\n\
 );\n\
 ",
 };
+
+/// Key under which `motel_world_state` stores the SQLite-side
+/// `CURRENT_TIMESTAMP` of the moment the *first* player stepped onto
+/// the Room 7 stairs with the key in hand. Pulled out as a constant
+/// so tests, the bulletin (Task 13d), and the "someone else opened
+/// it" surface (Task 12c) all reference the same string.
+pub const ROOM_7_OPENED_AT_KEY: &str = "room_7_opened_at";
+
+/// Key under which `motel_world_state` stores the `players.id` of the
+/// first player to open Room 7. Stored as a TEXT column (the table is
+/// schema-light key/value) and parsed back to `i64` in the helpers
+/// below.
+pub const ROOM_7_OPENED_BY_KEY: &str = "room_7_opened_by";
+
+/// Snapshot of the canonical "Room 7 was opened" facts as stored in
+/// `motel_world_state`. The two fields together identify *who* opened
+/// the room and *when*; `first_opening` distinguishes "this call is
+/// what wrote the row" from "the row already existed when we looked".
+///
+/// The struct is the return shape of both
+/// [`record_room_7_opening`] (write-then-read-back) and
+/// [`room_7_opening`] (read-only) so callers handle one type
+/// regardless of whether they're observing or recording.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Room7Opening {
+    /// SQLite `CURRENT_TIMESTAMP` text recorded on the first opening.
+    /// Format is the SQLite default `'YYYY-MM-DD HH:MM:SS'` UTC text
+    /// — the same shape the kit's `players.first_seen_at` column uses,
+    /// so renderers can reuse one formatter for both surfaces.
+    pub opened_at: String,
+    /// `players.id` of the first opener. Stored as TEXT in the
+    /// key/value table (Task 12a kept the schema deliberately
+    /// loose) and parsed back to a typed `i64` here so callers don't
+    /// have to repeat the parse at every read site.
+    pub opened_by_player_id: i64,
+    /// `true` only when *this* call inserted the row. Lets the caller
+    /// distinguish "first opener — emit the bulletin event" from
+    /// "later opener — show the 'someone got here first' surface"
+    /// without a follow-up read. Tasks 12c/13c key off this bit.
+    pub first_opening: bool,
+}
+
+/// Record that `player_id` just unlocked Room 7, but only if no
+/// earlier player got there first. Implements SPEC_v2 §Task 12b's
+/// "first-writer-wins" contract.
+///
+/// Mechanism: two `INSERT OR IGNORE` statements against
+/// [`MOTEL_WORLD_STATE_MIGRATION`]'s key/value table — one for
+/// [`ROOM_7_OPENED_AT_KEY`] (`CURRENT_TIMESTAMP`), one for
+/// [`ROOM_7_OPENED_BY_KEY`] (the player id). `INSERT OR IGNORE` makes
+/// the second-and-later callers no-ops at the SQL level, which is
+/// exactly the shared-world semantics Murder Motel needs: every
+/// player who steps onto the stairs runs this code, but only the
+/// first one's identity and timestamp are remembered.
+///
+/// Both keys are written through [`WorldDb::connection`] (a `&self`
+/// shared borrow) rather than [`WorldDb::transaction`] (`&mut self`).
+/// The shared borrow matches the runtime's `Option<&WorldDb>` handed
+/// to screens during `handle_input`, so the call site in
+/// [`crate::map::MapScreen`] can run this on the same tick that emits
+/// the screen transition. Strict atomicity isn't required because
+/// each `INSERT OR IGNORE` is itself atomic and the write is
+/// permanently first-writer-wins: if the process is killed between
+/// the two statements, the next caller's `INSERT OR IGNORE` finishes
+/// the pair using its own (later) player id, which is acceptable —
+/// Task 12b's promise is "the first observed opening is recorded",
+/// not "the two keys are written in a single SQL transaction".
+///
+/// After both inserts the function reads both keys back so callers
+/// always see the canonical pair, regardless of whether this call
+/// wrote them. `first_opening` reflects whether the *opened_at*
+/// insert affected a row in this call (mirrors SQLite's
+/// `Connection::execute` rows-affected return).
+///
+/// # Errors
+///
+/// Returns `rusqlite::Error` from any of the four statements. Callers
+/// (the map screen) treat a DB error as a non-fatal logging concern —
+/// the player still transitions to Room 7; the bulletin just misses
+/// a record. The kit's terminal-safety contract forbids panicking out
+/// of `handle_input`, so the screen layer log-and-continues.
+pub fn record_room_7_opening(
+    world: &WorldDb,
+    player_id: i64,
+) -> Result<Room7Opening, rusqlite::Error> {
+    let conn = world.connection();
+    // Statement 1: stamp the opening time. `INSERT OR IGNORE` makes
+    // the no-op path explicit; the rows-affected return tells us
+    // whether *this* call won the race.
+    let opened_at_inserted = conn.execute(
+        "INSERT OR IGNORE INTO motel_world_state (key, value) \
+         VALUES (?1, CURRENT_TIMESTAMP)",
+        rusqlite::params![ROOM_7_OPENED_AT_KEY],
+    )?;
+    // Statement 2: stamp the opener id. Stored as TEXT — the
+    // key/value table is intentionally schema-light (see Task 12a).
+    // We bind the i64 directly; rusqlite will format it as the
+    // canonical decimal text representation.
+    conn.execute(
+        "INSERT OR IGNORE INTO motel_world_state (key, value) \
+         VALUES (?1, ?2)",
+        rusqlite::params![ROOM_7_OPENED_BY_KEY, player_id],
+    )?;
+    // Read back the canonical pair. We don't trust our own writes to
+    // be the visible state — a concurrent process may have raced us
+    // — so the returned struct always reflects the row that landed.
+    let opened_at: String = conn.query_row(
+        "SELECT value FROM motel_world_state WHERE key = ?1",
+        rusqlite::params![ROOM_7_OPENED_AT_KEY],
+        |row| row.get(0),
+    )?;
+    let opened_by_text: String = conn.query_row(
+        "SELECT value FROM motel_world_state WHERE key = ?1",
+        rusqlite::params![ROOM_7_OPENED_BY_KEY],
+        |row| row.get(0),
+    )?;
+    let opened_by_player_id: i64 = opened_by_text.parse().map_err(|_err| {
+        // Surface a parse failure as a SQL-layer error so the caller's
+        // `Result<_, rusqlite::Error>` keeps a single error variant.
+        // Reaching this branch implies the key/value column was
+        // hand-edited to a non-integer — a schema violation worth
+        // surfacing rather than silently coercing.
+        rusqlite::Error::FromSqlConversionFailure(
+            0,
+            rusqlite::types::Type::Text,
+            Box::<dyn std::error::Error + Send + Sync>::from(format!(
+                "{ROOM_7_OPENED_BY_KEY} stored non-integer value: {opened_by_text:?}"
+            )),
+        )
+    })?;
+    Ok(Room7Opening {
+        opened_at,
+        opened_by_player_id,
+        first_opening: opened_at_inserted == 1,
+    })
+}
+
+/// Read-only view of the Room 7 opening record, returning `None` when
+/// no player has unlocked it yet. Used by the lobby UI surfaces in
+/// Task 12c/13d to decide whether to render the "someone already got
+/// here" affordance.
+///
+/// Returns `None` when *either* key is missing — covers the degenerate
+/// "process killed mid-write" case from
+/// [`record_room_7_opening`]'s docs by treating a half-written pair
+/// as "not yet opened" rather than fabricating one half from the
+/// other.
+pub fn room_7_opening(world: &WorldDb) -> Result<Option<Room7Opening>, rusqlite::Error> {
+    let conn = world.connection();
+    let opened_at: Option<String> = conn
+        .query_row(
+            "SELECT value FROM motel_world_state WHERE key = ?1",
+            rusqlite::params![ROOM_7_OPENED_AT_KEY],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let opened_by_text: Option<String> = conn
+        .query_row(
+            "SELECT value FROM motel_world_state WHERE key = ?1",
+            rusqlite::params![ROOM_7_OPENED_BY_KEY],
+            |row| row.get(0),
+        )
+        .optional()?;
+    match (opened_at, opened_by_text) {
+        (Some(opened_at), Some(opened_by_text)) => {
+            let opened_by_player_id: i64 = opened_by_text.parse().map_err(|_err| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    rusqlite::types::Type::Text,
+                    Box::<dyn std::error::Error + Send + Sync>::from(format!(
+                        "{ROOM_7_OPENED_BY_KEY} stored non-integer value: {opened_by_text:?}"
+                    )),
+                )
+            })?;
+            Ok(Some(Room7Opening {
+                opened_at,
+                opened_by_player_id,
+                first_opening: false,
+            }))
+        }
+        // Half-written pair (only one of the two keys present) is
+        // intentionally treated as "no opening recorded yet". See
+        // `record_room_7_opening` for why this state is reachable.
+        _ => Ok(None),
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -162,6 +349,99 @@ mod tests {
         assert_eq!(
             MOTEL_WORLD_STATE_MIGRATION.version, MOTEL_MIGRATION_VERSION_BASE,
             "first Murder Motel migration must occupy the base slot"
+        );
+    }
+
+    /// Set up a `WorldDb` with the motel migration applied. Used by
+    /// the Room 7 opening tests below to keep the boilerplate out of
+    /// each test body.
+    fn world_with_motel_state(dir: &tempfile::TempDir) -> WorldDb {
+        let db_path = dir.path().join("world.sqlite");
+        let mut world = WorldDb::open(&db_path).expect("open world db");
+        world
+            .apply_migration(&MOTEL_WORLD_STATE_MIGRATION)
+            .expect("apply motel_world_state migration");
+        world
+    }
+
+    /// First call must record both keys and report `first_opening`.
+    /// SPEC_v2 §Task 12b: the moment a player unlocks Room 7, the
+    /// timestamp and opener id land in `motel_world_state`.
+    #[test]
+    fn record_room_7_opening_writes_both_keys_on_first_call() {
+        let dir = tempdir().expect("tempdir");
+        let world = world_with_motel_state(&dir);
+
+        let outcome = record_room_7_opening(&world, 42).expect("first opening succeeds");
+        assert!(
+            outcome.first_opening,
+            "first call must report it wrote the row"
+        );
+        assert_eq!(outcome.opened_by_player_id, 42);
+        assert!(
+            !outcome.opened_at.is_empty(),
+            "opened_at must be populated by CURRENT_TIMESTAMP"
+        );
+    }
+
+    /// First-writer-wins: a second player calling
+    /// [`record_room_7_opening`] must NOT overwrite the original
+    /// opener id or timestamp. The shared-world fixture's whole point
+    /// is that "who opened Room 7" is one canonical answer across
+    /// all players.
+    #[test]
+    fn record_room_7_opening_is_first_writer_wins() {
+        let dir = tempdir().expect("tempdir");
+        let world = world_with_motel_state(&dir);
+
+        let alice = record_room_7_opening(&world, 1).expect("alice records first");
+        assert!(alice.first_opening);
+
+        let bob = record_room_7_opening(&world, 2).expect("bob's call must succeed");
+        assert!(
+            !bob.first_opening,
+            "subsequent caller must report the row already existed"
+        );
+        assert_eq!(
+            bob.opened_by_player_id, 1,
+            "second caller must observe the original opener id, not their own"
+        );
+        assert_eq!(
+            bob.opened_at, alice.opened_at,
+            "second caller must observe the original timestamp, not a new one"
+        );
+    }
+
+    /// [`room_7_opening`] returns `None` until the first opener writes
+    /// the pair. This is the read path Tasks 12c/13d will call from the
+    /// lobby UI to decide whether to render the "someone got here"
+    /// affordance.
+    #[test]
+    fn room_7_opening_returns_none_before_first_open() {
+        let dir = tempdir().expect("tempdir");
+        let world = world_with_motel_state(&dir);
+
+        let observed = room_7_opening(&world).expect("read succeeds even with no row");
+        assert!(observed.is_none(), "no opener yet => None");
+    }
+
+    /// After [`record_room_7_opening`] runs, [`room_7_opening`]
+    /// returns the same canonical pair (with `first_opening: false`,
+    /// since the read path is observational only).
+    #[test]
+    fn room_7_opening_returns_recorded_pair_after_first_open() {
+        let dir = tempdir().expect("tempdir");
+        let world = world_with_motel_state(&dir);
+
+        let written = record_room_7_opening(&world, 7).expect("record");
+        let observed = room_7_opening(&world)
+            .expect("read succeeds")
+            .expect("row exists after record");
+        assert_eq!(observed.opened_by_player_id, 7);
+        assert_eq!(observed.opened_at, written.opened_at);
+        assert!(
+            !observed.first_opening,
+            "read path always reports first_opening=false; only the writer learns 'I won the race'"
         );
     }
 }
