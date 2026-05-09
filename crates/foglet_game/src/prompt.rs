@@ -565,11 +565,43 @@ impl<T: Clone> ChoicePrompt<T> {
     /// method) keeps `ChoicePrompt::new`/`body`/`choice`/etc. usable
     /// with non-`Clone` `T` during construction-only flows like tests
     /// that introspect the data without ever calling `handle`.
-    pub fn handle(&self, _input: Input) -> PromptAction<T> {
-        // Task 3b–3e fill in: direct-key match against `self.choices`,
-        // disabled-key Disabled branch, Esc → Cancelled when configured,
-        // resize/unknown → None. Until those arms exist, the safe
-        // default is "nothing happened" — no spurious selections.
+    pub fn handle(&self, input: Input) -> PromptAction<T> {
+        // Translate the raw runtime event into the prompt's narrower
+        // vocabulary first. Anything that is not a printable hotkey,
+        // Enter, or Esc collapses to `None` here (resize, arrows,
+        // backspace, Ctrl combos, Unknown) — SPEC_v1_1.md §7's "resize
+        // ignored by prompt selection logic" falls out of this single
+        // gate without per-arm special cases.
+        let Some(key) = PromptKey::from_input(input) else {
+            return PromptAction::None;
+        };
+
+        // Direct hotkey path (Task 3b). Only `Char` keys participate in
+        // direct-key matching here; `Enter`/`Esc` are handled by Tasks
+        // 3d (cancellation) and 4c (navigation-mode confirm), so they
+        // currently fall through to `None`. Choices declared with
+        // `PromptKey::Enter`/`PromptKey::Esc` are exotic data-level
+        // configurations that the navigation/cancellation reducers will
+        // address explicitly.
+        if let PromptKey::Char(_) = key {
+            // Linear scan — choice lists are short (SPEC §4.4 ~5
+            // typical) and `validate()` already enforces uniqueness, so
+            // the first match is unambiguous. Keys are pre-normalised
+            // to lowercase on both sides (`PromptKey::char` on storage,
+            // `PromptKey::from_input` on input), so equality is the
+            // entire comparison — no per-call `to_ascii_lowercase`.
+            for choice in &self.choices {
+                if choice.key == key && choice.enabled {
+                    return PromptAction::Selected(choice.value.clone());
+                }
+            }
+        }
+
+        // Tasks 3c (disabled-key Disabled), 3d (Esc → Cancelled when
+        // configured), and 4c (Enter on highlighted choice) layer in
+        // on top of this scan. Until they land, anything that does not
+        // match an enabled hotkey is a no-op so the prompt never
+        // invents a selection from a press the player did not make.
         PromptAction::None
     }
 }
@@ -1145,38 +1177,137 @@ mod tests {
     }
 
     #[test]
-    fn handle_stub_returns_none_for_every_input_kind() {
-        // Task 3a only wires the dispatch shape. Until 3b–3e add the
-        // direct-key matching, disabled routing, Esc, and ignore arms,
-        // every input must classify as `None` — the safe default so a
-        // half-built prompt never invents a selection.
+    fn handle_direct_key_lowercase_selects_enabled_choice() {
+        // SPEC_v1_1.md §4.4: pressing an enabled choice's hotkey returns
+        // `Selected(id)` with the stable game id. The lowercase press
+        // is the canonical path — choices are stored normalised, so this
+        // is a direct equality match.
         let prompt: ChoicePrompt<LootAction> = ChoicePrompt::new()
-            .body("placeholder")
             .choice('e', LootAction::Equip, "Equip")
             .choice('t', LootAction::Take, "Take")
-            .disabled_if(true, "no room");
+            .choice('p', LootAction::Pass, "Pass");
+
+        assert_eq!(
+            prompt.handle(Input::Char('e')),
+            PromptAction::Selected(LootAction::Equip),
+        );
+        assert_eq!(
+            prompt.handle(Input::Char('t')),
+            PromptAction::Selected(LootAction::Take),
+        );
+        assert_eq!(
+            prompt.handle(Input::Char('p')),
+            PromptAction::Selected(LootAction::Pass),
+        );
+    }
+
+    #[test]
+    fn handle_direct_key_uppercase_selects_same_enabled_choice_as_lowercase() {
+        // SPEC §4.1: "Character hotkeys MUST match case-insensitively
+        // by default." This is the test the checklist names explicitly
+        // for Task 3b — uppercase input must produce the same Selected
+        // outcome as lowercase, with no shift handling required from
+        // the game.
+        let prompt: ChoicePrompt<LootAction> = ChoicePrompt::new()
+            .choice('e', LootAction::Equip, "Equip")
+            .choice('t', LootAction::Take, "Take");
+
+        assert_eq!(
+            prompt.handle(Input::Char('E')),
+            prompt.handle(Input::Char('e')),
+        );
+        assert_eq!(
+            prompt.handle(Input::Char('E')),
+            PromptAction::Selected(LootAction::Equip),
+        );
+        assert_eq!(
+            prompt.handle(Input::Char('T')),
+            PromptAction::Selected(LootAction::Take),
+        );
+    }
+
+    #[test]
+    fn handle_unmatched_key_returns_none() {
+        // Pressing a printable key that no choice binds is a no-op.
+        // Distinguishes "the input was prompt-relevant but not bound"
+        // from "the input was not prompt-relevant at all" — both flow
+        // through `None` here, but for different reasons; future
+        // disabled-routing (Task 3c) will diverge for the bound case.
+        let prompt: ChoicePrompt<LootAction> = ChoicePrompt::new()
+            .choice('e', LootAction::Equip, "Equip")
+            .choice('t', LootAction::Take, "Take");
+
+        assert_eq!(prompt.handle(Input::Char('z')), PromptAction::None);
+        assert_eq!(prompt.handle(Input::Char('1')), PromptAction::None);
+    }
+
+    #[test]
+    fn handle_ignores_non_prompt_inputs() {
+        // SPEC_v1_1.md §7: resize MUST NOT select a choice. Arrows,
+        // backspace, Ctrl combos, and Unknown collapse through
+        // `PromptKey::from_input -> None`, so the reducer reports `None`
+        // without touching the choice list. Task 4 will add an opt-in
+        // navigation mode that consumes arrows separately.
+        let prompt: ChoicePrompt<LootAction> = ChoicePrompt::new()
+            .choice('e', LootAction::Equip, "Equip")
+            .choice('t', LootAction::Take, "Take");
 
         for input in [
-            Input::Char('e'),
-            Input::Char('E'),
-            Input::Char('t'),
-            Input::Char('z'),
-            Input::Enter,
-            Input::Esc,
-            Input::Up,
-            Input::Down,
             Input::Resize {
                 width: 80,
                 height: 24,
             },
+            Input::Up,
+            Input::Down,
+            Input::Left,
+            Input::Right,
+            Input::Backspace,
+            Input::Ctrl('c'),
             Input::Unknown,
         ] {
             assert_eq!(
                 prompt.handle(input),
                 PromptAction::None,
-                "stub reducer should classify {input:?} as None until Tasks 3b-3e land",
+                "non-prompt input {input:?} must be a no-op",
             );
         }
+    }
+
+    #[test]
+    fn handle_does_not_select_disabled_choice_via_direct_key() {
+        // Task 3b is "direct hotkey selection of an enabled choice".
+        // Disabled-key routing is Task 3c — until that lands, pressing
+        // a disabled hotkey must NOT return `Selected` (that would be
+        // the worst possible silent bug: a disabled label that quietly
+        // fires the action). `None` is the safe interim outcome; 3c
+        // will upgrade it to `Disabled { id, reason }`.
+        let prompt: ChoicePrompt<LootAction> = ChoicePrompt::new()
+            .choice('m', LootAction::Take, "Mana potions")
+            .disabled_if(true, "full")
+            .choice('n', LootAction::Pass, "No thanks");
+
+        assert_eq!(prompt.handle(Input::Char('m')), PromptAction::None);
+        assert_eq!(prompt.handle(Input::Char('M')), PromptAction::None);
+        // Enabled neighbour still selects normally — the disabled row
+        // does not poison the rest of the prompt.
+        assert_eq!(
+            prompt.handle(Input::Char('n')),
+            PromptAction::Selected(LootAction::Pass),
+        );
+    }
+
+    #[test]
+    fn handle_enter_and_esc_are_no_ops_until_their_tasks_land() {
+        // Enter belongs to navigation mode (Task 4c); Esc belongs to
+        // cancellation (Task 3d). Neither is wired yet, so both must
+        // be no-ops on a default direct-key prompt — guards against a
+        // future change accidentally selecting the first choice on
+        // Enter, or marking the prompt cancelled on stray Esc.
+        let prompt: ChoicePrompt<LootAction> =
+            ChoicePrompt::new().choice('e', LootAction::Equip, "Equip");
+
+        assert_eq!(prompt.handle(Input::Enter), PromptAction::None);
+        assert_eq!(prompt.handle(Input::Esc), PromptAction::None);
     }
 
     #[test]
