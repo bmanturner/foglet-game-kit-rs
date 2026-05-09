@@ -1832,6 +1832,153 @@ impl ConfirmPrompt {
     }
 }
 
+/// Outcome of sending one [`Input`] through an [`AnyKeyPrompt`]
+/// (SPEC_v1_1.md §4.6).
+///
+/// Modeled as a flat enum mirroring [`PromptAction`] / [`ConfirmOutcome`]
+/// so a `Screen` routing through several prompt kinds reads
+/// symmetrically: every prompt's `handle` returns `…::None` when the
+/// input was not prompt-relevant and a meaningful variant otherwise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AnyKeyOutcome {
+    /// Input was ignored — resize events and [`Input::Unknown`] (which
+    /// covers modifier-only / release-only events the runtime decided
+    /// not to translate). The caller should re-render unchanged.
+    None,
+    /// Player pressed a meaningful key. SPEC §4.6 says "any meaningful
+    /// keypress" completes the pause; the prompt makes no distinction
+    /// between which key, because the contract is *acknowledgement*,
+    /// not *choice*. Games that want to know which key was pressed
+    /// should use [`ChoicePrompt`] instead.
+    Completed,
+}
+
+/// "Press any key to continue" pause prompt (SPEC_v1_1.md §4.6).
+///
+/// `AnyKeyPrompt` is the smallest prompt in the kit: it shows a body of
+/// post-event narration (loot description, vendor monologue, scripted
+/// flavor text) and waits for the player to acknowledge. The reducer
+/// has exactly two states — pending and completed — and a single rule:
+/// any meaningful keypress completes; resize and [`Input::Unknown`] do
+/// not.
+///
+/// # Why a dedicated type instead of a `ChoicePrompt` with no choices?
+///
+/// `ChoicePrompt` validates that at least one hotkey is bound (so it
+/// never silently swallows player input) and renders a hotkey legend.
+/// Both behaviours are wrong for an any-key pause: there are no
+/// hotkeys, and the legend would be a lie. Modelling the pause as its
+/// own type keeps the two prompts honest about what they promise.
+///
+/// # Why ignore resize?
+///
+/// SPEC §4.6 calls it out explicitly. The intent is that a player
+/// who resizes their terminal mid-pause sees the body re-flow rather
+/// than the screen instantly disappearing — resize is a layout event,
+/// not a player decision. [`Input::Unknown`] is collapsed for the same
+/// reason: a stray release event, a `Ctrl` chord the runtime didn't
+/// translate, or a focus change MUST NOT count as acknowledgement.
+///
+/// Rendering lives in Task 6c (`render` / `render_modal` follow the
+/// same shape as [`ChoicePrompt`]); this task implements only the
+/// reducer surface so the SPEC §4.6 input contract is testable without
+/// any layout dependencies.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct AnyKeyPrompt {
+    /// Body lines (post-event narration). Empty entries are SPEC §4.7
+    /// "explicit blank line" paragraph breaks — see [`TextBlock`] for
+    /// the wrapping contract Task 6c will apply at render time.
+    body: Vec<String>,
+    /// Footer cue. `None` means the renderer should fall back to the
+    /// SPEC §4.6 default `"Press any key to continue..."`. The override
+    /// exists so authors can localize the cue or replace it with a
+    /// scene-specific line ("Press any key to wake up.") without losing
+    /// the any-key semantics.
+    footer: Option<String>,
+    /// Optional modal title — only the bordered modal layout reads it,
+    /// matching the [`ChoicePrompt`] convention.
+    title: Option<String>,
+}
+
+impl AnyKeyPrompt {
+    /// Build an empty pause prompt with no body and the default footer.
+    /// Add narration lines with [`AnyKeyPrompt::body`].
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Append a body paragraph. Multiple calls accumulate, so authors
+    /// can build up narration over several `.body(...)` chains the
+    /// same way [`ChoicePrompt::body`] supports paragraph stacks.
+    pub fn body(mut self, line: impl Into<String>) -> Self {
+        self.body.push(line.into());
+        self
+    }
+
+    /// Override the footer cue. Pass any string to replace the SPEC
+    /// §4.6 default `"Press any key to continue..."`.
+    pub fn footer(mut self, footer: impl Into<String>) -> Self {
+        self.footer = Some(footer.into());
+        self
+    }
+
+    /// Set the modal title (only read by the bordered modal layout).
+    pub fn title(mut self, title: impl Into<String>) -> Self {
+        self.title = Some(title.into());
+        self
+    }
+
+    /// Body lines as supplied by the author, in order. Exposed for the
+    /// Task 6c renderer and for tests; not part of the reducer
+    /// contract.
+    pub fn body_lines(&self) -> &[String] {
+        &self.body
+    }
+
+    /// Footer cue if one was set; `None` means "use the SPEC §4.6
+    /// default". Exposed for the Task 6c renderer.
+    pub fn footer_text(&self) -> Option<&str> {
+        self.footer.as_deref()
+    }
+
+    /// Modal title if one was set. Exposed for the Task 6c renderer.
+    pub fn title_text(&self) -> Option<&str> {
+        self.title.as_deref()
+    }
+
+    /// Send one [`Input`] through the pause and return whether it
+    /// completed.
+    ///
+    /// Per SPEC §4.6:
+    /// - [`Input::Resize`] → ignored ([`AnyKeyOutcome::None`]).
+    /// - [`Input::Unknown`] → ignored. The runtime emits this for
+    ///   modifier-only and release events; collapsing them prevents
+    ///   spurious completions on focus changes or `Ctrl`-only chords.
+    /// - Every other variant → [`AnyKeyOutcome::Completed`]. SPEC says
+    ///   "any meaningful keypress" and treats arrows, Enter, Esc,
+    ///   Backspace, `Char`, and `Ctrl`-prefixed keys as meaningful.
+    ///
+    /// `&self` rather than `&mut self` because the prompt itself
+    /// carries no progress state — the *caller* decides what to do
+    /// when the pause completes (typically pop the prompt or transition
+    /// the screen). Keeping `handle` non-mutating mirrors
+    /// [`ChoicePrompt::handle`] and [`ConfirmPrompt::handle`].
+    pub fn handle(&self, input: Input) -> AnyKeyOutcome {
+        match input {
+            Input::Resize { .. } | Input::Unknown => AnyKeyOutcome::None,
+            Input::Up
+            | Input::Down
+            | Input::Left
+            | Input::Right
+            | Input::Enter
+            | Input::Esc
+            | Input::Backspace
+            | Input::Char(_)
+            | Input::Ctrl(_) => AnyKeyOutcome::Completed,
+        }
+    }
+}
+
 /// A reusable narration / status fragment rendered above a prompt
 /// (SPEC_v1_1.md §4.7).
 ///
@@ -4467,5 +4614,117 @@ mod tests {
             joined.contains("Your choice:"),
             "prompt label missing: {joined:?}"
         );
+    }
+
+    // ---- AnyKeyPrompt (SPEC_v1_1.md §4.6) -----------------------------
+    //
+    // The reducer surface is small but load-bearing: every meaningful
+    // key MUST complete the pause, and resize/Unknown MUST NOT. These
+    // tests pin both halves of that contract and serve as the public
+    // documentation of which Input variants count as "meaningful".
+
+    #[test]
+    fn any_key_prompt_resize_is_ignored() {
+        // SPEC §4.6: "Ignore resize events." A resize during a pause is
+        // a layout signal, not an acknowledgement.
+        let prompt = AnyKeyPrompt::new().body("You feel a chill.");
+        assert_eq!(
+            prompt.handle(Input::Resize {
+                width: 80,
+                height: 24
+            }),
+            AnyKeyOutcome::None,
+        );
+    }
+
+    #[test]
+    fn any_key_prompt_unknown_is_ignored() {
+        // SPEC §4.6 MAY clause: modifier-only / release-only events
+        // collapse to Input::Unknown in the runtime mapping; treating
+        // them as completion would let a focus-change or stray Ctrl
+        // press dismiss the pause.
+        let prompt = AnyKeyPrompt::new();
+        assert_eq!(prompt.handle(Input::Unknown), AnyKeyOutcome::None);
+    }
+
+    #[test]
+    fn any_key_prompt_enter_completes() {
+        // Enter is the conventional ack key for BBS pauses; SPEC §4.6
+        // calls Enter out implicitly by saying "any meaningful key".
+        let prompt = AnyKeyPrompt::new();
+        assert_eq!(prompt.handle(Input::Enter), AnyKeyOutcome::Completed);
+    }
+
+    #[test]
+    fn any_key_prompt_space_completes() {
+        // Char(' ') is the other classic continue-key; this test pins
+        // the Char(_) arm so a future refactor can't accidentally
+        // restrict completion to a hand-picked allowlist.
+        let prompt = AnyKeyPrompt::new();
+        assert_eq!(prompt.handle(Input::Char(' ')), AnyKeyOutcome::Completed);
+    }
+
+    #[test]
+    fn any_key_prompt_esc_completes() {
+        // SPEC §4.6 makes no carve-out for Esc — the pause is purely
+        // an acknowledgement, so Esc completes like any other
+        // meaningful key. Authors who need an Esc-cancellable pause
+        // should use ConfirmPrompt instead.
+        let prompt = AnyKeyPrompt::new();
+        assert_eq!(prompt.handle(Input::Esc), AnyKeyOutcome::Completed);
+    }
+
+    #[test]
+    fn any_key_prompt_arrow_keys_complete() {
+        // Pin the arrow arms explicitly: a player whose hand is on the
+        // arrow keys after a map scene shouldn't have to find a letter
+        // key to advance.
+        let prompt = AnyKeyPrompt::new();
+        for input in [Input::Up, Input::Down, Input::Left, Input::Right] {
+            assert_eq!(
+                prompt.handle(input),
+                AnyKeyOutcome::Completed,
+                "arrow key {input:?} should complete the pause",
+            );
+        }
+    }
+
+    #[test]
+    fn any_key_prompt_backspace_and_ctrl_complete() {
+        // Backspace and Ctrl(_) are meaningful keypresses per SPEC
+        // §4.6; only Resize and Unknown are explicitly excluded.
+        let prompt = AnyKeyPrompt::new();
+        assert_eq!(prompt.handle(Input::Backspace), AnyKeyOutcome::Completed);
+        assert_eq!(prompt.handle(Input::Ctrl('c')), AnyKeyOutcome::Completed);
+    }
+
+    #[test]
+    fn any_key_prompt_builder_records_body_footer_title() {
+        // The reducer ignores body/footer/title, but Task 6c needs them
+        // intact at render time. Pin the builder so a stray refactor
+        // can't drop a paragraph or silently overwrite the override.
+        let prompt = AnyKeyPrompt::new()
+            .body("First.")
+            .body("Second.")
+            .footer("Press any key to wake up.")
+            .title("Lobby");
+        assert_eq!(
+            prompt.body_lines(),
+            &["First.".to_string(), "Second.".to_string()],
+        );
+        assert_eq!(prompt.footer_text(), Some("Press any key to wake up."));
+        assert_eq!(prompt.title_text(), Some("Lobby"));
+    }
+
+    #[test]
+    fn any_key_prompt_default_footer_is_unset() {
+        // `None` at the data layer signals "use the SPEC §4.6 default"
+        // to the renderer — not "render an empty footer". The
+        // distinction matters for Task 6c, which will substitute
+        // "Press any key to continue..." when no override is present.
+        let prompt = AnyKeyPrompt::new();
+        assert!(prompt.footer_text().is_none());
+        assert!(prompt.title_text().is_none());
+        assert!(prompt.body_lines().is_empty());
     }
 }
