@@ -518,6 +518,7 @@ impl Game {
             screens: self.screens,
             config: self.config,
             foglet: self.foglet,
+            save_handler: self.save_handler,
         })
     }
 
@@ -550,6 +551,14 @@ pub struct BuiltGame {
     pub(crate) screens: ScreenStack,
     pub(crate) config: Option<GameConfig>,
     pub(crate) foglet: Option<FogletContext>,
+    /// Save handler threaded through from [`Game::with_save_handler`]
+    /// (Task 4b). [`run_built_with_opener`] takes this out of the
+    /// validated game and feeds it to [`run_with_io`] as `on_save`,
+    /// replacing the v2 stub. `None` means the author opted out of
+    /// persistence — the loop falls back to a no-op closure so a
+    /// stray [`crate::ScreenCommand::Save`] is silently ignored
+    /// rather than aborting the run.
+    pub(crate) save_handler: Option<SaveHandler>,
 }
 
 impl std::fmt::Debug for BuiltGame {
@@ -564,6 +573,7 @@ impl std::fmt::Debug for BuiltGame {
             )
             .field("config", &self.config.is_some())
             .field("foglet", &self.foglet.is_some())
+            .field("save_handler", &self.save_handler.is_some())
             .finish()
     }
 }
@@ -727,10 +737,18 @@ pub fn run_built_with_opener(mut built: BuiltGame, open_world: &WorldOpenerFn) -
     let mut terminal = Terminal::new(backend).map_err(|e| GameError::Render(e.to_string()))?;
     let mut events = CrosstermEventSource::new();
 
-    // Local config + foglet bindings so the closure on the save sink
-    // does not need to capture `built` (it has already been consumed
-    // by `run_with_io`'s ownership).
-    let mut on_save: Box<dyn FnMut() -> Result<(), GameError>> = Box::new(|| Ok(())); // Stub — Task 8b wires the real save manager.
+    // Save sink: prefer the handler installed via
+    // [`Game::with_save_handler`] (Task 4b). When the author hasn't
+    // installed one, fall back to a no-op so a screen that emits
+    // [`crate::ScreenCommand::Save`] without configured persistence
+    // does not abort the run — SPEC_v2_1 §4.4 explicitly allows games
+    // to opt out of save by simply never calling `with_save_handler`.
+    // We `take()` the handler out of `built` so `run_with_io` can move
+    // `built` while the closure lives outside that ownership.
+    let mut on_save: SaveHandler = built
+        .save_handler
+        .take()
+        .unwrap_or_else(|| Box::new(|| Ok(())));
 
     // Run the loop. We propagate the result through `cleanup_on` so a
     // failure inside the loop still observes teardown errors before
@@ -1438,6 +1456,69 @@ mod tests {
             *saves.borrow(),
             1,
             "Save side effect must call on_save once"
+        );
+    }
+
+    #[test]
+    fn built_game_save_handler_threads_into_runtime_loop() {
+        // Task 4c: the handler installed via `Game::with_save_handler`
+        // must travel through `Game::build()` onto `BuiltGame`, and
+        // from there `run_built` (here: `run_with_io` driven by the
+        // same `take()` move that `run_built_with_opener` performs)
+        // must observe it as the `on_save` sink. Asserts the handler
+        // fires exactly once for a single `ScreenCommand::Save`.
+        let cfg = fixture_config();
+        let fc = fixture_context();
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let screen = ScriptedScreen::new(
+            "only",
+            log,
+            vec![ScreenCommand::Save, ScreenCommand::Quit],
+            vec![],
+            vec![],
+        );
+
+        let saves = Rc::new(RefCell::new(0u32));
+        let saves_clone = saves.clone();
+
+        let mut built = Game::new("Test")
+            .push_screen(Box::new(screen))
+            .with_save_handler(move || {
+                *saves_clone.borrow_mut() += 1;
+                Ok(())
+            })
+            .build()
+            .expect("valid builder");
+
+        // Mirror what `run_built_with_opener` does: take the handler
+        // off the validated game and feed it to the loop. The fallback
+        // closure here matches the production path's "no handler ⇒
+        // no-op" behaviour and is never called in this test.
+        let mut on_save: SaveHandler = built
+            .save_handler
+            .take()
+            .expect("with_save_handler installs a handler");
+
+        let mut term = make_terminal();
+        let mut events = VecEventSource::new(vec![Some(Input::Char('s')), Some(Input::Char('q'))]);
+
+        let reason = run_with_io(
+            built,
+            &cfg,
+            &fc,
+            None,
+            (40, 10),
+            &mut term,
+            &mut events,
+            &mut on_save,
+        )
+        .expect("loop ok");
+
+        assert_eq!(reason, ExitReason::Quit);
+        assert_eq!(
+            *saves.borrow(),
+            1,
+            "the threaded SaveHandler must fire exactly once per Save side effect"
         );
     }
 
