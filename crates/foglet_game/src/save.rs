@@ -531,6 +531,42 @@ impl<T> SaveSlot<T> {
     }
 }
 
+impl<T: Serialize> SaveSlot<T> {
+    /// Persist the slot's current value to `path` atomically, then clear
+    /// the dirty flag.
+    ///
+    /// Thin typed wrapper over [`write_atomic`]: SPEC §13's reliability
+    /// bar (parent `mkdir -p`, temp-file write, fsync, `rename(2)`)
+    /// keeps applying because the actual byte-level write is delegated.
+    /// The slot adds two things on top:
+    ///
+    /// 1. A typed entry point — callers don't have to remember to pass
+    ///    a `&T` borrowed from the right place, the slot already holds
+    ///    the canonical handle.
+    /// 2. Dirty-flag bookkeeping — once `write_atomic` succeeds the slot
+    ///    is by definition in sync with disk, so `is_dirty()` returns
+    ///    `false` again and the runtime's "save iff dirty" hook
+    ///    (Task 4) won't immediately rewrite the same bytes.
+    ///
+    /// On failure the dirty flag is **left set** so the next save
+    /// attempt still tries to push the unsaved changes — clearing it
+    /// before knowing the bytes landed would silently swallow data
+    /// loss. This is the same reason `read_save` distinguishes "missing"
+    /// from "corrupt" rather than collapsing both into `None`.
+    pub fn save(&self, path: &Path) -> Result<(), SaveIoError> {
+        // Borrow immutably while serialising so other handles can still
+        // read concurrently from the same `RefCell` (interior reads do
+        // not block each other). Using `borrow_mut` here would pointlessly
+        // contend with renderers — the write goes through `write_atomic`
+        // on a separate temp file, not into `T`.
+        write_atomic(path, &*self.inner.borrow())?;
+        // Only clear after the rename has succeeded. Failed writes leave
+        // the flag set so a retry actually retries.
+        self.dirty.set(false);
+        Ok(())
+    }
+}
+
 impl<T: DeserializeOwned> SaveSlot<T> {
     /// Load a slot from `path`, returning `Ok(None)` if no save exists.
     ///
@@ -1225,6 +1261,82 @@ mod tests {
 
         let err = SaveSlot::<SaveFixture>::load_or_default(&path).unwrap_err();
         assert!(matches!(err, SaveIoError::Deserialize(_)));
+    }
+
+    // ----- SaveSlot::save tests (Task 1d) ---------------------------
+
+    #[test]
+    fn save_slot_save_round_trips_through_write_atomic() {
+        // After `save`, the bytes on disk must match what a subsequent
+        // `load` returns — the slot is just a typed handle on top of
+        // `write_atomic` / `read_save`, so the round-trip property the
+        // free functions guarantee must propagate to the slot API.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("save.json");
+        let slot: SaveSlot<SaveFixture> = SaveSlot::new(fixture_v1());
+
+        slot.save(&path).unwrap();
+
+        let reloaded = SaveSlot::<SaveFixture>::load(&path)
+            .unwrap()
+            .expect("save wrote the file");
+        assert_eq!(*reloaded.borrow(), fixture_v1());
+    }
+
+    #[test]
+    fn save_slot_save_clears_dirty_flag() {
+        // The whole point of the dirty bit is to let a "save iff dirty"
+        // loop skip no-op writes. `save` must clear the flag once the
+        // bytes are durable on disk.
+        let slot: SaveSlot<SaveFixture> = SaveSlot::new(fixture_v1());
+        slot.borrow_mut().player = "bob".into();
+        assert!(slot.is_dirty(), "precondition: borrow_mut dirties");
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("save.json");
+        slot.save(&path).unwrap();
+
+        assert!(
+            !slot.is_dirty(),
+            "successful save must clear the dirty flag",
+        );
+    }
+
+    #[test]
+    fn save_slot_save_persists_latest_mutations() {
+        // A mutation through `borrow_mut` between construction and save
+        // must end up in the file — verifying the slot serialises its
+        // *current* contents, not whatever was passed to `new`.
+        let slot: SaveSlot<SaveFixture> = SaveSlot::new(fixture_v1());
+        slot.apply(fixture_v2());
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("save.json");
+        slot.save(&path).unwrap();
+
+        let reloaded: SaveFixture = read_save(&path).unwrap().unwrap();
+        assert_eq!(reloaded, fixture_v2());
+    }
+
+    #[test]
+    fn save_slot_save_failure_leaves_dirty_flag_set() {
+        // If the write fails (here: degenerate path with no parent
+        // directory), the slot is still out of sync with disk — leaving
+        // the flag set lets a retry actually retry, instead of silently
+        // dropping unsaved changes.
+        let slot: SaveSlot<SaveFixture> = SaveSlot::new(fixture_v1());
+        slot.borrow_mut().player = "bob".into();
+        assert!(slot.is_dirty());
+
+        // `save.json` with no directory triggers `SaveIoError::NoParent`,
+        // mirroring the existing `write_to_path_with_no_parent_errors`
+        // case for the free function.
+        let err = slot.save(Path::new("save.json")).unwrap_err();
+        assert!(matches!(err, SaveIoError::NoParent { .. }));
+        assert!(
+            slot.is_dirty(),
+            "failed save must NOT clear the dirty flag — retry has to retry",
+        );
     }
 
     #[test]
