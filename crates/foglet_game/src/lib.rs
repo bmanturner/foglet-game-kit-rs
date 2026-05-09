@@ -38,6 +38,7 @@ pub mod input;
 pub mod manifest;
 pub mod map;
 pub mod prompt;
+pub mod prompt_screen;
 pub mod runtime;
 pub mod save;
 pub mod screen;
@@ -66,6 +67,7 @@ pub use prompt::{
     ChoicePrompt, ConfirmAction, ConfirmOutcome, ConfirmPrompt, FeedbackKind, FeedbackLine,
     PromptAction, PromptChoice, PromptError, PromptKey, StyleRole, Theme,
 };
+pub use prompt_screen::{PromptLayout, PromptScreen};
 pub use runtime::{
     run_built, run_with_io, BuiltGame, CrosstermEventSource, EventSource, Game, GameError,
     GameResult, SavePolicy, TICK_INTERVAL,
