@@ -421,12 +421,23 @@ pub fn validate_choices<T>(choices: &[PromptChoice<T>]) -> Result<(), PromptErro
 ///
 /// # What this type intentionally does NOT do (yet)
 ///
-/// - No selected-index state. That belongs to the reducer (Task 4).
 /// - No `confirm` per-choice flag. That lands with `ConfirmPrompt`
 ///   (Task 6a).
 /// - No theme/style storage. Per-choice `style: Option<StyleRole>`
 ///   already lives on `PromptChoice`; whole-prompt theming is a
 ///   render-layer concern (Task 5f).
+///
+/// # Optional arrow/Enter navigation cursor
+///
+/// `selected` is `None` for the default direct-key flow (every
+/// SPEC §5 example so far). Calling [`ChoicePrompt::navigable`] with `true`
+/// switches the prompt into the optional arrow/Enter mode by seeding
+/// `selected` with the index of the first enabled choice; Up/Down/
+/// Enter behavior layers on in Tasks 4b–4c. Storing the cursor on the
+/// prompt (not in a sibling state struct) keeps the navigation-mode
+/// path round-trippable through `Clone`/`PartialEq` for tests, and
+/// matches how the v1 `DialogState` reducer stores its cursor
+/// alongside its data.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChoicePrompt<T> {
     /// Body lines, one per `.body(...)` call. Multi-line bodies are
@@ -449,6 +460,22 @@ pub struct ChoicePrompt<T> {
     /// from dismissing a load-bearing prompt (vendor confirmation, save
     /// overwrite) that the game wants to force the player to resolve.
     pub cancellable: bool,
+    /// Highlighted choice index for arrow/Enter navigation mode
+    /// (SPEC_v1_1.md §4.5).
+    ///
+    /// `None` — direct-key mode (the default). Hotkeys select choices;
+    /// there is no cursor and Up/Down are ignored.
+    ///
+    /// `Some(i)` — navigation mode is active and the cursor sits on
+    /// `choices[i]`. Set by [`ChoicePrompt::navigable`] to the first
+    /// enabled choice's index, then advanced by Up/Down (Task 4b) and
+    /// confirmed by Enter (Task 4c). Index validity is the prompt's
+    /// invariant: `i < choices.len()` whenever the field is `Some`.
+    /// `None` is also produced when navigation is requested but no
+    /// choice is enabled — direct-key prompts already handle the empty
+    /// case as "no selection possible", and an out-of-bounds `Some(0)`
+    /// on an empty prompt would just be a panic waiting to happen.
+    pub selected: Option<usize>,
 }
 
 impl<T> Default for ChoicePrompt<T> {
@@ -473,6 +500,11 @@ impl<T> ChoicePrompt<T> {
             // author gets for free; opting into cancellation is an
             // explicit, single-line builder call.
             cancellable: false,
+            // SPEC §4.5: arrow/Enter navigation is an optional mode.
+            // `None` means direct-key only; opt in via `.navigable(true)`
+            // *after* the choices are added, since the seeding logic
+            // needs to scan them for the first enabled row.
+            selected: None,
         }
     }
 
@@ -547,6 +579,49 @@ impl<T> ChoicePrompt<T> {
         self
     }
 
+    /// Toggle the optional arrow/Enter navigation cursor
+    /// (SPEC_v1_1.md §4.5).
+    ///
+    /// Pass `true` to seed [`ChoicePrompt::selected`] with the index of
+    /// the first **enabled** choice — the cursor never starts on a row
+    /// the player cannot pick, so a freshly opened prompt is always
+    /// ready for an immediate Enter (Task 4c). When no choice is
+    /// enabled (an unusual data state, but representable), the field is
+    /// left as `None` rather than `Some(0)`: an unselectable cursor is
+    /// worse than no cursor at all, and Tasks 4b/4c can short-circuit
+    /// on `None` instead of guarding every move against the all-disabled
+    /// case.
+    ///
+    /// Pass `false` to drop back to direct-key mode and clear the
+    /// cursor. Round-tripping
+    /// `.navigable(true).navigable(false).navigable(true)` is supported
+    /// so dynamic chains like
+    /// `.navigable(player.prefers_arrow_keys())` compile.
+    ///
+    /// # Call this *after* `.choice(...)` calls
+    ///
+    /// The seeding scan looks at the current `choices` list. Calling
+    /// `.navigable(true)` on an empty prompt produces `selected = None`
+    /// (correctly — there is nothing to highlight), and choices added
+    /// later do not retroactively move the cursor onto themselves. The
+    /// SPEC §5 builder-chain shape (`.body … .choice … .choice …
+    /// .navigable(true)`) makes this ordering natural; the docs spell
+    /// it out so a misordered chain reads as the author's bug, not the
+    /// kit's.
+    pub fn navigable(mut self, enabled: bool) -> Self {
+        self.selected = if enabled {
+            // Linear scan is fine here for the same reason it is fine
+            // in `handle`: prompt choice lists are short (SPEC §4.4).
+            // `position` returns `None` on an empty list or one with
+            // no enabled rows, which is exactly the value we want for
+            // the unselectable case.
+            self.choices.iter().position(|c| c.enabled)
+        } else {
+            None
+        };
+        self
+    }
+
     /// Run SPEC §4.1 hotkey validation against the current choice
     /// list. Returns `Err(PromptError::DuplicateHotkey)` on the first
     /// collision in declaration order; `Ok(())` for a valid prompt
@@ -578,10 +653,11 @@ impl<T: Clone> ChoicePrompt<T> {
     /// Direct-key prompts have no internal state to mutate — selection
     /// is whatever the player just pressed, and the reducer's job is to
     /// classify that press, not remember it. The arrow/Enter navigation
-    /// reducer (Task 4) carries a selected-index cursor; that variant
-    /// will land as a separate `&mut self` method or a state struct, so
-    /// this method stays cheap to call (e.g. from a render path that
-    /// previews "would this key select something?").
+    /// cursor lives in [`ChoicePrompt::selected`] (Task 4a); the Up/Down
+    /// movement and Enter-confirm reducers that need to mutate it land
+    /// as separate `&mut self` methods in Tasks 4b–4c, so this `&self`
+    /// method stays cheap to call (e.g. from a render path that previews
+    /// "would this key select something?").
     ///
     /// # `T: Clone`
     ///
@@ -1429,6 +1505,7 @@ mod tests {
             choices: vec![choice],
             footer: None,
             cancellable: false,
+            selected: None,
         };
 
         assert_eq!(
@@ -1503,6 +1580,102 @@ mod tests {
         // to `true`, every existing prompt becomes silently dismissible.
         let prompt: ChoicePrompt<LootAction> = ChoicePrompt::new();
         assert!(!prompt.cancellable);
+    }
+
+    #[test]
+    fn navigable_defaults_to_none_for_direct_key_prompts() {
+        // SPEC §4.5: arrow/Enter is opt-in. The default `new()` flow —
+        // every example in SPEC §5 so far — must leave `selected = None`
+        // so direct-key prompts never accidentally render a cursor.
+        let prompt: ChoicePrompt<LootAction> = ChoicePrompt::new()
+            .choice('e', LootAction::Equip, "Equip")
+            .choice('t', LootAction::Take, "Take");
+        assert_eq!(prompt.selected, None);
+    }
+
+    #[test]
+    fn navigable_seeds_cursor_on_first_enabled_choice() {
+        // Task 4a contract: enabling arrow mode highlights the first
+        // enabled row so a fresh prompt is immediately Enter-ready.
+        let prompt: ChoicePrompt<LootAction> = ChoicePrompt::new()
+            .choice('e', LootAction::Equip, "Equip")
+            .choice('t', LootAction::Take, "Take")
+            .navigable(true);
+        assert_eq!(prompt.selected, Some(0));
+    }
+
+    #[test]
+    fn navigable_skips_leading_disabled_choices_when_seeding() {
+        // The cursor must never start on a row the player cannot pick,
+        // even when the data lists a disabled choice first. Without this
+        // skip, an Enter press on a freshly opened arrow-mode prompt
+        // would route through `Disabled` (or worse, through Task 4c's
+        // future Enter handling), surprising the player.
+        let prompt: ChoicePrompt<LootAction> = ChoicePrompt::new()
+            .choice('e', LootAction::Equip, "Equip")
+            .disabled_if(true, "bag full")
+            .choice('t', LootAction::Take, "Take")
+            .navigable(true);
+        assert_eq!(prompt.selected, Some(1));
+    }
+
+    #[test]
+    fn navigable_on_empty_prompt_leaves_selection_none() {
+        // Edge case: a partial builder chain that flips navigation on
+        // before any `.choice(...)` call must not produce `Some(0)` —
+        // there is no row at index 0 to highlight, and a stale cursor
+        // would be a panic vector for Task 4b's Up/Down reducer.
+        let prompt: ChoicePrompt<LootAction> = ChoicePrompt::new().navigable(true);
+        assert_eq!(prompt.selected, None);
+    }
+
+    #[test]
+    fn navigable_with_all_disabled_choices_leaves_selection_none() {
+        // No enabled row → no valid cursor position. Returning `None`
+        // here (instead of `Some(0)`) lets later movement/Enter logic
+        // treat "nothing selectable" as a single short-circuit case.
+        let prompt: ChoicePrompt<LootAction> = ChoicePrompt::new()
+            .choice('e', LootAction::Equip, "Equip")
+            .disabled_if(true, "bag full")
+            .choice('t', LootAction::Take, "Take")
+            .disabled_if(true, "bag full");
+        let prompt = prompt.navigable(true);
+        assert_eq!(prompt.selected, None);
+    }
+
+    #[test]
+    fn navigable_false_clears_cursor_for_round_trip() {
+        // Dynamic chains like `.navigable(player.prefers_arrows())` must
+        // round-trip both ways. Toggling off after on must clear the
+        // cursor, not freeze it on the previously-seeded index.
+        let prompt: ChoicePrompt<LootAction> = ChoicePrompt::new()
+            .choice('e', LootAction::Equip, "Equip")
+            .navigable(true)
+            .navigable(false);
+        assert_eq!(prompt.selected, None);
+
+        // And re-enabling re-seeds on the first enabled choice.
+        let prompt = prompt.navigable(true);
+        assert_eq!(prompt.selected, Some(0));
+    }
+
+    #[test]
+    fn navigable_does_not_affect_direct_key_handle() {
+        // Task 4a only adds the cursor field; direct-key dispatch in
+        // `handle` must keep its current behaviour so the SPEC §5 loot
+        // examples stay green. Tasks 4b–4c will introduce Up/Down/Enter
+        // reducers separately.
+        let prompt: ChoicePrompt<LootAction> = ChoicePrompt::new()
+            .choice('e', LootAction::Equip, "Equip")
+            .choice('t', LootAction::Take, "Take")
+            .navigable(true);
+        assert_eq!(
+            prompt.handle(Input::Char('t')),
+            PromptAction::Selected(LootAction::Take),
+        );
+        // Enter currently has no navigation-confirm wiring — should
+        // still collapse to `None` until Task 4c.
+        assert_eq!(prompt.handle(Input::Enter), PromptAction::None);
     }
 
     #[test]
