@@ -567,6 +567,52 @@ impl<T: Serialize> SaveSlot<T> {
     }
 }
 
+impl<T: Serialize + 'static> SaveSlot<T> {
+    /// Build a [`crate::runtime::SaveHandler`] closure that persists this slot's
+    /// current contents to `path` whenever the runtime invokes it.
+    ///
+    /// The returned closure captures **a clone of the slot's `Rc`
+    /// handles**, not the binding itself. SPEC_v2_1 §4.1 mandates this
+    /// so the handler stays valid even if the original `SaveSlot`
+    /// binding goes out of scope (e.g. the author moves the slot into
+    /// a screen constructor, then registers the handler with
+    /// `Game::with_save_handler`). Cloning is a refcount bump — see
+    /// the `Cheap to clone` note on [`SaveSlot`].
+    ///
+    /// Each invocation calls [`SaveSlot::save`], which delegates to
+    /// [`write_atomic`]. Errors are remapped to [`crate::runtime::GameError::Save`]
+    /// using the underlying [`SaveIoError`]'s `Display` impl —
+    /// stringifying preserves the granular variant message (`writing
+    /// save file failed`, `renaming temp save into place failed`,
+    /// etc.) in the operator-facing log without forcing the runtime
+    /// to grow a `From<SaveIoError> for GameError` impl that the rest
+    /// of the codebase doesn't need.
+    ///
+    /// `path` is taken by value (`PathBuf`) so the closure owns it
+    /// outright; passing `&Path` would tie the handler to the
+    /// caller's stack frame and defeat the "outlives the original
+    /// binding" guarantee above.
+    ///
+    /// # Why no dirty check here
+    ///
+    /// The handler unconditionally writes when invoked. SPEC_v2_1
+    /// §4.1 explicitly forbids using `is_dirty` to *gate* persistence
+    /// — that decision belongs to the runtime / the author. A
+    /// "save iff dirty" loop builds on top of this primitive by
+    /// checking `is_dirty()` before invoking the handler, not inside
+    /// it.
+    pub fn save_handler(&self, path: PathBuf) -> crate::runtime::SaveHandler {
+        // Clone the `Rc`-bearing slot so the closure owns its own
+        // refcounted view. Reusing `Self::clone` (refcount bump only)
+        // keeps this allocation-light.
+        let slot = self.clone();
+        Box::new(move || {
+            slot.save(&path)
+                .map_err(|e| crate::runtime::GameError::Save(e.to_string()))
+        })
+    }
+}
+
 impl<T: DeserializeOwned> SaveSlot<T> {
     /// Load a slot from `path`, returning `Ok(None)` if no save exists.
     ///
@@ -1336,6 +1382,89 @@ mod tests {
         assert!(
             slot.is_dirty(),
             "failed save must NOT clear the dirty flag — retry has to retry",
+        );
+    }
+
+    // ----- SaveSlot::save_handler tests (Task 1e) ------------------
+
+    #[test]
+    fn save_slot_save_handler_persists_current_contents() {
+        // A handler invocation must produce the same on-disk bytes as
+        // a direct `save()` call — proving the indirection through
+        // `SaveHandler` is just plumbing, not a behavioural fork.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("save.json");
+        let slot: SaveSlot<SaveFixture> = SaveSlot::new(fixture_v1());
+
+        let mut handler = slot.save_handler(path.clone());
+        handler().expect("handler write should succeed");
+
+        let reloaded: SaveFixture = read_save(&path).unwrap().unwrap();
+        assert_eq!(reloaded, fixture_v1());
+        assert!(
+            !slot.is_dirty(),
+            "underlying save() clears dirty; handler must inherit that",
+        );
+    }
+
+    #[test]
+    fn save_slot_save_handler_observes_post_registration_mutations() {
+        // The handler holds an `Rc` to the same backing state, so a
+        // mutation made *after* the handler was constructed must end
+        // up in the file. This is the property that makes the handler
+        // useful at all: register once at startup, persist the live
+        // state at quit/`SideEffect::Save` time.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("save.json");
+        let slot: SaveSlot<SaveFixture> = SaveSlot::new(fixture_v1());
+
+        let mut handler = slot.save_handler(path.clone());
+        slot.apply(fixture_v2());
+        handler().unwrap();
+
+        let reloaded: SaveFixture = read_save(&path).unwrap().unwrap();
+        assert_eq!(reloaded, fixture_v2());
+    }
+
+    #[test]
+    fn save_slot_save_handler_outlives_original_binding() {
+        // SPEC_v2_1 §4.1 rule: the handler captures the slot via `Rc`,
+        // so it MUST keep working after the originally-named binding
+        // is dropped. We model the realistic call shape: build the
+        // slot, hand a handle to a "screen" (here, a vector cell),
+        // register the handler, then drop the original binding by
+        // moving it into a no-op closure that immediately falls out
+        // of scope.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("save.json");
+
+        let slot: SaveSlot<SaveFixture> = SaveSlot::new(fixture_v1());
+        let mut handler = slot.save_handler(path.clone());
+
+        // "Move" the original binding away — represents the author
+        // handing the slot to a screen constructor and never holding
+        // it themselves again. The handler still owns its own clone.
+        drop(slot);
+
+        handler().expect("handler must work after the original slot is dropped");
+        let reloaded: SaveFixture = read_save(&path).unwrap().unwrap();
+        assert_eq!(reloaded, fixture_v1());
+    }
+
+    #[test]
+    fn save_slot_save_handler_surfaces_errors_as_game_error_save() {
+        // Failure mode: a degenerate path (`save.json` with no
+        // directory) makes `write_atomic` return `SaveIoError::NoParent`.
+        // The handler must remap that into `GameError::Save(_)` so the
+        // runtime can convert it to its public error variant without
+        // knowing about `SaveIoError`.
+        let slot: SaveSlot<SaveFixture> = SaveSlot::new(fixture_v1());
+        let mut handler = slot.save_handler(PathBuf::from("save.json"));
+
+        let err = handler().unwrap_err();
+        assert!(
+            matches!(err, crate::runtime::GameError::Save(_)),
+            "expected GameError::Save, got {err:?}",
         );
     }
 

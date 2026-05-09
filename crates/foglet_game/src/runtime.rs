@@ -207,6 +207,25 @@ pub enum GameError {
 /// `foglet_game::GameResult` into scope.
 pub type GameResult<T> = std::result::Result<T, GameError>;
 
+/// Boxed save closure type used by `Game::with_save_handler` (Task 4)
+/// and produced by [`crate::save::SaveSlot::save_handler`] (Task 1e).
+///
+/// SPEC_v2_1 §4.4 pins this exact signature so the runtime, the
+/// `SaveSlot` typed wrapper, and any author-written closure share one
+/// vocabulary. The type lives here (rather than in `save.rs`) because
+/// it references [`GameError`] — the failure mode the runtime turns
+/// handler errors into via `GameError::Save(_)`.
+///
+/// `FnMut` (not `Fn`) so handlers may carry mutable bookkeeping —
+/// e.g. a "writes-since-last-flush" counter — without resorting to
+/// interior mutability. `'static` because the runtime stores the box
+/// for the lifetime of the [`Game`] instance.
+///
+/// Defined eagerly in Task 1e so [`crate::save::SaveSlot::save_handler`]
+/// has a concrete return type to point at; Task 4 wires the runtime
+/// plumbing that consumes values of this type.
+pub type SaveHandler = Box<dyn FnMut() -> Result<(), GameError>>;
+
 /// Source of normalized [`Input`] events for the runtime loop.
 ///
 /// Production uses [`CrosstermEventSource`] (which polls
