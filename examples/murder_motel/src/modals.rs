@@ -11,8 +11,8 @@ use std::collections::BTreeSet;
 use std::rc::Rc;
 
 use foglet_game::{
-    render_inventory_list, EventRecord, GameContext, Input, InventoryList, LeaderboardSort,
-    ScoreRecord, Screen, ScreenCommand, WorldDb,
+    render_inventory_list, EventRecord, FogletContext, GameContext, Input, InventoryList,
+    LeaderboardSort, ScoreRecord, Screen, ScreenCommand, WorldDb,
 };
 use ratatui::layout::{Alignment, Rect};
 use ratatui::style::{Color, Style};
@@ -120,6 +120,171 @@ impl Screen for WinScreen {
     fn handle_input(&mut self, _ctx: &mut GameContext<'_>, _input: Input) -> ScreenCommand {
         // Any key quits — the modal is the end of the game.
         ScreenCommand::Quit
+    }
+}
+
+/// Read-only "Profile" modal showing the player's Foglet role and
+/// security level (SPEC_v2 §Task 13h).
+///
+/// SPEC §4.5 is explicit that role/security values are **advisory** —
+/// Foglet is the source of truth for door authorization, and the kit
+/// surfaces these only for in-game flavor (sysop/mod affordances,
+/// dropfile-compatible permission checks). The Profile modal exists so
+/// a player on a sysop or mod context can *see* that the game knows
+/// who they are, while the body copy spells out that the label has no
+/// authorization weight inside the door.
+///
+/// The screen captures the displayed values at construction time from
+/// [`GameContext::foglet`] so the render path does no
+/// [`FogletContext`] lookups (mirrors how the leaderboard and bulletin
+/// modals snapshot their data — keeps `Screen::render` allocation- and
+/// query-free per SPEC §Task 10d, which only formally applies to world
+/// queries but is the right shape for any read).
+///
+/// ## Why a dedicated screen
+///
+/// Task 13h calls for "sysop/mod/user synthetic contexts show distinct
+/// labels/security levels". Embedding the proof on the help screen
+/// would couple the controls reference to runtime state; a dedicated
+/// modal is the simplest path that keeps every other screen unchanged
+/// and lets the test load three synthetic contexts in isolation.
+///
+/// ## Input contract
+///
+/// - `Esc` / `Backspace` / `p` / `P` pop back to the menu beneath us.
+/// - `Q` / `Ctrl-C` still hard-quit, matching every other modal.
+#[derive(Debug)]
+pub struct ProfileScreen {
+    /// Display label for the role (e.g. `"sysop"`, `"mod"`, `"user"`,
+    /// or the raw payload from [`FogletRole::Other`]). Captured at
+    /// construction so render doesn't re-derive it per frame.
+    role_label: String,
+    /// Security level integer (50 / 90 / 100 today). Stored alongside
+    /// the label so the modal renders the SPEC §4.5 mapping next to the
+    /// role string the player would otherwise see in isolation.
+    security_level: i64,
+    /// Display handle for the player. Snapshot of
+    /// [`FogletContext::username`] (or `"(local dev)"` when absent) so
+    /// the operator-facing identity matches what the player typed at
+    /// the BBS prompt rather than the opaque `user_id`.
+    handle: String,
+}
+
+impl ProfileScreen {
+    /// Block title rendered on the bordered modal.
+    pub const TITLE: &'static str = "Profile";
+    /// Hint band shown at the bottom of the modal. Mirrors the close
+    /// affordances exposed by [`Self::handle_input`].
+    pub const HINT: &'static str = "[Esc/P/Backspace] close    [Q] quit";
+    /// Fallback display when the Foglet context didn't carry a username
+    /// (local-dev sessions, anonymous-access doors). Constant so tests
+    /// can pin the literal.
+    pub const ANONYMOUS_HANDLE: &'static str = "(local dev)";
+
+    /// Build a profile modal from a borrowed [`FogletContext`].
+    ///
+    /// Used by [`Self::from_context`] and by tests that want to assert
+    /// the captured fields without standing up a [`GameContext`]. The
+    /// inherent constructor takes a borrow so callers don't need to
+    /// clone their session-scoped context.
+    pub fn from_foglet(foglet: &FogletContext) -> Self {
+        let role = foglet.foglet_role();
+        Self {
+            role_label: role.as_token().to_string(),
+            security_level: foglet.security_level(),
+            handle: foglet
+                .username
+                .clone()
+                .unwrap_or_else(|| Self::ANONYMOUS_HANDLE.to_string()),
+        }
+    }
+
+    /// Convenience used from the menu activation path: build the modal
+    /// from a `&GameContext`. The borrow-bag context keeps the
+    /// `FogletContext` reference alive for as long as the runtime owns
+    /// it, so the snapshot we take here is always self-consistent.
+    pub fn from_context(ctx: &GameContext<'_>) -> Self {
+        Self::from_foglet(ctx.foglet)
+    }
+
+    /// Captured role label, exposed for tests.
+    pub fn role_label(&self) -> &str {
+        &self.role_label
+    }
+
+    /// Captured security level, exposed for tests.
+    pub fn security_level(&self) -> i64 {
+        self.security_level
+    }
+
+    /// Captured handle string, exposed for tests.
+    pub fn handle(&self) -> &str {
+        &self.handle
+    }
+
+    /// The body lines rendered inside the modal. Pulled into a method
+    /// so render and the test exercising "all three labels appear"
+    /// share one source of truth.
+    fn body_lines(&self) -> Vec<String> {
+        vec![
+            format!("Handle           {}", self.handle),
+            format!("Role             {}", self.role_label),
+            format!("Security level   {}", self.security_level),
+            String::new(),
+            // Two-line wrap so the advisory fits a 56-column modal even
+            // when the role label is the longest variant.
+            "Advisory only — Foglet decides who launches the door.".to_string(),
+            "These values are in-game flavor, not authorization.".to_string(),
+        ]
+    }
+}
+
+impl Screen for ProfileScreen {
+    fn render(&mut self, _ctx: &mut GameContext<'_>, frame: &mut Frame<'_>) {
+        let lines = self.body_lines();
+        // Reserve the bottom row for the hint band so close affordances
+        // are always visible regardless of body length.
+        let height = (lines.len() as u16) + 3; // +2 border, +1 hint
+        let area = centred_rect(60, height, frame.area());
+        let hint_h = 1.min(area.height);
+        let body_h = area.height.saturating_sub(hint_h);
+        let body = Rect {
+            x: area.x,
+            y: area.y,
+            width: area.width,
+            height: body_h,
+        };
+        let hint = Rect {
+            x: area.x,
+            y: area.y + body_h,
+            width: area.width,
+            height: hint_h,
+        };
+
+        let body_lines: Vec<Line<'_>> = lines.iter().map(|s| Line::from(s.as_str())).collect();
+        let widget = Paragraph::new(body_lines)
+            .alignment(Alignment::Left)
+            .block(Block::default().borders(Borders::ALL).title(Self::TITLE));
+        frame.render_widget(widget, body);
+        if hint_h > 0 {
+            let hint_widget = Paragraph::new(Self::HINT)
+                .alignment(Alignment::Center)
+                .style(Style::default().fg(Color::DarkGray));
+            frame.render_widget(hint_widget, hint);
+        }
+    }
+
+    fn handle_input(&mut self, _ctx: &mut GameContext<'_>, input: Input) -> ScreenCommand {
+        match input {
+            // Hard-quit affordances — Q / Ctrl-C never get trapped.
+            Input::Char('q') | Input::Char('Q') | Input::Ctrl('c') => ScreenCommand::Quit,
+            // The same key that opens the modal also closes it (`p`/`P`),
+            // mirroring the `i` toggle on the inventory screen.
+            Input::Esc | Input::Backspace | Input::Char('p') | Input::Char('P') => {
+                ScreenCommand::Pop
+            }
+            _ => ScreenCommand::None,
+        }
     }
 }
 
@@ -833,6 +998,185 @@ mod tests {
             found.contains("smoking gun"),
             "expected win body in render; buffer was:\n{found}"
         );
+    }
+
+    // ---- ProfileScreen ------------------------------------------------
+
+    /// Build a [`FogletContext`] for the role-display tests. Local-dev
+    /// source so we don't depend on Foglet wire JSON, and a deterministic
+    /// handle so the buffer assertion below can pin the rendered string.
+    fn ctx_for_role(role: Option<&str>) -> FogletContext {
+        FogletContext {
+            door_id: "murder-motel".into(),
+            user_id: Some("u-test".into()),
+            username: Some("tester".into()),
+            role: role.map(|r| r.to_string()),
+            session_id: Some("s-test".into()),
+            terminal_width: 80,
+            terminal_height: 24,
+            source: foglet_game::ContextSource::LocalDev,
+        }
+    }
+
+    /// Render a [`ProfileScreen`] into a [`TestBackend`] and dump the
+    /// cell grid as a single string so callers can assert substrings.
+    fn render_profile_to_string(role: Option<&str>) -> String {
+        let cfg = fixture_config();
+        let fc = ctx_for_role(role);
+        let mut ctx = GameContext::new(&cfg, &fc, (80, 24));
+        let mut screen = ProfileScreen::from_foglet(&fc);
+        let mut term = Terminal::new(TestBackend::new(80, 24)).expect("test backend");
+        term.draw(|frame| screen.render(&mut ctx, frame))
+            .expect("draw");
+        let buf = term.backend().buffer().clone();
+        let mut found = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                found.push_str(buf.cell((x, y)).expect("cell").symbol());
+            }
+            found.push('\n');
+        }
+        found
+    }
+
+    #[test]
+    fn profile_sysop_context_shows_distinct_label_and_security() {
+        // `"sysop"` must surface the canonical label and the SPEC §4.5
+        // security level (100). The two values together prove the
+        // typed `FogletRole` mapping reached the modal.
+        let screen = ProfileScreen::from_foglet(&ctx_for_role(Some("sysop")));
+        assert_eq!(screen.role_label(), "sysop");
+        assert_eq!(screen.security_level(), 100);
+        let buf = render_profile_to_string(Some("sysop"));
+        assert!(buf.contains("sysop"), "missing sysop label; buffer:\n{buf}");
+        assert!(buf.contains("100"), "missing sysop level; buffer:\n{buf}");
+    }
+
+    #[test]
+    fn profile_mod_context_shows_distinct_label_and_security() {
+        let screen = ProfileScreen::from_foglet(&ctx_for_role(Some("mod")));
+        assert_eq!(screen.role_label(), "mod");
+        assert_eq!(screen.security_level(), 90);
+        let buf = render_profile_to_string(Some("mod"));
+        assert!(buf.contains("mod"), "missing mod label; buffer:\n{buf}");
+        assert!(buf.contains("90"), "missing mod level; buffer:\n{buf}");
+    }
+
+    #[test]
+    fn profile_user_context_shows_distinct_label_and_security() {
+        // Both an explicit `"user"` and a missing role must collapse to
+        // the user-level mapping (50). We test both spellings here so a
+        // future tweak to `FogletRole::parse` that forgets one branch
+        // surfaces against the same modal.
+        for role in [Some("user"), None] {
+            let screen = ProfileScreen::from_foglet(&ctx_for_role(role));
+            assert_eq!(screen.role_label(), "user", "role={role:?}");
+            assert_eq!(screen.security_level(), 50, "role={role:?}");
+        }
+        let buf = render_profile_to_string(Some("user"));
+        assert!(buf.contains("user"), "missing user label; buffer:\n{buf}");
+        assert!(buf.contains("50"), "missing user level; buffer:\n{buf}");
+    }
+
+    #[test]
+    fn profile_distinguishes_all_three_roles() {
+        // The three canonical roles must produce three distinct
+        // (label, level) pairs. This is the SPEC_v2 §Task 13h
+        // "synthetic contexts show distinct labels/security levels"
+        // proof, asserted at the level-pair granularity rather than
+        // through three independent buffers.
+        let triples: Vec<(String, i64)> = ["sysop", "mod", "user"]
+            .iter()
+            .map(|r| {
+                let s = ProfileScreen::from_foglet(&ctx_for_role(Some(r)));
+                (s.role_label().to_string(), s.security_level())
+            })
+            .collect();
+        assert_eq!(
+            triples,
+            vec![
+                ("sysop".into(), 100),
+                ("mod".into(), 90),
+                ("user".into(), 50),
+            ],
+        );
+    }
+
+    #[test]
+    fn profile_render_includes_advisory_disclaimer() {
+        // The screen MUST surface the in-game/advisory framing — the
+        // proof would be misleading otherwise (a sysop label rendered
+        // without the disclaimer reads as a real authorization
+        // signal). Check both halves of the wrapped sentence to lock
+        // in the framing without binding to incidental whitespace.
+        let buf = render_profile_to_string(Some("sysop"));
+        assert!(
+            buf.contains("Advisory only") && buf.contains("Foglet decides"),
+            "missing advisory framing; buffer was:\n{buf}"
+        );
+        assert!(
+            buf.contains("in-game flavor"),
+            "missing in-game flavor framing; buffer was:\n{buf}"
+        );
+    }
+
+    #[test]
+    fn profile_unknown_role_falls_back_to_label_with_user_security() {
+        // `FogletRole::Other` keeps the raw string for the label but
+        // collapses to user-level (50) for security — the modal must
+        // surface both faithfully (otherwise an unknown payload would
+        // silently appear sysop-coloured by accident).
+        let screen = ProfileScreen::from_foglet(&ctx_for_role(Some("ops")));
+        assert_eq!(screen.role_label(), "ops");
+        assert_eq!(screen.security_level(), 50);
+    }
+
+    #[test]
+    fn profile_anonymous_handle_falls_back_to_local_dev_label() {
+        // No Foglet username → the modal shows the documented sentinel
+        // rather than rendering a bare colon. The test pins the literal
+        // so a future refactor can't silently change what the player
+        // sees.
+        let mut fc = ctx_for_role(Some("user"));
+        fc.username = None;
+        let screen = ProfileScreen::from_foglet(&fc);
+        assert_eq!(screen.handle(), ProfileScreen::ANONYMOUS_HANDLE);
+    }
+
+    #[test]
+    fn profile_close_keys_pop() {
+        // Esc / Backspace / `p` / `P` all close the modal — the
+        // open-key-toggles-closed pattern shared with the inventory
+        // screen.
+        let cfg = fixture_config();
+        let fc = ctx_for_role(Some("sysop"));
+        let mut ctx = GameContext::new(&cfg, &fc, (80, 24));
+        for key in [
+            Input::Esc,
+            Input::Backspace,
+            Input::Char('p'),
+            Input::Char('P'),
+        ] {
+            let mut screen = ProfileScreen::from_foglet(&fc);
+            assert!(
+                matches!(screen.handle_input(&mut ctx, key), ScreenCommand::Pop),
+                "{key:?} should pop the profile screen"
+            );
+        }
+    }
+
+    #[test]
+    fn profile_quit_keys_quit() {
+        let cfg = fixture_config();
+        let fc = ctx_for_role(Some("sysop"));
+        let mut ctx = GameContext::new(&cfg, &fc, (80, 24));
+        for key in [Input::Char('q'), Input::Char('Q'), Input::Ctrl('c')] {
+            let mut screen = ProfileScreen::from_foglet(&fc);
+            assert!(
+                matches!(screen.handle_input(&mut ctx, key), ScreenCommand::Quit),
+                "{key:?} should quit the profile screen"
+            );
+        }
     }
 
     // ---- InventoryScreen ----------------------------------------------

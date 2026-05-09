@@ -12,7 +12,7 @@ use ratatui::Frame;
 
 use crate::layout::centred_rect;
 use crate::map::MapScreen;
-use crate::modals::{HelpScreen, LeaderboardScreen};
+use crate::modals::{HelpScreen, LeaderboardScreen, ProfileScreen};
 use crate::room_7::Room7Screen;
 use crate::state::SharedSlots;
 
@@ -108,6 +108,10 @@ enum MainMenuItem {
     /// list. Reachable from the menu so a player can check rank without
     /// first walking into the map screen.
     Leaderboard,
+    /// Push the [`ProfileScreen`] (SPEC_v2 §Task 13h). Surfaces the
+    /// player's role and security level from the Foglet context, with
+    /// copy that flags both as advisory in-game flavor.
+    Profile,
     /// Push the help/controls screen.
     Help,
     /// Exit the runtime.
@@ -122,8 +126,9 @@ impl MainMenuItem {
             0 => Some(Self::NewGame),
             1 => Some(Self::Continue),
             2 => Some(Self::Leaderboard),
-            3 => Some(Self::Help),
-            4 => Some(Self::Quit),
+            3 => Some(Self::Profile),
+            4 => Some(Self::Help),
+            5 => Some(Self::Quit),
             _ => None,
         }
     }
@@ -175,6 +180,10 @@ impl MainMenuItem {
             Self::Leaderboard => {
                 ScreenCommand::Push(Box::new(LeaderboardScreen::from_world_db(ctx.world_db)))
             }
+            // Snapshot the Foglet context at push time so the modal
+            // renders without re-reading the borrow-bag per frame
+            // (mirrors how Leaderboard/Bulletin freeze their data).
+            Self::Profile => ScreenCommand::Push(Box::new(ProfileScreen::from_context(ctx))),
             Self::Help => ScreenCommand::Push(Box::new(HelpScreen)),
             Self::Quit => ScreenCommand::Quit,
         }
@@ -208,7 +217,14 @@ impl MainMenuScreen {
     pub const TITLE: &'static str = "Main Menu";
     /// Order of menu items. Kept aligned with [`MainMenuItem`] so the
     /// row index can be cast straight to an item.
-    pub const ITEMS: [&'static str; 5] = ["New Game", "Continue", "Leaderboard", "Help", "Quit"];
+    pub const ITEMS: [&'static str; 6] = [
+        "New Game",
+        "Continue",
+        "Leaderboard",
+        "Profile",
+        "Help",
+        "Quit",
+    ];
 
     /// Build a menu with the cursor on `New Game` and freshly defaulted
     /// shared slots. Used by tests and by callers that don't need to
@@ -290,6 +306,11 @@ impl Screen for MainMenuScreen {
             Input::Char('l') | Input::Char('L') => {
                 MainMenuItem::Leaderboard.activate(ctx, &self.slots)
             }
+            // `p`/`P` jumps straight to the Profile modal — the
+            // first-letter shortcut every other row uses, kept here so
+            // a sysop checking their advisory metadata doesn't have to
+            // walk the cursor down the list first.
+            Input::Char('p') | Input::Char('P') => MainMenuItem::Profile.activate(ctx, &self.slots),
             Input::Char('h') | Input::Char('H') => MainMenuItem::Help.activate(ctx, &self.slots),
             Input::Char('q') | Input::Char('Q') | Input::Esc | Input::Ctrl('c') => {
                 ScreenCommand::Quit
@@ -445,7 +466,7 @@ mod tests {
         let fc = fixture_context();
         let mut ctx = GameContext::new(&cfg, &fc, (80, 24));
         let mut menu = MainMenuScreen::new();
-        menu.selected = 3; // Help (after the Leaderboard row added by 13f)
+        menu.selected = 4; // Help (after the Leaderboard + Profile inserts)
         let cmd = menu.handle_input(&mut ctx, Input::Enter);
         assert!(
             matches!(cmd, ScreenCommand::Push(_)),
@@ -459,7 +480,7 @@ mod tests {
         let fc = fixture_context();
         let mut ctx = GameContext::new(&cfg, &fc, (80, 24));
         let mut menu = MainMenuScreen::new();
-        menu.selected = 4; // Quit (last row after the Leaderboard insert)
+        menu.selected = 5; // Quit (last row after the Leaderboard + Profile inserts)
         assert!(matches!(
             menu.handle_input(&mut ctx, Input::Enter),
             ScreenCommand::Quit
@@ -515,6 +536,31 @@ mod tests {
             matches!(cmd, ScreenCommand::Push(_)),
             "Enter on Leaderboard must push the leaderboard screen, got {cmd:?}"
         );
+    }
+
+    #[test]
+    fn menu_enter_on_profile_pushes_profile_screen() {
+        // SPEC_v2 §Task 13h: Profile sits at index 3, between
+        // Leaderboard and Help. Pinning the position here also catches
+        // a future ITEMS reorder that forgot to update
+        // `MainMenuItem::from_index`.
+        let cfg = fixture_config();
+        let fc = fixture_context();
+        let mut ctx = GameContext::new(&cfg, &fc, (80, 24));
+        let mut menu = MainMenuScreen::new();
+        menu.selected = 3; // Profile
+        let cmd = menu.handle_input(&mut ctx, Input::Enter);
+        assert!(
+            matches!(cmd, ScreenCommand::Push(_)),
+            "Enter on Profile must push the profile screen, got {cmd:?}"
+        );
+    }
+
+    #[test]
+    fn menu_p_shortcut_pushes_profile_screen() {
+        // First-letter shortcut mirrors `l`/`h` on the other rows.
+        let (_, cmd) = dispatch_menu(Input::Char('p'));
+        assert!(matches!(cmd, ScreenCommand::Push(_)));
     }
 
     #[test]
