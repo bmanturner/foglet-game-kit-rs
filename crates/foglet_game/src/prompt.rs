@@ -964,32 +964,58 @@ impl<T> ChoicePrompt<T> {
     }
 }
 
-/// Format a single choice row in the SPEC §4.3 `(K) Label` style.
+/// Format a single choice row in the SPEC §4.3 / §4.2 styles.
 ///
-/// Char hotkeys render as their uppercase glyph between parentheses
-/// (SPEC §4.1: "canonical display keys SHOULD store as uppercase when
-/// rendered"). The exotic `Enter`/`Esc` choice keys — legal at the
-/// data level (see `validate_choices_treats_enter_and_esc_…`) but
-/// uncommon — render as their human-readable name so the marker still
-/// communicates the binding.
+/// Two visual shapes share this helper because every choice row carries
+/// the same label/hint pipeline; only the leader and bracket glyphs
+/// change with the choice's `enabled` flag:
+///
+/// - **Enabled** (SPEC §4.3): `(K) Label`. Hotkey in parentheses,
+///   uppercased per SPEC §4.1's display rule.
+/// - **Disabled** (SPEC §4.2): `- [K] Label (reason)`. Leading `- `
+///   plus square brackets are the *monochrome* visual difference the
+///   SPEC requires — the row stays distinguishable from enabled rows
+///   even when the renderer is theme-stripped (Task 5f) or running on
+///   a strictly monochrome BBS terminal where the eventual
+///   `StyleRole::Disabled` dim style is invisible. The trailing
+///   `(reason)` annotation comes straight from
+///   `PromptChoice::disabled_reason` so the player sees *why* the row
+///   is unavailable without the game having to render a separate
+///   feedback line just to explain it.
+///
+/// The exotic `Enter`/`Esc` choice keys — legal at the data level (see
+/// `validate_choices_treats_enter_and_esc_…`) but uncommon — render as
+/// their human-readable name so the marker still communicates the
+/// binding under either bracket style.
 ///
 /// Hint text is appended after a two-space gutter so dynamic
 /// annotations like `"50g"` or `"0/26"` (SPEC §5 vendor example) sit
-/// alongside the label without a separate column. Disabled-reason
-/// formatting is intentionally minimal here — Task 5c will replace the
-/// trailing `(reason)` annotation with the SPEC §4.2 monochrome marker
-/// (`- [M] Mana potions … (full)`); for Task 5b the inline form keeps
-/// the reason visible without panicking on prompts that already carry
-/// disabled rows.
+/// alongside the label without a separate column, regardless of
+/// enabled state — disabled rows still benefit from the gold/capacity
+/// hint sitting between the label and the trailing `(reason)`.
 fn format_choice_row<T>(choice: &PromptChoice<T>) -> String {
-    let mut row = format!("({}) {}", marker_glyph(&choice.key), choice.label);
+    // Lead with the SPEC §4.2 disabled marker only when the row is
+    // actually disabled — keeping the enabled path's first character a
+    // `(` so the existing SPEC §4.3 reference rendering still passes
+    // its byte-for-byte test (no leading whitespace surprises an
+    // operator scanning a screenshot).
+    let mut row = if choice.enabled {
+        format!("({}) {}", marker_glyph(&choice.key), choice.label)
+    } else {
+        format!("- [{}] {}", marker_glyph(&choice.key), choice.label)
+    };
     if let Some(hint) = choice.hint.as_deref() {
         row.push_str("  ");
         row.push_str(hint);
     }
     if !choice.enabled {
         if let Some(reason) = choice.disabled_reason.as_deref() {
-            row.push_str("  (");
+            // Single space before the parenthesised reason matches
+            // SPEC §4.2's reference example `- [M] Mana potions ...
+            // (full)` exactly; using two spaces here would visibly
+            // drift the reason out of column alignment with the SPEC
+            // and break authors who paste the example into a manifest.
+            row.push_str(" (");
             row.push_str(reason);
             row.push(')');
         }
@@ -3070,5 +3096,128 @@ mod tests {
             assert!(row.chars().count() <= 20, "row {row:?} exceeds width 20");
         }
         assert_eq!(rows.last().map(String::as_str), Some("Your choice:"));
+    }
+
+    // ---- Task 5c: disabled-row monochrome marker ----
+    //
+    // The visible difference between an enabled and a disabled row
+    // MUST survive in a strictly monochrome terminal — SPEC §4.2's
+    // contract — so these tests assert *characters*, never style. The
+    // bracket flip (`(K)` → `[K]`) plus the `- ` leader plus the
+    // trailing `(reason)` are the three carriers of meaning the SPEC
+    // example `- [M] Mana potions ... (full)` puts on screen.
+
+    #[test]
+    fn rendered_lines_marks_disabled_choice_with_monochrome_marker_and_reason() {
+        // SPEC §4.2 reference example. The wandering-monk row from
+        // SPEC §5 is the canonical disabled-with-reason rendering and
+        // is the precise shape this checklist item gates on.
+        let prompt: ChoicePrompt<LootAction> = ChoicePrompt::new()
+            .choice('m', LootAction::Equip, "Mana potions")
+            .disabled_if(true, "full");
+        let rows = prompt.rendered_lines(60);
+        assert_eq!(rows[0], "- [M] Mana potions (full)");
+    }
+
+    #[test]
+    fn rendered_lines_disabled_without_reason_still_carries_marker() {
+        // Disabled-reason is optional at the data layer (`enabled =
+        // false` with no reason is legal — see `PromptChoice::new`).
+        // The leader + bracket flip MUST still distinguish the row,
+        // because that is the only mono-visible signal left when the
+        // reason is absent.
+        let prompt: ChoicePrompt<LootAction> =
+            ChoicePrompt::new().choice('e', LootAction::Equip, "Equip");
+        // Hand-craft via the builder's disabled flag without a reason
+        // by bypassing `disabled_if` — the builder sets reason every
+        // time, but `with_disabled_reason` is independent of `enabled`.
+        // We mutate the choice directly to pin the no-reason path.
+        let mut prompt = prompt;
+        prompt.choices[0].enabled = false;
+        let rows = prompt.rendered_lines(40);
+        assert_eq!(rows[0], "- [E] Equip");
+    }
+
+    #[test]
+    fn rendered_lines_mixes_enabled_and_disabled_rows_distinctly() {
+        // Two rows side-by-side prove the marker carries differential
+        // meaning, not just a global cosmetic change. `(E) Equip` vs
+        // `- [T] Take (bag full)` is the visual the player sees in
+        // a Murder Motel loot drawer with one slot occupied.
+        let prompt: ChoicePrompt<LootAction> = ChoicePrompt::new()
+            .choice('e', LootAction::Equip, "Equip")
+            .choice('t', LootAction::Take, "Take")
+            .disabled_if(true, "bag full");
+        let rows = prompt.rendered_lines(60);
+        assert_eq!(rows[0], "(E) Equip");
+        assert_eq!(rows[1], "- [T] Take (bag full)");
+    }
+
+    #[test]
+    fn rendered_lines_disabled_row_keeps_hint_between_label_and_reason() {
+        // Vendor-style rows carry a price/capacity hint AND, when the
+        // player cannot afford the row, a disabled reason. Both must
+        // remain visible: hint annotates *what* the option would do,
+        // reason annotates *why* it is unavailable, and the SPEC §5
+        // wandering monk is the prototype prompt that wants both.
+        let mut prompt: ChoicePrompt<LootAction> = ChoicePrompt::new()
+            .choice('m', LootAction::Equip, "Mana potions")
+            .disabled_if(true, "need 50g");
+        prompt.choices[0].hint = Some("174g".to_string());
+        let rows = prompt.rendered_lines(60);
+        // The wrapper collapses internal whitespace runs to a single
+        // space (see `wrap_line_into`), so the two-space gutter that
+        // `format_choice_row` writes between label and hint shows up
+        // as one space in the rendered row. The contract this test
+        // pins is the *order*: label, then hint, then `(reason)`.
+        assert_eq!(rows[0], "- [M] Mana potions 174g (need 50g)");
+    }
+
+    #[test]
+    fn rendered_lines_matches_spec_5_wandering_monk_disabled_row() {
+        // SPEC §5: the wandering-monk vendor prompt carries a
+        // `disabled_if(!can_buy, ...)` row plus an enabled "no thanks"
+        // out. Pinning the full rendering shape here protects future
+        // edits to `format_choice_row` from quietly changing what
+        // authors see when they paste the SPEC example into their
+        // game.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        enum ShopAction {
+            BuyMana,
+            NoThanks,
+        }
+        let prompt: ChoicePrompt<ShopAction> = ChoicePrompt::new()
+            .body("A wandering monk approaches after the battle...")
+            .choice('m', ShopAction::BuyMana, "Mana potions")
+            .disabled_if(true, "not enough gold or potion bag is full")
+            .choice('n', ShopAction::NoThanks, "No thanks")
+            .footer("Your gold: 32g");
+        let rows = prompt.rendered_lines(80);
+        assert_eq!(
+            rows,
+            vec![
+                "A wandering monk approaches after the battle...".to_string(),
+                String::new(),
+                "- [M] Mana potions (not enough gold or potion bag is full)".to_string(),
+                "(N) No thanks".to_string(),
+                String::new(),
+                "Your gold: 32g".to_string(),
+                String::new(),
+                "Your choice:".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn render_writes_disabled_marker_under_test_backend() {
+        // SPEC §6: deterministic under TestBackend, including the
+        // disabled marker. Drives the full `render` path so a buffer
+        // indexing bug surfaces against the visible characters, not
+        // just the helper that builds the row strings.
+        let prompt: ChoicePrompt<LootAction> = ChoicePrompt::new()
+            .choice('m', LootAction::Equip, "Mana potions")
+            .disabled_if(true, "full");
+        let rows = render_prompt_to_strings(&prompt, 40, 4);
+        assert_eq!(rows[0], "- [M] Mana potions (full)");
     }
 }
