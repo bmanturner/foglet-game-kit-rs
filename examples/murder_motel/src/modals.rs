@@ -169,18 +169,29 @@ impl InventoryScreen {
 
     /// Display labels for each currently held item, in catalog order.
     ///
-    /// Walks the static [`MapScreen::ITEMS`] catalog rather than
-    /// iterating the set directly so the UI order is stable and
-    /// independent of insertion order. Tests use this to assert
-    /// "exactly the picked-up items appear, with their canonical
-    /// names" without going through a `Frame`.
+    /// Walks two sources, in this order:
+    ///
+    /// 1. [`MapScreen::ITEMS`] — the on-map collectables picked up via
+    ///    `try_move`.
+    /// 2. [`MapScreen::EXTRA_INVENTORY_ITEMS`] — items granted by
+    ///    prompts (the Lost-and-Found Drawer's Room 7 key) that have
+    ///    no map cell and so wouldn't appear on the first list.
+    ///
+    /// Both sources are walked in declaration order so the UI listing
+    /// is stable and independent of insertion order. IDs in the
+    /// inventory set without a match in either catalog are silently
+    /// skipped — a forward-compat no-op for stale save IDs.
     pub fn current_labels(&self) -> Vec<String> {
         let held = self.inventory.borrow();
-        MapScreen::ITEMS
+        let from_map = MapScreen::ITEMS
             .iter()
             .filter(|item| held.contains(item.id))
-            .map(|item| item.name.to_string())
-            .collect()
+            .map(|item| item.name.to_string());
+        let from_extras = MapScreen::EXTRA_INVENTORY_ITEMS
+            .iter()
+            .filter(|(id, _)| held.contains(*id))
+            .map(|(_, name)| name.to_string());
+        from_map.chain(from_extras).collect()
     }
 }
 
@@ -485,6 +496,41 @@ mod tests {
         assert!(
             screen.current_labels().is_empty(),
             "unknown IDs must be silently ignored"
+        );
+    }
+
+    #[test]
+    fn inventory_lists_room_7_key_from_extras_catalog() {
+        // Regression for the user-reported bug "took the room 7 key
+        // from the drawer but it never appeared in inventory." The
+        // ID lives in `EXTRA_INVENTORY_ITEMS`, not the map-cell
+        // catalog, so the screen has to walk both sources.
+        let inv = Rc::new(RefCell::new(BTreeSet::new()));
+        inv.borrow_mut()
+            .insert(MapScreen::ROOM_7_KEY_ID.to_string());
+        let screen = InventoryScreen::new(Rc::clone(&inv));
+        assert_eq!(
+            screen.current_labels(),
+            vec!["Room 7 key".to_string()],
+            "drawer-granted Room 7 key must surface in the inventory list"
+        );
+    }
+
+    #[test]
+    fn inventory_orders_map_items_before_extras() {
+        // Ordering contract: map-cell items appear in catalog order
+        // first, then the extras. Prevents a future re-author of the
+        // drawer key's position in `EXTRA_INVENTORY_ITEMS` from
+        // accidentally pushing the brass key down the list.
+        let inv = Rc::new(RefCell::new(BTreeSet::new()));
+        inv.borrow_mut().insert("brass_key".to_string());
+        inv.borrow_mut()
+            .insert(MapScreen::ROOM_7_KEY_ID.to_string());
+        let screen = InventoryScreen::new(Rc::clone(&inv));
+        assert_eq!(
+            screen.current_labels(),
+            vec!["Brass key".to_string(), "Room 7 key".to_string()],
+            "map-cell items must list before extras-catalog entries"
         );
     }
 

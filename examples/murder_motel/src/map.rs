@@ -342,8 +342,22 @@ impl MapScreen {
     /// two collectables can co-exist in `SharedSlots::inventory` and
     /// be queried independently. Lives outside [`Self::ITEMS`] because
     /// the v1.1 proof scene grants it through a prompt rather than a
-    /// map cell — there is no glyph or coordinate to record.
+    /// map cell — there is no glyph or coordinate to record. Surfaced
+    /// in the inventory display via [`Self::EXTRA_INVENTORY_ITEMS`].
     pub const ROOM_7_KEY_ID: &'static str = "room_7_key";
+
+    /// `(id, display name)` pairs for inventory entries that are NOT
+    /// part of [`Self::ITEMS`] — i.e. items granted by prompts rather
+    /// than picked up off the map. The Lost-and-Found Drawer hands the
+    /// player [`Self::ROOM_7_KEY_ID`] without a corresponding map
+    /// cell; without an entry here it would land in the inventory set
+    /// but render as nothing, which is exactly the bug a player sees
+    /// when they take the key from the drawer and the `Inventory`
+    /// modal stays empty. Sequenced after the map-pickup catalog so a
+    /// drawer-granted key sorts beneath the cigarette case the player
+    /// already picked up earlier.
+    pub const EXTRA_INVENTORY_ITEMS: &'static [(&'static str, &'static str)] =
+        &[(Self::ROOM_7_KEY_ID, "Room 7 key")];
 
     /// Inventory id for the cracked matchbook offered by the
     /// Lost-and-Found Drawer prompt. Re-uses the existing catalog id
@@ -514,11 +528,23 @@ impl MapScreen {
         // same frame the inventory grows. Items aren't blocking — a
         // stranded item under foot would otherwise trap the player
         // until they pressed Enter, which is the wrong feel here.
+        //
+        // `BTreeSet::insert` returns `true` only when the value was
+        // newly added; gating the feedback line on it means a step
+        // back through an already-collected cell (the glyph is gone
+        // but the cell still walkable) does NOT re-narrate the pick-
+        // up — only the moment the inventory actually grew.
         if let Some(item) = Self::item_at(target_x, target_y) {
-            self.slots
+            let newly_added = self
+                .slots
                 .inventory
                 .borrow_mut()
                 .insert(item.id.to_string());
+            if newly_added {
+                *self.slots.feedback.borrow_mut() = Some(
+                    foglet_game::FeedbackLine::success(format!("Picked up {}.", item.name)),
+                );
+            }
         }
         true
     }
@@ -1709,6 +1735,110 @@ pub(crate) mod tests {
         assert!(
             matches!(cmd, ScreenCommand::Push(_)),
             "`i` must push the inventory screen, got {cmd:?}"
+        );
+    }
+
+    #[test]
+    fn map_pickup_emits_feedback_line() {
+        // Without a feedback line on map-item pickup the player has no
+        // signal that the brass key landed in their pocket — the glyph
+        // disappears under the player's `@` and silence follows. Pin
+        // the feedback contract so a future try_move refactor doesn't
+        // silently drop the cue.
+        let cfg = fixture_config();
+        let fc = fixture_context();
+        let mut ctx = GameContext::new(&cfg, &fc, (80, 24));
+        let mut map = fresh_map_screen();
+        // Brass key sits at (6, 5) — the only collectable in Room 1.
+        walk_to(&mut map, &mut ctx, 6, 5);
+        let feedback = map
+            .slots()
+            .feedback
+            .borrow()
+            .clone()
+            .expect("pickup must populate the feedback slot");
+        assert_eq!(
+            feedback.rendered_text(),
+            "+ Picked up Brass key.",
+            "feedback line must name the item just collected (FeedbackLine::success renders with a `+ ` marker)"
+        );
+    }
+
+    #[test]
+    fn map_pickup_does_not_re_emit_feedback_on_revisit() {
+        // Feedback fires only when the inventory actually grows. A
+        // player who walks onto the cell, leaves, and walks back must
+        // not re-narrate the pickup — the cell is empty and the line
+        // would be a lie.
+        let cfg = fixture_config();
+        let fc = fixture_context();
+        let mut ctx = GameContext::new(&cfg, &fc, (80, 24));
+        let mut map = fresh_map_screen();
+        walk_to(&mut map, &mut ctx, 6, 5);
+        // Stomp the feedback slot to a sentinel so we can detect
+        // whether the second pass overwrites it.
+        *map.slots().feedback.borrow_mut() =
+            Some(foglet_game::FeedbackLine::info("sentinel"));
+        // Step off then back onto the now-empty cell.
+        map.handle_input(&mut ctx, Input::Up);
+        map.handle_input(&mut ctx, Input::Down);
+        let feedback = map
+            .slots()
+            .feedback
+            .borrow()
+            .clone()
+            .expect("sentinel should still be present");
+        assert_eq!(
+            feedback.rendered_text(),
+            "sentinel",
+            "revisiting an emptied cell must not overwrite feedback"
+        );
+    }
+
+    #[test]
+    fn end_to_end_brass_key_pickup_unlocks_door_and_renders_in_inventory() {
+        // Reproduction for the user-reported bug "I picked up the
+        // brass key but the door didn't unlock and the inventory
+        // screen was empty." Drives the full pickup → inventory
+        // round-trip through the same input pump real gameplay uses,
+        // so any regression that bypasses `walk_to`'s direct insertion
+        // would surface here.
+        use crate::modals::InventoryScreen;
+        let cfg = fixture_config();
+        let fc = fixture_context();
+        let mut ctx = GameContext::new(&cfg, &fc, (80, 24));
+        let mut map = fresh_map_screen();
+
+        // Walk to the brass-key cell at (6, 5) using only the public
+        // input dispatcher. `walk_to` routes through `handle_input`,
+        // matching the runtime path.
+        walk_to(&mut map, &mut ctx, 6, 5);
+        assert_eq!(map.player(), (6, 5), "player should reach the key cell");
+        assert!(
+            map.is_collected(MapScreen::LOCKED_DOOR_KEY_ID),
+            "stepping onto the brass-key cell must add it to inventory"
+        );
+        assert!(
+            map.has_locked_door_key(),
+            "has_locked_door_key() must reflect the inventory state"
+        );
+
+        // Open the inventory screen with the same Rc handle the lobby
+        // uses and confirm the label list includes the brass key.
+        let inv_screen = InventoryScreen::new(map.inventory());
+        let labels = inv_screen.current_labels();
+        assert!(
+            labels.iter().any(|l| l == "Brass key"),
+            "Brass key must appear in the inventory list; got {labels:?}"
+        );
+
+        // Walk back east through the locked door and confirm the gate
+        // dropped — the player must reach a cell east of x=36.
+        walk_to(&mut map, &mut ctx, 39, 5);
+        assert_eq!(
+            map.player(),
+            (39, 5),
+            "with brass key in hand the locked door must let the player through"
         );
     }
 
