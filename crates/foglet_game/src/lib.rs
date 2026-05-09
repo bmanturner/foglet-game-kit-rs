@@ -36,6 +36,7 @@ pub mod dialog;
 pub mod events;
 pub mod foglet;
 pub mod input;
+pub mod leaderboards;
 pub mod manifest;
 pub mod map;
 pub mod players;
@@ -64,6 +65,7 @@ pub use foglet::{
     process_env, synthesize_local_dev, ContextError, ContextSource, FogletContext, LoadOptions,
 };
 pub use input::{from_event, from_key_event, Input};
+pub use leaderboards::LEADERBOARD_SCORES_MIGRATION;
 pub use manifest::{
     FogletManifest, ManifestError, ManifestInputs, DEFAULT_AUTH_SCOPE, DEFAULT_IDLE_TIMEOUT_MS,
     DEFAULT_TIMEOUT_MS, DEFAULT_VISIBILITY, RUNTIME_EXTERNAL_PTY,
