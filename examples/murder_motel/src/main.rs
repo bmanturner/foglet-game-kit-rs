@@ -36,9 +36,9 @@ use std::rc::Rc;
 
 use foglet_game::{
     load_context, load_dialog, parse_map, process_env, read_save, render_inventory_list,
-    render_menu_list, resolve_save_path, write_atomic, ChoicePrompt, Dialog, DialogState, FlagSet,
-    Game, GameConfig, GameContext, Input, InventoryList, Map, MenuList, SavePathInputs, Screen,
-    ScreenCommand, TileLegend,
+    render_menu_list, resolve_save_path, write_atomic, ChoicePrompt, Dialog, DialogState,
+    FeedbackLine, FlagSet, Game, GameConfig, GameContext, Input, InventoryList, Map, MenuList,
+    SavePathInputs, Screen, ScreenCommand, TileLegend,
 };
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -1277,6 +1277,53 @@ pub fn apply_lost_and_found_choice(
             LostAndFoundOutcome::ReadReceipt
         }
         LostAndFoundChoice::Leave => LostAndFoundOutcome::Left,
+    }
+}
+
+/// Player-facing line emitted after a successful `(K)` press
+/// (SPEC_v1_1.md §9 step 5). Centralised so the renderer, the test that
+/// pins the contract, and any future transcript log share one source.
+pub const TOOK_ROOM_7_KEY_FEEDBACK: &str = "Moved Room 7 key to inventory.";
+
+/// Player-facing line emitted after pocketing the cracked matchbook.
+/// Mirrors the SPEC §9 step 5 sample format ("Moved X to inventory.")
+/// while staying narratively distinct so the player can tell which
+/// `(M)` press just registered.
+pub const POCKETED_MATCHBOOK_FEEDBACK: &str = "Pocketed the cracked matchbook.";
+
+/// Player-facing line emitted when the player reads the receipt.
+///
+/// SPEC §9 step 5 only pins the post-action *shape*, not the receipt's
+/// wording, so the body lives here as a deliberate copy hook: the
+/// receipt is what unlocks the `receipt_read` flag's downstream value
+/// (J.M. initials, 23:47 timestamp, cash payment) without forcing the
+/// player to memorise it from the prompt.
+pub const READ_RECEIPT_FEEDBACK: &str =
+    "Receipt: Room 7, paid cash at 23:47 last night. Signed \"J.M.\"";
+
+/// Map a [`LostAndFoundOutcome`] to the player-facing feedback line the
+/// scene should display next (SPEC_v1_1.md §9 step 5, Task 10e).
+///
+/// Returns `None` for [`LostAndFoundOutcome::Left`] because walking away
+/// is a deliberate "no narration" path: we do not want a confirmation
+/// message implying the drawer remembered the player's hesitation.
+/// Every other variant emits a `FeedbackLine` so the caller can drop it
+/// straight into the runtime feedback slot without re-matching the
+/// outcome.
+///
+/// All three messages use [`FeedbackLine::info`] rather than `success`:
+/// the loot prompt is descriptive narration, not a transactional win,
+/// and the SPEC §9 step 5 sample shows no leading marker. The
+/// `success` style is reserved for the night-clerk vendor (Task 11)
+/// where a coffee purchase reads as an unambiguous positive outcome.
+pub fn lost_and_found_feedback(outcome: LostAndFoundOutcome) -> Option<FeedbackLine> {
+    match outcome {
+        LostAndFoundOutcome::TookRoom7Key => Some(FeedbackLine::info(TOOK_ROOM_7_KEY_FEEDBACK)),
+        LostAndFoundOutcome::PocketedMatchbook => {
+            Some(FeedbackLine::info(POCKETED_MATCHBOOK_FEEDBACK))
+        }
+        LostAndFoundOutcome::ReadReceipt => Some(FeedbackLine::info(READ_RECEIPT_FEEDBACK)),
+        LostAndFoundOutcome::Left => None,
     }
 }
 
@@ -4095,6 +4142,83 @@ mod tests {
             count, 1,
             "Room 7 key must not be duplicated by a disabled press"
         );
+    }
+
+    // ---- Lost-and-Found Drawer feedback messages (SPEC §9 Task 10e) ----
+
+    #[test]
+    fn lost_and_found_feedback_messages_match_spec_strings() {
+        // SPEC §9 step 5 pins the take-key wording verbatim. The
+        // matchbook and receipt strings live in the example, but Task
+        // 10e calls them out by name in the checklist; pin all three so
+        // a copy edit forces an explicit checklist update.
+        assert_eq!(TOOK_ROOM_7_KEY_FEEDBACK, "Moved Room 7 key to inventory.");
+        assert_eq!(
+            POCKETED_MATCHBOOK_FEEDBACK,
+            "Pocketed the cracked matchbook."
+        );
+        assert!(
+            READ_RECEIPT_FEEDBACK.contains("Room 7"),
+            "receipt feedback should mention Room 7 to reward the read"
+        );
+    }
+
+    #[test]
+    fn lost_and_found_feedback_take_key_emits_take_message() {
+        // Action handler returns `TookRoom7Key`; the feedback mapper
+        // MUST surface the SPEC §9 step 5 line. Using `rendered_text`
+        // also pins the absence of a leading marker (Info kind).
+        let line = lost_and_found_feedback(LostAndFoundOutcome::TookRoom7Key)
+            .expect("TookRoom7Key must emit a feedback line");
+        assert_eq!(line.text(), TOOK_ROOM_7_KEY_FEEDBACK);
+        assert_eq!(line.rendered_text(), TOOK_ROOM_7_KEY_FEEDBACK);
+    }
+
+    #[test]
+    fn lost_and_found_feedback_pocket_matchbook_emits_pocket_message() {
+        let line = lost_and_found_feedback(LostAndFoundOutcome::PocketedMatchbook)
+            .expect("PocketedMatchbook must emit a feedback line");
+        assert_eq!(line.text(), POCKETED_MATCHBOOK_FEEDBACK);
+    }
+
+    #[test]
+    fn lost_and_found_feedback_read_receipt_emits_receipt_text() {
+        let line = lost_and_found_feedback(LostAndFoundOutcome::ReadReceipt)
+            .expect("ReadReceipt must emit a feedback line");
+        assert_eq!(line.text(), READ_RECEIPT_FEEDBACK);
+    }
+
+    #[test]
+    fn lost_and_found_feedback_leave_emits_no_message() {
+        // Walking away is intentionally silent; emitting a "You walked
+        // away." line would imply state mutation the (L) branch
+        // explicitly avoids (Task 10e doc + Task 10c noop guarantee).
+        assert!(lost_and_found_feedback(LostAndFoundOutcome::Left).is_none());
+    }
+
+    #[test]
+    fn lost_and_found_feedback_pairs_with_apply_outcome_end_to_end() {
+        // End-to-end pin: apply each enabled choice against a fresh
+        // SharedSlots, feed the outcome through the feedback mapper,
+        // and assert the resulting text. Catches regressions where
+        // `apply_lost_and_found_choice` and `lost_and_found_feedback`
+        // drift apart on the variant->message contract.
+        let cases = [
+            (LostAndFoundChoice::TakeRoom7Key, TOOK_ROOM_7_KEY_FEEDBACK),
+            (
+                LostAndFoundChoice::PocketMatchbook,
+                POCKETED_MATCHBOOK_FEEDBACK,
+            ),
+            (LostAndFoundChoice::ReadReceipt, READ_RECEIPT_FEEDBACK),
+        ];
+        for (choice, expected) in cases {
+            let slots = SharedSlots::default();
+            slots.reset(0, 0);
+            let outcome = apply_lost_and_found_choice(&slots, choice);
+            let line = lost_and_found_feedback(outcome)
+                .unwrap_or_else(|| panic!("{choice:?} should produce feedback"));
+            assert_eq!(line.text(), expected, "feedback drift for {choice:?}");
+        }
     }
 
     #[test]
