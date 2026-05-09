@@ -65,6 +65,7 @@
 use crate::Input;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::widgets::{Block, Borders, Widget};
 
 /// Normalized direct-input key for prompts (SPEC_v1_1.md §4.1).
@@ -188,6 +189,165 @@ pub enum StyleRole {
     Disabled,
     /// Highlighted hotkey character inside a choice marker like `(E)`.
     Hotkey,
+}
+
+/// Mapping from semantic [`StyleRole`] to a concrete Ratatui [`Style`]
+/// (SPEC_v1_1.md §4.7).
+///
+/// Prompts carry roles, not raw styling — see [`StyleRole`] for the why.
+/// `Theme` is the layer that resolves a role into the [`Style`] the
+/// renderer hands to Ratatui. Splitting the data (role) from the
+/// presentation (theme) is what lets a game (or, in the future, an
+/// operator config) re-skin every prompt without re-walking the prompt
+/// tree.
+///
+/// # Default theme contract
+///
+/// SPEC §4.7 requires that "the default theme MUST be readable on
+/// black/white terminals" and that "color MUST NOT be the only carrier
+/// of meaning". The defaults below honour both:
+///
+/// - Every "loud" role (`Title`, `Emphasis`, `Hotkey`, `Error`) carries
+///   a [`Modifier`] so the role survives a monochrome terminal.
+/// - Color choices follow ANSI conventions a BBS operator will
+///   recognise (red/error, green/success, yellow/currency, cyan/hotkey)
+///   so a colored terminal communicates *the same thing* the modifier
+///   already says.
+/// - `Disabled` and `Muted` use `Modifier::DIM` only — the disabled-row
+///   visual difference is already carried by the `- [K] Label (reason)`
+///   marker shape in the choice-row formatter, so the dim is a *bonus*,
+///   not a load-bearing signal.
+///
+/// # Overriding
+///
+/// `Theme` derefs each role lookup through [`Theme::style`]. To swap a
+/// single role, build off the default with [`Theme::with_role`]:
+///
+/// ```ignore
+/// use foglet_game::{StyleRole, prompt::Theme};
+/// use ratatui::style::{Color, Modifier, Style};
+/// let theme = Theme::default()
+///     .with_role(StyleRole::Hotkey, Style::default().fg(Color::Magenta));
+/// ```
+///
+/// The renderer integration is layered: today this type is a standalone
+/// mapping unit-tested for deterministic field values. Wiring the theme
+/// into [`ChoicePrompt::render`] / [`TextBlock::render`] happens once
+/// the choice-row spans need per-segment styling (Task 6d feedback line
+/// helper is the natural caller).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Theme {
+    // Storing one Style per variant in declaration order keeps the
+    // resolver branch-light (the match below compiles to a fixed
+    // index) and makes `with_role` a single field assignment. A
+    // `HashMap<StyleRole, Style>` would also work but adds an alloc
+    // and a hash on every lookup for no functional gain — there are
+    // ten roles and the set is closed.
+    normal: Style,
+    title: Style,
+    emphasis: Style,
+    muted: Style,
+    hint: Style,
+    error: Style,
+    success: Style,
+    currency: Style,
+    disabled: Style,
+    hotkey: Style,
+}
+
+impl Theme {
+    /// Resolve a role to its [`Style`] under this theme.
+    ///
+    /// `Copy` return because [`Style`] is itself `Copy` and the
+    /// renderer wants to compose multiple roles into one `Style`
+    /// without dragging a borrow around.
+    pub fn style(&self, role: StyleRole) -> Style {
+        match role {
+            StyleRole::Normal => self.normal,
+            StyleRole::Title => self.title,
+            StyleRole::Emphasis => self.emphasis,
+            StyleRole::Muted => self.muted,
+            StyleRole::Hint => self.hint,
+            StyleRole::Error => self.error,
+            StyleRole::Success => self.success,
+            StyleRole::Currency => self.currency,
+            StyleRole::Disabled => self.disabled,
+            StyleRole::Hotkey => self.hotkey,
+        }
+    }
+
+    /// Replace the [`Style`] mapped to `role`. Returns the modified
+    /// theme so calls chain off [`Theme::default`].
+    pub fn with_role(mut self, role: StyleRole, style: Style) -> Self {
+        match role {
+            StyleRole::Normal => self.normal = style,
+            StyleRole::Title => self.title = style,
+            StyleRole::Emphasis => self.emphasis = style,
+            StyleRole::Muted => self.muted = style,
+            StyleRole::Hint => self.hint = style,
+            StyleRole::Error => self.error = style,
+            StyleRole::Success => self.success = style,
+            StyleRole::Currency => self.currency = style,
+            StyleRole::Disabled => self.disabled = style,
+            StyleRole::Hotkey => self.hotkey = style,
+        }
+        self
+    }
+}
+
+impl Default for Theme {
+    /// SPEC §4.7-compliant default mapping. See the type-level docs for
+    /// the rationale behind each role's modifier and color pick.
+    fn default() -> Self {
+        Self {
+            // Plain body text. No modifier and no color so a TUI host
+            // that never overrides theming still gets the terminal's
+            // own foreground — the same behaviour the prompt renderer
+            // had before Task 5f.
+            normal: Style::default(),
+            // BOLD makes titles stand out in monochrome; no color so
+            // the title sits in the terminal's foreground unless a
+            // game opts into a tint via `with_role`.
+            title: Style::default().add_modifier(Modifier::BOLD),
+            // BOLD is the SPEC's "loud but not error-loud" carrier.
+            emphasis: Style::default().add_modifier(Modifier::BOLD),
+            // DIM is universally understood as secondary text on
+            // black/white terminals; pairs with the `Hint` role for
+            // inline footnotes.
+            muted: Style::default().add_modifier(Modifier::DIM),
+            // Same DIM as `Muted` by default — hints are semantically a
+            // narrower role, but the SPEC calls for the same visual
+            // weight ("footnote-style"). Splitting them as separate
+            // fields lets a game push them apart without breaking the
+            // default behaviour.
+            hint: Style::default().add_modifier(Modifier::DIM),
+            // Error: red foreground PLUS bold so a monochrome terminal
+            // still reads "loud" even though it cannot show the red.
+            // SPEC §4.7's "color MUST NOT be the only carrier" test.
+            error: Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            // Success: green is the universal positive signal; no
+            // modifier because the surrounding success-feedback line
+            // (Task 6d) carries its own marker prefix.
+            success: Style::default().fg(Color::Green),
+            // Currency: yellow tracks the BBS convention of gold/coin
+            // text being yellow; the value still reads correctly when
+            // color is stripped because the label itself spells it out
+            // (`"50g"`).
+            currency: Style::default().fg(Color::Yellow),
+            // Disabled rows already carry the `- [K] ...` marker shape
+            // (SPEC §4.2) — the DIM here is supplementary. No color so
+            // a terminal that maps DIM to gray still leaves the row
+            // legible against a dark background.
+            disabled: Style::default().add_modifier(Modifier::DIM),
+            // Hotkey: cyan is the historical BBS color for action
+            // keys; BOLD is the monochrome carrier so the `(E)` marker
+            // visibly differs from surrounding label text even with
+            // color stripped.
+            hotkey: Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        }
+    }
 }
 
 /// One selectable option inside a `ChoicePrompt` (SPEC_v1_1.md §4.2).
@@ -3783,6 +3943,123 @@ mod tests {
         assert_eq!(chars.last(), Some(&'┐'));
         for (i, c) in chars.iter().enumerate().skip(1).take(chars.len() - 2) {
             assert_eq!(*c, '─', "expected unbroken top edge at index {i}, got {c}");
+        }
+    }
+
+    // ---- Task 5f: Theme / role-to-Style mapping -------------------------
+
+    #[test]
+    fn default_theme_hotkey_role_is_bold_cyan() {
+        // SPEC §4.7: hotkey markers MUST stay legible without color.
+        // BOLD is the monochrome carrier; cyan is the BBS-traditional
+        // action-key tint that gets stripped on monochrome terminals.
+        let style = Theme::default().style(StyleRole::Hotkey);
+        assert_eq!(style.fg, Some(Color::Cyan));
+        assert!(
+            style.add_modifier.contains(Modifier::BOLD),
+            "Hotkey role MUST add BOLD so the marker survives monochrome terminals"
+        );
+    }
+
+    #[test]
+    fn default_theme_error_role_is_bold_red() {
+        // SPEC §4.7: error feedback MUST NOT rely on color alone.
+        let style = Theme::default().style(StyleRole::Error);
+        assert_eq!(style.fg, Some(Color::Red));
+        assert!(
+            style.add_modifier.contains(Modifier::BOLD),
+            "Error role MUST add BOLD so red-blind / monochrome terminals still read it as loud"
+        );
+    }
+
+    #[test]
+    fn default_theme_disabled_role_is_dim_no_color() {
+        // SPEC §4.2 / §4.7: disabled rows already carry a marker shape;
+        // the role-level styling is supplementary DIM, no color, so
+        // black/white terminals see the same dim secondary weight.
+        let style = Theme::default().style(StyleRole::Disabled);
+        assert_eq!(style.fg, None, "Disabled MUST NOT lean on a color");
+        assert!(
+            style.add_modifier.contains(Modifier::DIM),
+            "Disabled role MUST add DIM as the supplementary visual weight"
+        );
+    }
+
+    #[test]
+    fn default_theme_normal_role_is_bare_default() {
+        // The bare-default normal style is what the existing renderer
+        // already writes for non-selected rows. Asserting it explicitly
+        // pins the contract so future theme tweaks cannot silently
+        // alter normal-row appearance.
+        assert_eq!(Theme::default().style(StyleRole::Normal), Style::default());
+    }
+
+    #[test]
+    fn default_theme_success_currency_carry_expected_colors() {
+        // Success/Currency are color-led roles whose monochrome carrier
+        // is the surrounding text content (e.g. "Moved Room 7 key..."
+        // or "50g"), so the style itself is color-only.
+        let theme = Theme::default();
+        assert_eq!(theme.style(StyleRole::Success).fg, Some(Color::Green));
+        assert_eq!(theme.style(StyleRole::Currency).fg, Some(Color::Yellow));
+    }
+
+    #[test]
+    fn default_theme_title_and_emphasis_are_bold() {
+        let theme = Theme::default();
+        assert!(theme
+            .style(StyleRole::Title)
+            .add_modifier
+            .contains(Modifier::BOLD));
+        assert!(theme
+            .style(StyleRole::Emphasis)
+            .add_modifier
+            .contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn default_theme_muted_and_hint_are_dim() {
+        let theme = Theme::default();
+        assert!(theme
+            .style(StyleRole::Muted)
+            .add_modifier
+            .contains(Modifier::DIM));
+        assert!(theme
+            .style(StyleRole::Hint)
+            .add_modifier
+            .contains(Modifier::DIM));
+    }
+
+    #[test]
+    fn theme_with_role_overrides_only_that_role() {
+        // Override one role and confirm (a) the override took effect
+        // and (b) other roles still match the default mapping. This is
+        // the contract that lets a game retheme a single accent without
+        // re-declaring the full table.
+        let custom =
+            Theme::default().with_role(StyleRole::Hotkey, Style::default().fg(Color::Magenta));
+        assert_eq!(
+            custom.style(StyleRole::Hotkey),
+            Style::default().fg(Color::Magenta)
+        );
+        // Untouched roles are byte-identical to the default theme.
+        let baseline = Theme::default();
+        for role in [
+            StyleRole::Normal,
+            StyleRole::Title,
+            StyleRole::Emphasis,
+            StyleRole::Muted,
+            StyleRole::Hint,
+            StyleRole::Error,
+            StyleRole::Success,
+            StyleRole::Currency,
+            StyleRole::Disabled,
+        ] {
+            assert_eq!(
+                custom.style(role),
+                baseline.style(role),
+                "with_role MUST NOT alter unrelated roles; {role:?} drifted"
+            );
         }
     }
 }

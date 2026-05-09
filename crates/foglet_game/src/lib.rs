@@ -62,7 +62,9 @@ pub use manifest::{
 pub use map::{
     parse_map, EntityPlacement, Map, MapError, Tile, TileKind, TileLegend, PLAYER_GLYPH,
 };
-pub use prompt::{ChoicePrompt, PromptAction, PromptChoice, PromptError, PromptKey, StyleRole};
+pub use prompt::{
+    ChoicePrompt, PromptAction, PromptChoice, PromptError, PromptKey, StyleRole, Theme,
+};
 pub use runtime::{
     run_built, run_with_io, BuiltGame, CrosstermEventSource, EventSource, Game, GameError,
     GameResult, SavePolicy, TICK_INTERVAL,
