@@ -43,7 +43,9 @@
 //! this door". That's not a SPEC requirement, but it's a free
 //! side-effect of the keying choice and worth not throwing away.
 
-use crate::world_db::WorldMigration;
+use thiserror::Error;
+
+use crate::world_db::{WorldDb, WorldMigration};
 
 /// Schema for the shared-world event log — SPEC_v2 §4.7 / §Task 7a.
 ///
@@ -135,9 +137,146 @@ CREATE INDEX IF NOT EXISTS idx_world_events_player_recent\n\
 ",
 };
 
+/// Decoded `world_events` row — SPEC_v2 §4.7 read model.
+///
+/// Mirrors the column shape pinned by [`WORLD_EVENTS_MIGRATION`]. The
+/// runtime layer (Task 10) and Murder Motel screens (Task 13) consume
+/// this struct rather than reaching into raw `rusqlite::Row`s — that
+/// keeps the schema-to-Rust mapping in one place and turns a column
+/// rename into a single compile error instead of a fan-out of runtime
+/// decode failures.
+///
+/// `created_at` and `metadata` stay as raw SQLite text. The kit stores
+/// the timestamp as ISO text precisely so the operator-facing
+/// `sqlite3` story (see the module docs) reads the same value the
+/// runtime sees; parsing it into a richer type would be a one-way trip
+/// that hides corrupt data instead of surfacing it. `metadata` is
+/// likewise opaque text — Task 7b does not own JSON serialization, and
+/// the kit treats the column as "whatever the caller put there".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventRecord {
+    /// Autoincrement primary key. Doubles as the deterministic
+    /// tiebreaker for `recent_events` (Task 7c) when two rows share a
+    /// `created_at` value at second resolution.
+    pub id: i64,
+    /// UTC timestamp written by SQLite at insert time
+    /// (`CURRENT_TIMESTAMP`). Kept as ISO text — see struct docs for
+    /// rationale.
+    pub created_at: String,
+    /// Game-authored kind label (e.g. `"room_7_opened"`). Round-tripped
+    /// verbatim; the kit imposes no namespace.
+    pub kind: String,
+    /// Player attribution. `None` for "system" events the runtime emits
+    /// without a player on whose behalf they acted (SPEC §4.7 calls
+    /// this case out explicitly).
+    pub player_id: Option<i64>,
+    /// Display string the lobby bulletin / per-player history will
+    /// render. Game-authored — never a raw transcript.
+    pub message: String,
+    /// Optional opaque metadata blob (typically a JSON object). Stored
+    /// as text so `sqlite3 -json` can pretty-print it; the kit does
+    /// not parse it.
+    pub metadata: Option<String>,
+}
+
+/// Failure modes for [`WorldDb::append_event`].
+///
+/// Library-internal `thiserror` shape — Task 10 will wrap these with
+/// `anyhow` at the process boundary so the operator-facing message
+/// stays a single sentence. Mirrors [`crate::players::PlayerError`]
+/// and [`crate::turns::TurnError`] so all world-DB write paths surface
+/// errors with the same shape.
+///
+/// Task 7e will add a `Validation` variant for the empty/overlong
+/// guard; today the only failure mode is the SQL round-trip itself.
+#[derive(Debug, Error)]
+pub enum EventError {
+    /// The `INSERT … RETURNING` round-trip failed. Wrapping
+    /// `rusqlite::Error` keeps the call site readable (one error type,
+    /// one mapping) while preserving the underlying cause for
+    /// `tracing` and operator-facing messages.
+    #[error("failed to append event to world database: {source}")]
+    Sqlite {
+        /// Underlying `rusqlite` error from the insert statement.
+        #[source]
+        source: rusqlite::Error,
+    },
+}
+
+impl WorldDb {
+    /// Append one row to `world_events` and return the canonical
+    /// [`EventRecord`] SQLite produced (SPEC_v2 §4.7 / §Task 7b).
+    ///
+    /// The contract is "the row I asked you to insert is now durably
+    /// in the log, with the id and timestamp the database assigned".
+    /// We use SQLite's `RETURNING` clause (≥ 3.35) so the caller gets
+    /// the autoincrement `id` and the SQL-side `CURRENT_TIMESTAMP`
+    /// without a second round-trip — the same pattern as
+    /// [`Self::upsert_player`].
+    ///
+    /// `kind` and `message` are required by the schema; `player_id`
+    /// and `metadata` are optional. The kit deliberately does *not*
+    /// validate `message` length or content here — Task 7e adds the
+    /// empty/overlong guard in its own commit so the bisect signal
+    /// stays sharp. Until that lands, callers are trusted to pass
+    /// game-authored strings (which is the SPEC §4.7 contract anyway).
+    ///
+    /// # Concurrency
+    ///
+    /// Takes `&self`: the insert is a single statement, so the busy
+    /// timeout configured at open time is the only contention story
+    /// we need. `&mut self` would fight the runtime layer (Task 10)
+    /// where `GameContext` borrows the world DB once per tick.
+    pub fn append_event(
+        &self,
+        kind: &str,
+        player_id: Option<i64>,
+        message: &str,
+        metadata: Option<&str>,
+    ) -> Result<EventRecord, EventError> {
+        // `RETURNING` echoes every column in the same order the
+        // migration declares them so [`row_to_event_record`] can be
+        // shared with future read helpers (Tasks 7c, 7d) without each
+        // one redeclaring the column list. A regression that reorders
+        // the migration columns will flunk the schema test in this
+        // module before this decoder even runs.
+        const SQL: &str = "\
+INSERT INTO world_events (kind, player_id, message, metadata) \
+VALUES (?1, ?2, ?3, ?4) \
+RETURNING id, created_at, kind, player_id, message, metadata";
+
+        self.connection()
+            .query_row(
+                SQL,
+                rusqlite::params![kind, player_id, message, metadata],
+                row_to_event_record,
+            )
+            .map_err(|source| EventError::Sqlite { source })
+    }
+}
+
+/// Decode a `world_events` row into [`EventRecord`].
+///
+/// Pulled out of the append call site so Task 7c/7d read helpers can
+/// share one decoder. Column order matches the `RETURNING` clause in
+/// [`WorldDb::append_event`] and the SPEC §4.7 schema; a regression
+/// that reorders columns in the migration will surface here as a
+/// `rusqlite` type error rather than a runtime panic in production.
+fn row_to_event_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<EventRecord> {
+    Ok(EventRecord {
+        id: row.get(0)?,
+        created_at: row.get(1)?,
+        kind: row.get(2)?,
+        player_id: row.get(3)?,
+        message: row.get(4)?,
+        metadata: row.get(5)?,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::foglet::{ContextSource, FogletContext};
     use crate::players::PLAYERS_MIGRATION;
     use crate::world_db::WorldDb;
     use tempfile::tempdir;
@@ -307,5 +446,129 @@ mod tests {
             ],
             "world_events migration must ship the recent + per-player indexes"
         );
+    }
+
+    /// Helper: build a minimally-populated [`FogletContext`] with just
+    /// the identity bits the upsert path reads. Mirrors the same
+    /// helper in `players::tests` so the per-module test bodies stay
+    /// focused on the assertion under test rather than restating the
+    /// full struct literal.
+    fn ctx_with(user_id: Option<&str>, username: Option<&str>) -> FogletContext {
+        FogletContext {
+            door_id: "test-door".to_string(),
+            user_id: user_id.map(str::to_string),
+            username: username.map(str::to_string),
+            role: None,
+            session_id: None,
+            terminal_width: 80,
+            terminal_height: 24,
+            source: ContextSource::ContextFile,
+        }
+    }
+
+    /// Helper: open a temp world DB and apply the migrations
+    /// `world_events` depends on (players → world_events). Returns the
+    /// open DB and the tempdir guard so callers can drop both in one
+    /// `let _guard` move at the end of a test.
+    fn open_world_with_events(dir: &tempfile::TempDir) -> WorldDb {
+        let db_path = dir.path().join("world.sqlite");
+        let mut world = WorldDb::open(&db_path).expect("open succeeds");
+        world
+            .apply_migration(&PLAYERS_MIGRATION)
+            .expect("players migration applies");
+        world
+            .apply_migration(&WORLD_EVENTS_MIGRATION)
+            .expect("world_events migration applies");
+        world
+    }
+
+    /// SPEC_v2 §Task 7b acceptance: `append_event` durably stores the
+    /// row with the supplied `kind` and `player_id`, and the returned
+    /// [`EventRecord`] echoes the same values plus a SQLite-assigned
+    /// `id` and `created_at`.
+    ///
+    /// Round-trip via a `SELECT` rather than trusting the `RETURNING`
+    /// row alone — a regression where `append_event` accidentally
+    /// `INSERT`ed nothing but synthesized a fake record from its
+    /// arguments would still pass a "the returned struct matches my
+    /// inputs" assertion. Reading the row back proves durability.
+    #[test]
+    fn append_event_stores_player_id_and_kind() {
+        let dir = tempdir().expect("tempdir creates");
+        let world = open_world_with_events(&dir);
+
+        let alice = world
+            .upsert_player(&ctx_with(Some("u-alice"), Some("alice")))
+            .expect("alice upsert succeeds");
+
+        let event = world
+            .append_event(
+                "room_7_opened",
+                Some(alice.id),
+                "@alice opened Room 7",
+                None,
+            )
+            .expect("append_event succeeds");
+
+        assert_eq!(event.kind, "room_7_opened");
+        assert_eq!(event.player_id, Some(alice.id));
+        assert_eq!(event.message, "@alice opened Room 7");
+        assert_eq!(event.metadata, None);
+        // SQLite assigns `id` from the INTEGER PRIMARY KEY; the first
+        // row in an empty table is `1`. Pinning the value (rather than
+        // just `> 0`) catches a regression that wires the wrong
+        // `RETURNING` column into the decoder.
+        assert_eq!(event.id, 1);
+        // `created_at` defaults to `CURRENT_TIMESTAMP`. We don't pin
+        // the exact value (it's wall-clock-dependent) but it must be
+        // non-empty, which proves the schema default fired and the
+        // decoder read the right column.
+        assert!(!event.created_at.is_empty(), "created_at must be set");
+
+        // Read it back through a fresh query — proves the row is
+        // actually in the table, not just synthesized in-memory.
+        let stored: (i64, String, Option<i64>, String) = world
+            .connection()
+            .query_row(
+                "SELECT id, kind, player_id, message FROM world_events WHERE id = ?1",
+                rusqlite::params![event.id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("event row readable");
+        assert_eq!(
+            stored,
+            (event.id, event.kind, event.player_id, event.message)
+        );
+    }
+
+    /// SPEC §4.7 explicitly types `player_id` as optional so the log
+    /// can carry "system" events with no player attribution. Pin that
+    /// the append path accepts `None` and stores it as SQL `NULL` —
+    /// otherwise a future caller emitting a midnight-reset tick would
+    /// be forced to invent a fake player id.
+    #[test]
+    fn append_event_allows_null_player_id_for_system_events() {
+        let dir = tempdir().expect("tempdir creates");
+        let world = open_world_with_events(&dir);
+
+        let event = world
+            .append_event("midnight_reset", None, "daily turns rolled over", None)
+            .expect("append_event succeeds with no player");
+
+        assert_eq!(event.player_id, None);
+
+        // Confirm the column is stored as SQL NULL, not as the string
+        // "None" or the integer `0` — both would silently pass the
+        // `Option<i64>` decode in `EventRecord` if the column were a
+        // legitimate row but corrupt the per-player query in Task 7d.
+        let raw_is_null: bool = world
+            .connection()
+            .query_row(
+                "SELECT player_id IS NULL FROM world_events WHERE id = ?1",
+                rusqlite::params![event.id],
+                |row| row.get(0),
+            )
+            .expect("null-check query runs");
+        assert!(raw_is_null, "system event must store player_id as SQL NULL");
     }
 }
