@@ -45,9 +45,11 @@
 //! `save.json` and may point at a directory that does not yet exist;
 //! Task 8b's writer is responsible for `mkdir -p` and atomic write.
 
+use std::cell::{Cell, Ref, RefCell};
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 use serde::{de::DeserializeOwned, Serialize};
 use thiserror::Error;
@@ -349,6 +351,115 @@ pub fn read_save<T: DeserializeOwned>(path: &Path) -> Result<Option<T>, SaveIoEr
     file.read_to_string(&mut buf).map_err(SaveIoError::Read)?;
     let value = serde_json::from_str(&buf).map_err(SaveIoError::Deserialize)?;
     Ok(Some(value))
+}
+
+// ---------------------------------------------------------------------------
+// SaveSlot<T> — typed handle bridging the runtime to read_save / write_atomic
+// ---------------------------------------------------------------------------
+//
+// SPEC_v2_1.md §2.1 introduces `SaveSlot<T>` as the v2.1 ergonomics primitive
+// that replaces the hand-rolled `Rc<RefCell<T>>` + dirty-bit pattern every
+// game previously had to write by hand (see the v2 `murder_motel` example
+// before the Task 5 refactor). The slot is deliberately a thin wrapper:
+//
+// * `inner: Rc<RefCell<T>>` is the shared, interior-mutable handle that
+//   screen constructors can clone freely. Multiple screens hold the same
+//   `T` and observe each other's writes the same way the v2 example did
+//   with hand-written handles.
+// * `dirty: Rc<Cell<bool>>` is the "needs persisting" flag that
+//   `borrow_mut` flips on (Task 1b) and `save` clears (Task 1d). The
+//   runtime's save handler (Task 4) reads this to skip no-op writes.
+//
+// Persistence is **not** owned by the slot — it delegates to the existing
+// `read_save` / `write_atomic` free functions so the v1 reliability bar
+// (atomic rename, parent mkdir, fsync) keeps applying unchanged. The slot
+// is a typed *handle*, not a second persistence path.
+
+/// Typed shared handle to a serialisable game-state value.
+///
+/// `SaveSlot<T>` is the v2.1 primitive that authors reach for instead of
+/// rolling their own `Rc<RefCell<T>>` plus a sibling dirty flag. It
+/// gives every screen in a game the same view of `T`, tracks whether
+/// the value has been mutated since the last save, and bridges to the
+/// existing [`read_save`] / [`write_atomic`] persistence helpers — so
+/// the SPEC §13 atomic-write contract still applies without a second
+/// code path.
+///
+/// # When to reach for it
+///
+/// - You have a single game-state value (a struct, an enum, a map) that
+///   multiple screens need to read or mutate while the runtime is live.
+/// - You want "save on quit" / "save on demand" without each screen
+///   re-discovering how to serialise the value.
+/// - You are willing to model the value as `T: Serialize +
+///   DeserializeOwned + Default + Clone`.
+///
+/// # When *not* to reach for it
+///
+/// - Truly ephemeral state that must never persist (e.g. transient
+///   feedback toasts) — keep that as a plain `Rc<RefCell<T>>` so the
+///   dirty flag can't accidentally pull it into the save file.
+/// - State that needs cross-process coordination (the shared-world
+///   SQLite layer in v2) — `SaveSlot<T>` is single-process only and
+///   makes no synchronisation guarantees.
+///
+/// # Cheap to clone
+///
+/// All fields are `Rc<...>`, so `Clone` is a refcount bump. Screens
+/// hold their own clone; mutating through any of them flips the same
+/// shared dirty flag.
+#[derive(Debug)]
+pub struct SaveSlot<T> {
+    /// Shared, interior-mutable handle to the game state value. Kept
+    /// private so callers go through [`SaveSlot::borrow`] /
+    /// `borrow_mut` (Task 1b) — that's what lets the slot enforce the
+    /// "borrow_mut implies dirty" contract.
+    pub(crate) inner: Rc<RefCell<T>>,
+    /// "Has the value been mutated since the last successful save?"
+    /// flag. Flipped on by `borrow_mut` (Task 1b) and cleared by
+    /// `save` (Task 1d). The runtime's save handler (Task 4) consults
+    /// this to skip writes when nothing changed.
+    pub(crate) dirty: Rc<Cell<bool>>,
+}
+
+impl<T> Clone for SaveSlot<T> {
+    /// Manual `Clone` impl rather than `#[derive(Clone)]` because the
+    /// derive would require `T: Clone` even though every field is
+    /// already an `Rc<...>` — cloning a slot bumps refcounts, it does
+    /// not clone `T`.
+    fn clone(&self) -> Self {
+        Self {
+            inner: Rc::clone(&self.inner),
+            dirty: Rc::clone(&self.dirty),
+        }
+    }
+}
+
+impl<T> SaveSlot<T> {
+    /// Wrap `value` in a fresh slot.
+    ///
+    /// The slot starts **clean** (`is_dirty() == false`): the value has
+    /// not yet been mutated since "load", and nothing needs persisting.
+    /// Authors typically build a slot from `read_save`'s output via
+    /// `SaveSlot::load_or_default` (Task 1c); calling `new` directly
+    /// is for tests and for games that synthesise their initial state.
+    pub fn new(value: T) -> Self {
+        Self {
+            inner: Rc::new(RefCell::new(value)),
+            dirty: Rc::new(Cell::new(false)),
+        }
+    }
+
+    /// Borrow the wrapped value immutably.
+    ///
+    /// Panics on an active mutable borrow, matching `RefCell` semantics
+    /// — the runtime is single-threaded so any panic here is a
+    /// programmer error (a screen holding a `borrow_mut` across an
+    /// `await` point or a nested re-entrant render call), not an
+    /// environmental failure.
+    pub fn borrow(&self) -> Ref<'_, T> {
+        self.inner.borrow()
+    }
 }
 
 #[cfg(test)]
@@ -757,6 +868,26 @@ mod tests {
 
         let err = read_save::<SaveFixture>(&path).unwrap_err();
         assert!(matches!(err, SaveIoError::Deserialize(_)));
+    }
+
+    // ----- SaveSlot<T> tests (Task 1) ------------------------------
+    //
+    // 1a covers only the constructor + immutable borrow. Mutation,
+    // dirty-flag tracking, snapshot/apply, handle cloning, and the
+    // load/save helpers land in 1b–1e and grow the test surface there.
+
+    #[test]
+    fn save_slot_new_round_trips_value_through_borrow() {
+        // Smallest possible contract for 1a: a freshly-constructed slot
+        // exposes the value the caller put in, byte-for-byte, through
+        // an immutable borrow. The fixture struct re-uses the same
+        // shape as `SaveFixture` above on purpose — this is the kind of
+        // record an authored game would actually persist.
+        let original = fixture_v1();
+        let slot: SaveSlot<SaveFixture> = SaveSlot::new(original.clone());
+
+        let view = slot.borrow();
+        assert_eq!(*view, original);
     }
 
     #[test]
