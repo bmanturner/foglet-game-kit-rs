@@ -45,7 +45,7 @@
 //! `save.json` and may point at a directory that does not yet exist;
 //! Task 8b's writer is responsible for `mkdir -p` and atomic write.
 
-use std::cell::{Cell, Ref, RefCell};
+use std::cell::{Cell, Ref, RefCell, RefMut};
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -459,6 +459,75 @@ impl<T> SaveSlot<T> {
     /// environmental failure.
     pub fn borrow(&self) -> Ref<'_, T> {
         self.inner.borrow()
+    }
+
+    /// Borrow the wrapped value mutably, **marking the slot dirty**.
+    ///
+    /// The dirty flag is flipped on **entry**, before the caller has a
+    /// chance to actually mutate `T`. SPEC_v2_1 §4.1 requires this
+    /// even if the resulting borrow goes unused: the slot has no way
+    /// to observe whether a caller mutated through the returned
+    /// [`RefMut`], so it conservatively assumes any `borrow_mut`
+    /// indicates intent to change. Authors who want a peek at the
+    /// value without dirtying it should call [`SaveSlot::borrow`]
+    /// instead.
+    ///
+    /// Panics on an active immutable or mutable borrow, matching
+    /// `RefCell::borrow_mut` semantics.
+    pub fn borrow_mut(&self) -> RefMut<'_, T> {
+        self.dirty.set(true);
+        self.inner.borrow_mut()
+    }
+
+    /// Return a deep clone of the wrapped value.
+    ///
+    /// Useful for tests and for screens that need an owned copy to
+    /// pass to a renderer or a comparison helper without holding a
+    /// borrow across an `await`/render boundary. Does **not** mutate
+    /// the slot or touch the dirty flag — taking a snapshot is a
+    /// read-only operation.
+    pub fn snapshot(&self) -> T
+    where
+        T: Clone,
+    {
+        self.inner.borrow().clone()
+    }
+
+    /// Overwrite the wrapped value in place and mark the slot dirty.
+    ///
+    /// Equivalent to `*slot.borrow_mut() = value;` but avoids the
+    /// `RefMut` round-trip at the call site and reads more naturally
+    /// when authors are bulk-replacing state (e.g. a "reset to new
+    /// game" button or a "load this snapshot" admin command). Like
+    /// [`SaveSlot::borrow_mut`], it always sets the dirty flag —
+    /// assigning the same value is still treated as a write because
+    /// the slot can't
+    /// cheaply prove equality for an arbitrary `T`.
+    pub fn apply(&self, value: T) {
+        *self.inner.borrow_mut() = value;
+        self.dirty.set(true);
+    }
+
+    /// Has the slot been mutated since the last `save` (or load)?
+    ///
+    /// Advisory only: SPEC_v2_1 §4.1 explicitly forbids using this to
+    /// *gate* a save — authors decide when to persist. The runtime's
+    /// save handler (Task 4) reads it to skip no-op writes when
+    /// nothing has changed since startup.
+    pub fn is_dirty(&self) -> bool {
+        self.dirty.get()
+    }
+
+    /// Return a clone-equivalent handle to the same underlying state.
+    ///
+    /// Functionally identical to [`Clone::clone`]; exposed under a
+    /// different name so authors reading constructor signatures like
+    /// `MapScreen::with_slots(slots.save.handle())` immediately see
+    /// the cheap-`Rc` semantics. SPEC_v2_1 §4.1 mandates this method
+    /// precisely so the API documents the sharing model at the call
+    /// site.
+    pub fn handle(&self) -> SaveSlot<T> {
+        self.clone()
     }
 }
 
@@ -888,6 +957,127 @@ mod tests {
 
         let view = slot.borrow();
         assert_eq!(*view, original);
+    }
+
+    #[test]
+    fn save_slot_starts_clean() {
+        // 1b precondition: a freshly-built slot is not dirty. The dirty
+        // flag is intended to track *post-construction* mutations, not
+        // the initial assignment via `new`. Authors rely on this so a
+        // "save on Quit if dirty" runtime hook (Task 4) doesn't write
+        // an unmodified file every launch.
+        let slot: SaveSlot<SaveFixture> = SaveSlot::new(fixture_v1());
+        assert!(!slot.is_dirty(), "freshly-constructed slot must be clean");
+    }
+
+    #[test]
+    fn save_slot_borrow_mut_sets_dirty_flag() {
+        // SPEC_v2_1 §4.1 rule: `borrow_mut()` flips the dirty flag on
+        // entry, regardless of whether the caller actually mutates
+        // through the returned `RefMut`. We exercise both halves:
+        // (a) merely calling `borrow_mut` dirties the slot, and
+        // (b) an actual mutation through it is observable on a later
+        //     `borrow`.
+        let slot: SaveSlot<SaveFixture> = SaveSlot::new(fixture_v1());
+        {
+            let mut view = slot.borrow_mut();
+            view.player = "bob".into();
+        }
+        assert!(slot.is_dirty(), "borrow_mut must set the dirty flag");
+        assert_eq!(slot.borrow().player, "bob");
+    }
+
+    #[test]
+    fn save_slot_borrow_mut_dirties_even_without_mutation() {
+        // The slot can't prove the caller didn't mutate, so it
+        // conservatively dirties on any `borrow_mut`. This test pins
+        // that behaviour so a future "optimise: track real writes"
+        // change has to update the contract deliberately.
+        let slot: SaveSlot<SaveFixture> = SaveSlot::new(fixture_v1());
+        {
+            let _view = slot.borrow_mut();
+            // Drop without writing.
+        }
+        assert!(slot.is_dirty(), "borrow_mut dirties even on no-op writes");
+    }
+
+    #[test]
+    fn save_slot_borrow_does_not_dirty() {
+        // The mirror of the borrow_mut test: read-only access must
+        // never set the dirty flag. Otherwise a "save on dirty" loop
+        // would write on every render.
+        let slot: SaveSlot<SaveFixture> = SaveSlot::new(fixture_v1());
+        {
+            let _view = slot.borrow();
+        }
+        assert!(!slot.is_dirty(), "borrow must not flip the dirty flag");
+    }
+
+    #[test]
+    fn save_slot_snapshot_returns_independent_clone() {
+        // `snapshot` returns an *owned* clone — mutating it must not
+        // be visible through the slot. This is the property that lets
+        // authors hand a snapshot to a renderer or a serialiser
+        // without worrying about aliasing.
+        let slot: SaveSlot<SaveFixture> = SaveSlot::new(fixture_v1());
+        let mut snap = slot.snapshot();
+        snap.player = "mallory".into();
+
+        assert_eq!(slot.borrow().player, "alice", "slot is unchanged");
+        assert_eq!(snap.player, "mallory", "snapshot was mutated locally");
+    }
+
+    #[test]
+    fn save_slot_snapshot_does_not_dirty() {
+        // Read-only operation. Snapshotting on every frame would
+        // otherwise mark the slot dirty forever.
+        let slot: SaveSlot<SaveFixture> = SaveSlot::new(fixture_v1());
+        let _snap = slot.snapshot();
+        assert!(!slot.is_dirty(), "snapshot must not flip the dirty flag");
+    }
+
+    #[test]
+    fn save_slot_apply_overwrites_in_place_and_dirties() {
+        // `apply` is the bulk-replace path used by reset / load. After
+        // it returns, observers see the new value and the slot is
+        // dirty so the next save will persist it.
+        let slot: SaveSlot<SaveFixture> = SaveSlot::new(fixture_v1());
+        slot.apply(fixture_v2());
+
+        assert_eq!(*slot.borrow(), fixture_v2());
+        assert!(slot.is_dirty(), "apply must set the dirty flag");
+    }
+
+    #[test]
+    fn save_slot_handle_shares_state_with_original() {
+        // Cloning via `handle` (or `Clone::clone`) bumps refcounts —
+        // both handles see each other's writes and share one dirty
+        // flag. This is the property that makes `SaveSlot<T>` viable
+        // as a per-screen constructor argument: every screen's clone
+        // is the same logical slot.
+        let slot: SaveSlot<SaveFixture> = SaveSlot::new(fixture_v1());
+        let handle = slot.handle();
+
+        // Mutate through `handle`; the original observes it.
+        handle.apply(fixture_v2());
+        assert_eq!(*slot.borrow(), fixture_v2());
+        assert!(slot.is_dirty());
+        assert!(handle.is_dirty(), "dirty flag is shared, not per-handle");
+    }
+
+    #[test]
+    fn save_slot_handle_is_alias_for_clone() {
+        // `handle()` and `clone()` are documented as equivalent; pin
+        // that. If one ever grows divergent semantics it should be
+        // a deliberate API change with a `DECISIONS.md` entry.
+        let slot: SaveSlot<SaveFixture> = SaveSlot::new(fixture_v1());
+        let via_handle = slot.handle();
+        let via_clone = slot.clone();
+
+        // Both should see the same mutation through `slot`.
+        slot.apply(fixture_v2());
+        assert_eq!(*via_handle.borrow(), fixture_v2());
+        assert_eq!(*via_clone.borrow(), fixture_v2());
     }
 
     #[test]
