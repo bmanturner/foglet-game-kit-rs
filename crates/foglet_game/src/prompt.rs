@@ -788,13 +788,38 @@ impl<T: Clone> ChoicePrompt<T> {
             return PromptAction::Cancelled;
         }
 
+        // Task 4c: Enter confirms the highlighted choice in navigation
+        // mode. `selected` is only ever `Some` when `.navigable(true)`
+        // has seeded a cursor (SPEC §4.5), so the `if let` here doubles
+        // as the "is this a navigation-mode prompt?" gate — direct-key
+        // prompts keep the legacy "Enter is a no-op" behaviour because
+        // their `selected` is `None`. Tasks 4a/4b maintain the invariant
+        // that the cursor sits on an enabled row, so the common path
+        // emits `Selected`; we still defensively surface `Disabled` for
+        // the row should that invariant ever be broken (e.g. a future
+        // dynamic-`enabled` toggle), instead of returning a phantom
+        // `Selected` for a row the player cannot pick.
+        if key == PromptKey::Enter {
+            if let Some(idx) = self.selected {
+                if let Some(choice) = self.choices.get(idx) {
+                    if choice.enabled {
+                        return PromptAction::Selected(choice.value.clone());
+                    }
+                    return PromptAction::Disabled {
+                        id: choice.value.clone(),
+                        reason: choice.disabled_reason.clone(),
+                    };
+                }
+            }
+        }
+
         // Direct hotkey path (Task 3b). Only `Char` keys participate in
-        // direct-key matching here; `Enter`/`Esc` are handled by Tasks
-        // 3d (cancellation) and 4c (navigation-mode confirm), so they
-        // currently fall through to `None`. Choices declared with
+        // direct-key matching here; `Enter` and `Esc` were already
+        // dispatched above (Task 3d cancellation, Task 4c navigation
+        // confirm) or fell through as no-ops. Choices declared with
         // `PromptKey::Enter`/`PromptKey::Esc` are exotic data-level
-        // configurations that the navigation/cancellation reducers will
-        // address explicitly.
+        // configurations that those earlier branches address before
+        // we ever reach the hotkey scan.
         if let PromptKey::Char(_) = key {
             // Linear scan — choice lists are short (SPEC §4.4 ~5
             // typical) and `validate()` already enforces uniqueness, so
@@ -824,11 +849,10 @@ impl<T: Clone> ChoicePrompt<T> {
             }
         }
 
-        // Tasks 3d (Esc → Cancelled when configured) and 4c (Enter on
-        // highlighted choice) layer in on top of this scan. Until they
-        // land, anything that does not match a registered hotkey is a
-        // no-op so the prompt never invents a selection from a press
-        // the player did not make.
+        // Anything that did not match a registered hotkey, an opt-in
+        // Esc cancel, or an Enter confirm in navigation mode is a no-op
+        // so the prompt never invents a selection from a press the
+        // player did not make.
         PromptAction::None
     }
 }
@@ -1616,13 +1640,16 @@ mod tests {
     }
 
     #[test]
-    fn handle_enter_is_a_no_op_until_navigation_mode_lands() {
-        // Enter belongs to navigation mode (Task 4c) — not wired yet,
-        // so it must stay a no-op on a default direct-key prompt rather
-        // than secretly selecting the first choice.
+    fn handle_enter_is_a_no_op_on_direct_key_prompts() {
+        // Enter is the navigation-mode confirm key (Task 4c). On a
+        // direct-key prompt (no `.navigable(true)`) the cursor is `None`,
+        // so Enter must not invent a selection — otherwise SPEC §5's
+        // hotkey-only loot prompts would silently route the first row
+        // through `Selected` whenever the player tapped Return.
         let prompt: ChoicePrompt<LootAction> =
             ChoicePrompt::new().choice('e', LootAction::Equip, "Equip");
 
+        assert_eq!(prompt.selected, None);
         assert_eq!(prompt.handle(Input::Enter), PromptAction::None);
     }
 
@@ -1758,11 +1785,12 @@ mod tests {
     }
 
     #[test]
-    fn navigable_does_not_affect_direct_key_handle() {
-        // Task 4a only adds the cursor field; direct-key dispatch in
-        // `handle` must keep its current behaviour so the SPEC §5 loot
-        // examples stay green. Tasks 4b–4c will introduce Up/Down/Enter
-        // reducers separately.
+    fn navigable_preserves_direct_key_handle() {
+        // Direct-key dispatch must keep working in navigation mode so a
+        // player can still tap a hotkey instead of arrow-stepping —
+        // SPEC §4.5 frames arrow/Enter as an *additional* affordance,
+        // not a replacement. Enter on the seeded cursor (index 0 =
+        // Equip) routes through Task 4c's confirm path.
         let prompt: ChoicePrompt<LootAction> = ChoicePrompt::new()
             .choice('e', LootAction::Equip, "Equip")
             .choice('t', LootAction::Take, "Take")
@@ -1771,8 +1799,62 @@ mod tests {
             prompt.handle(Input::Char('t')),
             PromptAction::Selected(LootAction::Take),
         );
-        // Enter currently has no navigation-confirm wiring — should
-        // still collapse to `None` until Task 4c.
+        assert_eq!(
+            prompt.handle(Input::Enter),
+            PromptAction::Selected(LootAction::Equip),
+        );
+    }
+
+    #[test]
+    fn handle_enter_selects_highlighted_choice_in_navigation_mode() {
+        // Task 4c: Enter on a navigation-mode prompt confirms the row
+        // the cursor currently sits on. Stepping Down once moves the
+        // cursor from the seeded index 0 (`Equip`) to index 1 (`Take`),
+        // and Enter must surface that as `Selected(Take)`.
+        let mut prompt: ChoicePrompt<LootAction> = ChoicePrompt::new()
+            .choice('e', LootAction::Equip, "Equip")
+            .choice('t', LootAction::Take, "Take")
+            .choice('p', LootAction::Pass, "Pass")
+            .navigable(true);
+        prompt.move_down();
+        assert_eq!(prompt.selected, Some(1));
+        assert_eq!(
+            prompt.handle(Input::Enter),
+            PromptAction::Selected(LootAction::Take),
+        );
+    }
+
+    #[test]
+    fn handle_enter_skips_disabled_seed_via_cursor_invariant() {
+        // The cursor seed (Task 4a) and Up/Down (Task 4b) guarantee the
+        // cursor lands on an enabled row even when index 0 is disabled.
+        // Enter must therefore confirm the *enabled* row, not return
+        // `Disabled` from a stale-looking index 0.
+        let prompt: ChoicePrompt<LootAction> = ChoicePrompt::new()
+            .choice('e', LootAction::Equip, "Equip")
+            .disabled_if(true, "bag full")
+            .choice('t', LootAction::Take, "Take")
+            .navigable(true);
+        assert_eq!(prompt.selected, Some(1));
+        assert_eq!(
+            prompt.handle(Input::Enter),
+            PromptAction::Selected(LootAction::Take),
+        );
+    }
+
+    #[test]
+    fn handle_enter_is_no_op_when_no_enabled_choices_exist() {
+        // If every choice is disabled, `.navigable(true)` leaves the
+        // cursor at `None` (pinned by `navigable_with_all_disabled_...`),
+        // so Enter has nothing to confirm and must collapse to `None`
+        // rather than panic on an out-of-bounds lookup.
+        let prompt: ChoicePrompt<LootAction> = ChoicePrompt::new()
+            .choice('e', LootAction::Equip, "Equip")
+            .disabled_if(true, "bag full")
+            .choice('t', LootAction::Take, "Take")
+            .disabled_if(true, "no slot")
+            .navigable(true);
+        assert_eq!(prompt.selected, None);
         assert_eq!(prompt.handle(Input::Enter), PromptAction::None);
     }
 
