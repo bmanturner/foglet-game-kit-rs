@@ -1,15 +1,15 @@
 //! `events` — shared-world append-only event log schema (SPEC_v2 §Task 7).
 //!
-//! Task 7a (this iteration) ships the `world_events` migration only.
-//! Subsequent sub-tasks layer behavior on top of the schema introduced
-//! here:
+//! Task 7a shipped the `world_events` migration. Subsequent sub-tasks
+//! layer behavior on top of the schema introduced here:
 //!
-//! - 7b adds `WorldDb::append_event` for inserting one row.
-//! - 7c adds `WorldDb::recent_events(limit)` for the lobby bulletin
-//!   (SPEC §3.1 / §13).
-//! - 7d adds `WorldDb::player_events(player_id, limit)` for per-player
-//!   history.
-//! - 7e adds the message validation guard (empty / overlong rejection).
+//! - 7b added `WorldDb::append_event` for inserting one row.
+//! - 7c (this iteration) adds `WorldDb::recent_events(limit)` for the
+//!   lobby bulletin (SPEC §3.1 / §13).
+//! - 7d will add `WorldDb::player_events(player_id, limit)` for
+//!   per-player history.
+//! - 7e will add the message validation guard (empty / overlong
+//!   rejection).
 //!
 //! Splitting the migration into its own commit keeps the bisect signal
 //! sharp: a regression that drops a column flunks the schema test in
@@ -251,6 +251,60 @@ RETURNING id, created_at, kind, player_id, message, metadata";
                 rusqlite::params![kind, player_id, message, metadata],
                 row_to_event_record,
             )
+            .map_err(|source| EventError::Sqlite { source })
+    }
+
+    /// Return the `limit` most recently appended events, newest first
+    /// (SPEC_v2 §4.7 / §Task 7c).
+    ///
+    /// Powers the Murder Motel lobby bulletin (Task 13d): "what's
+    /// happened recently across this door". The ordering contract is
+    /// `ORDER BY created_at DESC, id DESC` — newest timestamp wins,
+    /// and within one timestamp the higher (later) `id` wins. The
+    /// `id` tiebreaker matters because `created_at` is stored at
+    /// `CURRENT_TIMESTAMP` second resolution; two events appended in
+    /// the same second would otherwise sort non-deterministically.
+    /// SPEC §Task 7c specifically requires deterministic tie ordering
+    /// so the bulletin renders the same sequence on every refresh.
+    ///
+    /// The query is index-bound: `idx_world_events_recent` covers
+    /// `(created_at, id)` ascending, and SQLite walks the BTREE
+    /// backwards to satisfy the `DESC, DESC` sort without a temp
+    /// b-tree sort. Even on a long-running door with hundreds of
+    /// thousands of events, the bulletin read stays seek-bound.
+    ///
+    /// # Parameters
+    ///
+    /// `limit` is `u32`: large enough for any plausible bulletin size
+    /// (the Murder Motel UI shows ~20 entries) and small enough that
+    /// a lossless cast to SQLite's `i64` is trivial. A `usize`-typed
+    /// parameter would invite confusion on 32-bit targets and a
+    /// signed `i64` would force callers to think about negatives we
+    /// don't accept. `0` is legal and returns an empty vec — it lets
+    /// callers wire UI plumbing before the bulletin is sized.
+    ///
+    /// # Concurrency
+    ///
+    /// Takes `&self`: a single statement under the configured busy
+    /// timeout, same as [`Self::append_event`]. The runtime layer
+    /// (Task 10) will call this from the lobby render path; keeping
+    /// the borrow shared lets `GameContext` share one world-DB
+    /// reference across screens without a `RefCell` dance.
+    pub fn recent_events(&self, limit: u32) -> Result<Vec<EventRecord>, EventError> {
+        const SQL: &str = "\
+SELECT id, created_at, kind, player_id, message, metadata \
+FROM world_events \
+ORDER BY created_at DESC, id DESC \
+LIMIT ?1";
+
+        let mut stmt = self
+            .connection()
+            .prepare(SQL)
+            .map_err(|source| EventError::Sqlite { source })?;
+        let rows = stmt
+            .query_map(rusqlite::params![i64::from(limit)], row_to_event_record)
+            .map_err(|source| EventError::Sqlite { source })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(|source| EventError::Sqlite { source })
     }
 }
@@ -570,5 +624,79 @@ mod tests {
             )
             .expect("null-check query runs");
         assert!(raw_is_null, "system event must store player_id as SQL NULL");
+    }
+
+    /// SPEC_v2 §Task 7c acceptance (empty case): `recent_events` on a
+    /// fresh table returns an empty vec rather than erroring or
+    /// returning a sentinel row. The lobby bulletin renders this case
+    /// as "no events yet" and assumes a clean `Vec::is_empty()`.
+    #[test]
+    fn recent_events_empty_returns_empty_vec() {
+        let dir = tempdir().expect("tempdir creates");
+        let world = open_world_with_events(&dir);
+
+        let events = world.recent_events(10).expect("recent_events runs");
+        assert!(events.is_empty(), "no rows yet → empty vec");
+
+        // `limit = 0` is also legal and equally empty.
+        let none = world.recent_events(0).expect("recent_events(0) runs");
+        assert!(none.is_empty(), "limit=0 short-circuits to empty");
+    }
+
+    /// SPEC_v2 §Task 7c acceptance (ordering + tiebreak): newest events
+    /// come first, and when two events share `created_at` (stored at
+    /// SQLite's `CURRENT_TIMESTAMP` second resolution) the one with
+    /// the higher `id` wins. Also pins that `limit` truncates the
+    /// result.
+    ///
+    /// Seeding via direct SQL with explicit `created_at` is the only
+    /// way to deterministically force a tie — the public
+    /// `append_event` path uses the `CURRENT_TIMESTAMP` default and
+    /// the test would otherwise depend on wall-clock granularity to
+    /// produce two same-second rows.
+    #[test]
+    fn recent_events_returns_newest_first_with_id_tiebreak() {
+        let dir = tempdir().expect("tempdir creates");
+        let world = open_world_with_events(&dir);
+
+        // Two pairs of ties at two distinct timestamps. After the
+        // inserts, ids 1..=4 map to ("first", "second", "third",
+        // "fourth") in the order shown. Newest-first ordering should
+        // surface them as fourth → third (newer ts pair, id desc),
+        // then second → first (older ts pair, id desc).
+        world
+            .connection()
+            .execute_batch(
+                "INSERT INTO world_events (created_at, kind, message) VALUES \
+                 ('2026-05-08 10:00:00', 'first',  'first');\n\
+                 INSERT INTO world_events (created_at, kind, message) VALUES \
+                 ('2026-05-08 10:00:00', 'second', 'second');\n\
+                 INSERT INTO world_events (created_at, kind, message) VALUES \
+                 ('2026-05-08 10:00:01', 'third',  'third');\n\
+                 INSERT INTO world_events (created_at, kind, message) VALUES \
+                 ('2026-05-08 10:00:01', 'fourth', 'fourth');",
+            )
+            .expect("seed events");
+
+        let events = world.recent_events(10).expect("recent_events runs");
+        let kinds: Vec<&str> = events.iter().map(|e| e.kind.as_str()).collect();
+        assert_eq!(
+            kinds,
+            vec!["fourth", "third", "second", "first"],
+            "newer created_at first; within a tie, higher id first"
+        );
+
+        // `limit` truncates from the newest end, not from a random
+        // slice. A regression that ordered ascending and then
+        // reversed in Rust (instead of letting SQLite do the sort)
+        // would still pass the full-list assertion above but flunk
+        // here because the truncated head would be the oldest two.
+        let head = world.recent_events(2).expect("recent_events(2) runs");
+        let head_kinds: Vec<&str> = head.iter().map(|e| e.kind.as_str()).collect();
+        assert_eq!(
+            head_kinds,
+            vec!["fourth", "third"],
+            "limit takes the newest N"
+        );
     }
 }

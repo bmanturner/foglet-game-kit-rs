@@ -50,7 +50,7 @@ One unchecked item per iteration. Dependencies in `[brackets]` must be checked o
 
 - [x] **7a** — Add `world_events` migration with timestamp, kind, player id, message, and metadata JSON. [5a]
 - [x] **7b** — Implement `append_event`. Test: event is stored with player id and kind. [7a]
-- [ ] **7c** — Implement `recent_events(limit)`. Test: newest events return first with deterministic tie ordering. [7b]
+- [x] **7c** — Implement `recent_events(limit)`. Test: newest events return first with deterministic tie ordering. [7b]
 - [ ] **7d** — Implement `player_events(player_id, limit)`. Test: filters by player. [7b]
 - [ ] **7e** — Add message sanitization/validation guard rejecting empty messages and overlong messages. [7b]
 
