@@ -56,6 +56,15 @@ pub struct GameConfig {
     /// games keep working unchanged.
     #[serde(default)]
     pub world: WorldSection,
+    /// `[turns]` section — daily turn ledger (SPEC v2 §4.6, §5).
+    ///
+    /// Modeled as `Option` rather than a defaulted struct because the
+    /// SPEC explicitly says "Missing `[turns]` means no turn system":
+    /// fabricating a default allowance for a game that didn't ask for
+    /// turns would silently change runtime behavior. `None` is the
+    /// "off" signal the runtime checks before opening a ledger.
+    #[serde(default)]
+    pub turns: Option<TurnsSection>,
 }
 
 /// `[game]` section: every field is required.
@@ -201,6 +210,49 @@ impl Default for WorldSection {
     }
 }
 
+/// `[turns]` section: daily turn allowance settings (SPEC v2 §4.6, §5).
+///
+/// `daily_allowance` is required because there's no defensible default
+/// value — a game that opts into turns is making a design statement
+/// about pacing, and silently picking a number would mask authoring
+/// bugs (the same reason `[game]` fields aren't defaulted).
+///
+/// `reset` and `carryover_max` are field-level optional. The only
+/// documented reset cadence in v2 is local midnight (SPEC §5 example),
+/// so it has a default. `carryover_max = 0` is the SPEC-implied
+/// "no carryover" behavior: a player who doesn't spend today does not
+/// bank turns for tomorrow.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TurnsSection {
+    /// Number of turns granted at the start of each reset cycle.
+    /// Required; rejected at validation time if zero.
+    pub daily_allowance: u32,
+    /// When the ledger rolls over. v2 ships only `LocalMidnight`; the
+    /// closed enum means an unknown reset string surfaces as a parse
+    /// error rather than silently disabling resets.
+    #[serde(default)]
+    pub reset: TurnReset,
+    /// Maximum number of unspent turns carried into the next cycle.
+    /// `0` means no carryover (the safe default for a brand-new
+    /// configuration). Stored as `u32` so a TOML negative number is
+    /// rejected at parse time.
+    #[serde(default)]
+    pub carryover_max: u32,
+}
+
+/// Reset cadences understood by the turn ledger.
+///
+/// Closed enum: an unrecognised value in `assets/game.toml` is a
+/// load-time error, not a silent fallback to "never reset". v2 only
+/// ships `local_midnight`; later versions will extend this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnReset {
+    /// Roll the ledger over at the operator's local midnight.
+    #[default]
+    LocalMidnight,
+}
+
 fn default_world_path() -> String {
     "world/world.sqlite".to_string()
 }
@@ -327,6 +379,18 @@ impl GameConfig {
             return Err(ConfigError::Validate(
                 "[manifest].auth_scope must not be empty".into(),
             ));
+        }
+        if let Some(turns) = &self.turns {
+            // SPEC v2 §4.6 says "Initialize a player with today's
+            // allowance" — an allowance of zero would create a game
+            // where every action is rejected on day one, which is
+            // almost certainly an authoring mistake. Negative values
+            // are rejected earlier at parse time by `u32`.
+            if turns.daily_allowance == 0 {
+                return Err(ConfigError::Validate(
+                    "[turns].daily_allowance must be greater than zero".into(),
+                ));
+            }
         }
         Ok(())
     }
@@ -678,6 +742,184 @@ journal_mode = "delete"
         assert_eq!(reparsed.world.path, "data/shared.sqlite");
         assert_eq!(reparsed.world.busy_timeout_ms, 7_500);
         assert_eq!(reparsed.world.journal_mode, "delete");
+    }
+
+    #[test]
+    fn absent_turns_section_means_no_turn_system() {
+        // SPEC v2 §5: "Missing `[turns]` means no turn system." We
+        // must not synthesize a default — `None` is the off signal the
+        // runtime checks before opening a ledger.
+        let v1_style = r#"
+[game]
+title = "No Turns"
+slug = "no-turns"
+description = ""
+min_width = 80
+min_height = 24
+start_map = "lobby"
+start_x = 0
+start_y = 0
+"#;
+        let config = GameConfig::from_toml_str(v1_style).unwrap();
+        assert!(config.turns.is_none());
+    }
+
+    #[test]
+    fn parses_full_turns_section_from_spec_example() {
+        // Verbatim from SPEC v2 §5 so a future SPEC tweak surfaces as
+        // a failing test rather than silent drift.
+        let v2 = r#"
+[game]
+title = "Murder Motel"
+slug = "murder-motel"
+description = ""
+min_width = 80
+min_height = 24
+start_map = "lobby"
+start_x = 0
+start_y = 0
+
+[turns]
+daily_allowance = 30
+reset = "local_midnight"
+carryover_max = 10
+"#;
+        let config = GameConfig::from_toml_str(v2).unwrap();
+        let turns = config.turns.expect("turns section parsed");
+        assert_eq!(turns.daily_allowance, 30);
+        assert_eq!(turns.reset, TurnReset::LocalMidnight);
+        assert_eq!(turns.carryover_max, 10);
+    }
+
+    #[test]
+    fn turns_section_applies_field_level_defaults() {
+        // Author opts in but only sets the required `daily_allowance`
+        // — `reset` and `carryover_max` should fall back to defaults.
+        let partial = r#"
+[game]
+title = "Partial Turns"
+slug = "partial-turns"
+description = ""
+min_width = 80
+min_height = 24
+start_map = "lobby"
+start_x = 0
+start_y = 0
+
+[turns]
+daily_allowance = 5
+"#;
+        let config = GameConfig::from_toml_str(partial).unwrap();
+        let turns = config.turns.expect("turns section parsed");
+        assert_eq!(turns.daily_allowance, 5);
+        assert_eq!(turns.reset, TurnReset::LocalMidnight);
+        assert_eq!(turns.carryover_max, 0);
+    }
+
+    #[test]
+    fn turns_section_rejects_zero_allowance_with_validate() {
+        // Zero would create a game where every action is rejected on
+        // day one. We surface this as `Validate` so the author sees
+        // a SPEC-level message, not a generic parse error.
+        let bad = r#"
+[game]
+title = "Zero Turns"
+slug = "zero-turns"
+description = ""
+min_width = 80
+min_height = 24
+start_map = "lobby"
+start_x = 0
+start_y = 0
+
+[turns]
+daily_allowance = 0
+"#;
+        let err = GameConfig::from_toml_str(bad).unwrap_err();
+        match err {
+            ConfigError::Validate(msg) => {
+                assert!(msg.contains("daily_allowance"), "{msg}");
+            }
+            other => panic!("expected Validate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn turns_section_rejects_negative_allowance_at_parse_time() {
+        // `u32` rejects negatives at parse time. We assert the field
+        // name lands in the error so the author knows where to look.
+        let bad = r#"
+[game]
+title = "Negative"
+slug = "negative"
+description = ""
+min_width = 80
+min_height = 24
+start_map = "lobby"
+start_x = 0
+start_y = 0
+
+[turns]
+daily_allowance = -1
+"#;
+        let err = GameConfig::from_toml_str(bad).unwrap_err();
+        assert!(matches!(err, ConfigError::Parse(_)), "got {err:?}");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("daily_allowance") || msg.contains("invalid"),
+            "error should be informative: {msg}"
+        );
+    }
+
+    #[test]
+    fn turns_section_rejects_unknown_reset_cadence() {
+        // `TurnReset` is intentionally a closed enum so an
+        // unrecognised cadence fails loudly rather than silently
+        // disabling resets.
+        let bad = r#"
+[game]
+title = "Bad Reset"
+slug = "bad-reset"
+description = ""
+min_width = 80
+min_height = 24
+start_map = "lobby"
+start_x = 0
+start_y = 0
+
+[turns]
+daily_allowance = 10
+reset = "every_full_moon"
+"#;
+        let err = GameConfig::from_toml_str(bad).unwrap_err();
+        assert!(matches!(err, ConfigError::Parse(_)));
+    }
+
+    #[test]
+    fn turns_section_round_trips_through_toml() {
+        let original = r#"
+[game]
+title = "RT Turns"
+slug = "rt-turns"
+description = ""
+min_width = 80
+min_height = 24
+start_map = "lobby"
+start_x = 0
+start_y = 0
+
+[turns]
+daily_allowance = 25
+reset = "local_midnight"
+carryover_max = 7
+"#;
+        let config = GameConfig::from_toml_str(original).unwrap();
+        let serialized = config.to_toml_string();
+        let reparsed = GameConfig::from_toml_str(&serialized).unwrap();
+        assert_eq!(config, reparsed);
+        let turns = reparsed.turns.unwrap();
+        assert_eq!(turns.daily_allowance, 25);
+        assert_eq!(turns.carryover_max, 7);
     }
 
     #[test]

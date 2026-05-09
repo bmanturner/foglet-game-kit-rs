@@ -46,7 +46,8 @@ pub mod terminal;
 pub mod widgets;
 
 pub use config::{
-    ConfigError, GameConfig, GameSection, ManifestSection, SaveSection, SaveStrategy, WorldSection,
+    ConfigError, GameConfig, GameSection, ManifestSection, SaveSection, SaveStrategy, TurnReset,
+    TurnsSection, WorldSection,
 };
 pub use dialog::{
     dialog_choice_prompt, dialog_handle_prompt_input, load_dialog, Choice, ChoiceError, Dialog,

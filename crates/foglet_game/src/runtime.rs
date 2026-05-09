@@ -757,6 +757,7 @@ mod tests {
                 auth_scope: "site".into(),
             },
             world: Default::default(),
+            turns: None,
         }
     }
 
