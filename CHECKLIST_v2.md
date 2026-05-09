@@ -108,20 +108,20 @@ One unchecked item per iteration. Dependencies in `[brackets]` must be checked o
 - [x] **14b** — Add Murder Motel v2 walkthrough to README: two local users demonstrate shared world. [Task 13]
 - [x] **14c** — Document why v2 intentionally avoids real-time multiplayer. [14a]
 
-- [ ] **Task 15 — Final v2 verification**
+- [x] **Task 15 — Final v2 verification**
       Run `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`, `cargo doc --workspace --no-deps`, `cargo run --example murder_motel` local smoke for two users, and `cargo run -p fgk -- package --out <tmp>`. Quote results in the final iteration. [all prior tasks]
 
 ## Acceptance criteria — gate for `<promise>V2_COMPLETE</promise>`
 
-- [ ] All v1 acceptance criteria remain true
-- [ ] All Task 1–15 items above are checked
-- [ ] Shared-world SQLite DB opens, migrates, and survives relaunch
-- [ ] Player registry maps Foglet/local-dev identities to stable player records
-- [ ] Role/security helpers expose legacy-compatible metadata from modern Foglet context
-- [ ] Daily turn ledger supports spend, insufficient-turn rejection, reset, and carryover
-- [ ] Append-only event log powers a Murder Motel bulletin/ledger screen
-- [ ] Leaderboard helpers power a Murder Motel investigators leaderboard
-- [ ] Murder Motel proves shared Room 7 state across two players
-- [ ] Murder Motel proves role/security display for sysop/mod/user without treating it as launch authorization
-- [ ] `fgk package` emits a package with writable `world/` directory expectations documented
-- [ ] Docs explain backup/permissions and explicitly defer real-time multiplayer
+- [x] All v1 acceptance criteria remain true
+- [x] All Task 1–15 items above are checked
+- [x] Shared-world SQLite DB opens, migrates, and survives relaunch
+- [x] Player registry maps Foglet/local-dev identities to stable player records
+- [x] Role/security helpers expose legacy-compatible metadata from modern Foglet context
+- [x] Daily turn ledger supports spend, insufficient-turn rejection, reset, and carryover
+- [x] Append-only event log powers a Murder Motel bulletin/ledger screen
+- [x] Leaderboard helpers power a Murder Motel investigators leaderboard
+- [x] Murder Motel proves shared Room 7 state across two players
+- [x] Murder Motel proves role/security display for sysop/mod/user without treating it as launch authorization
+- [x] `fgk package` emits a package with writable `world/` directory expectations documented
+- [x] Docs explain backup/permissions and explicitly defer real-time multiplayer
