@@ -65,8 +65,9 @@ pub use map::{
     parse_map, EntityPlacement, Map, MapError, Tile, TileKind, TileLegend, PLAYER_GLYPH,
 };
 pub use prompt::{
-    ChoicePrompt, ConfirmAction, ConfirmOutcome, ConfirmPrompt, FeedbackKind, FeedbackLine,
-    PromptAction, PromptChoice, PromptError, PromptKey, StyleRole, Theme,
+    AnyKeyOutcome, AnyKeyPrompt, ChoicePrompt, ConfirmAction, ConfirmOutcome, ConfirmPrompt,
+    FeedbackKind, FeedbackLine, PromptAction, PromptChoice, PromptError, PromptKey, StyleRole,
+    Theme,
 };
 pub use prompt_screen::{PromptLayout, PromptScreen};
 pub use runtime::{

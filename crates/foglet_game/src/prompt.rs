@@ -46,6 +46,89 @@
 //! optional [`crate::screen::Screen`] adapter (Task 7) is a thin
 //! convenience over the same primitives.
 //!
+//! # Examples
+//!
+//! Three small end-to-end doctests covering the prompt shapes Task 9c
+//! is required to demonstrate: a direct-key choice, an Enter-default
+//! confirmation, and an any-key pause. Each test wires the reducer
+//! directly to [`Input`] so the contract is exercised without a live
+//! terminal — the same pattern an in-game `Screen::handle` uses.
+//!
+//! ## Direct-key choice prompt
+//!
+//! Build a [`ChoicePrompt`], send a hotkey through it, and route the
+//! [`PromptAction`] back into game state. The Murder Motel
+//! Lost-and-Found Drawer (SPEC_v1_1.md §5.1) uses exactly this shape.
+//!
+//! ```
+//! use foglet_game::{ChoicePrompt, Input, PromptAction};
+//!
+//! #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+//! enum DrawerAction { TakeKey, Leave }
+//!
+//! let prompt = ChoicePrompt::new()
+//!     .body("A musty drawer holds a tagged room key.")
+//!     .choice('k', DrawerAction::TakeKey, "Take the Room 7 key")
+//!     .choice('l', DrawerAction::Leave, "Leave it");
+//!
+//! // Lowercase and uppercase reach the same arm — SPEC §4.1.
+//! assert_eq!(
+//!     prompt.handle(Input::Char('K')),
+//!     PromptAction::Selected(DrawerAction::TakeKey),
+//! );
+//! // Resize is not a prompt-relevant signal.
+//! assert_eq!(
+//!     prompt.handle(Input::Resize { width: 80, height: 24 }),
+//!     PromptAction::None,
+//! );
+//! ```
+//!
+//! ## Confirmation prompt with Enter default
+//!
+//! [`ConfirmPrompt`] fixes the choice list to `(Y)es / (N)o`, projects
+//! outcomes onto [`ConfirmOutcome`], and lets the author opt into an
+//! Enter-default. SPEC §4.5 calls these out as a distinct prompt shape
+//! because their input contract — Enter-as-default, Esc-as-cancel — is
+//! load-bearing for "are you sure?" beats.
+//!
+//! ```
+//! use foglet_game::{ConfirmOutcome, ConfirmPrompt, Input};
+//!
+//! let prompt = ConfirmPrompt::new("Overwrite the existing save?")
+//!     .default_no();
+//!
+//! // Enter takes the safe default — a stray press will not destroy data.
+//! assert_eq!(prompt.handle(Input::Enter), ConfirmOutcome::No);
+//! // The hotkey still works when the player commits to the action.
+//! assert_eq!(prompt.handle(Input::Char('y')), ConfirmOutcome::Yes);
+//! // Esc backs out without resolving the question.
+//! assert_eq!(prompt.handle(Input::Esc), ConfirmOutcome::Cancelled);
+//! ```
+//!
+//! ## Any-key pause prompt
+//!
+//! [`AnyKeyPrompt`] is the smallest reducer in the kit (SPEC §4.6): show
+//! some narration, wait for any meaningful keypress to acknowledge.
+//! Resize and [`Input::Unknown`] are intentionally ignored so a player
+//! resizing their terminal mid-pause never loses the body.
+//!
+//! ```
+//! use foglet_game::{AnyKeyOutcome, AnyKeyPrompt, Input};
+//!
+//! let pause = AnyKeyPrompt::new()
+//!     .body("The night clerk slides a chipped mug across the counter.")
+//!     .footer("Press any key to continue...");
+//!
+//! // Resize is a layout event, not acknowledgement.
+//! assert_eq!(
+//!     pause.handle(Input::Resize { width: 80, height: 24 }),
+//!     AnyKeyOutcome::None,
+//! );
+//! // Any meaningful key completes the pause.
+//! assert_eq!(pause.handle(Input::Char(' ')), AnyKeyOutcome::Completed);
+//! assert_eq!(pause.handle(Input::Enter), AnyKeyOutcome::Completed);
+//! ```
+//!
 //! # Module map (target — populated across Tasks 2–8)
 //!
 //! - `PromptKey` — normalized direct-input key (Task 2a).
