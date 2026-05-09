@@ -65,6 +65,7 @@
 use crate::Input;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
+use ratatui::widgets::{Block, Borders, Widget};
 
 /// Normalized direct-input key for prompts (SPEC_v1_1.md §4.1).
 ///
@@ -490,6 +491,15 @@ pub struct ChoicePrompt<T> {
     /// configs compose so authors can ship a default-arrow build and a
     /// "Vim mode" build from the same prompt definition.
     pub vim_navigation: bool,
+    /// Optional modal title rendered into the top border by
+    /// [`ChoicePrompt::render_modal`] (SPEC_v1_1.md §4.8 bordered modal
+    /// mode).
+    ///
+    /// `None` — the bordered modal still renders, but the top border is
+    /// drawn unbroken. Compact unboxed mode ([`ChoicePrompt::render`])
+    /// ignores this field entirely; it is purely a modal-mode label, so
+    /// authors who never call `render_modal` pay nothing for it.
+    pub title: Option<String>,
 }
 
 impl<T> Default for ChoicePrompt<T> {
@@ -524,6 +534,9 @@ impl<T> ChoicePrompt<T> {
             // bound `j` or `k` as a choice hotkey) get the safer
             // behaviour for free; opt in via `.vim_navigation(true)`.
             vim_navigation: false,
+            // SPEC §4.8 modal title is optional; the default unboxed
+            // renderer never reads this field.
+            title: None,
         }
     }
 
@@ -581,6 +594,20 @@ impl<T> ChoicePrompt<T> {
     /// drop the `.footer(...)` call from the chain.
     pub fn footer(mut self, footer: impl Into<String>) -> Self {
         self.footer = Some(footer.into());
+        self
+    }
+
+    /// Set the modal title rendered into the top border by
+    /// [`ChoicePrompt::render_modal`] (SPEC_v1_1.md §4.8).
+    ///
+    /// Compact unboxed mode ignores the title — the body acts as the
+    /// header in that layout — so adding `.title(...)` to a prompt that
+    /// is later rendered through [`ChoicePrompt::render`] is harmless.
+    /// Callers who want to switch a prompt between layouts at runtime
+    /// can populate the title unconditionally and let the layout choice
+    /// decide visibility.
+    pub fn title(mut self, title: impl Into<String>) -> Self {
+        self.title = Some(title.into());
         self
     }
 
@@ -1031,6 +1058,57 @@ impl<T> ChoicePrompt<T> {
             buf.set_stringn(area.x, y, row, area.width as usize, style);
         }
         drawn as u16
+    }
+
+    /// Render the prompt as a bordered modal (SPEC_v1_1.md §4.8) into
+    /// `area` of `buf`. Returns the number of inner content rows actually
+    /// written (excluding the top/bottom border rows).
+    ///
+    /// Layout: a Ratatui [`Block`] with `Borders::ALL` plus the optional
+    /// [`ChoicePrompt::title`] in the top border. The block's `inner`
+    /// rect (one cell of margin on every side) is then handed to the
+    /// existing compact renderer so the wrap, blank-line, choice, and
+    /// selected-row logic stays in one place — the modal is purely a
+    /// frame around the same row stream.
+    ///
+    /// # Small-area policy
+    ///
+    /// SPEC §6 forbids panicking on tight slots. A border needs at least
+    /// 2×2 to draw; anything smaller is a no-op (returns `0`). When the
+    /// block's inner rect collapses to zero width or height (e.g. a 2×N
+    /// or N×2 area), the border is still drawn but no content rows are
+    /// written — the player sees an empty box rather than a panic. The
+    /// title is also clipped by Ratatui's own block layout: an
+    /// over-wide title trails into the corner glyph rather than
+    /// overflowing the border.
+    pub fn render_modal(&self, area: Rect, buf: &mut Buffer) -> u16 {
+        // SPEC §6: 0×0 must be a no-op. We also bail before constructing
+        // the block when either dimension is below the 2-cell minimum a
+        // border needs, so Ratatui never sees an underspec'd rect.
+        if area.width < 2 || area.height < 2 {
+            return 0;
+        }
+        // Build the block from references — the title String is owned by
+        // the prompt and outlives this call, so a borrowed `&str` keeps
+        // us from cloning per render. `Borders::ALL` is the SPEC §4.8
+        // "bordered modal" shape; future layout modes (full-screen
+        // transcript) would compose differently.
+        let mut block = Block::default().borders(Borders::ALL);
+        if let Some(title) = self.title.as_deref() {
+            block = block.title(title);
+        }
+        let inner = block.inner(area);
+        // Render the border first so the inner content writes over an
+        // already-blanked rect. `Widget::render` consumes the block; we
+        // own it locally so this is fine.
+        block.render(area, buf);
+        // 2-cell-tall or 2-cell-wide modals have a zero inner — the box
+        // renders but there is nowhere to put content. Returning 0 keeps
+        // the contract ("rows actually written") honest.
+        if inner.width == 0 || inner.height == 0 {
+            return 0;
+        }
+        self.render(inner, buf)
     }
 }
 
@@ -2250,6 +2328,7 @@ mod tests {
             cancellable: false,
             selected: None,
             vim_navigation: false,
+            title: None,
         };
 
         assert_eq!(
@@ -3500,5 +3579,210 @@ mod tests {
                 .contains(Modifier::REVERSED),
             "direct-key prompt picked up REVERSED on choice row"
         );
+    }
+
+    // -- Task 5e: bordered modal layout ------------------------------
+    //
+    // The modal is a thin frame around the same compact row stream the
+    // unboxed renderer produces, so these tests verify (1) the border is
+    // actually drawn, (2) the optional title appears in the top edge,
+    // (3) inner content does not overwrite the border, and (4) tight
+    // slots collapse gracefully without panic per SPEC §6.
+
+    /// Drive `render_modal` through a real `TestBackend` and return a
+    /// row-per-string view. Mirrors `render_prompt_to_strings` so modal
+    /// tests assert against the same backend semantics as the unboxed
+    /// reference snapshots.
+    fn render_modal_to_strings<T>(prompt: &ChoicePrompt<T>, w: u16, h: u16) -> Vec<String> {
+        use ratatui::{backend::TestBackend, Terminal};
+        let backend = TestBackend::new(w, h);
+        let mut term = Terminal::new(backend).expect("test backend");
+        term.draw(|frame| {
+            let area = frame.area();
+            prompt.render_modal(area, frame.buffer_mut());
+        })
+        .expect("draw");
+        let buf = term.backend().buffer().clone();
+        (0..h)
+            .map(|y| {
+                let mut row = String::new();
+                for x in 0..w {
+                    row.push_str(buf[(x, y)].symbol());
+                }
+                row.trim_end().to_string()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn render_modal_draws_full_border_and_inner_content() {
+        // SPEC §4.8: bordered modal mode. Top, bottom, and side edges
+        // MUST carry the box-drawing characters Ratatui's `Borders::ALL`
+        // emits, and the prompt's compact row stream must land inside —
+        // not on top of — those edges.
+        let prompt: ChoicePrompt<LootAction> =
+            ChoicePrompt::new()
+                .body("body")
+                .choice('e', LootAction::Equip, "Equip");
+        let rows = render_modal_to_strings(&prompt, 30, 8);
+        // Top + bottom edges: a continuous run of horizontal box glyphs
+        // bracketed by corners. Asserting the corner cells alone is the
+        // tightest contract; the middle is `─` between them.
+        assert!(
+            rows[0].starts_with('┌'),
+            "top-left corner missing: {:?}",
+            rows[0]
+        );
+        assert!(
+            rows[0].ends_with('┐'),
+            "top-right corner missing: {:?}",
+            rows[0]
+        );
+        assert!(
+            rows[7].starts_with('└'),
+            "bottom-left corner missing: {:?}",
+            rows[7]
+        );
+        assert!(
+            rows[7].ends_with('┘'),
+            "bottom-right corner missing: {:?}",
+            rows[7]
+        );
+        // Side edges on every interior row.
+        for (i, row) in rows.iter().enumerate().skip(1).take(6) {
+            assert!(row.starts_with('│'), "row {i} missing left border: {row:?}");
+        }
+        // Inner content lives strictly between the borders. The body
+        // word "body" is on row 1 (just inside the top border); the
+        // first character on that row is the left border, then a space
+        // of inner-margin x, then "body".
+        assert!(
+            rows[1].contains("body"),
+            "body did not render inside modal: {:?}",
+            rows[1]
+        );
+    }
+
+    #[test]
+    fn render_modal_renders_title_in_top_border() {
+        // SPEC §4.8 lists modal titles as a layout option. When set, the
+        // title MUST appear inside the top border so it is visible
+        // before the player reads the body — the SPEC's "Title" style
+        // role exists precisely for this slot.
+        let prompt: ChoicePrompt<LootAction> = ChoicePrompt::new()
+            .title("Lost & Found")
+            .body("body")
+            .choice('e', LootAction::Equip, "Equip");
+        let rows = render_modal_to_strings(&prompt, 30, 6);
+        assert!(
+            rows[0].contains("Lost & Found"),
+            "title missing from top border: {:?}",
+            rows[0]
+        );
+        // Top border MUST still close on the right with `┐` even after
+        // the title eats some of the run.
+        assert!(rows[0].ends_with('┐'));
+    }
+
+    #[test]
+    fn render_modal_inner_content_does_not_overwrite_borders() {
+        // Regression guard: a tall prompt MUST clip to the inner rect
+        // rather than punch through the border. Pick choices that would
+        // overflow without clipping (5 choices in a 6-tall box: top
+        // border + 4 inner rows + bottom border = only 4 inner rows).
+        let prompt: ChoicePrompt<LootAction> = ChoicePrompt::new()
+            .choice('a', LootAction::Equip, "alpha")
+            .choice('b', LootAction::Take, "beta")
+            .choice('c', LootAction::Pass, "gamma")
+            .choice('d', LootAction::Equip, "delta")
+            .choice('e', LootAction::Take, "epsilon");
+        let rows = render_modal_to_strings(&prompt, 20, 6);
+        // Bottom border MUST survive: if the inner renderer wrote past
+        // its rect, the corner glyph would be a content character.
+        assert!(
+            rows[5].starts_with('└'),
+            "bottom border clobbered: {:?}",
+            rows[5]
+        );
+        assert!(
+            rows[5].ends_with('┘'),
+            "bottom border clobbered: {:?}",
+            rows[5]
+        );
+        // Side borders likewise unbroken on every interior row.
+        for (i, row) in rows.iter().enumerate().skip(1).take(4) {
+            assert!(row.starts_with('│'), "row {i} left side broken: {row:?}");
+            // Right side is at column width-1; the trim drops trailing
+            // spaces but the `│` is non-space so it survives the trim.
+            assert!(row.ends_with('│'), "row {i} right side broken: {row:?}");
+        }
+    }
+
+    #[test]
+    fn render_modal_zero_area_is_a_noop() {
+        // SPEC §6 forbids panicking on small areas. A 0×0 rect must
+        // return 0 without touching `buf`.
+        let prompt: ChoicePrompt<LootAction> =
+            ChoicePrompt::new()
+                .body("body")
+                .choice('e', LootAction::Equip, "Equip");
+        let area = Rect::new(0, 0, 0, 0);
+        let mut buf = Buffer::empty(Rect::new(0, 0, 4, 4));
+        assert_eq!(prompt.render_modal(area, &mut buf), 0);
+    }
+
+    #[test]
+    fn render_modal_one_cell_area_does_not_panic() {
+        // Single-cell areas cannot fit a border at all. The renderer
+        // MUST bail with 0 rather than ask Ratatui to draw an
+        // underspec'd box (which would panic on debug assertions in
+        // older ratatui versions and is meaningless on any version).
+        let prompt: ChoicePrompt<LootAction> =
+            ChoicePrompt::new()
+                .body("body")
+                .choice('e', LootAction::Equip, "Equip");
+        let area = Rect::new(0, 0, 1, 1);
+        let mut buf = Buffer::empty(Rect::new(0, 0, 4, 4));
+        assert_eq!(prompt.render_modal(area, &mut buf), 0);
+    }
+
+    #[test]
+    fn render_modal_two_by_two_draws_border_only() {
+        // The minimum viable border is 2×2: four corner glyphs and no
+        // inner area. The renderer MUST still draw the box (so a tight
+        // layout shows *something* recognisable as a modal frame) but
+        // report zero content rows because nothing fit inside.
+        let prompt: ChoicePrompt<LootAction> =
+            ChoicePrompt::new()
+                .body("body")
+                .choice('e', LootAction::Equip, "Equip");
+        let area = Rect::new(0, 0, 2, 2);
+        let mut buf = Buffer::empty(area);
+        let drawn = prompt.render_modal(area, &mut buf);
+        assert_eq!(drawn, 0, "no inner rows possible at 2×2");
+        assert_eq!(buf[(0, 0)].symbol(), "┌");
+        assert_eq!(buf[(1, 0)].symbol(), "┐");
+        assert_eq!(buf[(0, 1)].symbol(), "└");
+        assert_eq!(buf[(1, 1)].symbol(), "┘");
+    }
+
+    #[test]
+    fn render_modal_without_title_renders_unbroken_top_edge() {
+        // Symmetry with the title-present test: when no title is set,
+        // the top edge MUST be a continuous run of horizontal box glyphs
+        // — no leading space where the title would have sat.
+        let prompt: ChoicePrompt<LootAction> =
+            ChoicePrompt::new()
+                .body("body")
+                .choice('e', LootAction::Equip, "Equip");
+        let rows = render_modal_to_strings(&prompt, 12, 5);
+        // Between corners, every cell on row 0 is `─`.
+        let top = &rows[0];
+        let chars: Vec<char> = top.chars().collect();
+        assert_eq!(chars.first(), Some(&'┌'));
+        assert_eq!(chars.last(), Some(&'┐'));
+        for (i, c) in chars.iter().enumerate().skip(1).take(chars.len() - 2) {
+            assert_eq!(*c, '─', "expected unbroken top edge at index {i}, got {c}");
+        }
     }
 }
