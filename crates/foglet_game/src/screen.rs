@@ -84,10 +84,12 @@ pub struct GameContext<'a> {
     /// `GameContext` is a *view* of runtime data, not a place where
     /// screens get exclusive ownership of subsystems.
     ///
-    /// Task 10d (a SPEC documentation task) reminds authors that
-    /// `render` callbacks must not run blocking world queries; reads
-    /// belong in `tick` / `handle_input` paths where the runtime can
-    /// tolerate the latency without dropping a frame.
+    /// **Do not run blocking world queries from `Screen::render`**
+    /// (SPEC_v2 §Task 10d). The draw path must stay non-blocking;
+    /// SQLite reads, writes, and transactions belong in `tick` or
+    /// `handle_input`, where the runtime tolerates latency. See the
+    /// [`Screen::render`] docs for the full rationale and the cache
+    /// pattern callers should use.
     pub world_db: Option<&'a WorldDb>,
 }
 
@@ -216,6 +218,22 @@ pub trait Screen {
     /// Implementations should be **pure with respect to the frame**:
     /// no side effects beyond writing widgets. Game-state mutations
     /// belong in `tick` or in response to `handle_input`.
+    ///
+    /// ## Do not run blocking world queries here (SPEC_v2 §Task 10d)
+    ///
+    /// `ctx.world_db` is reachable from `render` so widgets can format
+    /// data already in scope, but `render` runs on the per-frame draw
+    /// path and **must not** issue blocking SQLite reads, writes, or
+    /// transactions against the shared world DB. SQLite under load may
+    /// stall on `SQLITE_BUSY`/lock contention, and a blocked render
+    /// drops frames, freezes input, and — worst case — leaves the
+    /// terminal in raw mode for noticeably longer than the guard
+    /// expects.
+    ///
+    /// Instead, fetch what you need in `tick` or `handle_input`, cache
+    /// it on the screen struct, and read that cache in `render`. The
+    /// runtime explicitly tolerates latency on those paths; it does
+    /// not tolerate it on the draw path.
     fn render(&mut self, ctx: &mut GameContext<'_>, frame: &mut ratatui::Frame<'_>);
 
     /// Handle a normalized [`Input`] event.
