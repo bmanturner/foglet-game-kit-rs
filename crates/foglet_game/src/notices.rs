@@ -35,7 +35,9 @@
 //! kit version — game-authored migrations live in their own higher
 //! band and are not affected.
 
-use crate::world_db::WorldMigration;
+use thiserror::Error;
+
+use crate::world_db::{WorldDb, WorldMigration};
 
 /// Schema for the player-mail table — SPEC_v3 §4.1 / §Task 3a.
 ///
@@ -155,12 +157,232 @@ CREATE INDEX IF NOT EXISTS idx_notices_recipient_all\n\
 ",
 };
 
+/// Decoded `notices` row — SPEC_v3 §4.1 read model.
+///
+/// Mirrors the column shape pinned by [`NOTICES_MIGRATION`] one-for-one,
+/// in the same order, so the SQL `RETURNING` clause and the `query_map`
+/// row decoder share a single column list. Authoring code consumes
+/// this struct rather than reaching into raw `rusqlite::Row`s — that
+/// keeps the schema-to-Rust mapping in one place and turns a column
+/// rename into a single compile error instead of a fan-out of decode
+/// failures.
+///
+/// All timestamps stay as raw SQLite ISO text, the same contract as
+/// [`crate::events::EventRecord`]: parsing into a richer type would be
+/// a one-way trip that hides corrupt data and forces a chrono / time
+/// dependency on every consumer. `metadata` is likewise opaque text —
+/// game code that wants structured metadata serialises JSON before
+/// handing it to [`WorldDb::send_notice`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Notice {
+    /// Autoincrement primary key. Doubles as the deterministic
+    /// tiebreaker for the inbox query (Task 3d) when two notices share
+    /// a `created_at` value at second resolution.
+    pub id: i64,
+    /// UTC timestamp written by SQLite at insert time
+    /// (`CURRENT_TIMESTAMP`). Kept as ISO text — see struct docs.
+    pub created_at: String,
+    /// Sender's `players.id`, or `None` for system notices. SPEC §4.1
+    /// explicitly allows "System notices MAY have no sender".
+    pub sender_player_id: Option<i64>,
+    /// Recipient's `players.id`. Required by the schema — every notice
+    /// has exactly one addressee.
+    pub recipient_player_id: i64,
+    /// Game-authored kind label (e.g. `"guestbook_note"`,
+    /// `"challenge_offer"`). Round-tripped verbatim; the kit imposes
+    /// no namespace.
+    pub kind: String,
+    /// Player- or system-authored short title. Length bounds are
+    /// enforced by Task 3c, not at the storage layer.
+    pub subject: String,
+    /// Player- or system-authored body. Length bounds are enforced by
+    /// Task 3c, not at the storage layer.
+    pub body: String,
+    /// ISO timestamp the recipient first marked the notice as read, or
+    /// `None` while it is still unread. Flipped to a timestamp by the
+    /// idempotent Task 3e helper.
+    pub read_at: Option<String>,
+    /// ISO timestamp the recipient archived the notice, or `None` if
+    /// it is still in the active inbox. Flipped to a timestamp by the
+    /// Task 3f helper.
+    pub archived_at: Option<String>,
+    /// Optional ISO timestamp after which the notice is considered
+    /// expired. The kit does not auto-purge in v3 (see module docs);
+    /// game-authored or future kit code may filter on this.
+    pub expires_at: Option<String>,
+    /// Optional opaque metadata blob (typically a JSON object). Stored
+    /// as text so `sqlite3 -json` can pretty-print it; the kit does
+    /// not parse it.
+    pub metadata: Option<String>,
+}
+
+/// Failure modes for [`WorldDb::send_notice`].
+///
+/// Library-internal `thiserror` shape — the runtime wraps these with
+/// `anyhow` at the process boundary. Mirrors [`crate::events::EventError`]
+/// so all world-DB write paths surface errors with the same shape.
+///
+/// Task 3b only emits [`NoticeError::Sqlite`]; Task 3c will add
+/// length-validation variants (`EmptySubject`, `SubjectTooLong`,
+/// `BodyTooLong`, …) without disturbing the call signature — they slot
+/// in as additional `#[error]` arms before the `Sqlite` round-trip
+/// runs. Carving out the error type now means 3c is a non-breaking
+/// change to consumers.
+#[derive(Debug, Error)]
+pub enum NoticeError {
+    /// The `INSERT … RETURNING` round-trip failed. Wrapping
+    /// `rusqlite::Error` keeps the call site readable (one error type,
+    /// one mapping) while preserving the underlying cause for
+    /// `tracing` and operator-facing messages.
+    #[error("failed to write notice to world database: {source}")]
+    Sqlite {
+        /// Underlying `rusqlite` error from the insert statement.
+        #[source]
+        source: rusqlite::Error,
+    },
+}
+
+impl WorldDb {
+    /// Insert one row into `notices` and return the canonical
+    /// [`Notice`] SQLite produced (SPEC_v3 §4.1 / §Task 3b).
+    ///
+    /// The contract is "the notice I asked you to send is now durably
+    /// in the recipient's mailbox, with the id and `created_at` SQLite
+    /// assigned, and `read_at` / `archived_at` both still `NULL`". A
+    /// freshly sent notice MUST be unread — the test
+    /// `send_notice_stores_unread_notice` pins both fields explicitly
+    /// so a future schema or default-value change can't silently flip
+    /// the lifecycle.
+    ///
+    /// Length validation is intentionally **not** performed here —
+    /// SPEC_v3 §Task 3c owns the empty-subject / overlong-body guard
+    /// and lands in the next iteration. The schema's `NOT NULL`
+    /// constraints on `subject` and `body` are still in force, so a
+    /// caller who somehow passes a literal `""` will land a row with
+    /// an empty string (legal at the storage layer); 3c will reject
+    /// that case at the kit boundary before the SQL round-trip.
+    ///
+    /// `kind`, `subject`, and `body` are required by the schema.
+    /// `sender_player_id` is `Option<i64>` because system notices have
+    /// no attributable sender (§4.1). `expires_at` is the only optional
+    /// timestamp on the *write* path: `read_at` and `archived_at` are
+    /// always `NULL` at send time and get filled by their dedicated
+    /// helpers. `metadata` is opaque text, same contract as
+    /// [`crate::events::EventRecord::metadata`].
+    ///
+    /// We use SQLite's `RETURNING` clause (≥ 3.35) to read the
+    /// canonical row — `id`, the SQL-side `created_at`, plus every
+    /// other column — without a second round-trip, the same pattern
+    /// as [`Self::append_event`] and [`Self::upsert_player`].
+    ///
+    /// # Concurrency
+    ///
+    /// Takes `&self`: a single insert statement under the configured
+    /// busy timeout. `&mut self` would fight the runtime layer where
+    /// `GameContext` borrows the world DB once per tick.
+    #[allow(clippy::too_many_arguments)] // Matches the SPEC §4.1 column shape one-for-one (sender, recipient, kind, subject, body, expires_at, metadata); bundling into a struct would force every call site through a builder dance without adding type safety, since each parameter is already strongly typed.
+    pub fn send_notice(
+        &self,
+        sender_player_id: Option<i64>,
+        recipient_player_id: i64,
+        kind: &str,
+        subject: &str,
+        body: &str,
+        expires_at: Option<&str>,
+        metadata: Option<&str>,
+    ) -> Result<Notice, NoticeError> {
+        // `RETURNING` echoes the full row back — including the SQL-side
+        // `CURRENT_TIMESTAMP` default for `created_at` and the `NULL`
+        // values for `read_at` / `archived_at`. The column order here
+        // matches `row_to_notice` and the inbox query in Task 3d so all
+        // three share one decoder.
+        const SQL: &str = "\
+INSERT INTO notices \
+    (sender_player_id, recipient_player_id, kind, subject, body, expires_at, metadata) \
+VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+RETURNING id, created_at, sender_player_id, recipient_player_id, \
+          kind, subject, body, read_at, archived_at, expires_at, metadata";
+
+        self.connection()
+            .query_row(
+                SQL,
+                rusqlite::params![
+                    sender_player_id,
+                    recipient_player_id,
+                    kind,
+                    subject,
+                    body,
+                    expires_at,
+                    metadata,
+                ],
+                row_to_notice,
+            )
+            .map_err(|source| NoticeError::Sqlite { source })
+    }
+}
+
+/// Decode a `notices` row into [`Notice`].
+///
+/// Pulled out so the Task 3b write path and the upcoming Task 3d
+/// inbox query can share one decoder. Column order matches the
+/// `RETURNING` clause in [`WorldDb::send_notice`] *and* the inbox
+/// `SELECT` (when it lands); a regression that reorders columns will
+/// surface here as a type error rather than as a silent field swap.
+fn row_to_notice(row: &rusqlite::Row<'_>) -> rusqlite::Result<Notice> {
+    Ok(Notice {
+        id: row.get(0)?,
+        created_at: row.get(1)?,
+        sender_player_id: row.get(2)?,
+        recipient_player_id: row.get(3)?,
+        kind: row.get(4)?,
+        subject: row.get(5)?,
+        body: row.get(6)?,
+        read_at: row.get(7)?,
+        archived_at: row.get(8)?,
+        expires_at: row.get(9)?,
+        metadata: row.get(10)?,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::foglet::{ContextSource, FogletContext};
     use crate::players::PLAYERS_MIGRATION;
-    use crate::world_db::WorldDb;
     use tempfile::tempdir;
+
+    /// Helper: build a [`FogletContext`] just complete enough for
+    /// `upsert_player` to land a row. Tests don't care about
+    /// `terminal_*` or `session_id`, so this keeps test bodies focused
+    /// on the notice behavior under test.
+    fn ctx(user_id: &str, username: &str) -> FogletContext {
+        FogletContext {
+            door_id: "test-door".to_string(),
+            user_id: Some(user_id.to_string()),
+            username: Some(username.to_string()),
+            role: None,
+            session_id: None,
+            terminal_width: 80,
+            terminal_height: 24,
+            source: ContextSource::ContextFile,
+        }
+    }
+
+    /// Helper: open a fresh world DB with players + notices migrations
+    /// applied. Both Task 3b tests need this setup; pulling it out
+    /// keeps each test body focused on the assertion under test.
+    fn world_with_notices() -> (tempfile::TempDir, WorldDb) {
+        let dir = tempdir().expect("tempdir creates");
+        let db_path = dir.path().join("world.sqlite");
+        let mut world = WorldDb::open(&db_path).expect("open succeeds");
+        world
+            .apply_migration(&PLAYERS_MIGRATION)
+            .expect("players migration applies");
+        world
+            .apply_migration(&NOTICES_MIGRATION)
+            .expect("notices migration applies");
+        (dir, world)
+    }
 
     /// SPEC_v3 §Task 3a acceptance: applying [`NOTICES_MIGRATION`]
     /// creates the documented `notices` table with the column shape
@@ -345,5 +567,125 @@ mod tests {
         world
             .apply_migration(&NOTICES_MIGRATION)
             .expect("second notices migration applies (idempotent)");
+    }
+
+    /// SPEC_v3 §Task 3b acceptance: a freshly sent notice is durably
+    /// stored AND is unread. The "stored" half asserts the round-tripped
+    /// `Notice` matches what was sent (id assigned, fields preserved);
+    /// the "unread" half pins `read_at` and `archived_at` both to
+    /// `None`. SPEC §4.1 implicitly requires this — a notice that was
+    /// born "read" or "archived" would never surface in any inbox query
+    /// and the lifecycle would be broken from the start.
+    ///
+    /// We also verify the row is visible by primary key directly, so a
+    /// regression that returned a `Notice` from `RETURNING` without
+    /// actually persisting (e.g. a future change that wrapped the
+    /// insert in a transaction and forgot to commit) would flunk here
+    /// rather than only at the Task 3d inbox query.
+    #[test]
+    fn send_notice_stores_unread_notice() {
+        let (_dir, world) = world_with_notices();
+        let alice = world
+            .upsert_player(&ctx("u-alice", "alice"))
+            .expect("alice upsert succeeds");
+        let bob = world
+            .upsert_player(&ctx("u-bob", "bob"))
+            .expect("bob upsert succeeds");
+
+        let sent = world
+            .send_notice(
+                Some(alice.id),
+                bob.id,
+                "guestbook_note",
+                "Welcome to the motel",
+                "Stop by Room 7. There's a clue under the rug.",
+                None,
+                None,
+            )
+            .expect("send_notice succeeds");
+
+        // Returned record reflects the inputs and SQL-side defaults.
+        assert!(sent.id > 0, "RETURNING must echo an autoincrement id");
+        assert!(
+            !sent.created_at.is_empty(),
+            "RETURNING must echo CURRENT_TIMESTAMP"
+        );
+        assert_eq!(sent.sender_player_id, Some(alice.id));
+        assert_eq!(sent.recipient_player_id, bob.id);
+        assert_eq!(sent.kind, "guestbook_note");
+        assert_eq!(sent.subject, "Welcome to the motel");
+        assert_eq!(sent.body, "Stop by Room 7. There's a clue under the rug.");
+
+        // The unread / unarchived contract — the central Task 3b claim.
+        assert!(
+            sent.read_at.is_none(),
+            "freshly sent notice must be unread (read_at IS NULL)"
+        );
+        assert!(
+            sent.archived_at.is_none(),
+            "freshly sent notice must not be archived (archived_at IS NULL)"
+        );
+        assert!(sent.expires_at.is_none());
+        assert!(sent.metadata.is_none());
+
+        // Round-trip through a direct primary-key SELECT to prove the
+        // row really landed in the table — guards against a future
+        // refactor that returns the `Notice` from `RETURNING` without
+        // actually committing the insert.
+        let stored = world
+            .connection()
+            .query_row(
+                "SELECT id, created_at, sender_player_id, recipient_player_id, \
+                        kind, subject, body, read_at, archived_at, expires_at, metadata \
+                 FROM notices WHERE id = ?1",
+                rusqlite::params![sent.id],
+                row_to_notice,
+            )
+            .expect("primary-key SELECT decodes the row");
+        assert_eq!(stored, sent, "stored row must equal RETURNING row");
+    }
+
+    /// SPEC §4.1: "System notices MAY have no sender." A `None`
+    /// `sender_player_id` MUST round-trip as `NULL` and produce a
+    /// notice that is otherwise indistinguishable from a player-sent
+    /// one — same unread/unarchived contract. Pinning this here keeps
+    /// the system-advisory pathway honest; without an explicit test, a
+    /// future signature change that "helpfully" defaulted the sender to
+    /// some sentinel id would silently break §4.1.
+    ///
+    /// Also exercises the optional `expires_at` and `metadata`
+    /// parameters — the Task 3b signature accepts them, so a smoke
+    /// that they round-trip belongs here, not in a later 3d/3e test.
+    #[test]
+    fn send_notice_supports_system_sender_and_optional_fields() {
+        let (_dir, world) = world_with_notices();
+        let recipient = world
+            .upsert_player(&ctx("u-recipient", "recipient"))
+            .expect("recipient upsert succeeds");
+
+        let sent = world
+            .send_notice(
+                None,
+                recipient.id,
+                "system_advisory",
+                "Door reset reminder",
+                "The motel resets at midnight UTC.",
+                Some("2026-12-31T23:59:59Z"),
+                Some(r#"{"severity":"info"}"#),
+            )
+            .expect("system send_notice succeeds");
+
+        assert_eq!(
+            sent.sender_player_id, None,
+            "system notices must store NULL sender per SPEC §4.1"
+        );
+        assert_eq!(sent.recipient_player_id, recipient.id);
+        assert_eq!(sent.kind, "system_advisory");
+        assert_eq!(sent.expires_at.as_deref(), Some("2026-12-31T23:59:59Z"));
+        assert_eq!(sent.metadata.as_deref(), Some(r#"{"severity":"info"}"#));
+        assert!(
+            sent.read_at.is_none() && sent.archived_at.is_none(),
+            "system notices must also start unread/unarchived"
+        );
     }
 }
