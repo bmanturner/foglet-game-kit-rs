@@ -38,7 +38,7 @@ use foglet_game::{
     load_context, load_dialog, parse_map, process_env, read_save, render_inventory_list,
     render_menu_list, resolve_save_path, write_atomic, ChoicePrompt, Dialog, DialogState,
     FeedbackLine, FlagSet, Game, GameConfig, GameContext, Input, InventoryList, Map, MenuList,
-    SavePathInputs, Screen, ScreenCommand, TileLegend,
+    PromptAction, PromptScreen, SavePathInputs, Screen, ScreenCommand, TileLegend,
 };
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -136,6 +136,12 @@ pub struct SharedSlots {
     /// `borrow_mut()` swap is enough to apply a loaded save without
     /// briefly observing a half-restored position.
     pub player: Rc<RefCell<PlayerSlot>>,
+    /// Most recent player-facing feedback line — written by prompt
+    /// callbacks (e.g. the Lost-and-Found Drawer in Task 10f) and read
+    /// by the [`MapScreen`] renderer below the movement hint. Ephemeral
+    /// state: not part of [`SaveState`], cleared on `reset` so a fresh
+    /// run never opens with stale narration from a prior session.
+    pub feedback: Rc<RefCell<Option<FeedbackLine>>>,
 }
 
 /// Small POD bundle inside [`SharedSlots::player`].
@@ -182,6 +188,10 @@ impl SharedSlots {
         // previous run spent. The field is re-initialised in one place
         // so a future re-tune touches a single constant.
         p.cash = PlayerSlot::STARTING_CASH;
+        // Clear any leftover feedback so a new run never opens under a
+        // stale "Moved Room 7 key to inventory." line from a previous
+        // session.
+        *self.feedback.borrow_mut() = None;
     }
 
     /// Build a [`SaveState`] from the current slot contents. Cloning the
@@ -756,6 +766,23 @@ impl MapScreen {
     /// slot.
     pub const RECEIPT_READ_FLAG: &'static str = "receipt_read";
 
+    /// Map cell that hosts the Lost-and-Found Drawer (Task 10f). Sits
+    /// next to the Night Clerk at column 24 so the prompt's "behind the
+    /// desk" framing is geographically honest: the player walks up to
+    /// the front desk and finds the drawer beside the clerk. The cell
+    /// itself is treated as furniture — non-walkable, blocking via the
+    /// same gate that protects NPC tiles — so a press of the search key
+    /// from any orthogonally adjacent floor cell opens the prompt.
+    pub const LOST_AND_FOUND_POS: (u16, u16) = (25, 2);
+
+    /// Glyph painted at [`Self::LOST_AND_FOUND_POS`]. A single uppercase
+    /// `D` (for Drawer) keeps the affordance legible on monochrome BBS
+    /// clients without colliding with the existing NPC glyphs (`B`/`C`/
+    /// `M`) or item glyphs (lowercase). Pulled out as a constant so the
+    /// renderer and the headless `rendered_rows` test consult one
+    /// source of truth.
+    pub const LOST_AND_FOUND_GLYPH: char = 'D';
+
     /// Build a lobby map screen with fresh, unshared slots. Used by
     /// tests that want an isolated screen instance and by callers that
     /// don't need to participate in the Task 13h save/load handshake.
@@ -858,6 +885,13 @@ impl MapScreen {
         if Self::npc_at(target_x, target_y).is_some() {
             return false;
         }
+        // Lost-and-Found Drawer (Task 10f) is furniture. Blocking the
+        // step keeps the desk's framing consistent — the player stands
+        // beside the drawer and presses the search key, instead of
+        // standing *on* the drawer to interact with it.
+        if Self::is_lost_and_found_at(target_x, target_y) {
+            return false;
+        }
         {
             let mut p = self.slots.player.borrow_mut();
             p.x = target_x;
@@ -903,6 +937,32 @@ impl MapScreen {
             }
         }
         None
+    }
+
+    /// Whether the cell at `(x, y)` is the Lost-and-Found Drawer
+    /// (Task 10f). Centralised so the renderer, movement gate, and
+    /// adjacency probe consult the same answer instead of re-deriving
+    /// the comparison.
+    pub fn is_lost_and_found_at(x: u16, y: u16) -> bool {
+        (x, y) == Self::LOST_AND_FOUND_POS
+    }
+
+    /// Whether the player can act on the Lost-and-Found Drawer right
+    /// now. Mirrors [`Self::nearby_npc`]: the player must stand on the
+    /// drawer cell or one of the four cardinal neighbours. Diagonals
+    /// are excluded so a player two rooms away never accidentally
+    /// reaches across the wall to a drawer they cannot see.
+    pub fn nearby_lost_and_found(&self) -> bool {
+        const OFFSETS: &[(i32, i32)] = &[(0, 0), (1, 0), (-1, 0), (0, 1), (0, -1)];
+        let (px, py) = self.player();
+        OFFSETS.iter().any(|(dx, dy)| {
+            let cx = px as i32 + dx;
+            let cy = py as i32 + dy;
+            if cx < 0 || cy < 0 {
+                return false;
+            }
+            Self::is_lost_and_found_at(cx as u16, cy as u16)
+        })
     }
 
     /// Shared handle to the narrative-flag store. Cloned so the
@@ -1077,6 +1137,21 @@ impl MapScreen {
                     chars[col] = Self::WIN_TILE_GLYPH;
                     *row = chars.into_iter().collect();
                 }
+            }
+        }
+        // Lost-and-Found Drawer glyph (Task 10f). Painted unconditionally
+        // — there is no "drawer consumed" state because the prompt's own
+        // disabled-(K) branch (Task 10d) handles the only "already
+        // taken" case. Stamped before the player overlay below so
+        // standing adjacent to the drawer never hides its glyph.
+        let (lx, ly) = Self::LOST_AND_FOUND_POS;
+        if (ly as usize) < rows.len() {
+            let row = &mut rows[ly as usize];
+            let col = lx as usize;
+            if col < row.len() {
+                let mut chars: Vec<char> = row.chars().collect();
+                chars[col] = Self::LOST_AND_FOUND_GLYPH;
+                *row = chars.into_iter().collect();
             }
         }
         // Stamp the player glyph by replacing the byte at the player's
@@ -1316,6 +1391,60 @@ pub const READ_RECEIPT_FEEDBACK: &str =
 /// and the SPEC §9 step 5 sample shows no leading marker. The
 /// `success` style is reserved for the night-clerk vendor (Task 11)
 /// where a coffee purchase reads as an unambiguous positive outcome.
+/// Build the [`PromptScreen`] the lobby pushes when the player searches
+/// the Lost-and-Found Drawer (SPEC §9, Task 10f).
+///
+/// Centralising the wiring here keeps the [`MapScreen`] input handler a
+/// one-liner and lets tests exercise the same factory the runtime uses,
+/// so a future regression in the callback's outcome→`ScreenCommand`
+/// mapping cannot hide behind a private closure literal.
+///
+/// The closure clones the supplied [`SharedSlots`] handle so it can
+/// outlive the synchronous `handle_input` call: `PromptScreen` keeps the
+/// callback alive across frames, and the captured slots reach into the
+/// same `RefCell`s the map screen reads — there is only ever one logical
+/// inventory/feedback pair.
+///
+/// Outcome routing:
+///
+/// - `Selected(_)` applies the choice via [`apply_lost_and_found_choice`],
+///   stores the matching [`FeedbackLine`] (if any) in
+///   [`SharedSlots::feedback`], and pops back to the lobby. The disabled
+///   branch is `(K)`-specific and never reaches `Selected`.
+/// - `Disabled { reason, .. }` surfaces the reason as an error feedback
+///   line *without* popping — the player is told why the press was
+///   rejected and stays in the prompt to make a different choice.
+/// - `Cancelled` (Esc) and any-key fall-through (`None`) follow the
+///   SPEC §4.4 cancellation contract: pop the prompt, leave state
+///   untouched.
+pub fn lost_and_found_drawer_screen(slots: SharedSlots) -> PromptScreen<LostAndFoundChoice> {
+    let has_room_7_key = slots.inventory.borrow().contains(MapScreen::ROOM_7_KEY_ID);
+    let prompt = lost_and_found_drawer_prompt_with_state(has_room_7_key).cancellable(true);
+    let callback_slots = slots;
+    PromptScreen::new(prompt, move |action| match action {
+        PromptAction::Selected(choice) => {
+            let outcome = apply_lost_and_found_choice(&callback_slots, choice);
+            if let Some(line) = lost_and_found_feedback(outcome) {
+                *callback_slots.feedback.borrow_mut() = Some(line);
+            }
+            ScreenCommand::Pop
+        }
+        PromptAction::Disabled { reason, .. } => {
+            // Disabled hotkeys (currently only `(K)` once the Room 7
+            // key is held) keep the prompt open — the player gets an
+            // error line explaining the rejection and can pick a
+            // different choice without re-opening the drawer.
+            if let Some(reason) = reason {
+                *callback_slots.feedback.borrow_mut() = Some(FeedbackLine::error(reason));
+            }
+            ScreenCommand::None
+        }
+        PromptAction::Cancelled => ScreenCommand::Pop,
+        PromptAction::None | PromptAction::ConfirmRequested(_) => ScreenCommand::None,
+    })
+    .modal()
+}
+
 pub fn lost_and_found_feedback(outcome: LostAndFoundOutcome) -> Option<FeedbackLine> {
     match outcome {
         LostAndFoundOutcome::TookRoom7Key => Some(FeedbackLine::info(TOOK_ROOM_7_KEY_FEEDBACK)),
@@ -1438,6 +1567,20 @@ impl Screen for MapScreen {
                     x += 1;
                     continue;
                 }
+                // Lost-and-Found Drawer glyph (Task 10f). Painted in the
+                // same cyan+bold register as the room labels so the
+                // affordance reads as "important UI furniture" without
+                // getting confused with the locked door's red warning
+                // colour. The drawer cell is non-walkable so the player
+                // glyph never collides with it on this branch.
+                if Self::is_lost_and_found_at(x as u16, y as u16) {
+                    spans.push(Span::styled(
+                        Self::LOST_AND_FOUND_GLYPH.to_string(),
+                        label_style,
+                    ));
+                    x += 1;
+                    continue;
+                }
                 // Room label?
                 if let Some((label, _)) = labels_for_row.iter().find(|(_, lx)| (*lx as usize) == x)
                 {
@@ -1474,6 +1617,25 @@ impl Screen for MapScreen {
         if hint_area.y < frame.area().height {
             let hint = Paragraph::new(Self::HINT_LINE).alignment(Alignment::Center);
             frame.render_widget(hint, hint_area);
+        }
+
+        // Feedback line (Task 10f). Sits one row below the hint so the
+        // post-action narration from prompts (e.g. "Moved Room 7 key
+        // to inventory.") lands in a consistent spot regardless of map
+        // size. We borrow read-only and clone the line because
+        // `FeedbackLine::render` takes `&self` and writes directly into
+        // the frame's buffer.
+        let feedback_y = hint_area.y.saturating_add(1);
+        if feedback_y < frame.area().height {
+            if let Some(line) = self.slots.feedback.borrow().clone() {
+                let feedback_area = Rect {
+                    x: area.x,
+                    y: feedback_y,
+                    width: area.width,
+                    height: 1,
+                };
+                line.render(feedback_area, frame.buffer_mut());
+            }
         }
     }
 
@@ -1514,6 +1676,24 @@ impl Screen for MapScreen {
             Input::Char('i') | Input::Char('I') => {
                 ScreenCommand::Push(Box::new(InventoryScreen::new(self.inventory())))
             }
+            // Search affordance (Task 10f). When the player stands next
+            // to the Lost-and-Found Drawer, `x`/`X` opens the SPEC §9
+            // loot prompt; everywhere else the key is inert (silent
+            // rejection, same model as bumping a wall). Keeps the prompt
+            // reachable from normal lobby play without bolting it onto
+            // a debug menu.
+            Input::Char('x') | Input::Char('X') => {
+                if self.nearby_lost_and_found() {
+                    // Clear any prior feedback so a fresh interaction
+                    // never pops in under stale narration from the last
+                    // action — the prompt will write its own line on
+                    // dismissal.
+                    *self.slots.feedback.borrow_mut() = None;
+                    ScreenCommand::Push(Box::new(lost_and_found_drawer_screen(self.slots.clone())))
+                } else {
+                    ScreenCommand::None
+                }
+            }
             // Esc / Backspace pop back to the main menu so a curious
             // player can return to the splash flow without quitting.
             Input::Esc | Input::Backspace => ScreenCommand::Pop,
@@ -1529,7 +1709,7 @@ impl MapScreen {
     /// Pulled out as a constant so tests can assert it appears in the
     /// rendered buffer without binding to the precise wording.
     pub const HINT_LINE: &'static str =
-        "Move: arrows/hjkl    Talk: Enter    Inv: I    Back: Esc    Quit: Q";
+        "Move: arrows/hjkl  Talk: Enter  Search: X  Inv: I  Back: Esc  Quit: Q";
 }
 
 /// Modal dialog screen pushed when the player talks to an NPC.
@@ -4235,6 +4415,228 @@ mod tests {
             slots.snapshot(),
             before,
             "Leave must not mutate inventory, flags, or player state"
+        );
+    }
+
+    // ---- Lost-and-Found Drawer lobby integration (SPEC §9 Task 10f) ---
+
+    #[test]
+    fn drawer_position_is_a_lobby_floor_cell_next_to_the_clerk() {
+        // The prompt's "behind the desk" framing is meaningful only if
+        // the drawer actually sits beside the Night Clerk. Pin both:
+        // the cell is walkable in the underlying map (so the renderer
+        // does not silently erase a wall) and the clerk is one step
+        // away, matching SPEC §9 step 1's narrative geometry.
+        let map = fresh_map_screen();
+        let (dx, dy) = MapScreen::LOST_AND_FOUND_POS;
+        assert!(
+            map.map().is_walkable(dx, dy),
+            "drawer cell ({dx}, {dy}) must be a walkable floor in the lobby ASCII"
+        );
+        let clerk = MapScreen::NPCS
+            .iter()
+            .find(|n| n.name == "Night Clerk")
+            .expect("Night Clerk must exist on the lobby roster");
+        let manhattan = (clerk.x as i32 - dx as i32).abs() + (clerk.y as i32 - dy as i32).abs();
+        assert_eq!(
+            manhattan, 1,
+            "drawer must be one orthogonal step from the clerk"
+        );
+    }
+
+    #[test]
+    fn drawer_glyph_appears_in_rendered_rows() {
+        // The headless render surface is what BBS clients ultimately see.
+        // Stamping `D` proves the affordance is visible in normal play
+        // — not just reachable through a hidden hotkey.
+        let map = fresh_map_screen();
+        let rows = map.rendered_rows();
+        let (dx, dy) = MapScreen::LOST_AND_FOUND_POS;
+        let stamped: Vec<char> = rows[dy as usize].chars().collect();
+        assert_eq!(
+            stamped[dx as usize],
+            MapScreen::LOST_AND_FOUND_GLYPH,
+            "expected `D` at drawer column; row was {:?}",
+            rows[dy as usize]
+        );
+    }
+
+    #[test]
+    fn drawer_cell_blocks_player_movement() {
+        // The drawer is furniture — the player must stand *beside* it,
+        // not on it. Otherwise the SPEC §9 prompt's framing breaks down
+        // and a wandering player could end up perched on the desk.
+        // Approach from below: spawn (22, 4) → step right three times
+        // to (25, 4) → step up to (25, 3), the floor cell directly
+        // below the drawer at (25, 2).
+        let mut map = fresh_map_screen();
+        let cfg = fixture_config();
+        let fc = fixture_context();
+        let mut ctx = GameContext::new(&cfg, &fc, (80, 24));
+        for _ in 0..3 {
+            map.handle_input(&mut ctx, Input::Right);
+        }
+        map.handle_input(&mut ctx, Input::Up);
+        assert_eq!(
+            map.player(),
+            (25, 3),
+            "expected approach-from-below path to land at (25, 3)"
+        );
+        assert!(
+            map.nearby_lost_and_found(),
+            "(25, 3) is the orthogonal neighbour directly below the drawer"
+        );
+
+        // Stepping up would land on the drawer cell — must be rejected.
+        let cmd = map.handle_input(&mut ctx, Input::Up);
+        assert!(matches!(cmd, ScreenCommand::None));
+        assert_eq!(
+            map.player(),
+            (25, 3),
+            "drawer cell must reject the player's step"
+        );
+    }
+
+    #[test]
+    fn search_key_is_inert_when_not_adjacent_to_drawer() {
+        // From the spawn (22, 4) the drawer is well out of reach.
+        // Pressing `x` must be a no-op — silent, like bumping a wall —
+        // so the affordance does not leak into rooms where the prompt
+        // would be narratively wrong.
+        let (mut map, cmd) = dispatch_map(Input::Char('x'));
+        assert!(
+            matches!(cmd, ScreenCommand::None),
+            "search key without nearby drawer must produce no command"
+        );
+        // And again with uppercase so a Caps-Lock player isn't punished
+        // by triggering the prompt from anywhere on the map.
+        let cfg = fixture_config();
+        let fc = fixture_context();
+        let mut ctx = GameContext::new(&cfg, &fc, (80, 24));
+        let cmd = map.handle_input(&mut ctx, Input::Char('X'));
+        assert!(matches!(cmd, ScreenCommand::None));
+    }
+
+    #[test]
+    fn search_key_pushes_prompt_when_adjacent_to_drawer() {
+        // Approach the drawer from the right (the only adjacency that
+        // does not cross the Night Clerk's blocking cell) and verify
+        // both `x` and `X` open the prompt.
+        for key in [Input::Char('x'), Input::Char('X')] {
+            let mut map = fresh_map_screen();
+            let cfg = fixture_config();
+            let fc = fixture_context();
+            let mut ctx = GameContext::new(&cfg, &fc, (80, 24));
+            // Spawn (22, 4) → right thrice → up once = (25, 3),
+            // the cell directly below the drawer at (25, 2).
+            for _ in 0..3 {
+                map.handle_input(&mut ctx, Input::Right);
+            }
+            map.handle_input(&mut ctx, Input::Up);
+            assert_eq!(map.player(), (25, 3));
+            assert!(map.nearby_lost_and_found());
+            let cmd = map.handle_input(&mut ctx, key);
+            assert!(
+                matches!(cmd, ScreenCommand::Push(_)),
+                "{key:?} adjacent to drawer must push the prompt screen"
+            );
+        }
+    }
+
+    #[test]
+    fn drawer_screen_callback_take_key_writes_feedback_and_pops() {
+        // Drive the same `PromptScreen` the runtime uses, scripting a
+        // `(K)` press through `handle_input` and asserting the captured
+        // side effects: the Room 7 key lands in inventory, the feedback
+        // slot carries the SPEC §9 step 5 line, and the screen returns
+        // `Pop` so the lobby comes back into focus.
+        let slots = SharedSlots::default();
+        slots.reset(0, 0);
+        let mut screen = lost_and_found_drawer_screen(slots.clone());
+
+        let cfg = fixture_config();
+        let fc = fixture_context();
+        let mut ctx = GameContext::new(&cfg, &fc, (80, 24));
+        let cmd = screen.handle_input(&mut ctx, Input::Char('k'));
+        assert!(matches!(cmd, ScreenCommand::Pop));
+        assert!(
+            slots.inventory.borrow().contains(MapScreen::ROOM_7_KEY_ID),
+            "(K) must move the Room 7 key into the inventory"
+        );
+        let feedback = slots.feedback.borrow().clone().expect("feedback set");
+        assert_eq!(feedback.text(), TOOK_ROOM_7_KEY_FEEDBACK);
+    }
+
+    #[test]
+    fn drawer_screen_callback_disabled_take_key_writes_error_and_stays_open() {
+        // Pre-load the key so the prompt's `(K)` row builds disabled,
+        // then verify the callback surfaces the SPEC §9 reason as an
+        // error feedback line and emits `None` so the prompt stays on
+        // screen for a different choice.
+        let slots = SharedSlots::default();
+        slots.reset(0, 0);
+        slots
+            .inventory
+            .borrow_mut()
+            .insert(MapScreen::ROOM_7_KEY_ID.to_string());
+        let mut screen = lost_and_found_drawer_screen(slots.clone());
+
+        let cfg = fixture_config();
+        let fc = fixture_context();
+        let mut ctx = GameContext::new(&cfg, &fc, (80, 24));
+        let cmd = screen.handle_input(&mut ctx, Input::Char('k'));
+        assert!(
+            matches!(cmd, ScreenCommand::None),
+            "disabled press must keep the prompt open"
+        );
+        let feedback = slots
+            .feedback
+            .borrow()
+            .clone()
+            .expect("disabled press must surface a reason");
+        assert_eq!(feedback.text(), ROOM_7_KEY_ALREADY_HELD_REASON);
+    }
+
+    #[test]
+    fn drawer_screen_callback_cancel_pops_without_mutating_state() {
+        // Esc on a cancellable prompt is the SPEC §4.4 "back out" gesture.
+        // The lobby must come back unchanged — no key, no flag, no
+        // matchbook bonus from a hesitant press.
+        let slots = SharedSlots::default();
+        slots.reset(0, 0);
+        let before = slots.snapshot();
+        let mut screen = lost_and_found_drawer_screen(slots.clone());
+
+        let cfg = fixture_config();
+        let fc = fixture_context();
+        let mut ctx = GameContext::new(&cfg, &fc, (80, 24));
+        let cmd = screen.handle_input(&mut ctx, Input::Esc);
+        assert!(matches!(cmd, ScreenCommand::Pop));
+        assert_eq!(slots.snapshot(), before);
+        assert!(slots.feedback.borrow().is_none());
+    }
+
+    #[test]
+    fn shared_slots_reset_clears_feedback() {
+        // `feedback` is ephemeral — a New Game restart must wipe a stale
+        // "Moved Room 7 key to inventory." line so the splash flow does
+        // not open under prior-run narration.
+        let slots = SharedSlots::default();
+        slots.reset(0, 0);
+        *slots.feedback.borrow_mut() = Some(FeedbackLine::info("stale"));
+        slots.reset(0, 0);
+        assert!(slots.feedback.borrow().is_none());
+    }
+
+    #[test]
+    fn map_hint_advertises_search_affordance() {
+        // The hint line is the only place a player learns the search
+        // affordance exists. If a future copy edit drops "Search: X" the
+        // drawer becomes unreachable except by accident.
+        assert!(
+            MapScreen::HINT_LINE.contains("Search: X"),
+            "hint line must advertise the search key; got {:?}",
+            MapScreen::HINT_LINE
         );
     }
 }
