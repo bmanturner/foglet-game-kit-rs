@@ -52,7 +52,7 @@ One unchecked item per iteration. Dependencies in `[brackets]` must be checked o
 - [x] **7b** — Implement `append_event`. Test: event is stored with player id and kind. [7a]
 - [x] **7c** — Implement `recent_events(limit)`. Test: newest events return first with deterministic tie ordering. [7b]
 - [x] **7d** — Implement `player_events(player_id, limit)`. Test: filters by player. [7b]
-- [ ] **7e** — Add message sanitization/validation guard rejecting empty messages and overlong messages. [7b]
+- [x] **7e** — Add message sanitization/validation guard rejecting empty messages and overlong messages. [7b]
 
 ### Task 8 — Leaderboards
 

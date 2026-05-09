@@ -6,12 +6,14 @@
 //! - 7b added `WorldDb::append_event` for inserting one row.
 //! - 7c added `WorldDb::recent_events(limit)` for the lobby bulletin
 //!   (SPEC §3.1 / §13).
-//! - 7d (this iteration) adds `WorldDb::player_events(player_id, limit)`
-//!   for per-player history. Mirrors 7c's contract but constrains the
-//!   result to one player via the `idx_world_events_player_recent`
-//!   partial index.
-//! - 7e will add the message validation guard (empty / overlong
-//!   rejection).
+//! - 7d added `WorldDb::player_events(player_id, limit)` for per-player
+//!   history. Mirrors 7c's contract but constrains the result to one
+//!   player via the `idx_world_events_player_recent` partial index.
+//! - 7e (this iteration) adds the message validation guard
+//!   (`validate_event_message`) so `append_event` rejects empty and
+//!   overlong messages before they reach the SQL round-trip. The cap
+//!   lives in [`MAX_EVENT_MESSAGE_LEN`] so game authors and the kit
+//!   share one definition.
 //!
 //! Splitting the migration into its own commit keeps the bisect signal
 //! sharp: a regression that drops a column flunks the schema test in
@@ -181,6 +183,22 @@ pub struct EventRecord {
     pub metadata: Option<String>,
 }
 
+/// Maximum allowed character length for an event message — SPEC_v2
+/// §Task 7e cap.
+///
+/// Counted as Unicode scalar values via [`str::chars`] rather than
+/// bytes, because the lobby bulletin renders by visible characters and
+/// a byte cap would arbitrarily punish non-ASCII handles
+/// (e.g. "@玲" costs three bytes per character). The number itself —
+/// 500 — is chosen to comfortably exceed a few wrapped lines on an
+/// 80-column terminal (the SPEC §13.1 minimum) while still rejecting
+/// pathological multi-megabyte inputs that could DOS the bulletin
+/// query path or eat operator disk in seconds. SPEC_v2 §4.7 deliberately
+/// leaves the cap to the kit; pinning it here lets game authors call
+/// `MAX_EVENT_MESSAGE_LEN` rather than re-derive it from a magic number
+/// in this module.
+pub const MAX_EVENT_MESSAGE_LEN: usize = 500;
+
 /// Failure modes for [`WorldDb::append_event`].
 ///
 /// Library-internal `thiserror` shape — Task 10 will wrap these with
@@ -188,11 +206,32 @@ pub struct EventRecord {
 /// stays a single sentence. Mirrors [`crate::players::PlayerError`]
 /// and [`crate::turns::TurnError`] so all world-DB write paths surface
 /// errors with the same shape.
-///
-/// Task 7e will add a `Validation` variant for the empty/overlong
-/// guard; today the only failure mode is the SQL round-trip itself.
 #[derive(Debug, Error)]
 pub enum EventError {
+    /// The supplied message was empty (or whitespace-only). SPEC §4.7
+    /// describes messages as game-authored display strings; a blank row
+    /// has no useful UI rendering and almost certainly indicates a
+    /// caller bug (forgot to substitute a template variable, etc.).
+    /// Failing fast at the kit boundary keeps the bug visible instead
+    /// of silently filling the bulletin with empty entries.
+    #[error("event message must not be empty or whitespace-only")]
+    EmptyMessage,
+    /// The supplied message exceeded [`MAX_EVENT_MESSAGE_LEN`] characters.
+    /// Carrying both the offending length and the cap in the variant
+    /// gives operator-facing logs ("got 4096, max 500") without forcing
+    /// the caller to recompute either value.
+    #[error("event message too long: {len} chars exceeds max of {max}")]
+    MessageTooLong {
+        /// The character count of the rejected message — measured as
+        /// Unicode scalar values (`chars().count()`), the same unit the
+        /// cap is expressed in.
+        len: usize,
+        /// The cap the message exceeded. Mirrors
+        /// [`MAX_EVENT_MESSAGE_LEN`] at the time of the rejection so
+        /// the error survives a future config knob without rewriting
+        /// the message.
+        max: usize,
+    },
     /// The `INSERT … RETURNING` round-trip failed. Wrapping
     /// `rusqlite::Error` keeps the call site readable (one error type,
     /// one mapping) while preserving the underlying cause for
@@ -203,6 +242,38 @@ pub enum EventError {
         #[source]
         source: rusqlite::Error,
     },
+}
+
+/// Validate `message` against the SPEC_v2 §Task 7e guard rails — empty
+/// rejection and the [`MAX_EVENT_MESSAGE_LEN`] cap.
+///
+/// Pulled out of [`WorldDb::append_event`] so future paths that emit
+/// events through a different surface (e.g. the Task 9c spend-turn +
+/// append-event transaction helper) can share one validator instead of
+/// reimplementing the rule and drifting. The function is `pub(crate)`
+/// because callers outside the world-DB module shouldn't be inventing
+/// their own validation — they should go through `append_event`.
+///
+/// "Empty" is interpreted as `trim().is_empty()`: a message of `" "`
+/// or `"\n"` would render as a blank line in the bulletin, which is
+/// indistinguishable from a missing event and almost always a caller
+/// bug. Failing both literal empty and whitespace-only with the same
+/// error keeps the failure mode legible for operators.
+pub(crate) fn validate_event_message(message: &str) -> Result<(), EventError> {
+    if message.trim().is_empty() {
+        return Err(EventError::EmptyMessage);
+    }
+    // Counted as `chars()` rather than `len()` so the cap is in
+    // user-visible characters, not UTF-8 bytes. See the const docs for
+    // why that matters for non-ASCII handles.
+    let len = message.chars().count();
+    if len > MAX_EVENT_MESSAGE_LEN {
+        return Err(EventError::MessageTooLong {
+            len,
+            max: MAX_EVENT_MESSAGE_LEN,
+        });
+    }
+    Ok(())
 }
 
 impl WorldDb {
@@ -217,11 +288,14 @@ impl WorldDb {
     /// [`Self::upsert_player`].
     ///
     /// `kind` and `message` are required by the schema; `player_id`
-    /// and `metadata` are optional. The kit deliberately does *not*
-    /// validate `message` length or content here — Task 7e adds the
-    /// empty/overlong guard in its own commit so the bisect signal
-    /// stays sharp. Until that lands, callers are trusted to pass
-    /// game-authored strings (which is the SPEC §4.7 contract anyway).
+    /// and `metadata` are optional. `message` is validated before the
+    /// SQL round-trip — empty, whitespace-only, or longer than
+    /// [`MAX_EVENT_MESSAGE_LEN`] inputs fail fast with
+    /// [`EventError::EmptyMessage`] or [`EventError::MessageTooLong`]
+    /// (SPEC_v2 §Task 7e). `kind` and
+    /// `metadata` are intentionally not validated: `kind` is a
+    /// game-authored namespace and `metadata` is opaque text whose
+    /// shape the kit doesn't own.
     ///
     /// # Concurrency
     ///
@@ -242,6 +316,13 @@ impl WorldDb {
         // one redeclaring the column list. A regression that reorders
         // the migration columns will flunk the schema test in this
         // module before this decoder even runs.
+        // Validate before reaching SQL. A bad message is a caller bug,
+        // not a database problem — surfacing it as `EmptyMessage` /
+        // `MessageTooLong` is more actionable than the raw `rusqlite`
+        // error a CHECK constraint would emit, and it avoids paying for
+        // a round-trip on input that was always going to be rejected.
+        validate_event_message(message)?;
+
         const SQL: &str = "\
 INSERT INTO world_events (kind, player_id, message, metadata) \
 VALUES (?1, ?2, ?3, ?4) \
@@ -839,5 +920,119 @@ mod tests {
             .player_events(9_999, 10)
             .expect("unknown id query runs");
         assert!(none.is_empty(), "unknown player id → empty vec");
+    }
+
+    /// SPEC_v2 §Task 7e acceptance (empty rejection): `append_event`
+    /// rejects a literal empty message with [`EventError::EmptyMessage`]
+    /// and writes nothing to the table. Pinning that the row count
+    /// stays at zero proves the validator runs *before* the SQL
+    /// round-trip — a regression that validated post-insert would still
+    /// surface the error but leave a dangling row.
+    #[test]
+    fn append_event_rejects_empty_message() {
+        let dir = tempdir().expect("tempdir creates");
+        let world = open_world_with_events(&dir);
+        let alice = world
+            .upsert_player(&ctx_with(Some("u-alice"), Some("alice")))
+            .expect("alice upsert");
+
+        let err = world
+            .append_event("clue_found", Some(alice.id), "", None)
+            .expect_err("empty message must be rejected");
+        assert!(
+            matches!(err, EventError::EmptyMessage),
+            "expected EmptyMessage, got {err:?}"
+        );
+
+        let count: i64 = world
+            .connection()
+            .query_row("SELECT COUNT(*) FROM world_events", [], |row| row.get(0))
+            .expect("count query runs");
+        assert_eq!(count, 0, "rejected empty message must not persist a row");
+    }
+
+    /// SPEC §Task 7e acceptance (whitespace-only): a message of just
+    /// spaces / tabs / newlines is treated as empty. The SPEC §4.7
+    /// contract is "game-authored display string"; a blank-rendering
+    /// row is indistinguishable from a missing event in the lobby
+    /// bulletin and almost always a caller bug (forgot to substitute a
+    /// template variable). Reject it the same way as a literal empty.
+    #[test]
+    fn append_event_rejects_whitespace_only_message() {
+        let dir = tempdir().expect("tempdir creates");
+        let world = open_world_with_events(&dir);
+
+        for blank in ["   ", "\t", "\n", " \t\n "] {
+            let err = world
+                .append_event("clue_found", None, blank, None)
+                .expect_err("whitespace-only message must be rejected");
+            assert!(
+                matches!(err, EventError::EmptyMessage),
+                "expected EmptyMessage for {blank:?}, got {err:?}",
+            );
+        }
+    }
+
+    /// SPEC §Task 7e acceptance (overlong rejection): a message longer
+    /// than [`MAX_EVENT_MESSAGE_LEN`] characters is rejected with
+    /// [`EventError::MessageTooLong`] carrying both the offending
+    /// length and the cap. A message of exactly the cap is accepted —
+    /// the boundary is `len > MAX`, not `>= MAX`, so authors can paste
+    /// a known-good template right at the limit without surprise
+    /// failures.
+    #[test]
+    fn append_event_rejects_overlong_message_and_accepts_cap_exactly() {
+        let dir = tempdir().expect("tempdir creates");
+        let world = open_world_with_events(&dir);
+
+        // One character over the cap → rejected. Build the string from
+        // ASCII so the char-count and byte-count happen to match,
+        // making the assertion's failure mode obvious if it triggers.
+        let too_long: String = "a".repeat(MAX_EVENT_MESSAGE_LEN + 1);
+        let err = world
+            .append_event("clue_found", None, &too_long, None)
+            .expect_err("overlong message must be rejected");
+        match err {
+            EventError::MessageTooLong { len, max } => {
+                assert_eq!(len, MAX_EVENT_MESSAGE_LEN + 1);
+                assert_eq!(max, MAX_EVENT_MESSAGE_LEN);
+            }
+            other => panic!("expected MessageTooLong, got {other:?}"),
+        }
+
+        // Exactly at the cap → accepted. Proves the boundary is `>` not
+        // `>=` and pins it against an off-by-one regression.
+        let at_cap: String = "a".repeat(MAX_EVENT_MESSAGE_LEN);
+        world
+            .append_event("clue_found", None, &at_cap, None)
+            .expect("message at exactly the cap must be accepted");
+    }
+
+    /// SPEC §Task 7e acceptance (Unicode counting): the cap is
+    /// expressed in characters (Unicode scalar values), not bytes. A
+    /// non-ASCII message whose `len()` (bytes) exceeds the cap but
+    /// whose `chars().count()` does not must be accepted — otherwise
+    /// the kit silently penalizes non-ASCII handles.
+    ///
+    /// Pick a 3-byte-per-char glyph ("玲") and emit exactly
+    /// `MAX_EVENT_MESSAGE_LEN` of them. Bytes = 3 × cap (well over
+    /// any byte-cap we'd plausibly choose), chars = cap exactly →
+    /// accepted.
+    #[test]
+    fn append_event_caps_by_chars_not_bytes() {
+        let dir = tempdir().expect("tempdir creates");
+        let world = open_world_with_events(&dir);
+
+        let glyph = "玲";
+        assert_eq!(glyph.len(), 3, "test prerequisite: glyph is 3 bytes");
+        let multi_byte: String = glyph.repeat(MAX_EVENT_MESSAGE_LEN);
+        assert!(
+            multi_byte.len() > MAX_EVENT_MESSAGE_LEN,
+            "test prerequisite: byte length exceeds the char cap",
+        );
+
+        world
+            .append_event("clue_found", None, &multi_byte, None)
+            .expect("Unicode message at the char cap must be accepted");
     }
 }
