@@ -1046,6 +1046,7 @@ nodes:
             turns: None,
             leaderboards: Vec::new(),
             multiplayer: None,
+            factions: Default::default(),
         }
     }
 

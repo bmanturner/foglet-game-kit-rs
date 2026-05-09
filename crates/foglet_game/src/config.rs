@@ -86,6 +86,20 @@ pub struct GameConfig {
     /// signal the runtime checks before wiring any v3 primitive.
     #[serde(default)]
     pub multiplayer: Option<MultiplayerSection>,
+    /// `[[factions.seed]]` array — game-authored faction definitions
+    /// (SPEC v3 §5.2 example).
+    ///
+    /// Modeled as a defaulted `FactionsSection` (whose `seed` field is
+    /// itself a `Vec` defaulted to empty) rather than `Option<…>` for
+    /// the same reason as `[[leaderboards]]`: "no seeded factions" and
+    /// "an empty seed list" are the same SPEC-level statement, and
+    /// downstream consumers want to iterate. The section sits at the
+    /// top level (not inside `[multiplayer]`) because TOML's
+    /// `[[factions.seed]]` syntax declares a top-level `factions`
+    /// table containing a `seed` array — it deliberately does not
+    /// collide with the `multiplayer.factions` toggle bool.
+    #[serde(default)]
+    pub factions: FactionsSection,
 }
 
 /// `[game]` section: every field is required.
@@ -374,6 +388,47 @@ fn default_max_notice_body_chars() -> u32 {
     1_000
 }
 
+/// `[factions]` section: holder for the `[[factions.seed]]` array
+/// (SPEC v3 §5.2). The section itself carries no other knobs today;
+/// it exists so `serde` has a stable parent for the array of seeds.
+///
+/// Defaults to an empty `seed` list so games that never declare a
+/// faction (and v1/v2 games that predate the section entirely) parse
+/// without ceremony.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct FactionsSection {
+    /// One entry per faction the game ships out of the box.
+    /// Validated for slug shape, non-empty display name, and global
+    /// uniqueness on slug at load time so a typo can't silently merge
+    /// two intended-distinct agencies.
+    #[serde(default)]
+    pub seed: Vec<FactionSeed>,
+}
+
+/// A single seeded faction definition (SPEC v3 §5.2).
+///
+/// Seeds are pure data: the runtime upserts them into the
+/// `factions` table at startup (Task 6b) so game authors can edit
+/// `assets/game.toml` without writing migrations. The fields mirror
+/// the SPEC v3 §5.2 example one-to-one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FactionSeed {
+    /// URL-safe identifier; validated against the same slug rule as
+    /// `[game].slug` so the value is safe to use as a primary key in
+    /// the v3 `factions` table and stable across renames of the
+    /// human-facing `display_name`.
+    pub slug: String,
+    /// Human-facing name shown on screens and in notices. Required
+    /// (non-empty after trim) because every UI surface we plan to
+    /// build for v3 renders it; an empty value would produce a
+    /// blank menu entry.
+    pub display_name: String,
+    /// One-sentence flavour text shown on faction selection screens.
+    /// Required for the same reason as `display_name`: the agency
+    /// selector in `murder_motel` (Task 12) reads this verbatim.
+    pub description: String,
+}
+
 fn default_world_path() -> String {
     "world/world.sqlite".to_string()
 }
@@ -531,6 +586,39 @@ impl GameConfig {
                 )));
             }
             seen.push(board.name.as_str());
+        }
+        // Faction seeds: slug shape, non-empty display name and
+        // description, and slug uniqueness. We validate even when
+        // `multiplayer.factions` is `false` so an authoring mistake
+        // surfaces the moment it lands in the file rather than the
+        // first time someone flips the toggle on.
+        let mut faction_slugs: Vec<&str> = Vec::with_capacity(self.factions.seed.len());
+        for seed in &self.factions.seed {
+            if !is_valid_slug(&seed.slug) {
+                return Err(ConfigError::Validate(format!(
+                    "[[factions.seed]].slug `{}` must be lowercase alphanumeric with hyphens",
+                    seed.slug
+                )));
+            }
+            if seed.display_name.trim().is_empty() {
+                return Err(ConfigError::Validate(format!(
+                    "[[factions.seed]] `{}` is missing a non-empty display_name",
+                    seed.slug
+                )));
+            }
+            if seed.description.trim().is_empty() {
+                return Err(ConfigError::Validate(format!(
+                    "[[factions.seed]] `{}` is missing a non-empty description",
+                    seed.slug
+                )));
+            }
+            if faction_slugs.contains(&seed.slug.as_str()) {
+                return Err(ConfigError::Validate(format!(
+                    "duplicate [[factions.seed]].slug `{}`",
+                    seed.slug
+                )));
+            }
+            faction_slugs.push(seed.slug.as_str());
         }
         Ok(())
     }
@@ -1396,6 +1484,178 @@ max_notice_body_chars = -1
 "#;
         let err = GameConfig::from_toml_str(bad).unwrap_err();
         assert!(matches!(err, ConfigError::Parse(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn absent_factions_section_yields_empty_seed_list() {
+        // SPEC v3 §5.2: seeded factions are opt-in. v1/v2 games and v3
+        // games that ship with no agencies must parse without ceremony.
+        let v1_style = r#"
+[game]
+title = "No Factions"
+slug = "no-factions"
+description = ""
+min_width = 80
+min_height = 24
+start_map = "lobby"
+start_x = 0
+start_y = 0
+"#;
+        let config = GameConfig::from_toml_str(v1_style).unwrap();
+        assert!(config.factions.seed.is_empty());
+    }
+
+    #[test]
+    fn parses_factions_seed_array_from_spec_example() {
+        // Verbatim shape from SPEC v3 §5.2; pinned so a SPEC tweak that
+        // breaks compatibility surfaces here.
+        let v3 = r#"
+[game]
+title = "Murder Motel"
+slug = "murder-motel"
+description = ""
+min_width = 80
+min_height = 24
+start_map = "lobby"
+start_x = 0
+start_y = 0
+
+[[factions.seed]]
+slug = "blue-desk"
+display_name = "Blue Desk Agency"
+description = "Investigators who trust paperwork more than hunches."
+
+[[factions.seed]]
+slug = "red-room"
+display_name = "Red Room Agency"
+description = "Investigators who chase hunches into smoky alleys."
+"#;
+        let config = GameConfig::from_toml_str(v3).unwrap();
+        assert_eq!(config.factions.seed.len(), 2);
+        assert_eq!(config.factions.seed[0].slug, "blue-desk");
+        assert_eq!(config.factions.seed[0].display_name, "Blue Desk Agency");
+        assert!(config.factions.seed[0]
+            .description
+            .starts_with("Investigators"));
+        assert_eq!(config.factions.seed[1].slug, "red-room");
+    }
+
+    #[test]
+    fn factions_seed_round_trips_through_toml() {
+        let original = r#"
+[game]
+title = "RT Factions"
+slug = "rt-factions"
+description = ""
+min_width = 80
+min_height = 24
+start_map = "lobby"
+start_x = 0
+start_y = 0
+
+[[factions.seed]]
+slug = "alpha"
+display_name = "Alpha Squad"
+description = "Order of operations."
+
+[[factions.seed]]
+slug = "beta"
+display_name = "Beta Squad"
+description = "Counterpoint."
+"#;
+        let config = GameConfig::from_toml_str(original).unwrap();
+        let serialized = config.to_toml_string();
+        let reparsed = GameConfig::from_toml_str(&serialized).unwrap();
+        assert_eq!(config, reparsed);
+    }
+
+    #[test]
+    fn duplicate_faction_slug_is_rejected() {
+        // Task 2b's named acceptance: two seeds with the same slug
+        // would silently merge into a single row at upsert time, so we
+        // catch it at config load with a clearly-attributed error.
+        let bad = r#"
+[game]
+title = "Dup Slugs"
+slug = "dup-slugs"
+description = ""
+min_width = 80
+min_height = 24
+start_map = "lobby"
+start_x = 0
+start_y = 0
+
+[[factions.seed]]
+slug = "blue-desk"
+display_name = "Blue Desk Agency"
+description = "First."
+
+[[factions.seed]]
+slug = "blue-desk"
+display_name = "Other Blue Desk"
+description = "Second."
+"#;
+        let err = GameConfig::from_toml_str(bad).unwrap_err();
+        match err {
+            ConfigError::Validate(msg) => {
+                assert!(msg.contains("blue-desk"), "{msg}");
+                assert!(msg.contains("duplicate"), "{msg}");
+            }
+            other => panic!("expected Validate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn invalid_faction_slug_is_rejected() {
+        // Slug shape rule must apply to seeded factions too; otherwise
+        // an UPPERCASE slug ends up in the world DB and breaks any
+        // path-style consumer downstream.
+        let bad = r#"
+[game]
+title = "Bad Slug"
+slug = "bad-slug"
+description = ""
+min_width = 80
+min_height = 24
+start_map = "lobby"
+start_x = 0
+start_y = 0
+
+[[factions.seed]]
+slug = "Blue_Desk"
+display_name = "Bad"
+description = "Bad."
+"#;
+        let err = GameConfig::from_toml_str(bad).unwrap_err();
+        match err {
+            ConfigError::Validate(msg) => assert!(msg.contains("Blue_Desk"), "{msg}"),
+            other => panic!("expected Validate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn empty_faction_display_name_is_rejected() {
+        let bad = r#"
+[game]
+title = "Empty Name"
+slug = "empty-name"
+description = ""
+min_width = 80
+min_height = 24
+start_map = "lobby"
+start_x = 0
+start_y = 0
+
+[[factions.seed]]
+slug = "blue-desk"
+display_name = "   "
+description = "anything"
+"#;
+        let err = GameConfig::from_toml_str(bad).unwrap_err();
+        match err {
+            ConfigError::Validate(msg) => assert!(msg.contains("display_name"), "{msg}"),
+            other => panic!("expected Validate, got {other:?}"),
+        }
     }
 
     #[test]

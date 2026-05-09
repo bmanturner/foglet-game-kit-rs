@@ -437,6 +437,7 @@ mod tests {
             turns: None,
             leaderboards: Vec::new(),
             multiplayer: None,
+            factions: Default::default(),
         }
     }
 

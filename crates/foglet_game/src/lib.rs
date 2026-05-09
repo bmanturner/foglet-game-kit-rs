@@ -53,8 +53,9 @@ pub mod widgets;
 pub mod world_db;
 
 pub use config::{
-    ConfigError, GameConfig, GameSection, LeaderboardSection, LeaderboardSort, ManifestSection,
-    MultiplayerSection, SaveSection, SaveStrategy, TurnReset, TurnsSection, WorldSection,
+    ConfigError, FactionSeed, FactionsSection, GameConfig, GameSection, LeaderboardSection,
+    LeaderboardSort, ManifestSection, MultiplayerSection, SaveSection, SaveStrategy, TurnReset,
+    TurnsSection, WorldSection,
 };
 pub use dialog::{
     dialog_choice_prompt, dialog_handle_prompt_input, load_dialog, Choice, ChoiceError, Dialog,
