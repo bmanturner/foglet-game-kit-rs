@@ -99,6 +99,16 @@ fn main() -> anyhow::Result<()> {
     // identity with the slot's inner SaveState from frame zero —
     // calling `slots.save.apply(loaded)` after-the-fact would orphan
     // those aliases for the rest of the run.
+    //
+    // SPEC_v2_1 §Task 8c (decision recorded in `DECISIONS.md`):
+    // we deliberately keep `read_save` + `SharedSlots::with_save_state`
+    // here rather than reaching for `SaveSlot::load_or_default`. The
+    // helper builds an opaque slot, but `SharedSlots` publishes
+    // per-field `Rc` aliases out of `SaveState` — every screen mutates
+    // through those — and wiring those aliases requires the SaveState
+    // by value, not via a slot's `borrow()`. `load_or_default` is the
+    // right tool for games whose `T` stays opaque; this example is
+    // the canonical "field aliases in play" counter-case.
     let slots = match save_path.as_deref() {
         Some(path) => match read_save::<SaveState>(path)? {
             Some(loaded) => SharedSlots::with_save_state(loaded),
