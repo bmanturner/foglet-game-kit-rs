@@ -455,6 +455,42 @@ pub const DIALOG_PROMPT_MAX_CHOICES: usize = 9;
 /// self-contained can chain `.body(...)` calls onto the returned
 /// builder; the helper deliberately returns a builder, not a finished
 /// modal, so that composition stays open.
+///
+/// # When NOT to use this helper (SPEC §8 / Task 8c)
+///
+/// This helper exists for **branching NPC conversations** authored in
+/// the dialog YAML graph — a fixed set of `text`/`goto`/`if` lines that
+/// the writer wants to ship as content rather than code. SPEC §8
+/// explicitly calls out the inverse case:
+///
+/// > "The kit MUST NOT force all prompts into the dialog YAML graph.
+/// > Loot/shop prompts often need live game data, so Rust-authored
+/// > prompt builders remain first-class."
+///
+/// Concretely: do **not** reach for [`Dialog`] / `dialog_choice_prompt`
+/// when the prompt's choices, labels, or enabled state depend on
+/// runtime game state. The dialog YAML schema deliberately keeps
+/// choices to static `text`/`goto` pairs; bending it to carry live
+/// values produces awkward content and forces every gating decision
+/// through the flag store. Build a [`crate::prompt::ChoicePrompt`]
+/// directly in Rust instead, where the choice list, labels, hints, and
+/// disabled reasons are computed each frame from the live game.
+///
+/// Concrete cases that should stay Rust-authored:
+///
+/// - **Loot prompts** like the Lost-and-Found Drawer (SPEC §9): the
+///   `(K)` "take Room 7 key" choice must disappear or disable once the
+///   key is in inventory — that's a live inventory check, not a flag
+///   the writer flips in YAML.
+/// - **Shop / vendor prompts** like the night clerk (SPEC §9): the
+///   "Tip 50g for a rumor" label needs the player's *current* gold
+///   spliced into the hint and must disable when funds are short.
+/// - **Inventory pickers, capacity-bounded menus, container UIs**:
+///   anything whose choice list is derived from a `Vec<Item>` rather
+///   than from the dialog graph.
+///
+/// Use the helper when the conversation is content; build prompts in
+/// Rust when the conversation is game state.
 pub fn dialog_choice_prompt(
     state: &DialogState,
     dialog: &Dialog,
