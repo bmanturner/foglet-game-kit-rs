@@ -8,7 +8,6 @@
 //! `local_dev_key`-keyed row instead of erroring. Subsequent sub-tasks
 //! fill in the rest:
 //!
-//! - 5d — `last_seen_at` refresh on repeat upsert.
 //! - 5e — `FogletRole` parsing and `security_level` mapping.
 //! - 5f — Persist normalized role/security metadata at upsert time.
 //!
@@ -183,8 +182,9 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_players_local_dev_key\n\
 ///   / `50`). Task 5e/5f overwrite these from the live context.
 /// - `first_seen_at` — UTC timestamp of the first upsert. Preserved
 ///   across repeat upserts (Task 5d's invariant).
-/// - `last_seen_at` — UTC timestamp Task 5d will refresh on repeat
-///   upsert. Today it equals `first_seen_at` until that task lands.
+/// - `last_seen_at` — UTC timestamp refreshed to `CURRENT_TIMESTAMP`
+///   on every repeat upsert (Task 5d). Equals `first_seen_at` only on
+///   the very first insert.
 /// - `local_dev_key` — `Some` only on the Task 5c local-dev path;
 ///   `None` for Foglet-user-id rows like the ones 5b creates.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -201,7 +201,8 @@ pub struct PlayerRecord {
     pub security_level: i64,
     /// UTC timestamp of the first upsert; preserved by Task 5d.
     pub first_seen_at: String,
-    /// UTC timestamp Task 5d refreshes on every repeat upsert.
+    /// UTC timestamp refreshed to `CURRENT_TIMESTAMP` on every repeat
+    /// upsert (Task 5d).
     pub last_seen_at: String,
     /// Synthesised local-dev key (Task 5c) — always `None` here.
     pub local_dev_key: Option<String>,
@@ -244,9 +245,12 @@ impl WorldDb {
     /// - `ctx.user_id = None`    → upsert keyed on a synthesised
     ///   `local_dev_key` (Task 5c) derived from `ctx.username`.
     ///
-    /// Task 5d will refresh `last_seen_at` on every call; Task 5e/5f
-    /// will write normalized `role` and `security_level`. Until then
-    /// the `players` row picks up SQL defaults for those columns.
+    /// Repeat upsert refreshes `last_seen_at` to `CURRENT_TIMESTAMP`
+    /// (SPEC §4.4 / Task 5d) while leaving `first_seen_at` alone — the
+    /// "first time we saw this identity" column is an audit anchor and
+    /// must survive every relaunch. Task 5e/5f will write normalized
+    /// `role` and `security_level`; until then the `players` row picks
+    /// up the SQL defaults for those columns.
     ///
     /// # Concurrency
     ///
@@ -296,11 +300,19 @@ impl WorldDb {
         // first-insert path needs the autoincrement `id` we don't
         // know yet, and the conflict path benefits from echoing the
         // stored timestamps so the caller doesn't get a stale view.
+        // `last_seen_at = CURRENT_TIMESTAMP` is the Task 5d refresh:
+        // SQLite evaluates `CURRENT_TIMESTAMP` per-statement, so the
+        // conflict path stamps the row with the moment of this upsert
+        // without us threading a clock through. `first_seen_at` is
+        // *deliberately* not in the SET list — that's the column the
+        // audit story depends on, and excluding it from the update
+        // preserves the original insert timestamp across every relaunch.
         const SQL: &str = "\
 INSERT INTO players (foglet_user_id, handle) \
 VALUES (?1, ?2) \
 ON CONFLICT(foglet_user_id) WHERE foglet_user_id IS NOT NULL \
-DO UPDATE SET handle = excluded.handle \
+DO UPDATE SET handle = excluded.handle, \
+              last_seen_at = CURRENT_TIMESTAMP \
 RETURNING id, foglet_user_id, handle, role, security_level, \
           first_seen_at, last_seen_at, local_dev_key";
 
@@ -321,11 +333,18 @@ RETURNING id, foglet_user_id, handle, role, security_level, \
         local_dev_key: &str,
         handle: &str,
     ) -> Result<PlayerRecord, PlayerError> {
+        // See [`Self::upsert_by_foglet_user_id`] for the rationale on
+        // `last_seen_at = CURRENT_TIMESTAMP` (Task 5d). The local-dev
+        // branch carries the same first-seen-preserving contract — a
+        // dev who relaunches `cargo run --example murder_motel` keeps
+        // their original `first_seen_at` even as `last_seen_at` walks
+        // forward.
         const SQL: &str = "\
 INSERT INTO players (local_dev_key, handle) \
 VALUES (?1, ?2) \
 ON CONFLICT(local_dev_key) WHERE local_dev_key IS NOT NULL \
-DO UPDATE SET handle = excluded.handle \
+DO UPDATE SET handle = excluded.handle, \
+              last_seen_at = CURRENT_TIMESTAMP \
 RETURNING id, foglet_user_id, handle, role, security_level, \
           first_seen_at, last_seen_at, local_dev_key";
 
@@ -782,6 +801,107 @@ mod tests {
             dup.is_err(),
             "duplicate local_dev_key must be rejected by the partial unique index"
         );
+    }
+
+    /// SPEC_v2 §Task 5d acceptance: a repeat upsert refreshes
+    /// `last_seen_at` while leaving `first_seen_at` alone. The audit
+    /// story depends on `first_seen_at` being a stable "registered at"
+    /// anchor — a regression that put it on the SET list of the
+    /// conflict update would silently rewrite history on every
+    /// relaunch.
+    ///
+    /// The test fakes the passage of time by stamping the row with a
+    /// known-past timestamp directly through SQL after the first
+    /// upsert. `CURRENT_TIMESTAMP` has 1-second granularity in SQLite,
+    /// so two back-to-back upserts in the same second would share a
+    /// timestamp and prove nothing about whether the column was
+    /// rewritten. Manually backdating both columns to a clearly older
+    /// value lets the second upsert prove (a) `first_seen_at` was
+    /// preserved and (b) `last_seen_at` advanced to a *newer* value.
+    #[test]
+    fn repeat_upsert_refreshes_last_seen_without_changing_first_seen() {
+        let dir = tempdir().expect("tempdir creates");
+        let db_path = dir.path().join("world.sqlite");
+        let mut world = WorldDb::open(&db_path).expect("open succeeds");
+        world
+            .apply_migration(&PLAYERS_MIGRATION)
+            .expect("players migration applies");
+
+        let first = world
+            .upsert_player(&ctx_with(Some("u-alice"), Some("alice")))
+            .expect("first upsert succeeds");
+
+        // Backdate both timestamps so the second upsert has somewhere
+        // measurable to advance from. Using a fixed past value (rather
+        // than `datetime('now', '-1 day')`) keeps the assertions exact
+        // and the test independent of the host clock's millisecond
+        // jitter.
+        const BACKDATED: &str = "2000-01-01 00:00:00";
+        world
+            .connection()
+            .execute(
+                "UPDATE players SET first_seen_at = ?1, last_seen_at = ?1 WHERE id = ?2",
+                rusqlite::params![BACKDATED, first.id],
+            )
+            .expect("backdating both timestamps succeeds");
+
+        let second = world
+            .upsert_player(&ctx_with(Some("u-alice"), Some("alice")))
+            .expect("repeat upsert succeeds");
+
+        assert_eq!(second.id, first.id, "stable key still resolves to one row");
+        assert_eq!(
+            second.first_seen_at, BACKDATED,
+            "first_seen_at must survive a repeat upsert verbatim"
+        );
+        assert_ne!(
+            second.last_seen_at, BACKDATED,
+            "last_seen_at must advance on a repeat upsert"
+        );
+        // Lexicographic comparison is correct for SQLite's
+        // `YYYY-MM-DD HH:MM:SS` format. We can compare directly without
+        // parsing into a chrono type.
+        assert!(
+            second.last_seen_at.as_str() > BACKDATED,
+            "last_seen_at ({}) must be later than the backdated value ({BACKDATED})",
+            second.last_seen_at
+        );
+    }
+
+    /// Companion guard for the local-dev branch: the `first_seen_at`
+    /// preservation rule applies to both identity namespaces. Without
+    /// this, a dev relaunching with `--local-dev-user alice` (the
+    /// Murder Motel two-player smoke test setup) would lose their
+    /// original registration timestamp on every re-exec.
+    #[test]
+    fn repeat_local_dev_upsert_refreshes_last_seen_without_changing_first_seen() {
+        let dir = tempdir().expect("tempdir creates");
+        let db_path = dir.path().join("world.sqlite");
+        let mut world = WorldDb::open(&db_path).expect("open succeeds");
+        world
+            .apply_migration(&PLAYERS_MIGRATION)
+            .expect("players migration applies");
+
+        let first = world
+            .upsert_player(&ctx_with(None, Some("alice")))
+            .expect("first local-dev upsert succeeds");
+
+        const BACKDATED: &str = "2000-01-01 00:00:00";
+        world
+            .connection()
+            .execute(
+                "UPDATE players SET first_seen_at = ?1, last_seen_at = ?1 WHERE id = ?2",
+                rusqlite::params![BACKDATED, first.id],
+            )
+            .expect("backdating both timestamps succeeds");
+
+        let second = world
+            .upsert_player(&ctx_with(None, Some("alice")))
+            .expect("repeat local-dev upsert succeeds");
+
+        assert_eq!(second.id, first.id);
+        assert_eq!(second.first_seen_at, BACKDATED);
+        assert!(second.last_seen_at.as_str() > BACKDATED);
     }
 
     /// Defaults — role and security_level fall back to `'user'` / `50`

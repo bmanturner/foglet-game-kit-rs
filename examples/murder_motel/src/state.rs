@@ -48,6 +48,22 @@ pub struct SaveState {
     /// Game / load paths reset to [`PlayerSlot::STARTING_CASH`].
     #[serde(default)]
     pub cash: u32,
+    /// Identifier of the map the player was on at save time. Lets the
+    /// title-screen Continue path dispatch to the right map screen
+    /// (lobby vs. Room 7) instead of always pushing the lobby. The
+    /// `#[serde(default = "default_map_name")]` keeps v1 saves
+    /// deserialising as the lobby — the only map the example shipped
+    /// with before the Room 7 addition.
+    #[serde(default = "default_map_name")]
+    pub map_name: String,
+}
+
+/// Default map identifier baked into [`SaveState::map_name`] when a
+/// pre-Room-7 save file is read. Centralised so the spelling matches
+/// the value [`crate::map::MapScreen`] writes into the slots on
+/// construction.
+pub fn default_map_name() -> String {
+    "lobby".to_string()
 }
 
 /// Mutable runtime fields that need to survive a quit/launch cycle and
@@ -58,7 +74,7 @@ pub struct SaveState {
 /// screen that needs read or write access holds its own handle. The
 /// canonical handle lives in `main`, which uses [`Self::snapshot`] /
 /// [`Self::apply`] to bridge to and from on-disk [`SaveState`].
-#[derive(Clone, Default, Debug)]
+#[derive(Clone, Debug)]
 pub struct SharedSlots {
     /// Narrative-flag store. Same Rc the [`crate::scenes::dialog::DialogScreen`]
     /// borrows for `requires`-gated branches.
@@ -78,6 +94,15 @@ pub struct SharedSlots {
     /// `reset` so a fresh run never opens with stale narration from a
     /// prior session.
     pub feedback: Rc<RefCell<Option<FeedbackLine>>>,
+    /// Identifier of the map the player is currently standing on.
+    /// Each map screen (lobby, Room 7, …) writes its own identifier
+    /// here on construction; [`Self::snapshot`] reads it into the
+    /// on-disk save and [`Self::apply`] writes it back so the title
+    /// screen's Continue path can dispatch the resumed run onto the
+    /// correct screen. Defaults to [`default_map_name`] on a fresh
+    /// `SharedSlots` so a New Game starting in the lobby never has a
+    /// blank map identifier.
+    pub map_name: Rc<RefCell<String>>,
 }
 
 /// Small POD bundle inside [`SharedSlots::player`].
@@ -108,6 +133,23 @@ impl PlayerSlot {
     pub const STARTING_CASH: u32 = 40;
 }
 
+impl Default for SharedSlots {
+    /// Hand-written so the [`Self::map_name`] slot starts at the
+    /// canonical lobby identifier instead of an empty string. Every
+    /// other slot still uses its derived default — the only deviation
+    /// is the map name, which downstream code (snapshot, Continue
+    /// dispatch) relies on being non-empty.
+    fn default() -> Self {
+        Self {
+            flags: Rc::new(RefCell::new(FlagSet::new())),
+            inventory: Rc::new(RefCell::new(BTreeSet::new())),
+            player: Rc::new(RefCell::new(PlayerSlot::default())),
+            feedback: Rc::new(RefCell::new(None)),
+            map_name: Rc::new(RefCell::new(default_map_name())),
+        }
+    }
+}
+
 impl SharedSlots {
     /// Reset every slot to a fresh-game baseline at `(start_x, start_y)`.
     /// Called when the main menu activates "New Game" so leftover state
@@ -128,6 +170,10 @@ impl SharedSlots {
         // stale "Moved Room 7 key to inventory." line from a previous
         // session.
         *self.feedback.borrow_mut() = None;
+        // A fresh game always starts in the lobby; clobber any leftover
+        // identifier from a previously-loaded save so the snapshot
+        // taken on the New Game's first quit lands on the correct map.
+        *self.map_name.borrow_mut() = default_map_name();
     }
 
     /// Build a [`SaveState`] from the current slot contents. Cloning the
@@ -142,6 +188,7 @@ impl SharedSlots {
             flags: self.flags.borrow().clone(),
             inventory: self.inventory.borrow().clone(),
             cash: player.cash,
+            map_name: self.map_name.borrow().clone(),
         }
     }
 
@@ -158,6 +205,7 @@ impl SharedSlots {
         }
         *self.flags.borrow_mut() = state.flags;
         *self.inventory.borrow_mut() = state.inventory;
+        *self.map_name.borrow_mut() = state.map_name;
     }
 }
 
