@@ -387,45 +387,53 @@ impl SharedSlots {
     /// Called when the main menu activates "New Game" so leftover state
     /// from a previously loaded save does not bleed into the new run.
     ///
-    /// Mutations go through the per-field aliases (which point into
-    /// [`Self::save`]'s inner cells), preserving Rc identity so every
-    /// screen handle keeps observing the same cells across resets. We
-    /// also flip the SaveSlot's dirty flag so a "save iff dirty" hook
-    /// (Task 4) treats a New Game as a meaningful state change worth
-    /// persisting.
+    /// SPEC_v2_1 §Task 5c routes the persisted mutations through
+    /// [`SaveSlot::borrow_mut`] on [`Self::save`]. That gives us two
+    /// things in one move:
+    ///
+    /// * The SaveSlot's dirty flag flips as a side effect of legitimate
+    ///   writes — a "save iff dirty" hook (Task 4) treats a New Game as
+    ///   a meaningful state change worth persisting.
+    /// * The persisted half of the reset is grouped under one borrow,
+    ///   communicating "this block is the on-disk state" without a
+    ///   trailing `let _ = self.save.borrow_mut()` no-op.
+    ///
+    /// The per-field aliases ([`Self::flags`], [`Self::inventory`],
+    /// [`Self::player`], [`Self::map_name`]) share the same per-field
+    /// `Rc<RefCell<_>>` cells as the slot's inner [`SaveState`], so
+    /// every screen handle keeps observing the cleared values without
+    /// re-aliasing. SPEC_v2_1 §Task 5d will migrate those screen
+    /// consumers off the per-field aliases.
     pub fn reset(&self, start_x: u16, start_y: u16) {
-        self.flags.borrow_mut().clear();
-        self.inventory.borrow_mut().clear();
-        let mut p = self.player.borrow_mut();
-        p.x = start_x;
-        p.y = start_y;
-        p.won = false;
-        // Restore the v1.1 vendor-scene starting balance so a New Game
-        // hands the player the documented 40g regardless of what the
-        // previous run spent. The field is re-initialised in one place
-        // so a future re-tune touches a single constant.
-        p.cash = PlayerSlot::STARTING_CASH;
-        drop(p);
-        // Clear any leftover feedback so a new run never opens under a
-        // stale "Moved Room 7 key to inventory." line from a previous
-        // session.
-        *self.feedback.borrow_mut() = None;
+        // Persisted half — one borrow on the SaveSlot covers every
+        // on-disk field.
+        let state = self.save.borrow_mut();
+        state.flags.borrow_mut().clear();
+        state.inventory.borrow_mut().clear();
+        {
+            let mut p = state.player.borrow_mut();
+            p.x = start_x;
+            p.y = start_y;
+            p.won = false;
+            // Restore the v1.1 vendor-scene starting balance so a New
+            // Game hands the player the documented 40g regardless of
+            // what the previous run spent. Centralised so a future
+            // re-tune touches one constant.
+            p.cash = PlayerSlot::STARTING_CASH;
+        }
         // A fresh game always starts in the lobby; clobber any leftover
         // identifier from a previously-loaded save so the snapshot
         // taken on the New Game's first quit lands on the correct map.
-        *self.map_name.borrow_mut() = default_map_name();
-        // Drop any clue-found events that never reached the lobby tick
-        // (e.g. the player picked up the matchbook then immediately hit
-        // New Game from the title menu). A fresh run must start with a
-        // clean mailbox or the next world-DB flush would write a stale
-        // row attributed to whoever happens to launch next.
+        *state.map_name.borrow_mut() = default_map_name();
+        drop(state);
+
+        // Ephemeral half — never persisted, lives outside the SaveSlot.
+        // Clearing here keeps the New Game flow free of stale narration
+        // from a prior session (`feedback`) and stale mailbox entries
+        // from a previous run that never reached the lobby tick
+        // (`pending_clue_events`).
+        *self.feedback.borrow_mut() = None;
         self.pending_clue_events.borrow_mut().clear();
-        // The SaveSlot's dirty flag tracks `borrow_mut` on the slot
-        // itself, not the per-field `Rc<RefCell<_>>`s we just mutated
-        // above. Take a no-op `borrow_mut` so the flag is set — a
-        // "save on dirty" hook would otherwise miss the New Game
-        // wipe entirely.
-        let _ = self.save.borrow_mut();
     }
 }
 
