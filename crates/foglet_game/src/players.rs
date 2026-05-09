@@ -1,9 +1,10 @@
 //! `players` — shared-world player registry (SPEC_v2 §Task 5).
 //!
-//! Task 5a (this commit) ships the `players` table migration only.
-//! Subsequent sub-tasks build on it:
+//! Task 5a shipped the `players` table migration. Task 5b (this
+//! iteration) layers the typed [`PlayerRecord`] read model and the
+//! [`WorldDb::upsert_player`] write path on top, scoped to the
+//! Foglet-user-id case. Subsequent sub-tasks fill in the rest:
 //!
-//! - 5b — `PlayerRecord` plus `WorldDb::upsert_player(&FogletContext)`.
 //! - 5c — Local-dev fallback identity for missing `user_id`.
 //! - 5d — `last_seen_at` refresh on repeat upsert.
 //! - 5e — `FogletRole` parsing and `security_level` mapping.
@@ -18,7 +19,21 @@
 //! migrations in Task 12) can reference one canonical definition
 //! instead of redeclaring the schema and drifting from it.
 
-use crate::world_db::WorldMigration;
+use thiserror::Error;
+
+use crate::foglet::FogletContext;
+use crate::world_db::{WorldDb, WorldMigration};
+
+/// Default handle written when a [`FogletContext`] arrives without a
+/// `username` / `handle` field.
+///
+/// SPEC §4.4 makes `handle` `NOT NULL` because every player needs
+/// *something* to render in the lobby/leaderboard UI. Foglet normally
+/// supplies one, but the field is documented as optional in §5.1, so
+/// the upsert path needs a fallback. `"guest"` is intentionally
+/// unremarkable — the on-screen affordance is "we couldn't find a
+/// handle for this session" and the operator can fix it upstream.
+const DEFAULT_HANDLE: &str = "guest";
 
 /// Schema for the shared-world player registry — SPEC_v2 §4.4.
 ///
@@ -96,11 +111,315 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_players_local_dev_key\n\
 ",
 };
 
+/// Typed read of a `players` row — SPEC_v2 §4.4 column-for-column.
+///
+/// Returned by [`WorldDb::upsert_player`] so authoring code never has
+/// to spell out a `query_row` against the world database to learn its
+/// own player id. Owning every column (rather than borrowing) matches
+/// the rest of the v2 surface: the runtime hands these to screens by
+/// value and the lifetime story stays simple.
+///
+/// # Field semantics
+///
+/// - `id` — internal autoincrement primary key. Stable across
+///   relaunches; foreign-keyed by future tables (`turn_ledger` in
+///   Task 6, `world_events` in Task 7, `leaderboard_scores` in Task 8)
+///   so per-player joins stay numeric.
+/// - `foglet_user_id` — `Some` when the upsert came from a Foglet
+///   context with a user id; `None` for the local-dev path landing
+///   in Task 5c.
+/// - `handle` — display string. Refreshed on every upsert so a
+///   user who changes their Foglet handle sees the new value the
+///   next time they launch.
+/// - `role`, `security_level` — set by SQL defaults today (`'user'`
+///   / `50`). Task 5e/5f overwrite these from the live context.
+/// - `first_seen_at` — UTC timestamp of the first upsert. Preserved
+///   across repeat upserts (Task 5d's invariant).
+/// - `last_seen_at` — UTC timestamp Task 5d will refresh on repeat
+///   upsert. Today it equals `first_seen_at` until that task lands.
+/// - `local_dev_key` — `Some` only on the Task 5c local-dev path;
+///   `None` for Foglet-user-id rows like the ones 5b creates.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlayerRecord {
+    /// Internal primary key — stable across relaunches.
+    pub id: i64,
+    /// Foglet-supplied stable user id, when present.
+    pub foglet_user_id: Option<String>,
+    /// Display handle (refreshed on every upsert).
+    pub handle: String,
+    /// Normalized role text (`'sysop'`, `'mod'`, `'user'`).
+    pub role: String,
+    /// Integer derived from `role` (sysop=100, mod=90, user=50).
+    pub security_level: i64,
+    /// UTC timestamp of the first upsert; preserved by Task 5d.
+    pub first_seen_at: String,
+    /// UTC timestamp Task 5d refreshes on every repeat upsert.
+    pub last_seen_at: String,
+    /// Synthesised local-dev key (Task 5c) — always `None` here.
+    pub local_dev_key: Option<String>,
+}
+
+/// Failure modes for [`WorldDb::upsert_player`].
+///
+/// Library-internal `thiserror`: the runtime layer (Task 10) wraps
+/// these with `anyhow` at the process boundary so the operator-facing
+/// message stays a single sentence.
+#[derive(Debug, Error)]
+pub enum PlayerError {
+    /// The supplied [`FogletContext`] had no `user_id`. Task 5c lifts
+    /// this restriction by synthesising a `local_dev_key`; until then
+    /// callers either receive a Foglet-issued context (which always
+    /// carries `user_id` in production) or pre-call
+    /// [`crate::foglet::synthesize_local_dev`]. Surfacing the
+    /// constraint as a typed variant — instead of papering over it
+    /// with a placeholder row — keeps the 5c follow-up honest: a
+    /// regression that "fixes" 5b by inserting a guest row would
+    /// silently fork every local-dev player's history.
+    #[error("FogletContext.user_id is required to upsert a player (local-dev fallback lands in Task 5c)")]
+    MissingIdentity,
+
+    /// The `INSERT … ON CONFLICT … RETURNING` round-trip failed.
+    /// Wrapping `rusqlite::Error` keeps the upsert call site readable
+    /// (one error type, one mapping) while preserving the underlying
+    /// cause for `tracing` and operator-facing messages.
+    #[error("failed to upsert player into world database: {source}")]
+    Sqlite {
+        /// Underlying `rusqlite` error from the upsert statement.
+        #[source]
+        source: rusqlite::Error,
+    },
+}
+
+impl WorldDb {
+    /// Upsert the player identified by `ctx` and return the
+    /// resulting [`PlayerRecord`].
+    ///
+    /// Stable-key contract (SPEC_v2 §4.4): two calls with the same
+    /// `FogletContext.user_id` resolve to the same `players.id`. The
+    /// underlying mechanism is the partial unique index on
+    /// `foglet_user_id` plus an `ON CONFLICT … DO UPDATE` clause —
+    /// the conflict refreshes `handle` so a user who renames in
+    /// Foglet sees the new label without us creating a duplicate row.
+    ///
+    /// Today this method covers the **Foglet-user-id case only**:
+    ///
+    /// - `ctx.user_id = Some(_)` → upsert keyed on `foglet_user_id`.
+    /// - `ctx.user_id = None`    → [`PlayerError::MissingIdentity`].
+    ///
+    /// Task 5c will broaden the second branch to synthesise a
+    /// `local_dev_key`; Task 5d will refresh `last_seen_at` on every
+    /// call; Task 5e/5f will write normalized `role` and
+    /// `security_level`. Until then the `players` row picks up SQL
+    /// defaults for those columns.
+    ///
+    /// # Concurrency
+    ///
+    /// Takes `&self`: the upsert is a single statement, so the busy
+    /// timeout configured at open time is the only contention story
+    /// we need. `&mut self` would fight the runtime layer (Task 10)
+    /// where `GameContext` borrows the world DB once per tick.
+    pub fn upsert_player(&self, ctx: &FogletContext) -> Result<PlayerRecord, PlayerError> {
+        let Some(user_id) = ctx.user_id.as_deref() else {
+            return Err(PlayerError::MissingIdentity);
+        };
+
+        // `username` is optional on the wire (SPEC §5.1). Falling back
+        // to `DEFAULT_HANDLE` keeps the `NOT NULL` constraint
+        // satisfied without burying the choice in the SQL string.
+        let handle = ctx.username.as_deref().unwrap_or(DEFAULT_HANDLE);
+
+        // Partial unique indexes require the `WHERE` clause to be
+        // restated in the `ON CONFLICT` target; SQLite refuses to
+        // match against a partial index otherwise. `excluded.handle`
+        // names the row we tried to insert — this is the SQL idiom
+        // for "use the new value during the conflict update".
+        //
+        // `RETURNING` (SQLite ≥ 3.35) lets us read the canonical row
+        // back without a second `SELECT` — important because the
+        // first-insert path needs the autoincrement `id` we don't
+        // know yet, and the conflict path benefits from echoing the
+        // stored timestamps so the caller doesn't get a stale view.
+        const SQL: &str = "\
+INSERT INTO players (foglet_user_id, handle) \
+VALUES (?1, ?2) \
+ON CONFLICT(foglet_user_id) WHERE foglet_user_id IS NOT NULL \
+DO UPDATE SET handle = excluded.handle \
+RETURNING id, foglet_user_id, handle, role, security_level, \
+          first_seen_at, last_seen_at, local_dev_key";
+
+        self.connection()
+            .query_row(SQL, rusqlite::params![user_id, handle], row_to_record)
+            .map_err(|source| PlayerError::Sqlite { source })
+    }
+}
+
+/// Decode a `players` row into [`PlayerRecord`].
+///
+/// Pulled out of the upsert call site so Task 5c's local-dev path and
+/// any future read helpers (a `find_by_user_id` query, for instance)
+/// can share one decoder. Column order matches the `RETURNING` clause
+/// above and the SPEC §4.4 schema; a regression that reorders columns
+/// in the migration will surface here as a type error rather than as
+/// a runtime panic in production.
+fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<PlayerRecord> {
+    Ok(PlayerRecord {
+        id: row.get(0)?,
+        foglet_user_id: row.get(1)?,
+        handle: row.get(2)?,
+        role: row.get(3)?,
+        security_level: row.get(4)?,
+        first_seen_at: row.get(5)?,
+        last_seen_at: row.get(6)?,
+        local_dev_key: row.get(7)?,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::foglet::ContextSource;
     use crate::world_db::WorldDb;
     use tempfile::tempdir;
+
+    /// Helper: build a [`FogletContext`] with just the identity bits
+    /// the upsert path reads. Tests don't care about `terminal_*` or
+    /// `session_id`, but the struct fields are required, so this
+    /// keeps test bodies focused on the behavior under test.
+    fn ctx_with(user_id: Option<&str>, username: Option<&str>) -> FogletContext {
+        FogletContext {
+            door_id: "test-door".to_string(),
+            user_id: user_id.map(str::to_string),
+            username: username.map(str::to_string),
+            role: None,
+            session_id: None,
+            terminal_width: 80,
+            terminal_height: 24,
+            source: ContextSource::ContextFile,
+        }
+    }
+
+    /// SPEC_v2 §Task 5b acceptance: a Foglet `user_id` is the stable
+    /// key for a player row. Two upserts against the same user_id
+    /// resolve to the same `players.id` and never duplicate the row,
+    /// even if the display handle changes between calls.
+    #[test]
+    fn upsert_player_with_user_id_is_stable_across_repeats() {
+        let dir = tempdir().expect("tempdir creates");
+        let db_path = dir.path().join("world.sqlite");
+        let mut world = WorldDb::open(&db_path).expect("open succeeds");
+        world
+            .apply_migration(&PLAYERS_MIGRATION)
+            .expect("players migration applies");
+
+        let first = world
+            .upsert_player(&ctx_with(Some("u-alice"), Some("alice")))
+            .expect("first upsert succeeds");
+        let second = world
+            .upsert_player(&ctx_with(Some("u-alice"), Some("alice-renamed")))
+            .expect("repeat upsert succeeds");
+
+        assert_eq!(first.id, second.id, "user_id must be the stable key");
+        assert_eq!(first.foglet_user_id.as_deref(), Some("u-alice"));
+        assert_eq!(second.handle, "alice-renamed");
+
+        // And the table truly has one row — a regression that papered
+        // over the partial-unique-index conflict by inserting twice
+        // (and just hiding it from `RETURNING`) would flunk this.
+        let count: i64 = world
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM players WHERE foglet_user_id = ?1",
+                rusqlite::params!["u-alice"],
+                |row| row.get(0),
+            )
+            .expect("count query runs");
+        assert_eq!(count, 1, "stable key must not duplicate the row");
+    }
+
+    /// Two distinct user_ids land on two distinct rows. Pinning this
+    /// alongside the stability test prevents a regression where the
+    /// upsert path hard-codes the first-seen id and returns it for
+    /// every caller.
+    #[test]
+    fn upsert_player_with_distinct_user_ids_creates_distinct_rows() {
+        let dir = tempdir().expect("tempdir creates");
+        let db_path = dir.path().join("world.sqlite");
+        let mut world = WorldDb::open(&db_path).expect("open succeeds");
+        world
+            .apply_migration(&PLAYERS_MIGRATION)
+            .expect("players migration applies");
+
+        let alice = world
+            .upsert_player(&ctx_with(Some("u-alice"), Some("alice")))
+            .expect("alice upsert succeeds");
+        let bob = world
+            .upsert_player(&ctx_with(Some("u-bob"), Some("bob")))
+            .expect("bob upsert succeeds");
+
+        assert_ne!(alice.id, bob.id);
+        assert_eq!(alice.handle, "alice");
+        assert_eq!(bob.handle, "bob");
+    }
+
+    /// Missing `username` falls back to the documented default rather
+    /// than rejecting the upsert. Foglet's contract makes `username`
+    /// optional (SPEC §5.1) — refusing to register a player on that
+    /// path would lock anonymous-access doors out of the world.
+    #[test]
+    fn upsert_player_falls_back_to_default_handle_when_username_missing() {
+        let dir = tempdir().expect("tempdir creates");
+        let db_path = dir.path().join("world.sqlite");
+        let mut world = WorldDb::open(&db_path).expect("open succeeds");
+        world
+            .apply_migration(&PLAYERS_MIGRATION)
+            .expect("players migration applies");
+
+        let record = world
+            .upsert_player(&ctx_with(Some("u-anon"), None))
+            .expect("anonymous-handle upsert succeeds");
+        assert_eq!(record.handle, DEFAULT_HANDLE);
+    }
+
+    /// SQL defaults from the §4.4 schema cover `role` and
+    /// `security_level` until Task 5e/5f land. Pinning the values
+    /// here means a follow-up that flips a default (without touching
+    /// the upsert) lands in this test, not a downstream Murder Motel
+    /// assertion.
+    #[test]
+    fn upsert_player_uses_schema_defaults_for_role_and_security() {
+        let dir = tempdir().expect("tempdir creates");
+        let db_path = dir.path().join("world.sqlite");
+        let mut world = WorldDb::open(&db_path).expect("open succeeds");
+        world
+            .apply_migration(&PLAYERS_MIGRATION)
+            .expect("players migration applies");
+
+        let record = world
+            .upsert_player(&ctx_with(Some("u-defaults"), Some("d")))
+            .expect("defaults upsert succeeds");
+        assert_eq!(record.role, "user");
+        assert_eq!(record.security_level, 50);
+        assert!(record.local_dev_key.is_none());
+    }
+
+    /// A context without `user_id` is rejected with a typed error
+    /// rather than silently inserting a placeholder. Task 5c lifts
+    /// this restriction by synthesising a `local_dev_key`; locking
+    /// the contract in now keeps that follow-up honest.
+    #[test]
+    fn upsert_player_rejects_missing_user_id() {
+        let dir = tempdir().expect("tempdir creates");
+        let db_path = dir.path().join("world.sqlite");
+        let mut world = WorldDb::open(&db_path).expect("open succeeds");
+        world
+            .apply_migration(&PLAYERS_MIGRATION)
+            .expect("players migration applies");
+
+        let err = world
+            .upsert_player(&ctx_with(None, Some("orphan")))
+            .expect_err("missing user_id must error");
+        assert!(matches!(err, PlayerError::MissingIdentity));
+    }
 
     /// SPEC_v2 §Task 5a acceptance: applying [`PLAYERS_MIGRATION`]
     /// records the version *and* leaves the documented column shape

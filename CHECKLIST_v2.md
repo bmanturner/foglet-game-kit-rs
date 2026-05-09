@@ -31,7 +31,7 @@ One unchecked item per iteration. Dependencies in `[brackets]` must be checked o
 ### Task 5 — Player registry
 
 - [x] **5a** — Add `players` migration with `foglet_user_id`, `handle`, `role`, `security_level`, `first_seen_at`, `last_seen_at`, and `local_dev_key`. [4b]
-- [ ] **5b** — Implement `PlayerRecord` and `WorldDb::upsert_player(&FogletContext)`. Test: user_id creates stable record. [5a]
+- [x] **5b** — Implement `PlayerRecord` and `WorldDb::upsert_player(&FogletContext)`. Test: user_id creates stable record. [5a]
 - [ ] **5c** — Support local-dev player keys when `FogletContext.user_id` is missing. Test: two local-dev handles do not collide. [5b]
 - [ ] **5d** — Update `last_seen_at` on repeat upsert without changing `first_seen_at`. [5b]
 - [ ] **5e** — Add `FogletRole` parsing and `FogletContext::security_level()` mapping: `sysop` = 100, `mod` = 90, `user`/missing/unknown = 50. Tests cover mixed-case and unknown roles. [5b]
