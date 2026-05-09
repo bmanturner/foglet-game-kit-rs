@@ -33,6 +33,7 @@
 
 pub mod config;
 pub mod dialog;
+pub mod events;
 pub mod foglet;
 pub mod input;
 pub mod manifest;
@@ -57,6 +58,7 @@ pub use dialog::{
     dialog_choice_prompt, dialog_handle_prompt_input, load_dialog, Choice, ChoiceError, Dialog,
     DialogError, DialogState, FlagSet, Node, DIALOG_PROMPT_MAX_CHOICES,
 };
+pub use events::WORLD_EVENTS_MIGRATION;
 pub use foglet::{
     load_context, load_context_from_env, load_context_from_file, load_context_with_options,
     process_env, synthesize_local_dev, ContextError, ContextSource, FogletContext, LoadOptions,
