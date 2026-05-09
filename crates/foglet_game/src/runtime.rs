@@ -324,6 +324,19 @@ pub struct Game {
     /// Optional Foglet context. Same shape as `config`: required by
     /// [`Game::run`], optional on the builder.
     foglet: Option<FogletContext>,
+    /// Optional save handler installed via [`Game::with_save_handler`]
+    /// (Task 4b). The runtime invokes this on every
+    /// [`crate::ScreenCommand::Save`] emission and once on the Quit
+    /// drain (Tasks 4c–4d). Defaults to `None` so existing v2 games
+    /// keep their stub-callback behaviour until the author opts in.
+    ///
+    /// Stored as `Option<SaveHandler>` rather than `SaveHandler` so a
+    /// game built without persistence stays cheap (no allocation for
+    /// an unused boxed closure) and so `with_save_handler` can be a
+    /// "set or replace" rather than a "stack" — calling it twice
+    /// overwrites, matching the SPEC_v2_1 §4.4 contract that exactly
+    /// one handler is in scope at runtime.
+    save_handler: Option<SaveHandler>,
 }
 
 impl std::fmt::Debug for Game {
@@ -338,6 +351,7 @@ impl std::fmt::Debug for Game {
             )
             .field("config", &self.config.is_some())
             .field("foglet", &self.foglet.is_some())
+            .field("save_handler", &self.save_handler.is_some())
             .finish()
     }
 }
@@ -360,6 +374,7 @@ impl Game {
             screens: ScreenStack::new(),
             config: None,
             foglet: None,
+            save_handler: None,
         }
     }
 
@@ -420,6 +435,59 @@ impl Game {
     #[must_use]
     pub fn with_foglet_context(mut self, foglet: FogletContext) -> Self {
         self.foglet = Some(foglet);
+        self
+    }
+
+    /// Install a save handler that the runtime will invoke whenever a
+    /// screen emits [`crate::ScreenCommand::Save`] and once on the
+    /// Quit drain (SPEC_v2_1 §4.4 / Tasks 4c–4d).
+    ///
+    /// The canonical producer is [`crate::SaveSlot::save_handler`]:
+    ///
+    /// ```ignore
+    /// let slot: SaveSlot<MyState> = SaveSlot::load_or_default(&path)?;
+    /// Game::new("…")
+    ///     .with_config(cfg)
+    ///     .with_foglet_context(ctx)
+    ///     .with_save_handler(slot.save_handler(path.clone()))
+    ///     .push_screen(Box::new(TitleScreen::new(slot.handle())))
+    ///     .run()?;
+    /// ```
+    ///
+    /// Authors can also write a closure by hand — anything that is
+    /// `FnMut() -> Result<(), GameError> + 'static` is accepted, so a
+    /// game persisting to e.g. an HTTP endpoint can wire its own
+    /// effect here without going through `SaveSlot`.
+    ///
+    /// ## Replacement, not stacking
+    ///
+    /// Calling `with_save_handler` twice replaces the previous
+    /// handler. SPEC_v2_1 §4.4 pins this: the runtime owns exactly
+    /// one save effect at a time so the Quit drain can call it
+    /// idempotently. If a game needs multiple persistence effects,
+    /// the author composes them inside a single closure (e.g. write
+    /// the JSON save *and* publish a metric) — the runtime stays
+    /// agnostic to that fan-out.
+    ///
+    /// ## Contract
+    ///
+    /// - Handlers run **inside** the [`crate::TerminalGuard`]'s
+    ///   lifetime. They MUST NOT print to stdout (it would corrupt
+    ///   the alternate screen). Log to a file appender or
+    ///   `tracing`'s no-op subscriber instead.
+    /// - Returning `Err(_)` aborts the runtime with
+    ///   [`GameError::Save`]; terminal restoration still runs because
+    ///   the loop result threads back through the guard's `cleanup()`
+    ///   call. (See [`run_built_with_opener`].)
+    /// - The closure may carry mutable state (`FnMut`) — useful for a
+    ///   "writes since last flush" counter or for retrying a transient
+    ///   I/O error inside the handler before surfacing it.
+    #[must_use]
+    pub fn with_save_handler<F>(mut self, handler: F) -> Self
+    where
+        F: FnMut() -> Result<(), GameError> + 'static,
+    {
+        self.save_handler = Some(Box::new(handler));
         self
     }
 
@@ -1035,6 +1103,75 @@ mod tests {
             fc.door_id,
             "context round-trips by value"
         );
+    }
+
+    #[test]
+    fn with_save_handler_stores_handler_on_builder() {
+        // Task 4b: the builder must hold onto the handler so a later
+        // task (4c/4d) can hand it to the runtime. We verify both that
+        // the field flips from `None` to `Some` and that the closure
+        // we passed in is the one stored — by invoking it and watching
+        // the side-effect counter increment.
+        let calls = Rc::new(RefCell::new(0u32));
+        let calls_clone = calls.clone();
+        let mut g = Game::new("T")
+            .push_screen(dummy())
+            .with_save_handler(move || {
+                *calls_clone.borrow_mut() += 1;
+                Ok(())
+            });
+        assert!(
+            g.save_handler.is_some(),
+            "with_save_handler must populate the field"
+        );
+
+        // Invoke the stored handler. `as_mut()` because `FnMut` needs
+        // unique access; the runtime will do the same thing in 4c.
+        let handler = g.save_handler.as_mut().expect("just set");
+        handler().expect("handler ok");
+        assert_eq!(*calls.borrow(), 1, "stored handler is the one we passed");
+    }
+
+    #[test]
+    fn with_save_handler_replaces_rather_than_stacks() {
+        // SPEC_v2_1 §4.4 contract: the runtime owns *one* save effect.
+        // Calling `with_save_handler` twice must overwrite — invoking
+        // the stored handler once after two installs should fire only
+        // the second closure. (If we stacked, both would tick.)
+        let first = Rc::new(RefCell::new(0u32));
+        let second = Rc::new(RefCell::new(0u32));
+        let first_c = first.clone();
+        let second_c = second.clone();
+        let mut g = Game::new("T")
+            .push_screen(dummy())
+            .with_save_handler(move || {
+                *first_c.borrow_mut() += 1;
+                Ok(())
+            })
+            .with_save_handler(move || {
+                *second_c.borrow_mut() += 1;
+                Ok(())
+            });
+        let handler = g.save_handler.as_mut().expect("just set");
+        handler().expect("handler ok");
+        assert_eq!(*first.borrow(), 0, "first handler must be dropped");
+        assert_eq!(*second.borrow(), 1, "second handler is the live one");
+    }
+
+    #[test]
+    fn debug_for_game_reports_save_handler_presence() {
+        // The Debug impl flips `save_handler` between `false` and
+        // `true` so operators eyeballing a panic dump can tell whether
+        // a save effect is wired without leaking the closure itself.
+        let without = format!("{:?}", Game::new("T").push_screen(dummy()));
+        assert!(without.contains("save_handler: false"), "got: {without}");
+        let with = format!(
+            "{:?}",
+            Game::new("T")
+                .push_screen(dummy())
+                .with_save_handler(|| Ok(()))
+        );
+        assert!(with.contains("save_handler: true"), "got: {with}");
     }
 
     #[test]
