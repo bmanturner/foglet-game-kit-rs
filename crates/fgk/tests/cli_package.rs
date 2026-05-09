@@ -84,6 +84,63 @@ fn fgk_package_with_binary_writes_full_bundle() {
 }
 
 #[test]
+fn fgk_package_murder_motel_seeds_world_directory() {
+    // Task 11c: world-enabled bundles must ship a writable `world/`
+    // directory so operators don't have to remember to chmod or mkdir
+    // it on first install. The Murder Motel example is the canonical
+    // SPEC v2 fixture — it opts into `[world]`, so packaging it must
+    // materialize the parent of `world/world.sqlite` and seed it with
+    // a `.keep` file (Task 11a). Asserting it here, against the real
+    // example rather than a synthetic fixture, gives us a smoke test
+    // that the example's `game.toml` and the packager agree.
+    let project = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("examples")
+        .join("murder_motel");
+    assert!(
+        project.join("assets/game.toml").is_file(),
+        "Murder Motel fixture missing — test path drift?"
+    );
+
+    let td = tempfile::tempdir().unwrap();
+    let fake_bin = td.path().join("murder-motel-bin");
+    fs::write(&fake_bin, b"#!/bin/sh\necho fake\n").unwrap();
+    let out = td.path().join("dist");
+
+    Command::cargo_bin("fgk")
+        .unwrap()
+        .arg("package")
+        .arg("--out")
+        .arg(&out)
+        .arg("--project")
+        .arg(&project)
+        .arg("--binary")
+        .arg(&fake_bin)
+        .assert()
+        .success()
+        .stdout(contains("Packaged `murder-motel`"));
+
+    // The example's `[world].path = "world/world.sqlite"`, so the
+    // packager should have created `<out>/world/` and dropped the
+    // `.keep` sentinel. The DB file itself is intentionally absent;
+    // SPEC v2 §5 has the runtime create it on first launch.
+    let world_dir = out.join("world");
+    assert!(
+        world_dir.is_dir(),
+        "world/ directory missing for murder motel"
+    );
+    assert!(
+        world_dir.join(".keep").is_file(),
+        "world/.keep sentinel missing"
+    );
+    assert!(
+        !world_dir.join("world.sqlite").exists(),
+        "world.sqlite must not be pre-created at package time"
+    );
+}
+
+#[test]
 fn fgk_package_rejects_relative_install_dir() {
     let td = tempfile::tempdir().unwrap();
     let project = td.path().join("smoke-game");

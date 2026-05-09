@@ -79,7 +79,7 @@ One unchecked item per iteration. Dependencies in `[brackets]` must be checked o
 
 - [x] **11a** — Teach `fgk package` to include `world/.keep` for world-enabled games. [2a]
 - [x] **11b** — Ensure packaged `run.sh` does not delete or recreate `world/`. [11a]
-- [ ] **11c** — Add package smoke test asserting `world/` exists for Murder Motel. [11a]
+- [x] **11c** — Add package smoke test asserting `world/` exists for Murder Motel. [11a]
 - [ ] **11d** — Update install docs with writable `world/` permissions and backup notes. [11a]
 
 ### Task 12 — Murder Motel shared Room 7
