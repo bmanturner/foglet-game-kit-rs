@@ -273,15 +273,66 @@ impl DialogScreen {
 
     /// Inspect the configured [`DialogLayout`].
     ///
-    /// Exposed now (rather than waiting for Task 2e's full accessor
-    /// suite) because Task 2b's tests need to pin that the
-    /// constructor defaults to [`DialogLayout::Modal`] — the
-    /// authoring rule of thumb that motivates the whole adapter.
-    /// The remaining accessors (`dialog`, `state`, `modal`,
-    /// `compact`) land in Task 2e alongside the `Screen` impl from
-    /// Tasks 2c/2d.
+    /// Mirrors [`crate::prompt_screen::PromptScreen::layout`]. Useful
+    /// for tests that want to pin the constructor default
+    /// ([`DialogLayout::Modal`], SPEC_v2_1.md §4.2) and for screens that
+    /// compose a [`DialogScreen`] inside a larger layout and need to
+    /// know whether the adapter is drawing its own border.
     pub fn layout(&self) -> DialogLayout {
         self.layout
+    }
+
+    /// Borrow the underlying [`Dialog`] — the parsed graph the screen
+    /// is walking. Useful for tests and for outer screens that want to
+    /// peek at speaker metadata or the start node id without keeping a
+    /// second handle to the loaded asset alongside the
+    /// [`DialogScreen`].
+    ///
+    /// Mirrors [`crate::prompt_screen::PromptScreen::prompt`]. Returned
+    /// as `&Dialog` (not `&mut`) because mutating the graph mid-walk
+    /// would invalidate the [`DialogState`] cursor — authors who want
+    /// to swap dialogs should rebuild the screen instead.
+    pub fn dialog(&self) -> &Dialog {
+        &self.dialog
+    }
+
+    /// Borrow the live [`DialogState`] cursor.
+    ///
+    /// The state is the moving part of the adapter — every `Enter` in
+    /// line-pumping mode and every `ChoicePicked` in choice mode
+    /// advances it. Tests use this to assert the cursor landed on the
+    /// expected node after an input; outer screens occasionally use it
+    /// to render speaker metadata derived from the current node.
+    /// Returned as `&DialogState` rather than `&mut` because driving
+    /// the state directly would bypass the [`DialogScreen`]'s flag
+    /// borrow discipline — drive it through `handle_input` instead.
+    pub fn state(&self) -> &DialogState {
+        &self.state
+    }
+
+    /// Switch the layout to [`DialogLayout::Modal`] (SPEC_v2_1.md §4.2
+    /// default). Builder-style so the call site reads
+    /// `DialogScreen::new(...).modal()` even though it is the default —
+    /// useful when an author wants to spell the layout choice out
+    /// explicitly for readers (or to undo a prior `.compact()` in a
+    /// builder chain).
+    pub fn modal(mut self) -> Self {
+        self.layout = DialogLayout::Modal;
+        self
+    }
+
+    /// Switch the layout to [`DialogLayout::Compact`] — no border, body
+    /// and choices flow inside the supplied frame area. Use for inline
+    /// dialogs that share the screen with another widget (e.g. a map
+    /// pane plus an NPC line) or for short barker-style one-liners
+    /// where a modal frame would feel heavy.
+    ///
+    /// Mirrors [`crate::prompt_screen::PromptScreen::compact`]; the two
+    /// adapters intentionally use the same builder-method names so
+    /// authors can switch between them with the same muscle memory.
+    pub fn compact(mut self) -> Self {
+        self.layout = DialogLayout::Compact;
+        self
     }
 }
 
@@ -985,8 +1036,7 @@ nodes:
             let mut borrowed = flags.borrow_mut();
             DialogState::start(&dialog, &mut borrowed)
         };
-        let mut screen = DialogScreen::new(dialog, start, flags, |_| ScreenCommand::None);
-        screen.layout = DialogLayout::Compact;
+        let mut screen = DialogScreen::new(dialog, start, flags, |_| ScreenCommand::None).compact();
 
         let cfg = fixture_config();
         let fc = fixture_context();
@@ -1327,6 +1377,89 @@ nodes:
         let _ = dispatch(&mut screen, Input::Enter);
         assert_eq!(recorded.borrow().len(), 1);
         assert_eq!(recorded.borrow()[0], DialogAction::Finished);
+    }
+
+    // ---------- Task 2e accessor tests ----------
+    //
+    // The accessors are tiny — they hand back references or rebind the
+    // layout field — so the tests only need to confirm each one routes
+    // to the right field without side effects. They also pin builder
+    // chaining (`new(..).modal().compact()` lands in `Compact`) so a
+    // future contributor cannot inadvertently break the
+    // [`PromptScreen`] symmetry that motivated Task 2e.
+
+    #[test]
+    fn dialog_accessor_returns_loaded_graph() {
+        // The accessor must hand back the *same* graph the constructor
+        // received. Comparing to a freshly-loaded copy of the fixture
+        // verifies equality without needing the screen to expose
+        // pointer identity.
+        let dialog = load_dialog(fixture_dialog_yaml()).expect("fixture parses");
+        let flags = Rc::new(RefCell::new(FlagSet::new()));
+        let start = {
+            let mut borrowed = flags.borrow_mut();
+            DialogState::start(&dialog, &mut borrowed)
+        };
+        let screen = DialogScreen::new(dialog.clone(), start, flags, |_| ScreenCommand::None);
+        assert_eq!(screen.dialog(), &dialog);
+    }
+
+    #[test]
+    fn state_accessor_reflects_cursor_advances() {
+        // Drive the state forward via `handle_input` (the public path)
+        // and confirm `state()` reflects the new cursor. The simple
+        // fixture has one line then a goto to the terminal — one Enter
+        // walks both, so the post-input state must be `is_finished`.
+        let dialog = load_dialog(fixture_dialog_yaml()).expect("fixture parses");
+        let flags = Rc::new(RefCell::new(FlagSet::new()));
+        let start = {
+            let mut borrowed = flags.borrow_mut();
+            DialogState::start(&dialog, &mut borrowed)
+        };
+        let mut screen = DialogScreen::new(dialog, start, flags, |_| ScreenCommand::None);
+        assert!(
+            !screen.state().is_finished(),
+            "fresh state must not be finished"
+        );
+        let _ = dispatch(&mut screen, Input::Enter);
+        assert!(
+            screen.state().is_finished(),
+            "Enter on the simple fixture must walk to the terminal"
+        );
+    }
+
+    #[test]
+    fn modal_and_compact_builders_set_layout() {
+        // Cover the builder-chain shape — `.modal()` and `.compact()`
+        // must each set the corresponding variant, and the last call
+        // wins. This is the test that catches an accidental swap of
+        // the two methods (a copy-paste hazard given how similar they
+        // are to [`PromptScreen`]'s pair).
+        let dialog = load_dialog(fixture_dialog_yaml()).expect("fixture parses");
+        let flags = Rc::new(RefCell::new(FlagSet::new()));
+        let start = {
+            let mut borrowed = flags.borrow_mut();
+            DialogState::start(&dialog, &mut borrowed)
+        };
+        let modal_screen = DialogScreen::new(dialog.clone(), start.clone(), flags.clone(), |_| {
+            ScreenCommand::None
+        })
+        .modal();
+        assert_eq!(modal_screen.layout(), DialogLayout::Modal);
+
+        let compact_screen =
+            DialogScreen::new(dialog.clone(), start.clone(), flags.clone(), |_| {
+                ScreenCommand::None
+            })
+            .compact();
+        assert_eq!(compact_screen.layout(), DialogLayout::Compact);
+
+        // Last call wins — chaining `.modal().compact()` lands in
+        // Compact, mirroring [`PromptScreen`]'s builder semantics.
+        let chained = DialogScreen::new(dialog, start, flags, |_| ScreenCommand::None)
+            .modal()
+            .compact();
+        assert_eq!(chained.layout(), DialogLayout::Compact);
     }
 
     #[test]
