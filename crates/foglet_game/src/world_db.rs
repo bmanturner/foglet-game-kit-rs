@@ -9,11 +9,9 @@
 //!
 //! # What lands here, and when
 //!
-//! Task 3a (this commit) only stands up the type and a single
-//! constructor that opens a SQLite file at a caller-provided path. It
-//! deliberately does not:
+//! Task 3b (this commit) extends the open path so missing parent
+//! directories are created up-front. It still deliberately does not:
 //!
-//! - create parent directories — that's Task 3b;
 //! - apply the `[world].busy_timeout_ms` config — Task 3c;
 //! - apply the `[world].journal_mode` config — Task 3d;
 //! - run any migrations — Task 4.
@@ -42,6 +40,7 @@
 //!    behind `WorldDb::open` means tests in those tasks build on the
 //!    same surface authors use in production.
 
+use std::fs;
 use std::path::Path;
 
 use rusqlite::Connection;
@@ -76,15 +75,42 @@ impl WorldDb {
     /// world database at /srv/foglet/doors/.../world/world.sqlite")
     /// without callers having to match on `rusqlite::Error` directly.
     ///
-    /// # Out of scope for Task 3a
+    /// # Parent directory handling (Task 3b)
     ///
-    /// This constructor does not create missing parent directories
-    /// (3b), apply busy timeout (3c), or apply journal mode (3d). A
-    /// caller passing `world/world.sqlite` into a fresh package today
-    /// will get an `Open` error if `world/` does not exist yet — the
-    /// follow-up tasks make that case work end-to-end.
+    /// If the immediate or any ancestor parent directory of `path`
+    /// does not yet exist, [`open`](Self::open) creates the chain via
+    /// `fs::create_dir_all` *before* asking SQLite to open the file.
+    /// This matches SPEC §10.4's packaging contract: a fresh install
+    /// includes only `world/.keep` (later tasks), and authors should
+    /// be able to point at `world/world.sqlite` without an explicit
+    /// `mkdir -p` step in `run.sh`.
+    ///
+    /// Failures to create the parent chain surface as
+    /// [`WorldDbError::CreateParents`] so the operator can distinguish
+    /// "filesystem rejected `mkdir`" (permission/disk-full) from
+    /// "SQLite rejected the open" (corrupt file, locked DB).
+    ///
+    /// # Out of scope for Task 3b
+    ///
+    /// This constructor still does not apply busy timeout (3c) or
+    /// journal mode (3d). Those follow in their own iterations.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, WorldDbError> {
         let path_ref = path.as_ref();
+
+        // Create the parent chain when one is named. `Path::parent`
+        // returns `Some("")` for bare relative filenames like
+        // `world.sqlite`; `create_dir_all("")` is a no-op on Unix but
+        // skipping it keeps behavior portable and avoids surfacing
+        // confusing errors on platforms that disagree.
+        if let Some(parent) = path_ref.parent() {
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent).map_err(|source| WorldDbError::CreateParents {
+                    path: parent.display().to_string(),
+                    source,
+                })?;
+            }
+        }
+
         let conn = Connection::open(path_ref).map_err(|source| WorldDbError::Open {
             path: path_ref.display().to_string(),
             source,
@@ -110,10 +136,10 @@ impl WorldDb {
 /// `anyhow` so end-user output stays a single sentence.
 #[derive(Debug, Error)]
 pub enum WorldDbError {
-    /// `rusqlite::Connection::open` rejected the path. The most
-    /// common cause in v2 is "parent directory does not exist", which
-    /// Task 3b removes by creating parents up front; until then this
-    /// error gives the author a path string they can `mkdir -p`.
+    /// `rusqlite::Connection::open` rejected the path. With Task 3b
+    /// the "parent directory does not exist" failure mode is gone, so
+    /// hitting this variant typically means the file exists but is
+    /// corrupt, locked by another process, or unreadable.
     #[error("failed to open world database at `{path}`: {source}")]
     Open {
         /// Path the caller asked us to open, echoed back so the
@@ -122,6 +148,19 @@ pub enum WorldDbError {
         /// Underlying `rusqlite` error.
         #[source]
         source: rusqlite::Error,
+    },
+
+    /// `fs::create_dir_all` failed while ensuring the parent chain
+    /// for the database file exists. Distinct from [`Self::Open`] so
+    /// the operator can tell "filesystem won't let me make the
+    /// directory" apart from "SQLite won't let me open the file".
+    #[error("failed to create world database parent directory `{path}`: {source}")]
+    CreateParents {
+        /// Parent path we tried (and failed) to create.
+        path: String,
+        /// Underlying I/O error from `fs::create_dir_all`.
+        #[source]
+        source: std::io::Error,
     },
 }
 
@@ -158,23 +197,36 @@ mod tests {
         assert_eq!(one, 1);
     }
 
-    /// Opening a path whose parent directory does not exist surfaces
-    /// a [`WorldDbError::Open`] rather than panicking. Task 3b will
-    /// remove the failure mode by creating parents; this test pins
-    /// the *current* contract so the upgrade is a deliberate change.
+    /// SPEC_v2 §Task 3b acceptance: a nested `world/world.sqlite`
+    /// path whose parent directory does not yet exist is created on
+    /// open rather than rejected. This is the SPEC §10.4 packaging
+    /// shape — a fresh install ships `world/.keep` (later tasks) and
+    /// authors should not need an extra `mkdir -p` step.
     #[test]
-    fn missing_parent_directory_yields_open_error() {
+    fn open_creates_missing_parent_directories() {
         let dir = tempdir().expect("tempdir creates");
-        let bogus = dir.path().join("does_not_exist").join("world.sqlite");
+        // Two levels of missing parents to exercise `create_dir_all`,
+        // not just a single `mkdir`.
+        let nested = dir.path().join("world").join("nested").join("world.sqlite");
 
-        let err = WorldDb::open(&bogus).expect_err("missing parent must fail today");
-        match err {
-            WorldDbError::Open { path, .. } => {
-                assert!(
-                    path.contains("does_not_exist"),
-                    "error echoes the offending path back to the operator (got `{path}`)"
-                );
-            }
-        }
+        assert!(
+            !nested.parent().unwrap().exists(),
+            "precondition: nested parent must not yet exist"
+        );
+
+        let world = WorldDb::open(&nested).expect("open creates parents and succeeds");
+        assert!(nested.exists(), "SQLite file lands at the requested path");
+        assert!(
+            nested.parent().unwrap().is_dir(),
+            "the full parent chain is created"
+        );
+
+        // Sanity: the connection is still usable after the parent
+        // dance, so 3a's contract is preserved.
+        let one: i64 = world
+            .connection()
+            .query_row("SELECT 1", [], |row| row.get(0))
+            .expect("connection works after parent creation");
+        assert_eq!(one, 1);
     }
 }

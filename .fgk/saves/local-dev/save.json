@@ -1,0 +1,10 @@
+{
+  "player_x": 32,
+  "player_y": 2,
+  "won": false,
+  "flags": [],
+  "inventory": [
+    "lipstick"
+  ],
+  "cash": 40
+}
