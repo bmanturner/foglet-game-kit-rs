@@ -1,10 +1,16 @@
 {
-  "player_x": 32,
-  "player_y": 2,
+  "player_x": 35,
+  "player_y": 3,
   "won": false,
-  "flags": [],
-  "inventory": [
-    "lipstick"
+  "flags": [
+    "has_key",
+    "heard_rumor",
+    "receipt_read"
   ],
-  "cash": 40
+  "inventory": [
+    "matchbook",
+    "room_7_key"
+  ],
+  "cash": 40,
+  "map_name": "lobby"
 }

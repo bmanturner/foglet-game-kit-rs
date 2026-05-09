@@ -39,7 +39,7 @@ One unchecked item per iteration. Dependencies in `[brackets]` must be checked o
 
 ### Task 6 — Turn ledger
 
-- [ ] **6a** — Add `turn_ledger` migration keyed by player and local date. [5a]
+- [x] **6a** — Add `turn_ledger` migration keyed by player and local date. [5a]
 - [ ] **6b** — Add injectable date provider abstraction for turn tests. [6a]
 - [ ] **6c** — Implement initial daily allowance creation. Test: new player gets configured allowance. [6b]
 - [ ] **6d** — Implement atomic turn spend. Test: spending decrements balance. [6c]
