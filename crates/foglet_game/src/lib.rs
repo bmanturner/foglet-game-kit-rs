@@ -85,7 +85,7 @@ pub use prompt_screen::{PromptLayout, PromptScreen};
 pub use roles::{FogletRole, MOD_SECURITY_LEVEL, SYSOP_SECURITY_LEVEL, USER_SECURITY_LEVEL};
 pub use runtime::{
     run_built, run_with_io, BuiltGame, CrosstermEventSource, EventSource, Game, GameError,
-    GameResult, SavePolicy, TICK_INTERVAL,
+    GameResult, SaveHandler, SavePolicy, TICK_INTERVAL,
 };
 pub use save::{
     read_save, resolve_save_path, write_atomic, SaveIoError, SavePathError, SavePathInputs,
