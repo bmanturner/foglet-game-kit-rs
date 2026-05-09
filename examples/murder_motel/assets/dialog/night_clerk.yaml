@@ -1,8 +1,17 @@
 # Night Clerk dialog — the SPEC §13 acceptance fixture's branching
-# conversation (Task 13d). The third top-level choice is gated on
-# `heard_rumor`, which the player can only set by first asking about
-# the murder. Re-engaging the clerk after asking the rumor unlocks
-# the master-key request, demonstrating flag-driven branching.
+# conversation. Demonstrates two patterns:
+#
+#   1. **Hub-loop**: a one-shot `greeting` plays the intro lines and
+#      falls through to a re-enterable `hub` node. Every branch
+#      terminates with `goto: hub` so the player can keep talking
+#      after exhausting one topic, and only the explicit "Never mind"
+#      choice walks away to `end`.
+#
+#   2. **Exhausted topics**: each hub choice carries `requires_not`
+#      on the flag it sets, so picking it once removes it from the
+#      list on the next loop. The "Got a master key" choice combines
+#      this with a positive `requires: heard_rumor`, demonstrating
+#      that both gates must hold.
 
 start: greeting
 nodes:
@@ -10,14 +19,20 @@ nodes:
     lines:
       - "The Night Clerk slouches behind the counter, half-asleep."
       - "'Yeah? Whaddya want?'"
+    goto: hub
+
+  hub:
     choices:
       - text: "Just checking in."
+        requires_not: has_room_assigned
         goto: checkin
       - text: "I heard about the murder."
+        requires_not: heard_rumor
         set: [heard_rumor]
         goto: rumor
       - text: "Got a master key I can borrow?"
         requires: heard_rumor
+        requires_not: has_key
         set: [has_key]
         goto: key_handed_over
       - text: "Never mind."
@@ -27,7 +42,7 @@ nodes:
     lines:
       - "'Room 7 is open. Don't ask why.'"
     set: [has_room_assigned]
-    goto: end
+    goto: hub
 
   rumor:
     lines:
@@ -35,15 +50,16 @@ nodes:
       - "'Don't go pokin' around without protection.'"
     choices:
       - text: "What about that key?"
+        requires_not: has_key
         set: [has_key]
         goto: key_handed_over
       - text: "Thanks. I'll be careful."
-        goto: end
+        goto: hub
 
   key_handed_over:
     lines:
       - "He hesitates, then slides a brass key across the counter."
       - "'Don't lose it. And don't say I gave it to ya.'"
-    goto: end
+    goto: hub
 
   end: {}

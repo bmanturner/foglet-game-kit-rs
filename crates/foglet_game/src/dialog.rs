@@ -361,6 +361,20 @@ impl DialogState {
             .expect("validated dialog always resolves current node");
         if self.line_index < node.lines.len() {
             self.line_index += 1;
+            // If walking off the last line lands on a node with no
+            // available choice for the player, chase the `goto` in
+            // the same step. Prevents the screen from rendering an
+            // empty "(no more to say)" frame between the last line
+            // and the next perceptible state — the common shape for
+            // hub-loop dialogs that split intro lines from the
+            // re-enterable choice node.
+            if self.line_index >= node.lines.len()
+                && self.available_choices(dialog, flags).is_empty()
+            {
+                if let Some(target) = node.goto.clone() {
+                    self.jump_to(dialog, target, flags);
+                }
+            }
             return Ok(());
         }
         // Lines exhausted. If choices exist and at least one is
@@ -753,8 +767,9 @@ nodes:
         state.choose(&dialog, &mut flags, 0).unwrap();
         assert!(flags.contains("heard_rumor"));
         assert_eq!(state.current_node(), "rumor");
-        // Walk the single line, then the goto returns to hub.
-        state.advance(&dialog, &mut flags).unwrap();
+        // Walk the single line; advance chases the goto in the same
+        // step because rumor has no choices once the line is
+        // consumed.
         state.advance(&dialog, &mut flags).unwrap();
         assert_eq!(state.current_node(), "hub");
 
@@ -832,6 +847,12 @@ nodes:
 
     #[test]
     fn linear_goto_walks_through_intermediate_node() {
+        // Picking "I need a room" jumps to `room_request`, walks its
+        // single line, then follows the intermediate goto to the
+        // empty `end` terminal. `advance` chases the goto in the
+        // same step that consumes the last line because
+        // `room_request` has no choices for the player to make —
+        // the screen should never render an empty in-between frame.
         let dialog = load_dialog(sample_yaml()).unwrap();
         let mut flags = FlagSet::new();
         let mut state = DialogState::start(&dialog, &mut flags);
@@ -839,8 +860,7 @@ nodes:
         state.advance(&dialog, &mut flags).unwrap();
         state.choose(&dialog, &mut flags, 0).unwrap(); // -> room_request
         assert_eq!(state.current_line(&dialog), Some("Room 7 is open."));
-        state.advance(&dialog, &mut flags).unwrap(); // line index past last
-        state.advance(&dialog, &mut flags).unwrap(); // follow goto -> end (empty node finishes)
+        state.advance(&dialog, &mut flags).unwrap(); // line + chase -> end -> finished
         assert!(state.is_finished());
     }
 

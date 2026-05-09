@@ -383,6 +383,83 @@ mod tests {
     }
 
     #[test]
+    fn dialog_clerk_hub_loops_and_exhausts_topics() {
+        // Regression coverage for the hub-loop refactor: the player
+        // can take any branch, return to the hub, and pick another;
+        // each choice disappears once it has been taken; once every
+        // topic is exhausted only "Never mind." remains.
+        let cfg = fixture_config();
+        let fc = fixture_context();
+        let mut ctx = GameContext::new(&cfg, &fc, (80, 24));
+        let (mut screen, _flags) = fresh_clerk_dialog();
+
+        // Walk past the greeting lines into the hub.
+        screen.handle_input(&mut ctx, Input::Enter);
+        screen.handle_input(&mut ctx, Input::Enter);
+        let initial = screen.current_choice_labels();
+        assert_eq!(
+            initial,
+            vec![
+                "Just checking in.".to_string(),
+                "I heard about the murder.".to_string(),
+                "Never mind.".to_string(),
+            ],
+            "hub on first entry must show the two unflagged topics plus the exit"
+        );
+
+        // Pick "Just checking in." (index 0). Walk its single line
+        // back to the hub.
+        screen.handle_input(&mut ctx, Input::Enter);
+        assert_eq!(screen.state().current_node(), "checkin");
+        screen.handle_input(&mut ctx, Input::Enter); // line + chase -> hub
+        assert_eq!(screen.state().current_node(), "hub");
+        let after_checkin = screen.current_choice_labels();
+        assert_eq!(
+            after_checkin,
+            vec![
+                "I heard about the murder.".to_string(),
+                "Never mind.".to_string(),
+            ],
+            "checking in must hide the room topic"
+        );
+
+        // Pick "I heard about the murder." (index 0 now that the
+        // checkin topic is gone). Walk its lines + pick "Thanks. I'll
+        // be careful." (index 1) to bounce back to the hub without
+        // taking the key from the rumor branch.
+        screen.handle_input(&mut ctx, Input::Enter);
+        assert_eq!(screen.state().current_node(), "rumor");
+        screen.handle_input(&mut ctx, Input::Enter); // rumor line 1
+        screen.handle_input(&mut ctx, Input::Enter); // rumor line 2; choices visible
+        screen.handle_input(&mut ctx, Input::Down); // index 0 -> 1
+        screen.handle_input(&mut ctx, Input::Enter); // pick "Thanks..."
+        assert_eq!(screen.state().current_node(), "hub");
+        let after_rumor = screen.current_choice_labels();
+        assert_eq!(
+            after_rumor,
+            vec![
+                "Got a master key I can borrow?".to_string(),
+                "Never mind.".to_string(),
+            ],
+            "the rumor topic must hide and the master key must unlock"
+        );
+
+        // Pick the master key (index 0). Walk its two lines back to
+        // the hub; only "Never mind." remains.
+        screen.handle_input(&mut ctx, Input::Enter);
+        assert_eq!(screen.state().current_node(), "key_handed_over");
+        screen.handle_input(&mut ctx, Input::Enter); // key line 1
+        screen.handle_input(&mut ctx, Input::Enter); // key line 2 + chase -> hub
+        assert_eq!(screen.state().current_node(), "hub");
+        let exhausted = screen.current_choice_labels();
+        assert_eq!(
+            exhausted,
+            vec!["Never mind.".to_string()],
+            "every topic taken must leave only the exit choice"
+        );
+    }
+
+    #[test]
     fn dialog_esc_pops() {
         let cfg = fixture_config();
         let fc = fixture_context();
