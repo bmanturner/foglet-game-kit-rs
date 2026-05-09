@@ -904,7 +904,24 @@ where
             // construction; the runtime fails only on I/O / render
             // / save problems.
             SideEffect::Message(_) | SideEffect::Error(_) => {}
-            SideEffect::Exit(reason) => return Ok(reason),
+            SideEffect::Exit(reason) => {
+                // Task 4d: fire `on_save` once on the clean-exit drain
+                // path so an author who installed a handler via
+                // [`Game::with_save_handler`] gets a final flush on
+                // both `ExitReason::Quit` (explicit `ScreenCommand::Quit`)
+                // and `ExitReason::EmptyStack` (the last screen popped
+                // itself). SPEC_v2_1 §4.4 calls this out as the whole
+                // point of having a runtime-level save handler — the
+                // game shouldn't have to remember to flush on every
+                // exit path. Errors short-circuit through `?` above
+                // and skip this branch, so a `SideEffect::Save` that
+                // fails earlier in this iteration never double-runs
+                // here, and a render/IO error still leaves whatever
+                // partial state the game last persisted intact rather
+                // than half-overwriting it on a panicking exit.
+                on_save()?;
+                return Ok(reason);
+            }
         }
     }
 }
@@ -1452,10 +1469,13 @@ mod tests {
         .expect("loop ok");
 
         assert_eq!(reason, ExitReason::Quit);
+        // Task 4c emitted Save → on_save once; Task 4d adds a second
+        // call on the Quit drain path. Two invocations total: one
+        // explicit, one from clean-exit auto-flush.
         assert_eq!(
             *saves.borrow(),
-            1,
-            "Save side effect must call on_save once"
+            2,
+            "Save side effect + Quit drain must call on_save twice"
         );
     }
 
@@ -1515,10 +1535,137 @@ mod tests {
         .expect("loop ok");
 
         assert_eq!(reason, ExitReason::Quit);
+        // One call from the Save side effect (Task 4c) + one from the
+        // Quit drain (Task 4d). The "exactly once per Save" semantic
+        // for Task 4c is now exercised by `loop_save_only_invokes_handler_once`.
+        assert_eq!(
+            *saves.borrow(),
+            2,
+            "Save effect + Quit drain must each invoke the threaded SaveHandler"
+        );
+    }
+
+    #[test]
+    fn loop_quit_drain_invokes_save_handler_once() {
+        // Task 4d: a clean exit via `ScreenCommand::Quit` — with no
+        // explicit `Save` emitted by any screen — must still invoke
+        // the runtime save handler exactly once so games that opt
+        // into `Game::with_save_handler` get an unconditional flush
+        // on quit.
+        let cfg = fixture_config();
+        let fc = fixture_context();
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let screen = ScriptedScreen::new("only", log, vec![ScreenCommand::Quit], vec![], vec![]);
+        let built = make_built(Box::new(screen));
+        let mut term = make_terminal();
+        let mut events = VecEventSource::new(vec![Some(Input::Char('q'))]);
+
+        let saves = Rc::new(RefCell::new(0u32));
+        let saves_clone = saves.clone();
+        let mut on_save: Box<dyn FnMut() -> Result<(), GameError>> = Box::new(move || {
+            *saves_clone.borrow_mut() += 1;
+            Ok(())
+        });
+
+        let reason = run_with_io(
+            built,
+            &cfg,
+            &fc,
+            None,
+            (40, 10),
+            &mut term,
+            &mut events,
+            &mut on_save,
+        )
+        .expect("loop ok");
+
+        assert_eq!(reason, ExitReason::Quit);
         assert_eq!(
             *saves.borrow(),
             1,
-            "the threaded SaveHandler must fire exactly once per Save side effect"
+            "Quit drain must invoke on_save exactly once even with no prior Save"
+        );
+    }
+
+    #[test]
+    fn loop_empty_stack_drain_invokes_save_handler_once() {
+        // Task 4d: `ExitReason::EmptyStack` is the other clean-exit
+        // path — the last screen `Pop`s itself off the stack. SPEC_v2_1
+        // §4.4 lists "explicit Quit or empty stack" as the conditions
+        // for the drain call, so the handler must fire here too.
+        let cfg = fixture_config();
+        let fc = fixture_context();
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let screen = ScriptedScreen::new("only", log, vec![ScreenCommand::Pop], vec![], vec![]);
+        let built = make_built(Box::new(screen));
+        let mut term = make_terminal();
+        let mut events = VecEventSource::new(vec![Some(Input::Char('p'))]);
+
+        let saves = Rc::new(RefCell::new(0u32));
+        let saves_clone = saves.clone();
+        let mut on_save: Box<dyn FnMut() -> Result<(), GameError>> = Box::new(move || {
+            *saves_clone.borrow_mut() += 1;
+            Ok(())
+        });
+
+        let reason = run_with_io(
+            built,
+            &cfg,
+            &fc,
+            None,
+            (40, 10),
+            &mut term,
+            &mut events,
+            &mut on_save,
+        )
+        .expect("loop ok");
+
+        assert_eq!(reason, ExitReason::EmptyStack);
+        assert_eq!(
+            *saves.borrow(),
+            1,
+            "EmptyStack drain must invoke on_save exactly once"
+        );
+    }
+
+    #[test]
+    fn loop_error_exit_does_not_invoke_save_handler() {
+        // Task 4d: an error path (e.g. a failing Save callback or a
+        // render IO error) must NOT trigger the drain call — the
+        // drain is for *clean* exits only. Here we drive a failing
+        // Save and assert the handler ran exactly once (for the
+        // explicit Save) and not a second time on the way out.
+        let cfg = fixture_config();
+        let fc = fixture_context();
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let screen = ScriptedScreen::new("only", log, vec![ScreenCommand::Save], vec![], vec![]);
+        let built = make_built(Box::new(screen));
+        let mut term = make_terminal();
+        let mut events = VecEventSource::new(vec![Some(Input::Char('s'))]);
+
+        let saves = Rc::new(RefCell::new(0u32));
+        let saves_clone = saves.clone();
+        let mut on_save: Box<dyn FnMut() -> Result<(), GameError>> = Box::new(move || {
+            *saves_clone.borrow_mut() += 1;
+            Err(GameError::Save("synthetic".into()))
+        });
+
+        let err = run_with_io(
+            built,
+            &cfg,
+            &fc,
+            None,
+            (40, 10),
+            &mut term,
+            &mut events,
+            &mut on_save,
+        )
+        .unwrap_err();
+        assert!(matches!(err, GameError::Save(_)), "got {err:?}");
+        assert_eq!(
+            *saves.borrow(),
+            1,
+            "error exit must not double-invoke the handler via the drain path"
         );
     }
 
