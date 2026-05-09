@@ -113,6 +113,63 @@ Cleanup: `rm -rf "$FGK_SAVE_DIR"`. The save is JSON pretty-printed via
 `serde_json::to_writer_pretty` per `crates/foglet_game/src/save.rs`, so
 an operator inspecting `save.json` can read every field at a glance.
 
+## Scenario 7 — Lost-and-Found Drawer prompt (v1.1 Task 10)
+
+The drawer is the v1.1 proof scene for direct-key choice prompts with
+a disabled choice and feedback messages.
+
+1. Launch: `cargo run --example murder_motel`. From the title press
+   Enter, choose **New Game**.
+2. Walk west off the spawn until you reach the lobby's lost-and-found
+   tile (the `X` "Search" affordance lights up in the hint bar when
+   you are cardinally adjacent).
+3. Press `x` (or `X`). The Lost-and-Found Drawer prompt appears with
+   `(K) take Room 7 key`, `(M) pocket cracked matchbook`,
+   `(R) read receipt`, `(L) leave drawer`.
+4. **Expected:**
+   - Press `k` → `Moved Room 7 key to inventory.` feedback line; the
+     prompt re-renders with `(K)` greyed/disabled and the disabled
+     reason visible. Pressing `k` again surfaces the disabled reason
+     and does not duplicate the item.
+   - Press `M` → `Pocketed the cracked matchbook.` feedback. Case
+     insensitivity confirmed.
+   - Press `r` → receipt body text renders.
+   - Press `l` (or Esc) → drawer pops, returning to the map.
+5. Quit with `q`. Terminal restores cleanly.
+
+The keyboard reducer for these outcomes is exercised non-interactively
+by the unit suite (`lost_and_found_*` tests in
+`examples/murder_motel/src/main.rs`); this manual recipe confirms the
+same behaviour through a real TTY.
+
+## Scenario 8 — Night-clerk vendor prompt (v1.1 Task 11)
+
+The night-clerk vendor is the v1.1 proof scene for dynamic labels,
+disabled-by-state choices, and any-key continuation.
+
+1. Launch: `cargo run --example murder_motel`. Title → **New Game**.
+2. Walk to the front desk until you stand cardinally adjacent to the
+   night clerk; the hint bar advertises `Buy: B`.
+3. Press `b`. The vendor prompt renders with three choices whose
+   labels include the live cash total (e.g. `[B] Buy black coffee — 25g
+   (you have 40g)` and `[T] Tip for rumor — 50g (need 50g)`).
+4. **Expected:**
+   - With starting cash (40g), `(T)` is disabled and shows `need 50g`.
+     Pressing `t` surfaces the disabled reason; cash is unchanged.
+   - Press `b` → `Brewed a black coffee. -25g.` feedback, cash drops to
+     15g, prompt is replaced with the any-key continuation screen
+     (`Press any key to continue...`).
+   - Press any meaningful key → returns to the map. Terminal resize
+     while on the continuation screen is ignored (does not close it).
+   - Re-engage the clerk with `b`, press `n` (no thanks) → vendor pops
+     immediately with no state change.
+   - Re-engage with `b`, press Esc → vendor cancels with no state
+     change.
+5. Quit with `q`. Terminal restores cleanly.
+
+The state transitions are exercised by the `night_clerk_vendor_*`
+tests; this recipe confirms the live-TTY rendering and key path.
+
 ## What this file is not
 
 - Not a substitute for `cargo test` — the unit tests cover the
