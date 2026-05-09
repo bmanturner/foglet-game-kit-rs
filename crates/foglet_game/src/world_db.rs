@@ -257,6 +257,93 @@ impl WorldDb {
     pub(crate) fn connection(&self) -> &Connection {
         &self.conn
     }
+
+    /// Apply a single [`WorldMigration`], recording its version in
+    /// `world_migrations` on success.
+    ///
+    /// Task 4b implements the *happy path* only: one migration is
+    /// executed and one row is recorded. Idempotency (re-applying the
+    /// same version is a no-op) lands in Task 4c, and the
+    /// "failed-migration leaves no row" guarantee lands in Task 4d. The
+    /// SQL body and the bookkeeping insert run inside a single SQLite
+    /// transaction so 4d can keep the failure semantics tight without
+    /// having to revisit this code path.
+    ///
+    /// `&mut self` is required because [`Connection::transaction`] needs
+    /// a unique borrow. The runtime layer (Task 10) wraps the world DB
+    /// in `Option<WorldDb>` on `GameContext`, and authoring code reaches
+    /// it through a `&mut` borrow scoped to a single screen tick — so
+    /// the mutable signature here matches the call shape that's coming.
+    pub fn apply_migration(&mut self, migration: &WorldMigration) -> Result<(), WorldDbError> {
+        let WorldMigration { version, name, sql } = migration;
+
+        let tx = self
+            .conn
+            .transaction()
+            .map_err(|source| WorldDbError::ApplyMigration {
+                version: *version,
+                name: name.to_string(),
+                source,
+            })?;
+
+        // The migration body is author-supplied SQL — almost always a
+        // multi-statement `CREATE TABLE`/`CREATE INDEX` batch — so use
+        // `execute_batch` rather than `execute` to permit semicolons.
+        tx.execute_batch(sql)
+            .map_err(|source| WorldDbError::ApplyMigration {
+                version: *version,
+                name: name.to_string(),
+                source,
+            })?;
+
+        tx.execute(
+            "INSERT INTO world_migrations (version, name) VALUES (?1, ?2)",
+            rusqlite::params![*version, name],
+        )
+        .map_err(|source| WorldDbError::ApplyMigration {
+            version: *version,
+            name: name.to_string(),
+            source,
+        })?;
+
+        tx.commit().map_err(|source| WorldDbError::ApplyMigration {
+            version: *version,
+            name: name.to_string(),
+            source,
+        })?;
+
+        Ok(())
+    }
+}
+
+/// A schema/bootstrap step authored by a game.
+///
+/// Mirrors SPEC_v2 §4.3: a monotonically increasing `version`, a
+/// human-readable `name`, and a SQL `sql` body. The `checksum` field
+/// the SPEC mentions ("if practical") is intentionally deferred —
+/// Task 4b ships embedded SQL migrations only; file-backed migrations
+/// (and the checksum that goes with them) are a v2-future extension
+/// and would land alongside the public API surface that loads them.
+///
+/// Borrowed string fields keep the type allocation-free at the call
+/// site: a game module can declare `const MIGRATIONS: &[WorldMigration]
+/// = &[WorldMigration { version: 1, name: "init", sql: "..." }]`
+/// without any heap traffic. Owned-string variants can be added later
+/// if file-backed migrations need them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorldMigration {
+    /// Monotonically increasing version. SPEC §4.3 requires uniqueness;
+    /// Task 4c (idempotency) and Task 4d (failure handling) layer the
+    /// "applied exactly once" rule on top of this.
+    pub version: i64,
+    /// Short human-readable label echoed back in errors and operator
+    /// tooling. Kept distinct from `version` so two migrations with
+    /// adjacent versions stay diagnosable in logs.
+    pub name: &'static str,
+    /// SQL body executed via `execute_batch`. Multi-statement bodies
+    /// are supported on purpose: a single `CREATE TABLE` migration
+    /// commonly ships its supporting indexes in the same step.
+    pub sql: &'static str,
 }
 
 /// Apply `PRAGMA journal_mode = X` and return SQLite's reported active
@@ -397,6 +484,26 @@ pub enum WorldDbError {
     #[error("failed to bootstrap world_migrations table: {source}")]
     BootstrapMigrationsTable {
         /// Underlying `rusqlite` error from the `CREATE TABLE` batch.
+        #[source]
+        source: rusqlite::Error,
+    },
+
+    /// Applying a [`WorldMigration`] failed at any of its phases:
+    /// opening the wrapping transaction, executing the SQL body, or
+    /// recording the bookkeeping row in `world_migrations`. Task 4d
+    /// hardens the "no row written on failure" guarantee around this
+    /// variant; Task 4b only needs the variant to exist so the open
+    /// path's error type can carry it.
+    #[error("failed to apply world migration v{version} `{name}`: {source}")]
+    ApplyMigration {
+        /// Version we attempted to apply, echoed back so the
+        /// operator-facing error names the offending migration.
+        version: i64,
+        /// Human-readable name of the migration, echoed back for the
+        /// same reason.
+        name: String,
+        /// Underlying `rusqlite` error from the transaction, batch, or
+        /// insert.
         #[source]
         source: rusqlite::Error,
     },
@@ -708,6 +815,56 @@ mod tests {
         assert_eq!(
             count, 1,
             "reopen must leave exactly one world_migrations table"
+        );
+    }
+
+    /// SPEC_v2 §Task 4b acceptance: applying a [`WorldMigration`]
+    /// records its version in `world_migrations` and runs the SQL
+    /// body. Two assertions, one test: the row is present *and* the
+    /// migration's side effect (a created table) is observable. Either
+    /// failing on its own would mean the apply path is half-broken,
+    /// so the joint assertion catches both regressions in one place.
+    #[test]
+    fn apply_migration_records_version_and_runs_sql() {
+        let dir = tempdir().expect("tempdir creates");
+        let db_path = dir.path().join("world.sqlite");
+        let mut world = WorldDb::open(&db_path).expect("open succeeds");
+
+        let migration = WorldMigration {
+            version: 1,
+            name: "create_demo_table",
+            sql: "CREATE TABLE demo (id INTEGER PRIMARY KEY, label TEXT NOT NULL);",
+        };
+
+        world
+            .apply_migration(&migration)
+            .expect("first application of a fresh migration succeeds");
+
+        // Bookkeeping row is present with the version we asked for.
+        let recorded: i64 = world
+            .connection()
+            .query_row(
+                "SELECT version FROM world_migrations WHERE name = ?1",
+                rusqlite::params!["create_demo_table"],
+                |row| row.get(0),
+            )
+            .expect("recorded migration row is queryable");
+        assert_eq!(recorded, 1, "applied version must be recorded verbatim");
+
+        // SQL body actually ran — the table it created is now visible
+        // in sqlite_master. Without this leg, a regression that records
+        // the row but skips `execute_batch` would still pass.
+        let table_count: i64 = world
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'demo'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("sqlite_master query runs");
+        assert_eq!(
+            table_count, 1,
+            "migration SQL body must have executed against the connection"
         );
     }
 

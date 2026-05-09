@@ -115,6 +115,14 @@ pub struct Choice {
     /// dialog" requirement comes down to this single field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub requires: Option<String>,
+    /// Flag that must be **absent** for the choice to be offered.
+    /// `None` (the default) means there is no exclusion. The natural
+    /// home for "exhausted topic" gates: pair `requires_not: heard_rumor`
+    /// with `set: [heard_rumor]` and the choice disappears as soon as
+    /// the player picks it the first time. When both `requires` and
+    /// `requires_not` are set, both conditions must hold.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requires_not: Option<String>,
     /// Flags to add to the [`FlagSet`] when this choice is taken.
     /// Applied *before* the goto, so the destination node's
     /// `requires` checks see the new flags.
@@ -176,6 +184,7 @@ pub struct Dialog {
 ///       - "What do you want?"
 ///     choices:
 ///       - text: "I need a room"
+///         requires_not: has_room_assigned   # hide once the player has a room
 ///         goto: room_request
 ///       - text: "Tell me about the murder"
 ///         requires: heard_rumor
@@ -319,9 +328,16 @@ impl DialogState {
         }
         node.choices
             .iter()
-            .filter(|c| match &c.requires {
-                Some(flag) => flags.contains(flag),
-                None => true,
+            .filter(|c| {
+                let has_required = match &c.requires {
+                    Some(flag) => flags.contains(flag),
+                    None => true,
+                };
+                let lacks_excluded = match &c.requires_not {
+                    Some(flag) => !flags.contains(flag),
+                    None => true,
+                };
+                has_required && lacks_excluded
             })
             .collect()
     }
@@ -697,6 +713,109 @@ nodes:
         // Pick "I need a room" — node `room_request` sets `has_room_assigned` on entry.
         state.choose(&dialog, &mut flags, 0).unwrap();
         assert!(flags.contains("has_room_assigned"));
+    }
+
+    #[test]
+    fn requires_not_hides_choice_after_flag_is_set() {
+        // The "exhausted topic" idiom: a choice that sets a flag and
+        // also has `requires_not` on that same flag disappears from
+        // the list as soon as the player picks it once. Re-entering
+        // the hub should now show only the unflagged options.
+        let yaml = r#"
+start: hub
+nodes:
+  hub:
+    choices:
+      - text: "Ask about the murder"
+        requires_not: heard_rumor
+        set: [heard_rumor]
+        goto: rumor
+      - text: "Never mind"
+        goto: end
+  rumor:
+    lines: ["Bad business in Room 4."]
+    goto: hub
+  end: {}
+"#;
+        let dialog = load_dialog(yaml).unwrap();
+        let mut flags = FlagSet::new();
+        let mut state = DialogState::start(&dialog, &mut flags);
+        // First visit: both choices are visible.
+        let initial: Vec<&str> = state
+            .available_choices(&dialog, &flags)
+            .iter()
+            .map(|c| c.text.as_str())
+            .collect();
+        assert_eq!(initial, vec!["Ask about the murder", "Never mind"]);
+
+        // Take the murder topic; it sets `heard_rumor` and routes
+        // through the rumor node, then back to the hub.
+        state.choose(&dialog, &mut flags, 0).unwrap();
+        assert!(flags.contains("heard_rumor"));
+        assert_eq!(state.current_node(), "rumor");
+        // Walk the single line, then the goto returns to hub.
+        state.advance(&dialog, &mut flags).unwrap();
+        state.advance(&dialog, &mut flags).unwrap();
+        assert_eq!(state.current_node(), "hub");
+
+        // Second visit: the topic is exhausted, so only "Never mind"
+        // remains.
+        let after: Vec<&str> = state
+            .available_choices(&dialog, &flags)
+            .iter()
+            .map(|c| c.text.as_str())
+            .collect();
+        assert_eq!(after, vec!["Never mind"]);
+    }
+
+    #[test]
+    fn requires_and_requires_not_combine() {
+        // When a choice carries both a positive and a negative gate,
+        // the choice is offered only when *both* hold: the required
+        // flag is present AND the excluded flag is absent. This is
+        // the natural shape for "you can ask about the key after
+        // hearing the rumor, but only until you've already got it."
+        let yaml = r#"
+start: hub
+nodes:
+  hub:
+    choices:
+      - text: "Ask for the key"
+        requires: heard_rumor
+        requires_not: has_key
+        goto: key_handed_over
+  key_handed_over: {}
+"#;
+        let dialog = load_dialog(yaml).unwrap();
+
+        // Neither flag set: positive gate fails -> hidden.
+        let flags_none = FlagSet::new();
+        let state_none = DialogState::start(&dialog, &mut FlagSet::new());
+        assert_eq!(
+            state_none.available_choices(&dialog, &flags_none).len(),
+            0,
+            "without `heard_rumor` the choice must be hidden"
+        );
+
+        // Only `has_key` set: positive gate fails AND negative gate
+        // would also fail; should remain hidden.
+        let mut flags_key_only = FlagSet::new();
+        flags_key_only.insert("has_key".into());
+        assert_eq!(
+            state_none.available_choices(&dialog, &flags_key_only).len(),
+            0
+        );
+
+        // Only `heard_rumor` set: both gates pass -> visible.
+        let mut flags_rumor = FlagSet::new();
+        flags_rumor.insert("heard_rumor".into());
+        assert_eq!(state_none.available_choices(&dialog, &flags_rumor).len(), 1);
+
+        // Both flags set: positive passes but negative fails -> hidden.
+        let mut flags_both = FlagSet::new();
+        flags_both.insert("heard_rumor".into());
+        flags_both.insert("has_key".into());
+        assert_eq!(state_none.available_choices(&dialog, &flags_both).len(), 0);
     }
 
     #[test]
