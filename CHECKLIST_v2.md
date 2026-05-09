@@ -70,7 +70,7 @@ One unchecked item per iteration. Dependencies in `[brackets]` must be checked o
 
 ### Task 10 — Runtime context integration
 
-- [ ] **10a** — Add optional `world_db` handle to `GameContext`. [3a]
+- [x] **10a** — Add optional `world_db` handle to `GameContext`. [3a]
 - [ ] **10b** — Open world DB during startup only when `[world].enabled = true`. [10a, 2a]
 - [ ] **10c** — Ensure DB-open failure restores terminal before printing an error. Test with injectable failing opener. [10b]
 - [ ] **10d** — Document that render functions must not run blocking world queries. [10a]

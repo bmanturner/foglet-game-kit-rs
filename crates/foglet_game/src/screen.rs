@@ -35,6 +35,7 @@
 use crate::config::GameConfig;
 use crate::foglet::FogletContext;
 use crate::input::Input;
+use crate::world_db::WorldDb;
 
 /// Per-frame view of the runtime state passed to every [`Screen`]
 /// callback.
@@ -67,6 +68,27 @@ pub struct GameContext<'a> {
     /// against the live size (e.g. centring widgets) should read this
     /// rather than re-querying `crossterm`.
     pub terminal_size: (u16, u16),
+    /// Optional shared-world SQLite handle (SPEC_v2 §Task 3 / §Task 10).
+    ///
+    /// `Some` only when the game's `[world].enabled = true` and the
+    /// runtime successfully opened the database at startup; `None`
+    /// otherwise so single-player games (and unit tests that build a
+    /// context without standing up a SQLite file) keep compiling
+    /// untouched.
+    ///
+    /// Held as a shared borrow rather than `&mut` because every
+    /// `WorldDb` API takes `&self` — the `Connection` is wrapped in
+    /// interior `RefCell`/transaction state inside the type, so screens
+    /// can issue reads and writes through the same `&` they get here.
+    /// The shared borrow also matches the SPEC §8.2 promise that
+    /// `GameContext` is a *view* of runtime data, not a place where
+    /// screens get exclusive ownership of subsystems.
+    ///
+    /// Task 10d (a SPEC documentation task) reminds authors that
+    /// `render` callbacks must not run blocking world queries; reads
+    /// belong in `tick` / `handle_input` paths where the runtime can
+    /// tolerate the latency without dropping a frame.
+    pub world_db: Option<&'a WorldDb>,
 }
 
 impl<'a> GameContext<'a> {
@@ -85,7 +107,24 @@ impl<'a> GameContext<'a> {
             config,
             foglet,
             terminal_size,
+            world_db: None,
         }
+    }
+
+    /// Builder that attaches a shared-world handle to an existing
+    /// [`GameContext`]. Used by the runtime in Task 10b once the world
+    /// DB has been opened, and by tests that need to exercise screens
+    /// against a real `WorldDb`.
+    ///
+    /// Kept as a `with_*` builder rather than a fourth positional
+    /// argument to [`GameContext::new`] so the dozens of existing
+    /// `new(&cfg, &fc, size)` call sites in tests and example games
+    /// keep compiling without churn — adding `world_db` is purely
+    /// additive for v1 callers.
+    #[must_use]
+    pub fn with_world_db(mut self, world_db: &'a WorldDb) -> Self {
+        self.world_db = Some(world_db);
+        self
     }
 }
 
@@ -410,6 +449,34 @@ mod tests {
         assert_eq!(ctx.config.game.slug, "test");
         assert_eq!(ctx.foglet.user_id.as_deref(), Some("test-user"));
         assert_eq!(ctx.terminal_size, (100, 30));
+        assert!(
+            ctx.world_db.is_none(),
+            "GameContext::new defaults world_db to None so v1 call sites are unaffected"
+        );
+    }
+
+    #[test]
+    fn game_context_with_world_db_attaches_handle() {
+        // Builder threads a real `WorldDb` borrow into the context so
+        // Task 10b can hand screens a working handle without touching
+        // any of the existing `GameContext::new(...)` call sites. We
+        // drive a query through it to prove the borrow is the same
+        // object the test opened, not a copy.
+        use crate::world_db::WorldDb;
+
+        let cfg = fixture_config();
+        let fc = fixture_context();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db = WorldDb::open(tmp.path().join("world.sqlite")).expect("open world db");
+
+        let ctx = GameContext::new(&cfg, &fc, (80, 24)).with_world_db(&db);
+        assert!(ctx.world_db.is_some(), "builder attaches the handle");
+        // SQLite reports the connection it gave us, confirming the
+        // borrow points at the same `WorldDb` we opened above.
+        assert_eq!(
+            ctx.world_db.expect("attached above").journal_mode(),
+            db.journal_mode()
+        );
     }
 
     #[test]
