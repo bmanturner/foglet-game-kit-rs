@@ -1504,31 +1504,57 @@ pub const COFFEE_PRICE: u32 = 25;
 /// 11d to demonstrate.
 pub const RUMOR_TIP_PRICE: u32 = 50;
 
-/// Build the night-clerk vendor prompt with every choice enabled and
-/// static labels (SPEC_v1_1.md §9 step 4, Task 11a).
+/// Format the priced-row label for the night-clerk vendor prompt
+/// (SPEC_v1_1.md §9 step 4, Task 11b).
 ///
-/// Task 11a deliberately ships static labels — `Buy a black coffee`,
-/// `Tip the clerk for a rumor`, `No thanks` — without the SPEC's
-/// `25g | You have: 40g` annotations. Task 11b refactors this to a
-/// state-aware builder that renders the price/cash hints, and Task 11d
-/// adds the `disabled_if(cash < RUMOR_TIP_PRICE, ...)` branch on top.
-/// Splitting it this way lets each follow-up task own one observable
-/// behaviour change instead of bundling three under a single commit.
+/// The SPEC pins the shape `"<action>: <price>g | You have: <cash>g"`
+/// — a single source of truth keeps `Buy a black coffee` and
+/// `Tip the clerk for a rumor` in lockstep so a copy-edit to the
+/// separator (`|`) only touches one place. Returning `String` (rather
+/// than `Cow<'static, str>`) is intentional: the cash component is
+/// dynamic on every render, so the allocation is unavoidable.
+fn priced_vendor_label(action: &str, price: u32, cash: u32) -> String {
+    format!("{action}: {price}g | You have: {cash}g")
+}
+
+/// Build the night-clerk vendor prompt with dynamic price/cash hints
+/// (SPEC_v1_1.md §9 step 4, Task 11b).
+///
+/// `cash` is the player's current gold balance, which the priced rows
+/// (`(B)` and `(T)`) splice into their labels in the SPEC's
+/// `"<action>: <price>g | You have: <cash>g"` shape. Re-calling this
+/// function after a transaction is the supported path for refreshing
+/// the labels — the prompt itself does not retain a reference to the
+/// player's wallet, which keeps the data model a value type and lets
+/// every reducer test pin a deterministic balance without plumbing
+/// shared state through `Rc<RefCell<_>>`.
+///
+/// `(N) No thanks` keeps a static label because the SPEC's reference
+/// block deliberately omits a price annotation for the leave path —
+/// adding one would imply a cost the row does not actually charge.
+///
+/// Task 11d will layer `disabled_if` on top of the `(T)` row when
+/// `cash < RUMOR_TIP_PRICE`; until then every choice ships enabled so
+/// Task 11c's transaction handler can exercise both priced rows.
 ///
 /// The choice ordering matches SPEC §9 step 4 verbatim (`B`, `T`, `N`)
 /// so the rendered prompt reads top-to-bottom in the same order an
 /// operator scanning the SPEC's reference block would expect.
-pub fn night_clerk_vendor_prompt() -> ChoicePrompt<NightClerkVendorChoice> {
+pub fn night_clerk_vendor_prompt(cash: u32) -> ChoicePrompt<NightClerkVendorChoice> {
     let mut prompt = ChoicePrompt::new();
     for line in NIGHT_CLERK_VENDOR_BODY {
         prompt = prompt.body(line);
     }
     prompt
-        .choice('B', NightClerkVendorChoice::BuyCoffee, "Buy a black coffee")
+        .choice(
+            'B',
+            NightClerkVendorChoice::BuyCoffee,
+            priced_vendor_label("Buy a black coffee", COFFEE_PRICE, cash),
+        )
         .choice(
             'T',
             NightClerkVendorChoice::TipForRumor,
-            "Tip the clerk for a rumor",
+            priced_vendor_label("Tip the clerk for a rumor", RUMOR_TIP_PRICE, cash),
         )
         .choice('N', NightClerkVendorChoice::NoThanks, "No thanks")
 }
@@ -4171,7 +4197,10 @@ mod tests {
         // the prompt into a Screen.
         use foglet_game::PromptKey;
 
-        let prompt = night_clerk_vendor_prompt();
+        // Pin the prompt to the SPEC's reference balance (40g) so the
+        // priced labels match the example block byte-for-byte. The
+        // dynamic-label coverage lives in the dedicated test below.
+        let prompt = night_clerk_vendor_prompt(PlayerSlot::STARTING_CASH);
 
         assert_eq!(
             prompt.body.as_slice(),
@@ -4180,10 +4209,14 @@ mod tests {
         );
 
         let expected: &[(char, &str, NightClerkVendorChoice)] = &[
-            ('b', "Buy a black coffee", NightClerkVendorChoice::BuyCoffee),
+            (
+                'b',
+                "Buy a black coffee: 25g | You have: 40g",
+                NightClerkVendorChoice::BuyCoffee,
+            ),
             (
                 't',
-                "Tip the clerk for a rumor",
+                "Tip the clerk for a rumor: 50g | You have: 40g",
                 NightClerkVendorChoice::TipForRumor,
             ),
             ('n', "No thanks", NightClerkVendorChoice::NoThanks),
@@ -4215,7 +4248,7 @@ mod tests {
         // uses (SPEC §6 deterministic-render contract). 70x10 gives the
         // body two rows plus the three choice rows + label without
         // forcing the renderer into modal mode.
-        let prompt = night_clerk_vendor_prompt();
+        let prompt = night_clerk_vendor_prompt(PlayerSlot::STARTING_CASH);
         let backend = TestBackend::new(70, 10);
         let mut term = Terminal::new(backend).expect("test backend");
         term.draw(|frame| {
@@ -4251,8 +4284,8 @@ mod tests {
             );
         }
         for label in [
-            "Buy a black coffee",
-            "Tip the clerk for a rumor",
+            "Buy a black coffee: 25g | You have: 40g",
+            "Tip the clerk for a rumor: 50g | You have: 40g",
             "No thanks",
         ] {
             assert!(
@@ -4260,6 +4293,43 @@ mod tests {
                 "missing label {label:?} in rendered prompt:\n{rendered}"
             );
         }
+    }
+
+    #[test]
+    fn night_clerk_vendor_prompt_labels_track_current_cash() {
+        // SPEC §9 step 4: priced rows render `<action>: <price>g | You
+        // have: <cash>g`, where the cash component reflects the
+        // *current* balance — not the starting balance. Building the
+        // prompt with two distinct cash values and asserting the
+        // priced labels move in lockstep with the input is the
+        // cheapest way to prove the dynamic-label refactor (Task 11b)
+        // didn't accidentally hardcode 40g. The leave-row label must
+        // stay static across both balances because the SPEC reference
+        // block deliberately omits a price annotation for `(N)`.
+        let lean = night_clerk_vendor_prompt(0);
+        let flush = night_clerk_vendor_prompt(123);
+
+        let lean_labels: Vec<&str> = lean.choices.iter().map(|c| c.label.as_str()).collect();
+        let flush_labels: Vec<&str> = flush.choices.iter().map(|c| c.label.as_str()).collect();
+
+        assert_eq!(
+            lean_labels,
+            vec![
+                "Buy a black coffee: 25g | You have: 0g",
+                "Tip the clerk for a rumor: 50g | You have: 0g",
+                "No thanks",
+            ],
+            "lean wallet should render `You have: 0g` on both priced rows",
+        );
+        assert_eq!(
+            flush_labels,
+            vec![
+                "Buy a black coffee: 25g | You have: 123g",
+                "Tip the clerk for a rumor: 50g | You have: 123g",
+                "No thanks",
+            ],
+            "flush wallet should render `You have: 123g` on both priced rows",
+        );
     }
 
     // ---- Lost-and-Found Drawer action handler (SPEC §9 Task 10c) -----
