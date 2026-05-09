@@ -234,6 +234,7 @@ mod tests {
                 visibility: "members".into(),
                 auth_scope: "site".into(),
             },
+            world: Default::default(),
         }
     }
 

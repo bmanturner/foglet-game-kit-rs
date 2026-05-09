@@ -51,6 +51,11 @@ pub struct GameConfig {
     /// the file; defaults applied on load.
     #[serde(default)]
     pub manifest: ManifestSection,
+    /// `[world]` section — shared SQLite world DB settings (SPEC v2 §5).
+    /// Optional in the file; absent section defaults to disabled so v1
+    /// games keep working unchanged.
+    #[serde(default)]
+    pub world: WorldSection,
 }
 
 /// `[game]` section: every field is required.
@@ -144,6 +149,66 @@ impl Default for ManifestSection {
             auth_scope: DEFAULT_AUTH_SCOPE.to_string(),
         }
     }
+}
+
+/// `[world]` section: shared SQLite world DB settings (SPEC v2 §5).
+///
+/// Every field is field-level optional with a SPEC-documented default
+/// so an author can write the section as `[world]\nenabled = true` and
+/// inherit safe values for path, busy timeout, and journal mode. The
+/// section as a whole is also optional: a v1 game with no `[world]`
+/// block parses cleanly and behaves as if `enabled = false`.
+///
+/// We do not validate `path` against the filesystem here — that's the
+/// world DB layer's job (Task 3). Storing it as a `String` rather than
+/// a `PathBuf` keeps cross-platform packaging predictable: a config
+/// authored on macOS deploys cleanly to a Linux Foglet host.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorldSection {
+    /// Whether the runtime should open a shared-world SQLite DB. The
+    /// safe default is `false` so v1 projects without a `[world]`
+    /// section continue to behave exactly as they did pre-v2.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Path to the SQLite file relative to the package root. The
+    /// default matches the SPEC v2 §5 example so an operator who
+    /// inspects a packaged door knows where to look without consulting
+    /// the config.
+    #[serde(default = "default_world_path")]
+    pub path: String,
+    /// SQLite `busy_timeout` in milliseconds. Applied during DB open
+    /// (Task 3c) so contention from a parallel local-dev session
+    /// retries instead of erroring out immediately.
+    #[serde(default = "default_world_busy_timeout_ms")]
+    pub busy_timeout_ms: u64,
+    /// Journal mode applied during DB open (Task 3d). Stored as a
+    /// `String` rather than a closed enum because SQLite has more
+    /// journal modes than v2 currently uses; the world DB layer
+    /// validates the value at apply time and falls back if a host
+    /// rejects WAL.
+    #[serde(default = "default_world_journal_mode")]
+    pub journal_mode: String,
+}
+
+impl Default for WorldSection {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            path: default_world_path(),
+            busy_timeout_ms: default_world_busy_timeout_ms(),
+            journal_mode: default_world_journal_mode(),
+        }
+    }
+}
+
+fn default_world_path() -> String {
+    "world/world.sqlite".to_string()
+}
+fn default_world_busy_timeout_ms() -> u64 {
+    5_000
+}
+fn default_world_journal_mode() -> String {
+    "wal".to_string()
 }
 
 fn default_timeout_ms() -> u64 {
@@ -508,6 +573,111 @@ start_y = 0
         assert!(is_valid_slug("murder-motel"));
         assert!(is_valid_slug("door1"));
         assert!(is_valid_slug("a"));
+    }
+
+    #[test]
+    fn absent_world_section_defaults_to_disabled() {
+        // SPEC v2 §5: a v1 project without `[world]` MUST continue to
+        // work, with the world layer effectively off.
+        let v1_style = r#"
+[game]
+title = "V1 Game"
+slug = "v1-game"
+description = ""
+min_width = 80
+min_height = 24
+start_map = "lobby"
+start_x = 0
+start_y = 0
+"#;
+        let config = GameConfig::from_toml_str(v1_style).unwrap();
+        assert!(!config.world.enabled);
+        // Defaults still get populated so downstream consumers never
+        // have to special-case "disabled".
+        assert_eq!(config.world.path, "world/world.sqlite");
+        assert_eq!(config.world.busy_timeout_ms, 5_000);
+        assert_eq!(config.world.journal_mode, "wal");
+    }
+
+    #[test]
+    fn parses_full_world_section_from_spec_example() {
+        // Verbatim from SPEC v2 §5 so a future SPEC tweak surfaces as
+        // a failing test rather than silent drift.
+        let v2 = r#"
+[game]
+title = "Murder Motel"
+slug = "murder-motel"
+description = ""
+min_width = 80
+min_height = 24
+start_map = "lobby"
+start_x = 0
+start_y = 0
+
+[world]
+enabled = true
+path = "world/world.sqlite"
+busy_timeout_ms = 5000
+journal_mode = "wal"
+"#;
+        let config = GameConfig::from_toml_str(v2).unwrap();
+        assert!(config.world.enabled);
+        assert_eq!(config.world.path, "world/world.sqlite");
+        assert_eq!(config.world.busy_timeout_ms, 5_000);
+        assert_eq!(config.world.journal_mode, "wal");
+    }
+
+    #[test]
+    fn world_section_applies_field_level_defaults() {
+        // Author opts in but only sets `enabled` — every other field
+        // should fall back to the SPEC-documented default.
+        let partial = r#"
+[game]
+title = "Partial World"
+slug = "partial-world"
+description = ""
+min_width = 80
+min_height = 24
+start_map = "lobby"
+start_x = 0
+start_y = 0
+
+[world]
+enabled = true
+"#;
+        let config = GameConfig::from_toml_str(partial).unwrap();
+        assert!(config.world.enabled);
+        assert_eq!(config.world.path, "world/world.sqlite");
+        assert_eq!(config.world.busy_timeout_ms, 5_000);
+        assert_eq!(config.world.journal_mode, "wal");
+    }
+
+    #[test]
+    fn world_section_round_trips_through_toml() {
+        let original = r#"
+[game]
+title = "RT World"
+slug = "rt-world"
+description = ""
+min_width = 80
+min_height = 24
+start_map = "lobby"
+start_x = 0
+start_y = 0
+
+[world]
+enabled = true
+path = "data/shared.sqlite"
+busy_timeout_ms = 7500
+journal_mode = "delete"
+"#;
+        let config = GameConfig::from_toml_str(original).unwrap();
+        let serialized = config.to_toml_string();
+        let reparsed = GameConfig::from_toml_str(&serialized).unwrap();
+        assert_eq!(config, reparsed);
+        assert_eq!(reparsed.world.path, "data/shared.sqlite");
+        assert_eq!(reparsed.world.busy_timeout_ms, 7_500);
+        assert_eq!(reparsed.world.journal_mode, "delete");
     }
 
     #[test]
