@@ -244,29 +244,102 @@ the operator's to triage.
 
 ## 7. Why no real-time multiplayer
 
-v2 is intentionally an asynchronous shared-world layer. SPEC_v2 §2.2
-forbids real-time multiplayer, networked game servers, and cross-door
-shared state APIs in this slice. The reasons are deliberate:
+v2 is intentionally an *asynchronous* shared-world layer. SPEC_v2 §2.2
+explicitly forbids real-time multiplayer, networked game servers, and
+cross-door shared state APIs in this slice (see also SPEC_v2 §17, which
+lists "async shared worlds over real-time multiplayer" as a guiding
+principle). This section is the long-form answer to "why not?" so that
+future contributors don't re-litigate the decision in PR review.
+
+### 7.1 What "asynchronous shared world" actually means
+
+The v2 contract is a single SQLite file per game, mutated by whichever
+door process happens to be running, observed by the next door process
+that opens it. Concretely:
+
+- Two callers in two PTYs at the same wall-clock minute do **not** see
+  each other's cursors, chat, or moves as they happen. The runtime
+  never broadcasts anything between live sessions.
+- The first caller's commit is durable before the second caller's
+  process starts reading; SQLite plus the kit's transaction wrapper
+  (SPEC_v2 §4.6) is the entire concurrency story.
+- Latency between "Alice did X" and "Bob sees X" is bounded by how
+  long Bob takes to launch the door and reach the screen that reads
+  the relevant table. In Murder Motel that is seconds-to-minutes —
+  enough for a BBS-style "someone was here before you" feel, not
+  enough for cooperative or adversarial real-time play.
+
+If your game's correctness depends on Bob seeing Alice's input *while
+both are connected*, the v2 kit cannot deliver that, and trying to
+bolt it on is out of scope.
+
+### 7.2 Why we picked async
+
+Four load-bearing reasons, in roughly the order they would bite a
+real-time alternative:
 
 - **Operational simplicity.** A SQLite file the operator can copy and
   inspect is a much smaller commitment than a service to run, monitor,
-  and upgrade.
-- **Foglet's process model.** Doors are `:external_pty` children; the
-  adapter owns lifecycle, timeouts, and disconnect handling (SPEC §2).
-  A real-time game server would have to coordinate with that, and the
-  kit would have to ship its own networking / auth story — both out of
-  scope for v2.
+  upgrade, secure, and triage at 3am. The whole `world/` directory
+  fits in a `tar` (§5). A real-time server would add a process to
+  supervise, a port to firewall, a deploy story to maintain, and a new
+  failure mode to page on.
+- **Foglet's process model.** Doors are `:external_pty` children;
+  the adapter owns lifecycle, timeouts, and disconnect handling
+  (SPEC §2, SPEC_v2 §3). A real-time game server would have to
+  coordinate with that — graceful disconnects, zombie-session cleanup,
+  timeouts that don't cross-contaminate Foglet's own — and the kit
+  would have to ship its own networking + auth story. Both are
+  out of scope for v2; both are big enough to be their own product.
 - **Testability.** Every shared-world primitive is exercised under
-  `cargo test` against a `tempfile`-backed DB with an injected clock.
-  A networked server would push the test surface toward integration
-  harnesses that are slower and flakier than the kit's current "no
-  live terminal, no live network" defaults.
-- **Author ergonomics.** Asynchronous shared state is the BBS
-  aesthetic the v2 design targets — one caller changes the town,
-  another caller sees the consequences. That is *more* expressive than
-  it sounds, and it covers the Murder Motel acceptance fixture without
-  needing real-time coordination.
+  `cargo test` against a `tempfile`-backed DB with an injected clock
+  and no live terminal (SPEC_v2 §13). Adding a network would push the
+  test surface toward integration harnesses that are slower and
+  flakier — the exact regression the kit's "no live terminal, no
+  live network" default is designed to prevent.
+- **Author ergonomics.** Asynchronous shared state is the BBS aesthetic
+  the v2 design targets — one caller changes the town, another caller
+  sees the consequences. That model covers the Murder Motel acceptance
+  fixture (Room 7 first-opener, shared clue ledger, leaderboard) end
+  to end without anyone reasoning about race windows, dropped frames,
+  or partition recovery. Authors get to write game logic, not network
+  logic.
 
-A future major version MAY revisit this if a concrete game motivates
-it. v2's contract is: shared state, async semantics, single SQLite
-file, no network.
+### 7.3 What to do if you think you need real-time
+
+Most "I need real-time" requests for a BBS-style door collapse into
+one of these async-shaped patterns. Reach for them before reaching
+past the v2 contract:
+
+- **"Players need to see each other's actions."** Append a
+  `world_events` row on the action and have the other player's screen
+  poll `recent_events` on a turn boundary. Murder Motel's lobby
+  bulletin (Task 13d) does exactly this.
+- **"Players need to react to each other within a session."** Don't.
+  Two callers on the same door at the same instant is rare on a
+  classic BBS; designing for it is usually a sign the game wants to
+  be a *web* game, not a door.
+- **"I want a shared chat."** That belongs in Foglet itself, not in a
+  door. The kit doesn't try to compete with the host's communication
+  primitives.
+- **"I want a leaderboard that updates while the player watches."**
+  Re-read the leaderboard from SQLite on screen entry and on a turn
+  spend. The freshness is bounded by the player's own input cadence,
+  which is plenty.
+
+If after all that you genuinely need synchronous cross-session
+coordination — say, a real-time card game — the v2 kit is the wrong
+foundation, and you should run that game outside the door system or
+wait for a future major version.
+
+### 7.4 Future direction
+
+A future major version MAY revisit real-time semantics if a concrete
+game motivates it and Foglet itself grows the supporting primitives
+(presence channel, push API, broker). v2 explicitly does not paint
+itself into a corner: nothing in the SQLite contract precludes a
+later release adding a separate sidecar service for live coordination
+while keeping the durable state in the same file.
+
+For now, the v2 contract is, and remains: **shared state, async
+semantics, single SQLite file, no network.**

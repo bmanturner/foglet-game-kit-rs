@@ -106,7 +106,7 @@ One unchecked item per iteration. Dependencies in `[brackets]` must be checked o
 
 - [x] **14a** — Add `docs/shared-world.md` explaining SQLite file locations, migration policy, backups, and lock recovery. [Task 11]
 - [x] **14b** — Add Murder Motel v2 walkthrough to README: two local users demonstrate shared world. [Task 13]
-- [ ] **14c** — Document why v2 intentionally avoids real-time multiplayer. [14a]
+- [x] **14c** — Document why v2 intentionally avoids real-time multiplayer. [14a]
 
 - [ ] **Task 15 — Final v2 verification**
       Run `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`, `cargo doc --workspace --no-deps`, `cargo run --example murder_motel` local smoke for two users, and `cargo run -p fgk -- package --out <tmp>`. Quote results in the final iteration. [all prior tasks]
