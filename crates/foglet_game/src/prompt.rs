@@ -2074,6 +2074,217 @@ impl AnyKeyPrompt {
 /// SPEC text and the rendering tests assert against the same string.
 pub const DEFAULT_ANY_KEY_FOOTER: &str = "Press any key to continue...";
 
+/// Severity tag for [`FeedbackLine`] (SPEC_v1_1.md §4.5, §4.7).
+///
+/// The three variants are the post-action feedback shapes a door game
+/// reaches for: a neutral status note, a positive confirmation that the
+/// state changed in the player's favor, and a negative report that
+/// something went wrong or was rejected. They map onto the SPEC §4.7
+/// style roles (`Normal` / `Success` / `Error`) so a `Theme` override
+/// re-skins the line without touching the call site.
+///
+/// # Monochrome contract
+///
+/// SPEC §4.7 requires "monochrome fallbacks through prefixes, punctuation,
+/// indentation, or markers". Each variant therefore carries a *distinct*
+/// ASCII marker prefix via [`FeedbackKind::marker`]; that marker is what
+/// communicates severity on a black/white terminal where the role's color
+/// has been stripped. The role-to-color mapping is a *bonus* on top.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FeedbackKind {
+    /// Neutral status — `Moved Room 7 key to inventory.`-style notes
+    /// that report a state change without implying success or failure.
+    Info,
+    /// Positive feedback — purchase succeeded, item taken, save written.
+    Success,
+    /// Negative feedback — selection rejected, transaction failed,
+    /// validation error. Pairs with the disabled-choice reason text the
+    /// reducer returns in [`PromptAction::Disabled`].
+    Error,
+}
+
+impl FeedbackKind {
+    /// Monochrome-safe ASCII marker prefix.
+    ///
+    /// Each variant returns a distinct prefix so a black/white terminal
+    /// can still tell info / success / error apart by shape alone:
+    ///
+    /// - `Info` → `""` (no marker; reads as a plain status note).
+    /// - `Success` → `"+ "` (BBS convention for "added" / "gained").
+    /// - `Error` → `"! "` (BBS convention for warnings / problems).
+    ///
+    /// The marker pool is intentionally small and pure-ASCII so it
+    /// renders identically under any locale or codepage — see SPEC §4.7's
+    /// "labels MUST NOT include raw terminal control sequences" rule.
+    pub const fn marker(self) -> &'static str {
+        match self {
+            FeedbackKind::Info => "",
+            FeedbackKind::Success => "+ ",
+            FeedbackKind::Error => "! ",
+        }
+    }
+
+    /// Semantic [`StyleRole`] this kind paints under via [`Theme`].
+    ///
+    /// `Info` rides on `StyleRole::Normal` (the terminal's default
+    /// foreground) so a neutral note doesn't fight the surrounding body
+    /// text for attention. `Success` and `Error` map to their
+    /// SPEC §4.7-listed roles, which the default theme already renders
+    /// with a color *and* a modifier — keeping color-stripping safe.
+    pub const fn style_role(self) -> StyleRole {
+        match self {
+            FeedbackKind::Info => StyleRole::Normal,
+            FeedbackKind::Success => StyleRole::Success,
+            FeedbackKind::Error => StyleRole::Error,
+        }
+    }
+}
+
+/// Single-line post-action feedback rendered alongside a prompt
+/// (SPEC_v1_1.md §4.5 example: `Moved Room 7 key to inventory.`).
+///
+/// `FeedbackLine` is the prompt-flavored cousin of
+/// [`crate::widgets::MessageLine`]. The widget version targets the
+/// always-on status row at the bottom of a screen and uses ad-hoc
+/// `Color`/`Modifier` pairs; this version lives inside the prompt
+/// module, derives its visual style from a [`Theme`] via
+/// [`StyleRole`], and renders directly into a [`Buffer`] so it composes
+/// with [`ChoicePrompt::render`] / [`AnyKeyPrompt::render`] without
+/// going through `Frame::render_widget`.
+///
+/// # Why a separate type for prompts?
+///
+/// Prompt feedback follows the SPEC §4 contract: a finite set of
+/// severity tags, monochrome-readable markers, and theme-overridable
+/// color. Threading those constraints through the freer-form
+/// [`crate::widgets::MessageLine`] would either bloat that widget's
+/// API or weaken the prompt-side guarantees. Keeping them separate
+/// also lets a future Task 5f extension push prompt feedback through
+/// a `Theme` without rewriting screens that still use `MessageLine`
+/// for their persistent status row.
+///
+/// # Rendering shape
+///
+/// The line writes a single visual row of `marker + text`, styled with
+/// the [`FeedbackKind::style_role`] looked up through a [`Theme`].
+/// Text longer than `area.width` is right-truncated cell-by-cell — a
+/// status line never wraps, because a wrapped feedback line shifts the
+/// rest of the layout under the prompt and is harder to scan.
+///
+/// # What this type intentionally does NOT do
+///
+/// - It does not own a stack of past messages. Authors store the
+///   current feedback in their game state (typically `Option<FeedbackLine>`
+///   on the screen) and overwrite it on the next action.
+/// - It does not animate, fade, or expire. SPEC §4 keeps prompts
+///   side-effect-free; lifecycle is the screen's job.
+/// - It does not split into multiple rows. Use [`TextBlock`] when a
+///   message needs paragraphing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FeedbackLine {
+    kind: FeedbackKind,
+    text: String,
+}
+
+impl FeedbackLine {
+    /// Build a neutral status note — `FeedbackKind::Info`.
+    ///
+    /// Use this for state-change reports that are neither a win nor a
+    /// failure: `"Moved Room 7 key to inventory."`,
+    /// `"You sit down at the bar."`, etc. The renderer prepends no
+    /// marker, so the text reads exactly as the author wrote it.
+    pub fn info(text: impl Into<String>) -> Self {
+        Self {
+            kind: FeedbackKind::Info,
+            text: text.into(),
+        }
+    }
+
+    /// Build a positive feedback line — `FeedbackKind::Success`.
+    ///
+    /// Renders with a `"+ "` marker. Reach for this when the player's
+    /// action moved the world in their favor: a purchase, a successful
+    /// save, an item taken. The marker keeps the win readable on a
+    /// monochrome terminal without relying on the green color.
+    pub fn success(text: impl Into<String>) -> Self {
+        Self {
+            kind: FeedbackKind::Success,
+            text: text.into(),
+        }
+    }
+
+    /// Build a negative feedback line — `FeedbackKind::Error`.
+    ///
+    /// Renders with a `"! "` marker. Use this for rejected actions,
+    /// validation problems, or the disabled-choice reason returned by
+    /// [`PromptAction::Disabled`]. The marker survives color stripping
+    /// so a BBS terminal still flags the line as a problem.
+    pub fn error(text: impl Into<String>) -> Self {
+        Self {
+            kind: FeedbackKind::Error,
+            text: text.into(),
+        }
+    }
+
+    /// Severity tag.
+    pub fn kind(&self) -> FeedbackKind {
+        self.kind
+    }
+
+    /// Author-supplied message body, without the kind's marker.
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    /// Final visual string: `marker + text`. Useful in tests and for
+    /// callers (e.g. screen-level transcripts) that want the rendered
+    /// shape without a `Buffer`. Stays SPEC §4.7 monochrome-safe — the
+    /// marker is the only carrier of severity here.
+    pub fn rendered_text(&self) -> String {
+        let marker = self.kind.marker();
+        let mut out = String::with_capacity(marker.len() + self.text.len());
+        out.push_str(marker);
+        out.push_str(&self.text);
+        out
+    }
+
+    /// Render the line into the top row of `area` using the default
+    /// [`Theme`]. Returns `1` if a row was written, `0` if the area was
+    /// too small (zero width or height).
+    ///
+    /// Most callers want this overload — it matches the SPEC §4.7
+    /// "default theme MUST be readable on black/white terminals"
+    /// promise without forcing the screen to plumb a `Theme` through
+    /// every render call. Use [`FeedbackLine::render_with_theme`] when
+    /// the game has its own theme.
+    pub fn render(&self, area: Rect, buf: &mut Buffer) -> u16 {
+        self.render_with_theme(area, buf, &Theme::default())
+    }
+
+    /// Render the line into the top row of `area` using the supplied
+    /// [`Theme`]. Returns `1` if a row was written, `0` if the area
+    /// was too small.
+    ///
+    /// Text that doesn't fit in `area.width` is right-truncated by
+    /// `Buffer::set_stringn` — SPEC §6's "MUST NOT panic on small
+    /// areas" rule. Extra rows beneath the first are left untouched
+    /// so the caller can stack a feedback line over a body without
+    /// the line clobbering the body's first row.
+    pub fn render_with_theme(&self, area: Rect, buf: &mut Buffer, theme: &Theme) -> u16 {
+        if area.width == 0 || area.height == 0 {
+            return 0;
+        }
+        let style = theme.style(self.kind.style_role());
+        let line = self.rendered_text();
+        // `set_stringn` truncates if `line.len()` exceeds `area.width`,
+        // which is the contract a single-row status indicator wants —
+        // wrapping would push the rest of the layout out from under
+        // the prompt and break the SPEC §4.5 example's vertical shape.
+        buf.set_stringn(area.x, area.y, &line, area.width as usize, style);
+        1
+    }
+}
+
 /// A reusable narration / status fragment rendered above a prompt
 /// (SPEC_v1_1.md §4.7).
 ///
@@ -5050,5 +5261,237 @@ mod tests {
         let mut buf = Buffer::empty(Rect::new(0, 0, 4, 4));
         assert_eq!(prompt.render_modal(Rect::new(0, 0, 1, 4), &mut buf), 0);
         assert_eq!(prompt.render_modal(Rect::new(0, 0, 4, 1), &mut buf), 0);
+    }
+
+    // -- Task 6d: FeedbackLine ----------------------------------------
+
+    #[test]
+    fn feedback_kind_markers_are_unique_and_monochrome_safe() {
+        // SPEC §4.7: monochrome readability requires *distinct* prefixes
+        // — color is not load-bearing, so the markers themselves must
+        // tell info / success / error apart on a black/white terminal.
+        let info = FeedbackKind::Info.marker();
+        let success = FeedbackKind::Success.marker();
+        let error = FeedbackKind::Error.marker();
+        assert_ne!(info, success);
+        assert_ne!(info, error);
+        assert_ne!(success, error);
+        // Pure-ASCII so the prefix renders identically under any
+        // codepage; no terminal control sequences (SPEC §4.2).
+        for marker in [info, success, error] {
+            assert!(
+                marker.chars().all(|c| c.is_ascii() && !c.is_control()),
+                "marker {marker:?} must be plain ASCII",
+            );
+        }
+    }
+
+    #[test]
+    fn feedback_kind_marker_pins_concrete_strings() {
+        // Pin the literals so a typo in the marker mapping surfaces here
+        // rather than during a Murder Motel screenshot review.
+        assert_eq!(FeedbackKind::Info.marker(), "");
+        assert_eq!(FeedbackKind::Success.marker(), "+ ");
+        assert_eq!(FeedbackKind::Error.marker(), "! ");
+    }
+
+    #[test]
+    fn feedback_kind_style_role_maps_to_spec_roles() {
+        // SPEC §4.7 lists Success and Error among the initial style
+        // roles; Info rides the default `Normal` foreground so it does
+        // not compete with the surrounding body.
+        assert_eq!(FeedbackKind::Info.style_role(), StyleRole::Normal);
+        assert_eq!(FeedbackKind::Success.style_role(), StyleRole::Success);
+        assert_eq!(FeedbackKind::Error.style_role(), StyleRole::Error);
+    }
+
+    #[test]
+    fn feedback_line_constructors_record_kind_and_text() {
+        // The three constructors are the public API surface; verify each
+        // sets the kind and stores the author-supplied text verbatim
+        // (no marker pre-applied, no trimming).
+        let info = FeedbackLine::info("Moved Room 7 key to inventory.");
+        assert_eq!(info.kind(), FeedbackKind::Info);
+        assert_eq!(info.text(), "Moved Room 7 key to inventory.");
+
+        let success = FeedbackLine::success("Bought black coffee for 25g.");
+        assert_eq!(success.kind(), FeedbackKind::Success);
+        assert_eq!(success.text(), "Bought black coffee for 25g.");
+
+        let error = FeedbackLine::error("Need 50g to tip for a rumor.");
+        assert_eq!(error.kind(), FeedbackKind::Error);
+        assert_eq!(error.text(), "Need 50g to tip for a rumor.");
+    }
+
+    #[test]
+    fn feedback_line_rendered_text_concatenates_marker_and_body() {
+        // SPEC §4.7 monochrome contract: the marker is the visible
+        // severity carrier, so `rendered_text()` MUST surface it.
+        let info = FeedbackLine::info("Moved Room 7 key to inventory.");
+        assert_eq!(info.rendered_text(), "Moved Room 7 key to inventory.");
+
+        let success = FeedbackLine::success("Bought black coffee for 25g.");
+        assert_eq!(success.rendered_text(), "+ Bought black coffee for 25g.");
+
+        let error = FeedbackLine::error("Need 50g to tip for a rumor.");
+        assert_eq!(error.rendered_text(), "! Need 50g to tip for a rumor.");
+    }
+
+    /// Drive `FeedbackLine::render` through `TestBackend` and return
+    /// each visual row as a trimmed string. Mirrors the helper used by
+    /// the AnyKeyPrompt rendering tests so the assertions stay uniform.
+    fn render_feedback_to_strings(line: &FeedbackLine, w: u16, h: u16) -> Vec<String> {
+        use ratatui::{backend::TestBackend, Terminal};
+        let backend = TestBackend::new(w, h);
+        let mut term = Terminal::new(backend).expect("test backend");
+        term.draw(|frame| {
+            let area = frame.area();
+            line.render(area, frame.buffer_mut());
+        })
+        .expect("draw");
+        let buf = term.backend().buffer().clone();
+        (0..h)
+            .map(|y| {
+                let mut row = String::new();
+                for x in 0..w {
+                    row.push_str(buf[(x, y)].symbol());
+                }
+                row.trim_end().to_string()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn feedback_line_render_writes_marker_plus_text_under_test_backend() {
+        // SPEC §6: deterministic output under TestBackend. Exercise all
+        // three variants so each marker shape is pinned in the buffer,
+        // not just the helper output.
+        let info = FeedbackLine::info("Moved Room 7 key to inventory.");
+        assert_eq!(
+            render_feedback_to_strings(&info, 40, 1),
+            vec!["Moved Room 7 key to inventory.".to_string()],
+        );
+
+        let success = FeedbackLine::success("Bought black coffee for 25g.");
+        assert_eq!(
+            render_feedback_to_strings(&success, 40, 1),
+            vec!["+ Bought black coffee for 25g.".to_string()],
+        );
+
+        let error = FeedbackLine::error("Need 50g to tip for a rumor.");
+        assert_eq!(
+            render_feedback_to_strings(&error, 40, 1),
+            vec!["! Need 50g to tip for a rumor.".to_string()],
+        );
+    }
+
+    #[test]
+    fn feedback_line_render_returns_one_row_and_leaves_extra_rows_blank() {
+        // Single-row contract: render writes exactly one row and reports
+        // 1, regardless of how tall the area is. The remaining rows must
+        // stay untouched so the caller can stack a body beneath.
+        let line = FeedbackLine::success("Saved.");
+        let mut buf = Buffer::empty(Rect::new(0, 0, 20, 3));
+        let written = line.render(Rect::new(0, 0, 20, 3), &mut buf);
+        assert_eq!(written, 1);
+        // Row 0: marker + text. Rows 1+: blank (Buffer::empty default).
+        let row0: String = (0..20).map(|x| buf[(x, 0)].symbol()).collect();
+        let row1: String = (0..20).map(|x| buf[(x, 1)].symbol()).collect();
+        assert_eq!(row0.trim_end(), "+ Saved.");
+        assert_eq!(
+            row1.trim().chars().filter(|c| !c.is_whitespace()).count(),
+            0
+        );
+    }
+
+    #[test]
+    fn feedback_line_render_truncates_when_width_is_short() {
+        // SPEC §6: small areas MUST NOT panic. A width that can't hold
+        // the full message right-truncates rather than wraps — wrapping
+        // would shift the layout below the line and break the SPEC §4.5
+        // single-row feedback shape.
+        let line = FeedbackLine::error("Need 50g to tip for a rumor.");
+        let rows = render_feedback_to_strings(&line, 10, 1);
+        // 10 cells: "! Need 50g" (the prefix consumes 2, leaving 8).
+        assert_eq!(rows, vec!["! Need 50g".to_string()]);
+    }
+
+    #[test]
+    fn feedback_line_render_zero_dimensions_is_noop() {
+        // SPEC §6 small-area policy: 0×N or N×0 returns 0 and writes no
+        // cells. Exercise both axes with a hand-built buffer so the
+        // TestBackend rejection of 0-sized backends doesn't apply.
+        let line = FeedbackLine::info("hi");
+        let mut buf = Buffer::empty(Rect::new(0, 0, 4, 4));
+        assert_eq!(line.render(Rect::new(0, 0, 0, 4), &mut buf), 0);
+        assert_eq!(line.render(Rect::new(0, 0, 4, 0), &mut buf), 0);
+    }
+
+    #[test]
+    fn feedback_line_render_with_theme_applies_role_style() {
+        // Theme overrides MUST flow into the buffer cells the line
+        // writes. We override the `Success` role with a magenta
+        // foreground (a value the default theme never emits) and assert
+        // every cell carrying a marker/text glyph picks up that color.
+        // Cells outside the rendered prefix should NOT inherit the role
+        // style — that's how `set_stringn` handles a short string.
+        let line = FeedbackLine::success("Saved.");
+        let theme =
+            Theme::default().with_role(StyleRole::Success, Style::default().fg(Color::Magenta));
+        let mut buf = Buffer::empty(Rect::new(0, 0, 20, 1));
+        let written = line.render_with_theme(Rect::new(0, 0, 20, 1), &mut buf, &theme);
+        assert_eq!(written, 1);
+        // Rendered text is "+ Saved." — eight cells. Each MUST carry the
+        // overridden foreground; cell 8 onward should not.
+        for x in 0..8u16 {
+            assert_eq!(
+                buf[(x, 0)].style().fg,
+                Some(Color::Magenta),
+                "cell {x} missing role override",
+            );
+        }
+        // Cells past the rendered string keep the buffer's default
+        // foreground (Color::Reset) — the role override doesn't bleed.
+        assert_ne!(buf[(8, 0)].style().fg, Some(Color::Magenta));
+    }
+
+    #[test]
+    fn feedback_line_info_renders_with_normal_role_not_a_loud_one() {
+        // SPEC §4.7: `Info` rides on `StyleRole::Normal`, which the
+        // default theme keeps unstyled (no color override, no modifier).
+        // The whole point of `Normal` is that it inherits the terminal's
+        // own foreground — a neutral status note must not accidentally
+        // render as an error or success, which would break the
+        // monochrome contract by making severity ambiguous.
+        let line = FeedbackLine::info("Moved Room 7 key to inventory.");
+        let theme = Theme::default();
+        let mut buf = Buffer::empty(Rect::new(0, 0, 40, 1));
+        line.render_with_theme(Rect::new(0, 0, 40, 1), &mut buf, &theme);
+        // Compare against a cell that has never been touched: same row,
+        // past the end of the rendered string. If `Normal` is truly the
+        // identity style, the touched cells must be indistinguishable
+        // from the untouched baseline.
+        let baseline = buf[(39, 0)].style();
+        for x in 0..30u16 {
+            let cell_style = buf[(x, 0)].style();
+            assert_eq!(
+                cell_style.fg, baseline.fg,
+                "info cell {x} fg drifted from untouched baseline",
+            );
+            assert_eq!(
+                cell_style.add_modifier, baseline.add_modifier,
+                "info cell {x} modifier drifted from untouched baseline",
+            );
+        }
+        // And the loud roles MUST differ — guard against future drift
+        // where `Normal` accidentally inherits, say, `Success` styling.
+        assert_ne!(
+            theme.style(StyleRole::Success),
+            theme.style(StyleRole::Normal)
+        );
+        assert_ne!(
+            theme.style(StyleRole::Error),
+            theme.style(StyleRole::Normal)
+        );
     }
 }
