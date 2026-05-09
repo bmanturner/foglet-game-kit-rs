@@ -24,6 +24,19 @@
 //! choosing between this adapter and a hand-rolled [`Screen`] that
 //! composes [`ChoicePrompt`] manually.
 //!
+//! # See also
+//!
+//! For NPC conversation screens — multi-node dialog graphs with
+//! `requires`-gated branches — reach for the sibling adapter
+//! [`crate::dialog_screen::DialogScreen`] instead. `PromptScreen<T>`
+//! handles a single [`ChoicePrompt`]; `DialogScreen` walks a whole
+//! [`crate::dialog::Dialog`] / [`crate::dialog::DialogState`] pair and
+//! manages flag-gated choice filtering. The two adapters are
+//! deliberately shaped the same way (boxed `FnMut` callback,
+//! `Modal`/`Compact` layout enum, builder-style `modal()` / `compact()`
+//! methods) so authors can move between them without re-learning the
+//! ergonomics — see SPEC_v2_1.md §4.2 for the design symmetry.
+//!
 //! # Why a callback, not a return-value-only design
 //!
 //! [`ScreenCommand`] is the SPEC §5.5 vocabulary the runtime understands;
@@ -48,6 +61,11 @@ use crate::screen::{GameContext, Screen, ScreenCommand};
 /// adapter keeps both available rather than picking one because real
 /// games mix them — title-screen menus tend to be compact, mid-game
 /// confirmations tend to be modal.
+///
+/// Parallel to [`crate::dialog_screen::DialogLayout`]; the two enums
+/// are kept structurally identical so a screen can swap between
+/// prompt-shaped and dialog-shaped adapters without changing how the
+/// surrounding code spells "modal" vs "compact".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PromptLayout {
     /// SPEC §4.3 compact unboxed layout: no border, body and choices
@@ -92,6 +110,13 @@ type ActionCallback<T> = Box<dyn FnMut(PromptAction<T>) -> ScreenCommand + 'stat
 /// `Box<dyn Screen>` requires (no borrowed data leaks through the trait
 /// object). Real games use small `Copy` enums for `T`, so neither bound
 /// is a practical constraint.
+///
+/// # See also
+///
+/// [`crate::dialog_screen::DialogScreen`] — sibling adapter for
+/// multi-node NPC conversations. Reach for it when the screen drives a
+/// [`crate::dialog::Dialog`] graph rather than a single
+/// [`ChoicePrompt`].
 pub struct PromptScreen<T> {
     prompt: ChoicePrompt<T>,
     on_action: ActionCallback<T>,
