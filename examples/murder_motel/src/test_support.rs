@@ -31,3 +31,44 @@ pub fn fixture_context() -> FogletContext {
         source: ContextSource::LocalDev,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    //! Pin the v3 multiplayer config shape. Murder Motel is the SPEC §13
+    //! acceptance fixture, so a regression here (toggle drift, agency
+    //! slug typo, missing notice cap) silently breaks the example's
+    //! contract with the rest of v3. Loading via [`fixture_config`]
+    //! exercises the same path every other test uses, so we catch it.
+    use super::fixture_config;
+
+    #[test]
+    fn game_toml_enables_every_v3_multiplayer_primitive() {
+        let cfg = fixture_config();
+        let mp = cfg
+            .multiplayer
+            .as_ref()
+            .expect("scaffold opts into [multiplayer]");
+        assert!(mp.notices, "notices toggle on for guestbook content");
+        assert!(mp.challenges, "challenges toggle on for rival flow");
+        assert!(mp.market, "market toggle on for lost-and-found");
+        assert!(mp.factions, "factions toggle on for detective agencies");
+        assert!(mp.bounties, "bounties toggle on for clue board");
+        assert_eq!(
+            mp.max_notice_body_chars, 1_000,
+            "scaffold pins SPEC v3 §5.2 default cap"
+        );
+    }
+
+    #[test]
+    fn game_toml_seeds_both_detective_agencies() {
+        let cfg = fixture_config();
+        let slugs: Vec<&str> = cfg.factions.seed.iter().map(|s| s.slug.as_str()).collect();
+        assert_eq!(slugs, vec!["blue-desk", "red-room"]);
+        let blue = &cfg.factions.seed[0];
+        assert_eq!(blue.display_name, "Blue Desk Agency");
+        assert!(!blue.description.is_empty());
+        let red = &cfg.factions.seed[1];
+        assert_eq!(red.display_name, "Red Room Agency");
+        assert!(!red.description.is_empty());
+    }
+}

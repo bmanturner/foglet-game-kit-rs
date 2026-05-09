@@ -63,3 +63,34 @@ carryover_max = 0
 [[leaderboards]]
 name = "investigators"
 sort = "desc"
+
+# SPEC v3 §5.2: opt the SPEC §13 acceptance fixture into every BBS-native
+# async multiplayer primitive so v3 Tasks 9–13 have a real config to
+# drive against. Each toggle is independently opt-in; we light all five
+# here because Murder Motel's v3 content surface (guestbook, rival
+# challenges, lost-and-found market, detective agencies, clue bounties)
+# exercises every primitive end to end. `max_notice_body_chars` matches
+# the SPEC v3 §5.2 default — 1000 chars is comfortably sized for the
+# guestbook compose flow without straining 80×24 rendering.
+[multiplayer]
+notices = true
+challenges = true
+market = true
+factions = true
+bounties = true
+max_notice_body_chars = 1000
+
+# SPEC v3 §5.2 / §6: seed the two detective agencies that anchor Task
+# 12's faction screen. These are pure data — Task 6b will upsert them
+# into the `factions` table at startup so authors edit `game.toml`
+# rather than writing migrations. Slugs are stable primary keys; the
+# display names and descriptions are what players see in-game.
+[[factions.seed]]
+slug = "blue-desk"
+display_name = "Blue Desk Agency"
+description = "Investigators who trust paperwork more than hunches."
+
+[[factions.seed]]
+slug = "red-room"
+display_name = "Red Room Agency"
+description = "Investigators who chase hunches into smoky alleys."
