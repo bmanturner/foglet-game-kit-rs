@@ -1456,6 +1456,83 @@ pub fn lost_and_found_feedback(outcome: LostAndFoundOutcome) -> Option<FeedbackL
     }
 }
 
+/// Player-facing narration shown above the night-clerk vendor prompt
+/// (SPEC_v1_1.md §9 step 4).
+///
+/// Two body lines mirror the SPEC's two-paragraph framing so the
+/// renderer can wrap them independently — the first sets the scene,
+/// the second drops the pricing-fueled barb. Authoring the lines as a
+/// constant keeps the wording version-controlled and lets the data
+/// test below pin it byte-for-byte without re-typing the SPEC quote.
+pub const NIGHT_CLERK_VENDOR_BODY: [&str; 2] = [
+    "The night clerk drums his fingers beside a locked cigar box.",
+    "\"Evidence costs extra after midnight.\"",
+];
+
+/// Stable id returned by [`night_clerk_vendor_prompt`] when the player
+/// picks one of its three options (SPEC_v1_1.md §9 step 4).
+///
+/// Carries semantics, not display strings, so Task 11b's dynamic
+/// label refactor (price/cash interpolation) and Task 11c's transaction
+/// handler can both branch on the variant without re-parsing the
+/// rendered label. The enum mirrors SPEC §9 step 4's three-row layout
+/// one-for-one — there is intentionally no separate "leave" variant
+/// because [`Self::NoThanks`] already serves that role.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NightClerkVendorChoice {
+    /// `(B)` — pay the coffee price (Task 11c will decrement cash by
+    /// [`COFFEE_PRICE`] gold and emit a success feedback line).
+    BuyCoffee,
+    /// `(T)` — tip for a rumor; Task 11d disables this row when the
+    /// player has fewer than [`RUMOR_TIP_PRICE`] gold and surfaces the
+    /// `need 50g` reason.
+    TipForRumor,
+    /// `(N)` — close the prompt without spending anything.
+    NoThanks,
+}
+
+/// Cost of the night clerk's black coffee, in gold pieces
+/// (SPEC_v1_1.md §9 step 4). Centralised so Task 11b's dynamic label
+/// and Task 11c's transaction handler share one source of truth — a
+/// future copy-edit to "30g" only changes the constant, never the
+/// branching logic.
+pub const COFFEE_PRICE: u32 = 25;
+
+/// Cost of the rumor tip, in gold pieces (SPEC_v1_1.md §9 step 4).
+/// Pairs with [`PlayerSlot::STARTING_CASH`] (40g) so the proof scene
+/// always boots into the disabled-`(T)` branch the SPEC requires Task
+/// 11d to demonstrate.
+pub const RUMOR_TIP_PRICE: u32 = 50;
+
+/// Build the night-clerk vendor prompt with every choice enabled and
+/// static labels (SPEC_v1_1.md §9 step 4, Task 11a).
+///
+/// Task 11a deliberately ships static labels — `Buy a black coffee`,
+/// `Tip the clerk for a rumor`, `No thanks` — without the SPEC's
+/// `25g | You have: 40g` annotations. Task 11b refactors this to a
+/// state-aware builder that renders the price/cash hints, and Task 11d
+/// adds the `disabled_if(cash < RUMOR_TIP_PRICE, ...)` branch on top.
+/// Splitting it this way lets each follow-up task own one observable
+/// behaviour change instead of bundling three under a single commit.
+///
+/// The choice ordering matches SPEC §9 step 4 verbatim (`B`, `T`, `N`)
+/// so the rendered prompt reads top-to-bottom in the same order an
+/// operator scanning the SPEC's reference block would expect.
+pub fn night_clerk_vendor_prompt() -> ChoicePrompt<NightClerkVendorChoice> {
+    let mut prompt = ChoicePrompt::new();
+    for line in NIGHT_CLERK_VENDOR_BODY {
+        prompt = prompt.body(line);
+    }
+    prompt
+        .choice('B', NightClerkVendorChoice::BuyCoffee, "Buy a black coffee")
+        .choice(
+            'T',
+            NightClerkVendorChoice::TipForRumor,
+            "Tip the clerk for a rumor",
+        )
+        .choice('N', NightClerkVendorChoice::NoThanks, "No thanks")
+}
+
 impl Screen for MapScreen {
     fn render(&mut self, _ctx: &mut GameContext<'_>, frame: &mut Frame<'_>) {
         // Centre the map inside the frame. The +2 accounts for the
@@ -4074,6 +4151,109 @@ mod tests {
             "Pocket the matchbook",
             "Read the receipt",
             "Leave it alone",
+        ] {
+            assert!(
+                rendered.contains(label),
+                "missing label {label:?} in rendered prompt:\n{rendered}"
+            );
+        }
+    }
+
+    // ---- Night-clerk vendor prompt data (SPEC §9 Task 11a) -----------
+
+    #[test]
+    fn night_clerk_vendor_prompt_exposes_spec_choices_and_body() {
+        // SPEC §9 step 4 pins the prompt's three hotkeys, their labels,
+        // and the two-line narration above them. Asserting against the
+        // typed prompt (rather than the rendered buffer) catches drift
+        // in the data Task 11b will read for dynamic labels and Task
+        // 11c for the transaction handler, before the renderer hooks
+        // the prompt into a Screen.
+        use foglet_game::PromptKey;
+
+        let prompt = night_clerk_vendor_prompt();
+
+        assert_eq!(
+            prompt.body.as_slice(),
+            &NIGHT_CLERK_VENDOR_BODY[..],
+            "narration must match SPEC §9 step 4 verbatim"
+        );
+
+        let expected: &[(char, &str, NightClerkVendorChoice)] = &[
+            ('b', "Buy a black coffee", NightClerkVendorChoice::BuyCoffee),
+            (
+                't',
+                "Tip the clerk for a rumor",
+                NightClerkVendorChoice::TipForRumor,
+            ),
+            ('n', "No thanks", NightClerkVendorChoice::NoThanks),
+        ];
+        assert_eq!(
+            prompt.choices.len(),
+            expected.len(),
+            "Night-clerk vendor must expose the three SPEC §9 choices"
+        );
+        for (choice, (key, label, value)) in prompt.choices.iter().zip(expected) {
+            assert_eq!(
+                choice.key,
+                PromptKey::char(*key),
+                "hotkey for {label:?} drifted from SPEC §9"
+            );
+            assert_eq!(choice.label, *label, "label for {key} drifted from SPEC §9");
+            assert_eq!(choice.value, *value, "value for {label:?} drifted");
+            assert!(
+                choice.enabled,
+                "Task 11a ships every choice enabled; Task 11d adds the disabled-(T) branch"
+            );
+        }
+    }
+
+    #[test]
+    fn night_clerk_vendor_prompt_renders_body_and_hotkeys() {
+        // Drive the prompt through Ratatui's `TestBackend` so the test
+        // asserts against the same buffer semantics the live runtime
+        // uses (SPEC §6 deterministic-render contract). 70x10 gives the
+        // body two rows plus the three choice rows + label without
+        // forcing the renderer into modal mode.
+        let prompt = night_clerk_vendor_prompt();
+        let backend = TestBackend::new(70, 10);
+        let mut term = Terminal::new(backend).expect("test backend");
+        term.draw(|frame| {
+            let area = frame.area();
+            prompt.render(area, frame.buffer_mut());
+        })
+        .expect("draw");
+
+        let buf = term.backend().buffer().clone();
+        let mut rendered = String::new();
+        for y in 0..10 {
+            for x in 0..70 {
+                rendered.push_str(buf[(x, y)].symbol());
+            }
+            rendered.push('\n');
+        }
+
+        // SPEC §9 step 4 narration — both body fragments must survive
+        // the renderer's word-wrap regardless of where the lines break
+        // at 70 columns.
+        for fragment in ["night clerk drums", "Evidence costs extra"] {
+            assert!(
+                rendered.contains(fragment),
+                "rendered prompt missing SPEC §9 step 4 fragment {fragment:?}; got:\n{rendered}"
+            );
+        }
+        // Each choice row must surface its `(X)` hotkey marker plus the
+        // SPEC §9 label so monochrome terminals stay legible.
+        for marker in ["(B)", "(T)", "(N)"] {
+            assert!(
+                rendered.contains(marker),
+                "missing hotkey marker {marker} in rendered prompt:\n{rendered}"
+            );
+        }
+        for label in [
+            "Buy a black coffee",
+            "Tip the clerk for a rumor",
+            "No thanks",
         ] {
             assert!(
                 rendered.contains(label),
