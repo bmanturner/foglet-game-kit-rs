@@ -276,10 +276,15 @@ impl WorldDb {
     /// migration ("init" → "v1_init") between releases without the runtime
     /// thinking the renamed migration is a new one to apply.
     ///
-    /// Task 4d will harden the "failed migration leaves no row" guarantee.
-    /// The SQL body and the bookkeeping insert already run inside a single
-    /// SQLite transaction so 4d can keep that work tight without
-    /// revisiting this code path.
+    /// Task 4d (this iteration) pins the **"failed migration leaves no
+    /// row"** guarantee with an explicit test. The mechanism that delivers
+    /// it is the wrapping `Connection::transaction`: if `execute_batch` or
+    /// the bookkeeping `INSERT` returns an error, the early return drops
+    /// `tx` without `commit()`, and `rusqlite::Transaction`'s `Drop` impl
+    /// rolls the transaction back. The bookkeeping row is therefore never
+    /// observable to the next `apply_migration` call — the relaunch path
+    /// will retry the migration cleanly rather than silently skip a half-
+    /// applied version.
     ///
     /// `&mut self` is required because [`Connection::transaction`] needs
     /// a unique borrow. The runtime layer (Task 10) wraps the world DB
@@ -1021,6 +1026,82 @@ mod tests {
             )
             .expect("recorded name is queryable");
         assert_eq!(recorded_name, "init");
+    }
+
+    /// SPEC_v2 §Task 4d acceptance: a migration whose SQL body is
+    /// rejected by SQLite surfaces as a [`WorldDbError::ApplyMigration`]
+    /// **and** leaves no row in `world_migrations`. Without this guard
+    /// the relaunch path (SPEC §7 `external_pty` re-exec) could record a
+    /// version that never actually ran, then silently skip it on the
+    /// next startup — a half-applied migration that no operator tooling
+    /// would ever notice.
+    ///
+    /// The body is invalid SQL (`NOT_A_KEYWORD ...`) so the parser fails
+    /// before any side effects; pairing the error assertion with a
+    /// `world_migrations` count keeps both halves of the guarantee
+    /// (loud failure, clean state) in one place.
+    #[test]
+    fn apply_migration_failure_does_not_record_row() {
+        let dir = tempdir().expect("tempdir creates");
+        let db_path = dir.path().join("world.sqlite");
+        let mut world = WorldDb::open(&db_path).expect("open succeeds");
+
+        let bad = WorldMigration {
+            version: 7,
+            name: "broken_migration",
+            sql: "NOT_A_KEYWORD totally_invalid_sql;",
+        };
+
+        let err = world
+            .apply_migration(&bad)
+            .expect_err("invalid SQL must surface as an error");
+
+        match err {
+            WorldDbError::ApplyMigration { version, name, .. } => {
+                assert_eq!(version, 7, "error must echo the offending version");
+                assert_eq!(
+                    name, "broken_migration",
+                    "error must echo the offending name"
+                );
+            }
+            other => panic!("expected ApplyMigration, got {other:?}"),
+        }
+
+        // No row recorded — the wrapping transaction must have rolled back.
+        // Counting the whole table (rather than `WHERE version = 7`) also
+        // catches a regression that recorded the row under a different
+        // version key.
+        let row_count: i64 = world
+            .connection()
+            .query_row("SELECT COUNT(*) FROM world_migrations", [], |row| {
+                row.get(0)
+            })
+            .expect("count query runs");
+        assert_eq!(
+            row_count, 0,
+            "failed migration must leave the bookkeeping table empty"
+        );
+
+        // And a subsequent successful apply at the same version works —
+        // proving the rollback didn't leave SQLite in a state that blocks
+        // retry. This is the property the relaunch path actually depends
+        // on; without it, a transient SQL error would brick the door.
+        let good = WorldMigration {
+            version: 7,
+            name: "broken_migration",
+            sql: "CREATE TABLE recovered (id INTEGER PRIMARY KEY);",
+        };
+        world
+            .apply_migration(&good)
+            .expect("retry after a failed apply succeeds");
+
+        let row_count_after: i64 = world
+            .connection()
+            .query_row("SELECT COUNT(*) FROM world_migrations", [], |row| {
+                row.get(0)
+            })
+            .expect("count query runs");
+        assert_eq!(row_count_after, 1, "retry must record exactly one row");
     }
 
     /// SPEC_v2 §Task 3b acceptance: a nested `world/world.sqlite`

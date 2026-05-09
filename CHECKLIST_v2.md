@@ -26,7 +26,7 @@ One unchecked item per iteration. Dependencies in `[brackets]` must be checked o
 - [x] **4a** — Add `world_migrations` table creation. Test: table exists after bootstrap. [3a]
 - [x] **4b** — Add `WorldMigration { version, name, sql }` and apply one migration. Test: version is recorded. [4a]
 - [x] **4c** — Make migration application idempotent. Test: applying the same migration twice records one row and leaves schema valid. [4b]
-- [ ] **4d** — Surface failed migration errors without recording success. Test: invalid SQL returns an error and no migration row. [4b]
+- [x] **4d** — Surface failed migration errors without recording success. Test: invalid SQL returns an error and no migration row. [4b]
 
 ### Task 5 — Player registry
 
