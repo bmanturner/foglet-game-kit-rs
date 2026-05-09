@@ -431,6 +431,72 @@ pub fn spend_clue_inspection_turn(
     }
 }
 
+/// Snapshot of today's clue-turn balance for the active player, paired
+/// with the configured daily allowance — SPEC_v2 §Task 13b "show
+/// remaining turns in the map/status UI".
+///
+/// The lobby map screen caches the most recent value of this struct
+/// and renders `Turns: remaining/daily_allowance` underneath the map.
+/// `daily_allowance` rides along so the renderer never has to thread a
+/// `&GameConfig` into the hint string just to format the denominator;
+/// the cache carries enough data to paint a complete status line on
+/// its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RemainingTurns {
+    /// Today's post-spend balance for the player, mirroring
+    /// [`crate::world::ClueInspectionOutcome::Spent::remaining`]. May be
+    /// zero — the status line still renders so a player understands
+    /// why their next X-press will be rejected.
+    pub remaining: i64,
+    /// Snapshot of `[turns].daily_allowance` from `game.toml`.
+    /// Captured at read time rather than via a stored handle so the
+    /// renderer has a self-contained value to format.
+    pub daily_allowance: u32,
+}
+
+/// Read today's clue-turn balance for the player identified by
+/// `foglet`, returning `None` when the game has not opted into the
+/// `[turns]` ledger or when the read fails for any reason.
+///
+/// SPEC_v2 §Task 13b consumes this from [`crate::map::MapScreen::tick`]
+/// to populate a one-time cache the map renders under the hint line.
+/// The function:
+///
+/// 1. Short-circuits to `None` when `cfg.turns` is absent — single-
+///    player games (and tests that don't opt into the ledger) get no
+///    status line, matching the existing "no `[turns]` ⇒ free
+///    inspections" branch in [`spend_clue_inspection_turn`].
+/// 2. Upserts the player so the read sees the same `players.id` the
+///    spend path would, even on the very first frame after launch.
+/// 3. Calls [`foglet_game::WorldDb::ensure_today_turns`] to lazily
+///    create today's row from `daily_allowance` plus any capped
+///    carryover. The kit's no-transaction guarantee on this method is
+///    why running it from `tick` (not `render`) is safe: the SQLite
+///    write is small and atomic, but it is still a write and SPEC §Task
+///    10d forbids it on the draw path.
+///
+/// Errors collapse to `None` rather than propagating because the
+/// status line is purely advisory: a transient SQLite hiccup must not
+/// blank the lobby screen or panic out of the runtime. The kit's
+/// `tracing` boundary will eventually pick up these failures; for v2
+/// the swallow keeps the player visible.
+pub fn read_remaining_turns(
+    world: &WorldDb,
+    foglet: &FogletContext,
+    cfg: &GameConfig,
+    date: &dyn DateProvider,
+) -> Option<RemainingTurns> {
+    let turns = cfg.turns.as_ref()?;
+    let player = world.upsert_player(foglet).ok()?;
+    let row = world
+        .ensure_today_turns(player.id, turns.daily_allowance, turns.carryover_max, date)
+        .ok()?;
+    Some(RemainingTurns {
+        remaining: row.balance,
+        daily_allowance: turns.daily_allowance,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     //! Migration smoke tests — apply the migration into a temp DB and
@@ -777,6 +843,77 @@ mod tests {
             outcome_again,
             ClueInspectionOutcome::InsufficientTurns { balance: 0 },
             "repeat rejected attempts must observe the same zero balance"
+        );
+    }
+
+    // ---- SPEC_v2 §Task 13b read_remaining_turns ---------------------
+
+    /// On a fresh ledger the read helper reports the full
+    /// `daily_allowance` as the remaining balance, paired with the
+    /// configured allowance. Confirms the lazy ensure-today-row write
+    /// fires from the read path so the very first frame after launch
+    /// has a populated cache instead of `None`.
+    #[test]
+    fn read_remaining_turns_returns_daily_allowance_on_first_call() {
+        let dir = tempdir().expect("tempdir");
+        let world = world_with_turn_stack(&dir);
+        let cfg = fixture_config();
+        let fc = fixture_context();
+        let date = fixed_today();
+
+        let status = read_remaining_turns(&world, &fc, &cfg, &date)
+            .expect("status populates with [turns] configured");
+        assert_eq!(
+            status,
+            RemainingTurns {
+                remaining: 3,
+                daily_allowance: 3,
+            },
+            "fresh ledger reports the full allowance"
+        );
+    }
+
+    /// After a spend lands, `read_remaining_turns` observes the
+    /// post-spend balance — the renderer's cache and the ledger don't
+    /// drift even when the screen forgets to update its cache directly.
+    #[test]
+    fn read_remaining_turns_reflects_prior_spend() {
+        let dir = tempdir().expect("tempdir");
+        let world = world_with_turn_stack(&dir);
+        let cfg = fixture_config();
+        let fc = fixture_context();
+        let date = fixed_today();
+
+        let _ = spend_clue_inspection_turn(&world, &fc, &cfg, &date);
+
+        let status =
+            read_remaining_turns(&world, &fc, &cfg, &date).expect("status populates after spend");
+        assert_eq!(
+            status,
+            RemainingTurns {
+                remaining: 2,
+                daily_allowance: 3,
+            },
+            "one spend must leave 3 - 1 = 2 turns observable"
+        );
+    }
+
+    /// Without a `[turns]` section the helper returns `None` so
+    /// `MapScreen::tick` keeps its cache empty and the renderer omits
+    /// the status line entirely. Mirrors the `NotConfigured` branch in
+    /// the spend helper.
+    #[test]
+    fn read_remaining_turns_returns_none_when_turns_unconfigured() {
+        let dir = tempdir().expect("tempdir");
+        let world = world_with_turn_stack(&dir);
+        let mut cfg: GameConfig = fixture_config();
+        cfg.turns = None;
+        let fc = fixture_context();
+        let date = fixed_today();
+
+        assert!(
+            read_remaining_turns(&world, &fc, &cfg, &date).is_none(),
+            "missing [turns] must short-circuit to None"
         );
     }
 

@@ -92,7 +92,7 @@ One unchecked item per iteration. Dependencies in `[brackets]` must be checked o
 ### Task 13 — Murder Motel turns/events/leaderboard
 
 - [x] **13a** — Make clue inspection spend one daily turn. [6d]
-- [ ] **13b** — Show remaining turns in the map/status UI. [13a]
+- [x] **13b** — Show remaining turns in the map/status UI. [13a]
 - [ ] **13c** — Append event when Room 7 opens and when a major clue is found. [7b, 12b]
 - [ ] **13d** — Add lobby bulletin/ledger screen that lists recent events. [7c]
 - [ ] **13e** — Increment `investigators` leaderboard when clues are found. [8c]

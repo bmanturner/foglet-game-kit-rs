@@ -147,6 +147,21 @@ pub struct MapScreen {
     /// what used to be three separate fields so Task 13h's save/load
     /// path manipulates the same handles the screens read.
     slots: SharedSlots,
+    /// SPEC_v2 §Task 13b cache for the lobby's "remaining turns" status
+    /// line. Populated lazily from [`Self::tick`] (which is allowed to
+    /// touch SQLite under the kit's contract) and updated in place by
+    /// the X-press handler when a clue inspection lands. Stays `None`
+    /// until the first `tick` runs against a [`GameContext`] that has a
+    /// world DB attached *and* a `[turns]` section configured — which is
+    /// precisely the set of runs that should display a status line, so
+    /// no separate "should we show this?" flag is needed alongside the
+    /// option.
+    ///
+    /// Held in a `RefCell` because [`Screen::render`] takes `&mut self`
+    /// while [`Self::hint_line`] takes `&self`; the cell keeps both
+    /// paths consulting the same value without forcing a wider mutable
+    /// borrow through the ratatui draw path.
+    turns_status: RefCell<Option<crate::world::RemainingTurns>>,
 }
 
 impl MapScreen {
@@ -419,7 +434,11 @@ impl MapScreen {
         let legend = lobby_legend();
         let map =
             parse_map(LOBBY_MAP_TEXT, &legend).expect("embedded lobby map parses against legend");
-        let screen = Self { map, slots };
+        let screen = Self {
+            map,
+            slots,
+            turns_status: RefCell::new(None),
+        };
         // Mark the slots as "we are now on the lobby" so a save
         // snapshot taken before the next transition records the right
         // map identifier. Symmetric with
@@ -625,17 +644,33 @@ impl MapScreen {
     /// the hint never advertises an action the keypress would silently
     /// reject.
     pub fn hint_line(&self) -> String {
-        let mut segments: Vec<&str> = vec![Self::HINT_BASE_PREFIX];
+        // Owned `String` segments rather than `&str` because the Task
+        // 13b status segment (`"Turns: N/D"`) is formatted on the fly
+        // and would otherwise be a dangling reference. The static
+        // prefix/suffix get a one-time `.to_string()` to share the
+        // segment vector's element type.
+        let mut segments: Vec<String> = vec![Self::HINT_BASE_PREFIX.to_string()];
         if self.nearby_npc().is_some() {
-            segments.push("Talk: Enter");
+            segments.push("Talk: Enter".to_string());
         }
         if self.nearby_clerk() {
-            segments.push("Buy: B");
+            segments.push("Buy: B".to_string());
         }
         if self.nearby_lost_and_found() {
-            segments.push("Search: X");
+            segments.push("Search: X".to_string());
         }
-        segments.push(Self::HINT_BASE_SUFFIX);
+        // SPEC_v2 §Task 13b: paint today's clue-turn balance into the
+        // hint line whenever the cache is populated. The cache stays
+        // empty when `[turns]` is absent (single-player runs / pre-v2
+        // games), so the segment naturally drops out for those games
+        // without a separate feature flag.
+        if let Some(status) = self.turns_status.borrow().as_ref() {
+            segments.push(format!(
+                "Turns: {}/{}",
+                status.remaining, status.daily_allowance
+            ));
+        }
+        segments.push(Self::HINT_BASE_SUFFIX.to_string());
         segments.join("  ")
     }
 
@@ -1241,14 +1276,40 @@ impl Screen for MapScreen {
                         None => ClueInspectionOutcome::NotConfigured,
                     };
                     match outcome {
-                        ClueInspectionOutcome::InsufficientTurns { .. } => {
+                        ClueInspectionOutcome::InsufficientTurns { balance } => {
                             *self.slots.feedback.borrow_mut() =
                                 Some(FeedbackLine::error(NO_CLUE_TURNS_FEEDBACK));
+                            // Sync the status cache to the rejected
+                            // balance so the hint line shows "Turns:
+                            // 0/D" the very next frame — without this
+                            // a stale "1/D" from before the day's
+                            // final spend would linger until tick re-
+                            // queried (SPEC_v2 §Task 13b).
+                            if let Some(turns) = ctx.config.turns.as_ref() {
+                                *self.turns_status.borrow_mut() =
+                                    Some(crate::world::RemainingTurns {
+                                        remaining: balance,
+                                        daily_allowance: turns.daily_allowance,
+                                    });
+                            }
                             return ScreenCommand::None;
                         }
-                        ClueInspectionOutcome::Spent { .. }
-                        | ClueInspectionOutcome::NotConfigured
-                        | ClueInspectionOutcome::Failed(_) => {}
+                        ClueInspectionOutcome::Spent { remaining } => {
+                            // Update the status cache from the spend's
+                            // post-decrement balance — the screen does
+                            // not re-query SQLite for the hint line, so
+                            // this is the canonical refresh point for a
+                            // successful inspection (SPEC_v2 §Task 13b).
+                            if let Some(turns) = ctx.config.turns.as_ref() {
+                                *self.turns_status.borrow_mut() =
+                                    Some(crate::world::RemainingTurns {
+                                        remaining,
+                                        daily_allowance: turns.daily_allowance,
+                                    });
+                            }
+                        }
+                        ClueInspectionOutcome::NotConfigured | ClueInspectionOutcome::Failed(_) => {
+                        }
                     }
                     // Clear any prior feedback so a fresh interaction
                     // never pops in under stale narration from the last
@@ -1267,6 +1328,37 @@ impl Screen for MapScreen {
             Input::Char('q') | Input::Char('Q') | Input::Ctrl('c') => ScreenCommand::Quit,
             _ => ScreenCommand::None,
         }
+    }
+
+    /// Per-frame hook: when the SPEC_v2 §Task 13b status cache is
+    /// empty and a world DB is attached, lazily populate it via
+    /// [`crate::world::read_remaining_turns`]. Subsequent frames
+    /// short-circuit on the `Some` check, and clue-spend handlers
+    /// keep the cache fresh in place — so this hook is effectively a
+    /// one-shot loader plus a "world DB attached after launch" safety
+    /// net.
+    ///
+    /// Why `tick` and not `render`: SPEC §Task 10d / `Screen::render`
+    /// docs forbid blocking world queries on the draw path. `tick`
+    /// runs once per frame *before* render and explicitly tolerates
+    /// SQLite latency; `read_remaining_turns` performs an upsert plus
+    /// an ensure-today-row write, both of which fall under that
+    /// tolerance.
+    fn tick(&mut self, ctx: &mut GameContext<'_>) -> ScreenCommand {
+        if self.turns_status.borrow().is_some() {
+            return ScreenCommand::None;
+        }
+        if let Some(world) = ctx.world_db {
+            if let Some(status) = crate::world::read_remaining_turns(
+                world,
+                ctx.foglet,
+                ctx.config,
+                &*self.slots.date_provider,
+            ) {
+                *self.turns_status.borrow_mut() = Some(status);
+            }
+        }
+        ScreenCommand::None
     }
 }
 
@@ -3080,6 +3172,121 @@ pub(crate) mod tests {
         assert!(
             matches!(cmd, ScreenCommand::Push(_)),
             "no world DB attached must fall back to the unconditional push; got {cmd:?}"
+        );
+    }
+
+    // ---- SPEC_v2 §Task 13b remaining-turns status line --------------
+
+    /// Before any tick fires (or with no world DB attached), the
+    /// hint line must NOT carry a "Turns:" segment — single-player
+    /// runs keep the lobby's status row terse.
+    #[test]
+    fn hint_line_omits_turns_segment_until_cache_populated() {
+        let slots = fixed_date_slots();
+        let map = fresh_map_screen_with_slots(slots);
+        let hint = map.hint_line();
+        assert!(
+            !hint.contains("Turns:"),
+            "fresh map screen must not advertise a turn balance: {hint}"
+        );
+    }
+
+    /// First tick against a context with a world DB attached must
+    /// populate the Task 13b cache so the next render's hint line
+    /// includes the full daily allowance. Drives the public `Screen`
+    /// surface (not the `read_remaining_turns` helper directly) so a
+    /// regression in the tick wiring fails here.
+    #[test]
+    fn tick_populates_turns_status_from_world_db() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let world = world_with_full_stack(&dir);
+        let cfg = fixture_config();
+        let fc = fixture_context();
+        let slots = fixed_date_slots();
+        let mut map = fresh_map_screen_with_slots(slots);
+
+        {
+            let mut ctx = GameContext::new(&cfg, &fc, (80, 24)).with_world_db(&world);
+            let cmd = map.tick(&mut ctx);
+            assert!(
+                matches!(cmd, ScreenCommand::None),
+                "tick should not emit a screen transition; got {cmd:?}"
+            );
+        }
+
+        let hint = map.hint_line();
+        assert!(
+            hint.contains("Turns: 3/3"),
+            "tick must populate the status cache to the full daily_allowance: {hint}"
+        );
+    }
+
+    /// After a successful clue inspection the X-press handler updates
+    /// the cache in place — without re-querying SQLite — so the next
+    /// frame's hint line reflects the post-spend balance. Asserts the
+    /// SPEC_v2 §Task 13b refresh-on-spend wiring.
+    #[test]
+    fn x_press_updates_turns_status_on_successful_spend() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let world = world_with_full_stack(&dir);
+        let cfg = fixture_config();
+        let fc = fixture_context();
+        let slots = fixed_date_slots();
+        let mut map = fresh_map_screen_with_slots(slots);
+
+        {
+            let mut ctx = GameContext::new(&cfg, &fc, (80, 24)).with_world_db(&world);
+            walk_to_drawer(&mut map, &mut ctx);
+            let cmd = map.handle_input(&mut ctx, Input::Char('x'));
+            assert!(matches!(cmd, ScreenCommand::Push(_)));
+        }
+
+        let hint = map.hint_line();
+        assert!(
+            hint.contains("Turns: 2/3"),
+            "X-press must drop remaining from 3 to 2 in the status line: {hint}"
+        );
+    }
+
+    /// When the day's allowance is exhausted, the rejected X-press
+    /// still syncs the cache to the canonical zero balance — the
+    /// previous frame might have shown "1/3" right before the final
+    /// spend, and the rejected press is the right place to land on
+    /// "0/3" without waiting for tick to re-query.
+    #[test]
+    fn rejected_x_press_syncs_turns_status_to_zero() {
+        use crate::world::spend_clue_inspection_turn;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let world = world_with_full_stack(&dir);
+        let cfg = fixture_config();
+        let fc = fixture_context();
+        let slots = fixed_date_slots();
+        let mut map = fresh_map_screen_with_slots(slots.clone());
+
+        // Drain the allowance through the helper so the X-press tested
+        // below exercises only the rejection path.
+        for _ in 0..3 {
+            let _ = spend_clue_inspection_turn(&world, &fc, &cfg, &*slots.date_provider);
+        }
+
+        {
+            let mut ctx = GameContext::new(&cfg, &fc, (80, 24)).with_world_db(&world);
+            walk_to_drawer(&mut map, &mut ctx);
+            // Pre-seed the cache to a stale "1/3" so the test fails if
+            // the rejection path forgets to overwrite it.
+            *map.turns_status.borrow_mut() = Some(crate::world::RemainingTurns {
+                remaining: 1,
+                daily_allowance: 3,
+            });
+            let cmd = map.handle_input(&mut ctx, Input::Char('x'));
+            assert!(matches!(cmd, ScreenCommand::None));
+        }
+
+        let hint = map.hint_line();
+        assert!(
+            hint.contains("Turns: 0/3"),
+            "rejected X-press must overwrite stale cache with the true zero balance: {hint}"
         );
     }
 }
