@@ -1558,6 +1558,280 @@ impl From<char> for PromptKey {
     }
 }
 
+/// Stable id for the two confirmation choices a [`ConfirmPrompt`]
+/// surfaces to the player. The wrapper type exists rather than reusing
+/// a `bool` so [`ChoicePrompt`]'s `T` parameter stays expressive in
+/// `Debug`/`PartialEq` — a printed `Selected(Yes)` reads more naturally
+/// in test failure output than `Selected(true)`, and refactoring later
+/// to add new outcomes (e.g. `Always`) is a single-enum change rather
+/// than a public-API rename.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ConfirmAction {
+    /// Player accepted the action (typically via `(Y)`).
+    Yes,
+    /// Player declined the action (typically via `(N)`).
+    No,
+}
+
+/// Outcome of sending one [`Input`] through a [`ConfirmPrompt`]
+/// (SPEC_v1_1.md §4.5 "Return typed yes/no/cancel outcomes").
+///
+/// A flat enum mirrors [`PromptAction`]'s shape so confirmation match
+/// arms read symmetrically with normal choice-prompt match arms — a
+/// game routing both kinds of prompt through the same `Screen` does
+/// not have to translate vocabulary between them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ConfirmOutcome {
+    /// Input was not confirmation-relevant (resize, unknown key,
+    /// Enter without a configured default, etc.). The caller should
+    /// re-render the prompt unchanged.
+    None,
+    /// Player chose [`ConfirmAction::Yes`] (or pressed Enter when
+    /// [`ConfirmPrompt::default_yes`] was configured).
+    Yes,
+    /// Player chose [`ConfirmAction::No`] (or pressed Enter when
+    /// [`ConfirmPrompt::default_no`] was configured).
+    No,
+    /// Player cancelled — Esc on a cancellable prompt. Distinct from
+    /// `No`: SPEC §4.5 calls out yes/no/cancel as three outcomes
+    /// because "no" is a deliberate decline while "cancel" means
+    /// "I changed my mind about being asked". Games can collapse the
+    /// two when they want to.
+    Cancelled,
+}
+
+/// Two-way confirmation prompt with optional Esc-cancel and optional
+/// Enter-default behaviour (SPEC_v1_1.md §4.5).
+///
+/// `ConfirmPrompt` is a thin wrapper around [`ChoicePrompt`] that
+/// fixes the choice list to the canonical `(Y)es / (N)o` pair, layers
+/// an Enter-default policy on top, and projects the underlying
+/// [`PromptAction`] vocabulary down to the smaller [`ConfirmOutcome`]
+/// surface. Reusing `ChoicePrompt` (rather than reimplementing the
+/// renderer and reducer) keeps the SPEC §4.8 compact-unboxed and
+/// bordered-modal layouts free of duplicate code paths and means every
+/// existing `ChoicePrompt` test (wrap, blank-line preservation,
+/// disabled glyphs, theme mapping) carries through to confirmations
+/// for free.
+///
+/// The third "cancel" outcome from SPEC §4.5 is represented as Esc
+/// rather than a third visible choice — door-game conventions treat
+/// Esc as "back out" and the test surface
+/// (`cancellable_confirm_returns_cancelled_on_esc`) exercises that
+/// path directly. Authors who want a literal `(C)ancel` row can
+/// drop down to `ChoicePrompt` and route the third value themselves;
+/// adding a builder for it here would invite scope drift past the
+/// SPEC's "two- or three-way" wording.
+///
+/// # Why default cancellable, opposite of `ChoicePrompt`?
+///
+/// `ChoicePrompt::cancellable` defaults to `false` because a generic
+/// hotkey prompt may be load-bearing (a save-overwrite confirmation
+/// the game wants to force a resolution on). `ConfirmPrompt` is, by
+/// definition, the "are you sure?" beat — Esc-as-back-out is the
+/// dominant convention for that beat in BBS-era door UIs and matches
+/// SPEC §4.5's explicit "yes/no/cancel" framing. Authors who need a
+/// non-cancellable confirmation (rare, but representable — e.g. a
+/// terminal-quit guard) opt out via `.cancellable(false)`.
+///
+/// # Why no internal cursor / arrow navigation?
+///
+/// SPEC §4.5 defines `ConfirmPrompt` in direct-hotkey terms (`Y`/`N`)
+/// plus an Enter default. Adding the optional [`ChoicePrompt::navigable`]
+/// cursor on top would multiply the test matrix for negligible UX
+/// gain on a two-row prompt. Authors who genuinely need an arrow-mode
+/// confirmation can compose `ChoicePrompt<ConfirmAction>` themselves.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfirmPrompt {
+    /// Underlying generic prompt — owns the body, cancellable flag,
+    /// optional title/footer, and the actual reducer logic. Public
+    /// reads are kept package-internal: callers go through the
+    /// `ConfirmPrompt` API so the yes/no choice list stays an
+    /// invariant of the type (you cannot `.choice(...)` a third row
+    /// onto a `ConfirmPrompt` from outside this module).
+    inner: ChoicePrompt<ConfirmAction>,
+    /// Which confirmation Enter selects when no other key has been
+    /// pressed. `None` → Enter is a no-op (`ConfirmOutcome::None`),
+    /// matching direct-key `ChoicePrompt` behaviour. SPEC §4.5 lists
+    /// the Enter-default as opt-in precisely because some prompts
+    /// must not have an "easy yes" path — a delete-save confirmation
+    /// should require an explicit `(Y)` press.
+    default: Option<ConfirmAction>,
+}
+
+impl ConfirmPrompt {
+    /// Build a yes/no confirmation with `question` as the body line.
+    ///
+    /// Defaults: `Y` → Yes, `N` → No, no Enter default,
+    /// **cancellable on** (Esc returns `Cancelled`). Customise via
+    /// the chained builder methods. Use multiple `.body(...)` calls if
+    /// the question spans paragraphs — `ConfirmPrompt::body` mirrors
+    /// `ChoicePrompt::body` so wrap and blank-line preservation behave
+    /// identically.
+    pub fn new(question: impl Into<String>) -> Self {
+        // Keys are stored lowercase by `PromptKey::char`, so passing
+        // 'y'/'n' here picks up `from_input`'s case-insensitive match
+        // for free — `Y` and `y` both reach the same arm in `handle`.
+        let inner = ChoicePrompt::new()
+            .body(question)
+            .choice('y', ConfirmAction::Yes, "Yes")
+            .choice('n', ConfirmAction::No, "No")
+            .cancellable(true);
+        Self {
+            inner,
+            default: None,
+        }
+    }
+
+    /// Append another body paragraph (delegates to
+    /// [`ChoicePrompt::body`]). Useful for the SPEC §4.5
+    /// "dangerous-action copy" requirement — a stark second line like
+    /// `"This cannot be undone."` reads better as its own paragraph
+    /// than concatenated to the question.
+    pub fn body(mut self, line: impl Into<String>) -> Self {
+        self.inner = self.inner.body(line);
+        self
+    }
+
+    /// Replace the default `"Yes"` label on the affirmative choice
+    /// (e.g. `"Delete the save"`). The hotkey stays `Y` — relabelling
+    /// does not change the binding, which keeps muscle memory honest
+    /// across games.
+    pub fn yes_label(mut self, label: impl Into<String>) -> Self {
+        // Index 0 is the `Yes` row by construction in `new`. The
+        // pattern match keeps us from blowing up if a future refactor
+        // changes the order; we silently ignore rather than panic so
+        // builder chains stay safe to inspect mid-construction (see
+        // the rationale on `ChoicePrompt::disabled_if`).
+        if let Some(choice) = self.inner.choices.get_mut(0) {
+            choice.label = label.into();
+        }
+        self
+    }
+
+    /// Replace the default `"No"` label on the negative choice (e.g.
+    /// `"Keep the save"`). See [`ConfirmPrompt::yes_label`] for the
+    /// rationale on why the hotkey stays `N`.
+    pub fn no_label(mut self, label: impl Into<String>) -> Self {
+        if let Some(choice) = self.inner.choices.get_mut(1) {
+            choice.label = label.into();
+        }
+        self
+    }
+
+    /// Configure the Enter-default outcome. Pass `Some(action)` to
+    /// make Enter return that confirmation, `None` to clear it. The
+    /// setter form (rather than two separate marker methods) lets
+    /// authors express dynamic policies like
+    /// `default(if dangerous { None } else { Some(ConfirmAction::Yes) })`
+    /// without an `if`/`else` branching the chain.
+    pub fn default(mut self, action: Option<ConfirmAction>) -> Self {
+        self.default = action;
+        self
+    }
+
+    /// Convenience: make Enter confirm Yes. Equivalent to
+    /// `.default(Some(ConfirmAction::Yes))`. Use for low-stakes prompts
+    /// where the "obvious" answer is to proceed.
+    pub fn default_yes(self) -> Self {
+        self.default(Some(ConfirmAction::Yes))
+    }
+
+    /// Convenience: make Enter confirm No. Equivalent to
+    /// `.default(Some(ConfirmAction::No))`. Use for high-stakes prompts
+    /// where a stray Enter must NOT proceed (delete confirmations,
+    /// destructive game actions). SPEC §4.5's "dangerous-action copy"
+    /// guidance pairs naturally with this — copy says "are you sure?"
+    /// while the default-no policy makes the safe answer the cheap one.
+    pub fn default_no(self) -> Self {
+        self.default(Some(ConfirmAction::No))
+    }
+
+    /// Toggle Esc cancellation. Defaults to `true` — see the type doc
+    /// for why `ConfirmPrompt` inverts `ChoicePrompt::cancellable`'s
+    /// default.
+    pub fn cancellable(mut self, cancellable: bool) -> Self {
+        self.inner = self.inner.cancellable(cancellable);
+        self
+    }
+
+    /// Replace the footer line (delegates to [`ChoicePrompt::footer`]).
+    /// Common use: `"Press Enter to confirm."` when an Enter default is
+    /// set, so the cue is part of the rendered prompt rather than
+    /// implicit.
+    pub fn footer(mut self, footer: impl Into<String>) -> Self {
+        self.inner = self.inner.footer(footer);
+        self
+    }
+
+    /// Set the modal title (delegates to [`ChoicePrompt::title`]).
+    /// Only the bordered modal layout reads it; compact unboxed mode
+    /// ignores titles, mirroring `ChoicePrompt`.
+    pub fn title(mut self, title: impl Into<String>) -> Self {
+        self.inner = self.inner.title(title);
+        self
+    }
+
+    /// Borrow the underlying [`ChoicePrompt`] for renderer access in
+    /// custom screens. Crate-private because the public surface is
+    /// `render`/`render_modal`; this hook exists for the optional
+    /// `PromptScreen` adapter (Task 7) without committing to a stable
+    /// public projection of the wrapped prompt.
+    #[allow(dead_code)]
+    pub(crate) fn inner(&self) -> &ChoicePrompt<ConfirmAction> {
+        &self.inner
+    }
+
+    /// Send one [`Input`] through the prompt and return a typed
+    /// [`ConfirmOutcome`].
+    ///
+    /// Resolution order:
+    ///
+    /// 1. **Enter with a configured default** → returns the default's
+    ///    matching outcome. Checked first so the Enter default beats
+    ///    `ChoicePrompt::handle`'s own Enter handling (which would be
+    ///    a no-op here because we never enable navigation mode on the
+    ///    inner prompt).
+    /// 2. Everything else flows through [`ChoicePrompt::handle`] and
+    ///    is projected from [`PromptAction`] to [`ConfirmOutcome`].
+    ///    `Disabled` and `ConfirmRequested` cannot occur in practice
+    ///    (we never disable a row, never declare confirm-requested
+    ///    semantics) but we collapse them to `None` defensively rather
+    ///    than panicking, in case a future refactor adds a disabled
+    ///    "confirm with override" branch.
+    pub fn handle(&self, input: Input) -> ConfirmOutcome {
+        if matches!(input, Input::Enter) {
+            if let Some(default) = self.default {
+                return match default {
+                    ConfirmAction::Yes => ConfirmOutcome::Yes,
+                    ConfirmAction::No => ConfirmOutcome::No,
+                };
+            }
+        }
+        match self.inner.handle(input) {
+            PromptAction::Selected(ConfirmAction::Yes) => ConfirmOutcome::Yes,
+            PromptAction::Selected(ConfirmAction::No) => ConfirmOutcome::No,
+            PromptAction::Cancelled => ConfirmOutcome::Cancelled,
+            PromptAction::None
+            | PromptAction::Disabled { .. }
+            | PromptAction::ConfirmRequested(_) => ConfirmOutcome::None,
+        }
+    }
+
+    /// Render the confirmation in compact unboxed mode (delegates to
+    /// [`ChoicePrompt::render`]). Returns the number of rows written.
+    pub fn render(&self, area: Rect, buf: &mut Buffer) -> u16 {
+        self.inner.render(area, buf)
+    }
+
+    /// Render the confirmation as a bordered modal (delegates to
+    /// [`ChoicePrompt::render_modal`]). Returns the number of inner
+    /// content rows written, excluding the border.
+    pub fn render_modal(&self, area: Rect, buf: &mut Buffer) -> u16 {
+        self.inner.render_modal(area, buf)
+    }
+}
+
 /// A reusable narration / status fragment rendered above a prompt
 /// (SPEC_v1_1.md §4.7).
 ///
@@ -4061,5 +4335,137 @@ mod tests {
                 "with_role MUST NOT alter unrelated roles; {role:?} drifted"
             );
         }
+    }
+
+    // -- ConfirmPrompt (Task 6a) --------------------------------------
+    //
+    // SPEC §4.5 fixes the contract: render a question, two-or-three-way
+    // choices, optional Enter default, typed yes/no/cancel outcomes.
+    // These tests pin the four behaviours the checklist calls out — `y`,
+    // `n`, Esc, and the Enter-default policy — plus the boundary cases
+    // (case-insensitive hotkeys, Enter without a default, resize ignored)
+    // a regression in the inner reducer would silently break.
+
+    #[test]
+    fn confirm_prompt_y_returns_yes_case_insensitive() {
+        let prompt = ConfirmPrompt::new("Delete the save?");
+        assert_eq!(prompt.handle(Input::Char('y')), ConfirmOutcome::Yes);
+        // Case-insensitive matching is inherited from `PromptKey::char`'s
+        // lowercasing — pin it here so a future "store as authored" change
+        // would have to update this test too, not just the storage.
+        assert_eq!(prompt.handle(Input::Char('Y')), ConfirmOutcome::Yes);
+    }
+
+    #[test]
+    fn confirm_prompt_n_returns_no_case_insensitive() {
+        let prompt = ConfirmPrompt::new("Delete the save?");
+        assert_eq!(prompt.handle(Input::Char('n')), ConfirmOutcome::No);
+        assert_eq!(prompt.handle(Input::Char('N')), ConfirmOutcome::No);
+    }
+
+    #[test]
+    fn confirm_prompt_esc_cancels_by_default() {
+        // SPEC §4.5: yes/no/cancel. ConfirmPrompt inverts ChoicePrompt's
+        // default-off cancellable so Esc means "back out" without an
+        // explicit opt-in.
+        let prompt = ConfirmPrompt::new("Delete the save?");
+        assert_eq!(prompt.handle(Input::Esc), ConfirmOutcome::Cancelled);
+    }
+
+    #[test]
+    fn confirm_prompt_esc_no_op_when_cancellation_disabled() {
+        // The inverse of the default — confirms the builder genuinely
+        // toggles the underlying ChoicePrompt::cancellable flag rather
+        // than hard-wiring Esc handling in `handle`.
+        let prompt = ConfirmPrompt::new("Confirm quit?").cancellable(false);
+        assert_eq!(prompt.handle(Input::Esc), ConfirmOutcome::None);
+    }
+
+    #[test]
+    fn confirm_prompt_enter_without_default_is_noop() {
+        // SPEC §4.5: Enter-default is "when configured". Without a
+        // default, Enter must not silently pick yes — that would create
+        // a phantom confirmation on a stray keypress.
+        let prompt = ConfirmPrompt::new("Delete the save?");
+        assert_eq!(prompt.handle(Input::Enter), ConfirmOutcome::None);
+    }
+
+    #[test]
+    fn confirm_prompt_default_yes_makes_enter_confirm() {
+        let prompt = ConfirmPrompt::new("Continue?").default_yes();
+        assert_eq!(prompt.handle(Input::Enter), ConfirmOutcome::Yes);
+        // Hotkeys still work alongside the default — Enter is *additive*,
+        // not a replacement for direct-key matching.
+        assert_eq!(prompt.handle(Input::Char('n')), ConfirmOutcome::No);
+    }
+
+    #[test]
+    fn confirm_prompt_default_no_makes_enter_decline() {
+        // Dangerous-action default: Enter declines so a stray keypress
+        // never destroys progress. SPEC §4.5 calls this out explicitly.
+        let prompt = ConfirmPrompt::new("Delete the save?").default_no();
+        assert_eq!(prompt.handle(Input::Enter), ConfirmOutcome::No);
+        assert_eq!(prompt.handle(Input::Char('y')), ConfirmOutcome::Yes);
+    }
+
+    #[test]
+    fn confirm_prompt_resize_is_ignored() {
+        // SPEC §4.4: `Resize` MUST NOT select a choice. ConfirmPrompt
+        // inherits this through `ChoicePrompt::handle` — pin it here so
+        // a future direct match on Input in ConfirmPrompt::handle does
+        // not accidentally re-introduce a resize-as-confirm bug.
+        let prompt = ConfirmPrompt::new("Continue?").default_yes();
+        assert_eq!(
+            prompt.handle(Input::Resize {
+                width: 80,
+                height: 24
+            }),
+            ConfirmOutcome::None
+        );
+    }
+
+    #[test]
+    fn confirm_prompt_unknown_key_is_ignored() {
+        let prompt = ConfirmPrompt::new("Continue?");
+        assert_eq!(prompt.handle(Input::Char('q')), ConfirmOutcome::None);
+        assert_eq!(prompt.handle(Input::Unknown), ConfirmOutcome::None);
+    }
+
+    #[test]
+    fn confirm_prompt_labels_are_customisable_without_changing_keys() {
+        // Custom labels — body words like "Delete the save" — still bind
+        // to Y/N. Hotkey identity is the SPEC §4.5 contract; the visible
+        // label is pure presentation.
+        let prompt = ConfirmPrompt::new("Delete the save?")
+            .yes_label("Delete it")
+            .no_label("Keep it");
+        let inner = prompt.inner();
+        assert_eq!(inner.choices[0].key, PromptKey::Char('y'));
+        assert_eq!(inner.choices[0].label, "Delete it");
+        assert_eq!(inner.choices[1].key, PromptKey::Char('n'));
+        assert_eq!(inner.choices[1].label, "Keep it");
+    }
+
+    #[test]
+    fn confirm_prompt_renders_question_and_choices() {
+        // Smoke test that delegation to ChoicePrompt's renderer
+        // produces the expected row stream — the question as body, the
+        // (Y) and (N) choice rows, and the default prompt label. We
+        // assert containment rather than exact equality because the
+        // upstream renderer's row format is already byte-pinned by its
+        // own tests.
+        let prompt = ConfirmPrompt::new("Delete the save?");
+        let rows = prompt.inner().rendered_lines(40);
+        let joined = rows.join("\n");
+        assert!(
+            joined.contains("Delete the save?"),
+            "body missing: {joined:?}"
+        );
+        assert!(joined.contains("(Y) Yes"), "yes row missing: {joined:?}");
+        assert!(joined.contains("(N) No"), "no row missing: {joined:?}");
+        assert!(
+            joined.contains("Your choice:"),
+            "prompt label missing: {joined:?}"
+        );
     }
 }
