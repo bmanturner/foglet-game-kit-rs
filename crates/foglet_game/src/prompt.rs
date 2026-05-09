@@ -849,6 +849,165 @@ impl<T> ChoicePrompt<T> {
         // handler will continue to fire on the current (still-enabled)
         // row.
     }
+
+    /// Default prompt-line label rendered after the choice list in
+    /// compact unboxed mode (SPEC_v1_1.md §4.3, §4.8). Returns the
+    /// SPEC's example text `"Your choice:"`. Customisation hooks
+    /// (`>`, `"Choice:"`, …) are reserved for the Task 5e/5f layout
+    /// surface; carving the value out as its own method now means the
+    /// rendering pipeline already reads from a single source of truth
+    /// when that lands.
+    fn prompt_label_text(&self) -> &str {
+        "Your choice:"
+    }
+
+    /// Render the prompt as one [`String`] per visual row in the
+    /// **compact unboxed** layout (SPEC_v1_1.md §4.8 — the bordered
+    /// modal layout lands in Task 5e).
+    ///
+    /// Row order, top to bottom:
+    ///
+    /// 1. Wrapped body lines (using [`TextBlock`]'s wrap rules so the
+    ///    same blank-line preservation applies).
+    /// 2. A single blank row separating body and choices, but only when
+    ///    both are present — empty bodies do not push a stray gap onto
+    ///    a top-of-screen prompt.
+    /// 3. Each choice as `"({KEY}) {label}"`, wrapped to `width`. The
+    ///    marker is uppercased per SPEC §4.1's "canonical display keys
+    ///    SHOULD store as uppercase when rendered". Disabled-row
+    ///    formatting (the `- [M] … (full)` marker family) and the
+    ///    selected-row marker layer in on top in Tasks 5c and 5d.
+    /// 4. Optional footer, preceded by one blank row when anything has
+    ///    already been rendered.
+    /// 5. A blank row plus the prompt label (`"Your choice:"`) when the
+    ///    prompt has at least one choice. SPEC §4.3's example
+    ///    rendering ends with that label, and a choiceless prompt
+    ///    (used as a pure narration block) skips it so the layout does
+    ///    not invite a key the prompt cannot accept.
+    ///
+    /// Width `0` returns an empty `Vec` so callers with a degenerate
+    /// area do not panic — SPEC §6 forbids that. The `render`
+    /// companion calls back into this method, so width handling stays
+    /// in one place.
+    pub fn rendered_lines(&self, width: u16) -> Vec<String> {
+        if width == 0 {
+            return Vec::new();
+        }
+        let mut rows: Vec<String> = Vec::new();
+
+        // 1. Body — re-use `TextBlock`'s wrap so blank-line
+        //    preservation, hard-break-on-overlong-word, and the
+        //    deterministic-under-`TestBackend` contract carry through
+        //    without a second implementation drifting from the first.
+        let body = TextBlock::from_lines(self.body.iter().cloned());
+        rows.extend(body.wrapped_rows(width));
+
+        // 2. Body→choices gap.
+        if !rows.is_empty() && !self.choices.is_empty() {
+            rows.push(String::new());
+        }
+
+        // 3. Choices.
+        for choice in &self.choices {
+            let line = format_choice_row(choice);
+            // Wrap the choice line itself so a long label on a narrow
+            // terminal still fits without truncation. Going through
+            // `TextBlock::new` here (rather than a one-off wrap call)
+            // mirrors the body path so the wrap policy stays a single
+            // implementation.
+            rows.extend(TextBlock::new(&line).wrapped_rows(width));
+        }
+
+        // 4. Footer.
+        if let Some(footer) = self.footer.as_deref() {
+            if !rows.is_empty() {
+                rows.push(String::new());
+            }
+            rows.extend(TextBlock::new(footer).wrapped_rows(width));
+        }
+
+        // 5. Prompt label.
+        if !self.choices.is_empty() {
+            rows.push(String::new());
+            rows.extend(TextBlock::new(self.prompt_label_text()).wrapped_rows(width));
+        }
+
+        rows
+    }
+
+    /// Render the prompt into `area` of `buf`, top-down, in the
+    /// compact unboxed layout. Returns the number of visual rows
+    /// actually written (clamped to `area.height`).
+    ///
+    /// Lines past the available height are silently clipped — SPEC §6
+    /// forbids panicking on small areas, and overflow handling for the
+    /// bordered modal layout lives in Task 5e. Style application is a
+    /// Task 5f concern; today every cell is written with the buffer's
+    /// default style so `TestBackend` assertions read as plain ASCII.
+    pub fn render(&self, area: Rect, buf: &mut Buffer) -> u16 {
+        if area.width == 0 || area.height == 0 {
+            return 0;
+        }
+        let rows = self.rendered_lines(area.width);
+        let drawn = rows.len().min(area.height as usize);
+        for (i, row) in rows.iter().take(drawn).enumerate() {
+            let y = area.y + i as u16;
+            buf.set_stringn(
+                area.x,
+                y,
+                row,
+                area.width as usize,
+                ratatui::style::Style::default(),
+            );
+        }
+        drawn as u16
+    }
+}
+
+/// Format a single choice row in the SPEC §4.3 `(K) Label` style.
+///
+/// Char hotkeys render as their uppercase glyph between parentheses
+/// (SPEC §4.1: "canonical display keys SHOULD store as uppercase when
+/// rendered"). The exotic `Enter`/`Esc` choice keys — legal at the
+/// data level (see `validate_choices_treats_enter_and_esc_…`) but
+/// uncommon — render as their human-readable name so the marker still
+/// communicates the binding.
+///
+/// Hint text is appended after a two-space gutter so dynamic
+/// annotations like `"50g"` or `"0/26"` (SPEC §5 vendor example) sit
+/// alongside the label without a separate column. Disabled-reason
+/// formatting is intentionally minimal here — Task 5c will replace the
+/// trailing `(reason)` annotation with the SPEC §4.2 monochrome marker
+/// (`- [M] Mana potions … (full)`); for Task 5b the inline form keeps
+/// the reason visible without panicking on prompts that already carry
+/// disabled rows.
+fn format_choice_row<T>(choice: &PromptChoice<T>) -> String {
+    let mut row = format!("({}) {}", marker_glyph(&choice.key), choice.label);
+    if let Some(hint) = choice.hint.as_deref() {
+        row.push_str("  ");
+        row.push_str(hint);
+    }
+    if !choice.enabled {
+        if let Some(reason) = choice.disabled_reason.as_deref() {
+            row.push_str("  (");
+            row.push_str(reason);
+            row.push(')');
+        }
+    }
+    row
+}
+
+/// Pick the display glyph for a [`PromptKey`] inside the `(K)` marker.
+/// Char keys uppercase the stored lowercase form (SPEC §4.1's display
+/// rule); `Enter`/`Esc` render as their name so the marker is still
+/// legible if a prompt binds them. The free-function form keeps the
+/// formatter testable without an instance.
+fn marker_glyph(key: &PromptKey) -> String {
+    match key {
+        PromptKey::Char(c) => c.to_ascii_uppercase().to_string(),
+        PromptKey::Enter => "Enter".to_string(),
+        PromptKey::Esc => "Esc".to_string(),
+    }
 }
 
 /// Internal direction marker for [`ChoicePrompt::step_selection`].
@@ -2651,5 +2810,265 @@ mod tests {
         assert!(!choice.enabled);
         assert_eq!(choice.hint.as_deref(), Some("50g"));
         assert_eq!(choice.disabled_reason.as_deref(), Some("need 50g"));
+    }
+
+    // -- Task 5b: compact unboxed ChoicePrompt rendering -------------
+
+    /// Render a `ChoicePrompt` through `TestBackend` and return one
+    /// trimmed-trailing `String` per visible row. Mirrors the helper
+    /// used for `TextBlock` so the two render paths assert against the
+    /// same backend semantics.
+    fn render_prompt_to_strings<T>(prompt: &ChoicePrompt<T>, w: u16, h: u16) -> Vec<String> {
+        use ratatui::{backend::TestBackend, Terminal};
+        let backend = TestBackend::new(w, h);
+        let mut term = Terminal::new(backend).expect("test backend");
+        term.draw(|frame| {
+            let area = frame.area();
+            prompt.render(area, frame.buffer_mut());
+        })
+        .expect("draw");
+        let buf = term.backend().buffer().clone();
+        (0..h)
+            .map(|y| {
+                let mut row = String::new();
+                for x in 0..w {
+                    row.push_str(buf[(x, y)].symbol());
+                }
+                row.trim_end().to_string()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn rendered_lines_matches_spec_4_3_giant_spider_example() {
+        // SPEC §4.3 reference rendering, modulo the typed-letter trail
+        // ("Your choice: e" — the `e` is the player's typed input,
+        // which the renderer never produces). The renderer's job ends
+        // at the prompt label.
+        let prompt: ChoicePrompt<LootAction> = ChoicePrompt::new()
+            .body("You found this on the Giant Spider's corpse.")
+            .choice('e', LootAction::Equip, "Equip immediately")
+            .choice('t', LootAction::Take, "Take to inventory")
+            .choice('p', LootAction::Pass, "Pass");
+
+        let rows = prompt.rendered_lines(60);
+        assert_eq!(
+            rows,
+            vec![
+                "You found this on the Giant Spider's corpse.".to_string(),
+                String::new(),
+                "(E) Equip immediately".to_string(),
+                "(T) Take to inventory".to_string(),
+                "(P) Pass".to_string(),
+                String::new(),
+                "Your choice:".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn rendered_lines_uppercases_marker_for_lowercase_or_uppercase_input() {
+        // SPEC §4.1: storage is lowercase, display is uppercase. The
+        // builder normalises `'E'` to `'e'` on the way in, and the
+        // renderer normalises back on the way out, regardless of which
+        // case the author typed.
+        let prompt: ChoicePrompt<LootAction> = ChoicePrompt::new()
+            .choice('E', LootAction::Equip, "Equip")
+            .choice('t', LootAction::Take, "Take");
+
+        let rows = prompt.rendered_lines(40);
+        assert_eq!(rows[0], "(E) Equip");
+        assert_eq!(rows[1], "(T) Take");
+    }
+
+    #[test]
+    fn rendered_lines_matches_spec_9_lost_and_found_example() {
+        // SPEC §9 Murder Motel proof scene: four direct-key choices,
+        // `Your choice:` label. The renderer's compact mode is the
+        // contract that scene relies on once Task 10 wires it up.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        enum Drawer {
+            Key,
+            Match,
+            Receipt,
+            Leave,
+        }
+        let prompt: ChoicePrompt<Drawer> = ChoicePrompt::new()
+            .choice('k', Drawer::Key, "Take the Room 7 key")
+            .choice('m', Drawer::Match, "Pocket the matchbook")
+            .choice('r', Drawer::Receipt, "Read the receipt")
+            .choice('l', Drawer::Leave, "Leave it alone");
+
+        let rows = prompt.rendered_lines(60);
+        assert_eq!(
+            rows,
+            vec![
+                "(K) Take the Room 7 key".to_string(),
+                "(M) Pocket the matchbook".to_string(),
+                "(R) Read the receipt".to_string(),
+                "(L) Leave it alone".to_string(),
+                String::new(),
+                "Your choice:".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn rendered_lines_includes_optional_footer_with_blank_gap() {
+        // SPEC §5 vendor example footer (`Your gold: 173g`) sits below
+        // the choices, separated by a blank row, and BEFORE the prompt
+        // label so the cost annotation is the last context the player
+        // sees before typing.
+        let prompt: ChoicePrompt<LootAction> = ChoicePrompt::new()
+            .choice('e', LootAction::Equip, "Equip")
+            .footer("Your gold: 173g");
+
+        let rows = prompt.rendered_lines(40);
+        assert_eq!(
+            rows,
+            vec![
+                "(E) Equip".to_string(),
+                String::new(),
+                "Your gold: 173g".to_string(),
+                String::new(),
+                "Your choice:".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn rendered_lines_preserves_explicit_blank_lines_in_body() {
+        // Multi-paragraph body via two `.body(...)` calls. The
+        // `from_lines` path inside the renderer emits one blank visual
+        // row between them — matching the SPEC §4.7 contract that the
+        // `TextBlock` tests already pin down.
+        let prompt: ChoicePrompt<LootAction> = ChoicePrompt::new()
+            .body("first")
+            .body("")
+            .body("second")
+            .choice('e', LootAction::Equip, "Equip");
+
+        let rows = prompt.rendered_lines(40);
+        assert_eq!(
+            rows,
+            vec![
+                "first".to_string(),
+                String::new(),
+                "second".to_string(),
+                String::new(),
+                "(E) Equip".to_string(),
+                String::new(),
+                "Your choice:".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn rendered_lines_omits_prompt_label_when_no_choices() {
+        // A choiceless prompt is a pure narration block — the
+        // `Your choice:` label would invite a key press the prompt has
+        // no handler for, so the renderer drops it.
+        let prompt: ChoicePrompt<LootAction> = ChoicePrompt::new().body("narration only");
+        let rows = prompt.rendered_lines(40);
+        assert_eq!(rows, vec!["narration only".to_string()]);
+    }
+
+    #[test]
+    fn rendered_lines_zero_width_returns_no_rows_and_does_not_panic() {
+        // SPEC §6: prompt rendering MUST NOT panic on small areas. A
+        // zero-width slot is the worst case the bordered-modal path in
+        // Task 5e will hand us; pinning it now keeps the contract
+        // honest before that layout lands.
+        let prompt: ChoicePrompt<LootAction> =
+            ChoicePrompt::new()
+                .body("body")
+                .choice('e', LootAction::Equip, "Equip");
+        assert!(prompt.rendered_lines(0).is_empty());
+    }
+
+    #[test]
+    fn render_writes_rows_under_test_backend() {
+        // SPEC §6: deterministic output under `TestBackend`. Drives the
+        // full `render` path (not just the helper) so a future
+        // off-by-one in `Buffer` indexing surfaces here, not during a
+        // Murder Motel smoke test.
+        let prompt: ChoicePrompt<LootAction> = ChoicePrompt::new()
+            .body("You found this on the Giant Spider's corpse.")
+            .choice('e', LootAction::Equip, "Equip immediately")
+            .choice('t', LootAction::Take, "Take to inventory")
+            .choice('p', LootAction::Pass, "Pass");
+
+        let rows = render_prompt_to_strings(&prompt, 60, 8);
+        assert_eq!(
+            rows,
+            vec![
+                "You found this on the Giant Spider's corpse.".to_string(),
+                String::new(),
+                "(E) Equip immediately".to_string(),
+                "(T) Take to inventory".to_string(),
+                "(P) Pass".to_string(),
+                String::new(),
+                "Your choice:".to_string(),
+                String::new(),
+            ]
+        );
+    }
+
+    #[test]
+    fn render_clips_when_height_exceeded_without_panic() {
+        // SPEC §6: clip rather than panic when the prompt is taller
+        // than the slot. Returning the actually-drawn count lets the
+        // caller layout below us; the buffer must still be filled
+        // top-down with the rows that fit.
+        let prompt: ChoicePrompt<LootAction> = ChoicePrompt::new()
+            .body("body")
+            .choice('a', LootAction::Equip, "alpha")
+            .choice('b', LootAction::Take, "beta")
+            .choice('c', LootAction::Pass, "gamma");
+        let area = Rect::new(0, 0, 20, 2);
+        let mut buf = Buffer::empty(area);
+        let drawn = prompt.render(area, &mut buf);
+        assert_eq!(drawn, 2);
+        let row0: String = (0..area.width).map(|x| buf[(x, 0)].symbol()).collect();
+        let row1: String = (0..area.width).map(|x| buf[(x, 1)].symbol()).collect();
+        assert_eq!(row0.trim_end(), "body");
+        assert_eq!(row1.trim_end(), "");
+    }
+
+    #[test]
+    fn render_zero_area_is_a_noop() {
+        // Defensive — a 0×0 inner rect must not panic. The bordered
+        // modal renderer in Task 5e relies on this guarantee.
+        let prompt: ChoicePrompt<LootAction> =
+            ChoicePrompt::new()
+                .body("anything")
+                .choice('e', LootAction::Equip, "Equip");
+        let area = Rect::new(0, 0, 0, 0);
+        let mut buf = Buffer::empty(Rect::new(0, 0, 4, 4));
+        assert_eq!(prompt.render(area, &mut buf), 0);
+    }
+
+    #[test]
+    fn rendered_lines_wraps_long_choice_label_at_word_boundary() {
+        // SPEC §6: truncation OR wrapping at terminal width. A label
+        // wider than the slot must wrap rather than overflow — the
+        // greedy whitespace policy from `TextBlock` is the same one we
+        // re-use, so behaviour stays consistent across body and
+        // choice rows.
+        let prompt: ChoicePrompt<LootAction> = ChoicePrompt::new().choice(
+            'e',
+            LootAction::Equip,
+            "Equip the very long sword of overflow",
+        );
+        let rows = prompt.rendered_lines(20);
+        // "(E) Equip the very" is 18 cols, "long sword of" is 13,
+        // "overflow" is 8. The exact split is the wrapper's policy;
+        // pinning the *count* (3 wrapped lines + blank + label) is
+        // what the renderer guarantees.
+        assert!(rows.len() >= 3);
+        for row in rows.iter() {
+            assert!(row.chars().count() <= 20, "row {row:?} exceeds width 20");
+        }
+        assert_eq!(rows.last().map(String::as_str), Some("Your choice:"));
     }
 }
