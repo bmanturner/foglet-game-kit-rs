@@ -15,6 +15,18 @@ See [`SPEC.md`](SPEC.md) for the full contract.
 - **`foglet_game`** — terminal guard with panic-safe restoration, a
   screen-stack runtime, input normalization, save manager with atomic
   writes, ASCII map and YAML dialog primitives, and ratatui widgets.
+  v2.1 layers on **authoring ergonomics** so games stop hand-rolling
+  the same glue: `SaveSlot<T>` (typed shared save handle with a dirty
+  flag, `load_or_default`, and a `save_handler` closure for runtime
+  persistence), `DialogScreen` (a `Screen` adapter over the YAML
+  dialog runner that mirrors `PromptScreen<T>` and supports
+  modal/compact layouts), modal layout helpers (`centred_rect`,
+  `render_modal`, `render_hint_line`), and `Game::with_save_handler`
+  so persistence runs inside the terminal guard's lifetime instead of
+  a manual tail in `main`. See
+  [`docs/save-and-state.md`](docs/save-and-state.md) and
+  [`docs/dialog-screens.md`](docs/dialog-screens.md) for when to reach
+  for each.
 - **`fgk`** — `new` (scaffolder), `emit-manifest` (Foglet operator
   JSON), and `package` (deployable bundle with a boring auditable
   `run.sh` wrapper).
@@ -246,6 +258,10 @@ DECISIONS.md     # ADRs for crate-budget and architecture deviations
 docs/
   foglet-install.md     # operator-facing install walkthrough
   terminal-safety.md    # SPEC §13.1 evidence and recipes
+  save-and-state.md     # save manager + v2.1 SaveSlot<T> guidance
+  prompt-screens.md     # PromptScreen<T> authoring guide
+  dialog-screens.md     # v2.1 DialogScreen authoring guide
+  shared-world.md       # v2 shared-world schema and ops
 ```
 
 ## Development
