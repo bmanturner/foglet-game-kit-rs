@@ -415,6 +415,70 @@ RETURNING id, created_at, sender_player_id, recipient_player_id, \
             )
             .map_err(|source| NoticeError::Sqlite { source })
     }
+
+    /// Return the recipient's active inbox, newest first
+    /// (SPEC_v3 §4.1 / §Task 3d).
+    ///
+    /// "Active" means `archived_at IS NULL` — archived notices are
+    /// hidden by the default view. A future helper can surface the
+    /// full history (Task 3f's archive UI may want a "show archived"
+    /// toggle); the partial-index split documented on
+    /// [`NOTICES_MIGRATION`] already provides the second covering
+    /// index for that path. Reading vs. unread is *not* a filter here:
+    /// inbox views typically render both, with unread rows styled
+    /// differently. `read_at` is a column on the returned [`Notice`],
+    /// so callers can filter or style without a second query.
+    ///
+    /// # Ordering
+    ///
+    /// `ORDER BY created_at DESC, id DESC` — newest first, with the
+    /// autoincrement `id` as the deterministic tiebreaker when two
+    /// notices land in the same SQLite second. Same shape as
+    /// [`Self::recent_events`] / [`Self::player_events`] so the inbox
+    /// and event log feel consistent in the UI.
+    ///
+    /// The `idx_notices_inbox` partial index covers
+    /// `(recipient_player_id, created_at, id) WHERE archived_at IS
+    /// NULL` exactly — the planner can satisfy this query with a
+    /// reverse index walk and no residual filter.
+    ///
+    /// # Parameters
+    ///
+    /// `recipient_player_id` is the canonical id from
+    /// [`crate::players::PlayerRecord`]. Passing an unknown id is not
+    /// an error: it returns an empty vec, the correct UI behaviour for
+    /// "this player has no notices yet". No limit parameter — SPEC §4.1
+    /// scopes notices "to one game world DB" and the v3 mailbox is
+    /// expected to stay small (per-recipient, archive on read); a
+    /// future paged variant can be added without breaking this
+    /// signature.
+    ///
+    /// # Concurrency
+    ///
+    /// Takes `&self`: a single statement under the configured busy
+    /// timeout, same as [`Self::send_notice`].
+    pub fn inbox(&self, recipient_player_id: i64) -> Result<Vec<Notice>, NoticeError> {
+        // Column order matches `row_to_notice` and the `RETURNING`
+        // clause in `send_notice` — one decoder, one column list,
+        // surfaced as a type error if a future schema edit ever
+        // diverges them.
+        const SQL: &str = "\
+SELECT id, created_at, sender_player_id, recipient_player_id, \
+       kind, subject, body, read_at, archived_at, expires_at, metadata \
+FROM notices \
+WHERE recipient_player_id = ?1 AND archived_at IS NULL \
+ORDER BY created_at DESC, id DESC";
+
+        let mut stmt = self
+            .connection()
+            .prepare(SQL)
+            .map_err(|source| NoticeError::Sqlite { source })?;
+        let rows = stmt
+            .query_map(rusqlite::params![recipient_player_id], row_to_notice)
+            .map_err(|source| NoticeError::Sqlite { source })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|source| NoticeError::Sqlite { source })
+    }
 }
 
 /// Decode a `notices` row into [`Notice`].
@@ -984,6 +1048,184 @@ mod tests {
                 4,
             )
             .expect("4-emoji body must pass a 4-char cap (chars, not bytes)");
+    }
+
+    /// SPEC_v3 §Task 3d: an empty inbox returns an empty vec, not an
+    /// error. A new player with no notices is the dominant first-login
+    /// case — surfacing an error there would force every UI consumer
+    /// to special-case the empty path.
+    #[test]
+    fn inbox_returns_empty_vec_for_player_with_no_notices() {
+        let (_dir, world) = world_with_notices();
+        let alice = world.upsert_player(&ctx("u-a", "alice")).unwrap();
+
+        let notices = world.inbox(alice.id).expect("inbox runs");
+        assert!(notices.is_empty(), "fresh inbox must be empty");
+    }
+
+    /// SPEC_v3 §Task 3d headline: the inbox returns the recipient's
+    /// notices newest first, with `id` breaking ties when two notices
+    /// land in the same SQLite second. Mirrors the
+    /// `recent_events_returns_newest_first_with_id_tiebreak` contract
+    /// for the event log so the two feeds feel consistent in the UI.
+    ///
+    /// Also pins the recipient scope: a notice addressed to `bob`
+    /// MUST NOT appear in `alice`'s inbox. A regression that dropped
+    /// the `WHERE recipient_player_id = ?` clause would silently leak
+    /// every player's mail to every player.
+    #[test]
+    fn inbox_returns_newest_first_scoped_to_recipient() {
+        let (_dir, world) = world_with_notices();
+        let alice = world.upsert_player(&ctx("u-a", "alice")).unwrap();
+        let bob = world.upsert_player(&ctx("u-b", "bob")).unwrap();
+
+        // Three notices to bob, sent in order — created_at defaults
+        // to CURRENT_TIMESTAMP (second resolution), so the id
+        // tiebreaker MUST kick in to pin the order.
+        let n1 = world
+            .send_notice(
+                Some(alice.id),
+                bob.id,
+                "k",
+                "first",
+                "b1",
+                None,
+                None,
+                1_000,
+            )
+            .unwrap();
+        let n2 = world
+            .send_notice(
+                Some(alice.id),
+                bob.id,
+                "k",
+                "second",
+                "b2",
+                None,
+                None,
+                1_000,
+            )
+            .unwrap();
+        let n3 = world
+            .send_notice(None, bob.id, "k", "third (system)", "b3", None, None, 1_000)
+            .unwrap();
+        // One notice to alice — must not appear in bob's inbox.
+        let _to_alice = world
+            .send_notice(
+                Some(bob.id),
+                alice.id,
+                "k",
+                "for alice",
+                "ba",
+                None,
+                None,
+                1_000,
+            )
+            .unwrap();
+
+        let inbox = world.inbox(bob.id).expect("inbox runs");
+        assert_eq!(
+            inbox.iter().map(|n| n.id).collect::<Vec<_>>(),
+            vec![n3.id, n2.id, n1.id],
+            "inbox must be newest-first with id tiebreak"
+        );
+        assert!(
+            inbox.iter().all(|n| n.recipient_player_id == bob.id),
+            "inbox must be scoped to the recipient"
+        );
+
+        // Alice's inbox sees only her one notice.
+        let alice_inbox = world.inbox(alice.id).expect("alice inbox runs");
+        assert_eq!(alice_inbox.len(), 1);
+        assert_eq!(alice_inbox[0].subject, "for alice");
+    }
+
+    /// SPEC_v3 §Task 3d: the *default* inbox excludes archived
+    /// notices — that's what makes Task 3f's archive button
+    /// meaningful. Pinned here even though `archive_notice` itself
+    /// lands in 3f: we exercise the filter by hand-flipping
+    /// `archived_at` so the contract is locked before any helper that
+    /// flips it lands.
+    #[test]
+    fn inbox_excludes_archived_notices() {
+        let (_dir, world) = world_with_notices();
+        let alice = world.upsert_player(&ctx("u-a", "alice")).unwrap();
+        let bob = world.upsert_player(&ctx("u-b", "bob")).unwrap();
+
+        let kept = world
+            .send_notice(Some(alice.id), bob.id, "k", "kept", "b", None, None, 1_000)
+            .unwrap();
+        let archived = world
+            .send_notice(
+                Some(alice.id),
+                bob.id,
+                "k",
+                "archived",
+                "b",
+                None,
+                None,
+                1_000,
+            )
+            .unwrap();
+
+        // Hand-flip archived_at; Task 3f's helper will replace this.
+        world
+            .connection()
+            .execute(
+                "UPDATE notices SET archived_at = CURRENT_TIMESTAMP WHERE id = ?1",
+                rusqlite::params![archived.id],
+            )
+            .unwrap();
+
+        let inbox = world.inbox(bob.id).expect("inbox runs");
+        assert_eq!(inbox.len(), 1, "archived notices must be hidden");
+        assert_eq!(inbox[0].id, kept.id);
+    }
+
+    /// SPEC_v3 §Task 3d: read notices stay in the default inbox view.
+    /// Inbox UIs typically render unread *and* read mail with
+    /// different styling; filtering on `read_at` here would force
+    /// every consumer through a second query. Pin that an unread+read
+    /// mix surfaces both rows.
+    #[test]
+    fn inbox_includes_read_notices() {
+        let (_dir, world) = world_with_notices();
+        let alice = world.upsert_player(&ctx("u-a", "alice")).unwrap();
+        let bob = world.upsert_player(&ctx("u-b", "bob")).unwrap();
+
+        let read = world
+            .send_notice(Some(alice.id), bob.id, "k", "read", "b", None, None, 1_000)
+            .unwrap();
+        let _unread = world
+            .send_notice(
+                Some(alice.id),
+                bob.id,
+                "k",
+                "unread",
+                "b",
+                None,
+                None,
+                1_000,
+            )
+            .unwrap();
+        world
+            .connection()
+            .execute(
+                "UPDATE notices SET read_at = CURRENT_TIMESTAMP WHERE id = ?1",
+                rusqlite::params![read.id],
+            )
+            .unwrap();
+
+        let inbox = world.inbox(bob.id).expect("inbox runs");
+        assert_eq!(
+            inbox.len(),
+            2,
+            "read notices must remain in the default inbox"
+        );
+        assert!(
+            inbox.iter().any(|n| n.id == read.id && n.read_at.is_some()),
+            "read flag must round-trip"
+        );
     }
 
     /// SPEC_v3 §Task 3c: rejected notices MUST NOT produce a row.
