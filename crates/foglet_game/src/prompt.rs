@@ -63,6 +63,8 @@
 //! the types above land alongside the tasks that exercise them.
 
 use crate::Input;
+use ratatui::buffer::Buffer;
+use ratatui::layout::Rect;
 
 /// Normalized direct-input key for prompts (SPEC_v1_1.md §4.1).
 ///
@@ -1061,6 +1063,245 @@ impl From<char> for PromptKey {
     fn from(c: char) -> Self {
         PromptKey::char(c)
     }
+}
+
+/// A reusable narration / status fragment rendered above a prompt
+/// (SPEC_v1_1.md §4.7).
+///
+/// `TextBlock` is the data shape behind a prompt body: a sequence of
+/// logical lines that the renderer wraps to the supplied area's width
+/// while preserving the author's explicit blank lines as visual gaps.
+/// It carries an optional [`StyleRole`] default so a status block can
+/// declare itself as `Success` / `Error` / `Muted` once instead of
+/// per-line; the role-to-`Style` mapping itself lives in Task 5f and is
+/// intentionally absent here so this task stays focused on layout.
+///
+/// # Wrapping rules
+///
+/// - Logical lines are the entries in [`TextBlock::lines`], which
+///   [`TextBlock::new`] derives by splitting the input on `\n`.
+/// - Each non-empty logical line wraps to the area width on whitespace
+///   boundaries (greedy fill). A single word longer than the width is
+///   hard-broken at the width — terminal output never silently drops
+///   characters.
+/// - An **empty logical line stays empty**: it produces exactly one
+///   blank visual row, regardless of width. This is what SPEC §4.7's
+///   "preserve explicit blank lines" requires, and it matches how
+///   author-written narration uses `\n\n` as a paragraph break.
+/// - A width of `0` collapses to a no-op render (no panic). This keeps
+///   the SPEC §6 "MUST NOT panic on small areas" guarantee true even
+///   when the layout caller hands the body a zero-width slot.
+///
+/// # What this type intentionally does NOT do
+///
+/// - It does not carry per-span styling. Inline emphasis is the job of
+///   [`StyleRole`] applied at the choice/feedback level (Tasks 5c–5f),
+///   not of in-line markup inside a body string.
+/// - It does not own scroll state. SPEC §4.8 lists "optional scrolling
+///   for long bodies" as future scope; the v1.1 prompt rendering MUST
+///   support compact unboxed and bordered modal modes (Tasks 5b, 5e),
+///   both of which clip rather than scroll.
+/// - It does not perform side effects. Rendering only writes cells to
+///   a `Buffer`; the reducer / game state is untouched.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct TextBlock {
+    /// Logical lines, in order. An empty `String` means "render a
+    /// blank visual row" — see the wrapping rules in the type doc.
+    lines: Vec<String>,
+    /// Optional default style role for the whole block. The Task 5f
+    /// theme layer maps this to a `ratatui::style::Style`; until then
+    /// the renderer ignores it (no styling is still SPEC-legal).
+    style: Option<StyleRole>,
+}
+
+impl TextBlock {
+    /// Build a [`TextBlock`] from any string-ish input by splitting on
+    /// `\n`.
+    ///
+    /// `\r\n` is normalised away by stripping a trailing `\r` from each
+    /// line — Windows-authored content stays readable without leaking
+    /// stray carriage returns into the buffer. The split is on the
+    /// **logical** line break, so a leading or trailing `\n` produces
+    /// the empty line the author intended.
+    pub fn new(text: impl AsRef<str>) -> Self {
+        let text = text.as_ref();
+        // `split('\n')` (rather than `lines()`) preserves a trailing
+        // empty line — `"a\n"` becomes `["a", ""]`. SPEC §4.7's
+        // blank-line contract relies on that round-trip behaviour.
+        let lines = text
+            .split('\n')
+            .map(|line| line.strip_suffix('\r').unwrap_or(line).to_string())
+            .collect();
+        Self { lines, style: None }
+    }
+
+    /// Build a [`TextBlock`] from an explicit list of logical lines.
+    ///
+    /// Useful when an author has already split their content (e.g. one
+    /// `String` per generated line of a status block) and does not want
+    /// to re-join with `\n` only to have [`TextBlock::new`] split it
+    /// again.
+    pub fn from_lines<I, S>(lines: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        Self {
+            lines: lines.into_iter().map(Into::into).collect(),
+            style: None,
+        }
+    }
+
+    /// Attach a default semantic [`StyleRole`] to the block.
+    ///
+    /// The theme layer in Task 5f turns this into a Ratatui `Style`;
+    /// today it is a recorded intent the renderer reads when that task
+    /// lands. Storing the role on the data (not on the renderer) keeps
+    /// theming overridable without re-walking the prompt tree.
+    pub fn with_style(mut self, role: StyleRole) -> Self {
+        self.style = Some(role);
+        self
+    }
+
+    /// Logical lines (post-split, pre-wrap). Mostly useful in tests and
+    /// for layout code that needs to know how many paragraphs the body
+    /// carries before it commits to a `Rect`.
+    pub fn lines(&self) -> &[String] {
+        &self.lines
+    }
+
+    /// Default [`StyleRole`] declared via [`TextBlock::with_style`], if
+    /// any.
+    pub fn style(&self) -> Option<StyleRole> {
+        self.style
+    }
+
+    /// Wrap the block's logical lines to the given visual width.
+    ///
+    /// Returns one [`String`] per visual row, in render order. An empty
+    /// logical line yields exactly one empty row; a non-empty line is
+    /// greedily filled at whitespace boundaries, and a word longer than
+    /// `width` is hard-broken so output never silently drops content.
+    ///
+    /// Width `0` returns an empty `Vec` (no panic, no work) — that is
+    /// the contract the bordered modal renderer in Task 5e relies on
+    /// when the caller area is too small to host a body column.
+    pub fn wrapped_rows(&self, width: u16) -> Vec<String> {
+        if width == 0 {
+            return Vec::new();
+        }
+        let width = width as usize;
+        let mut out: Vec<String> = Vec::with_capacity(self.lines.len());
+        for line in &self.lines {
+            if line.is_empty() {
+                // SPEC §4.7: blank lines are preserved as one row.
+                out.push(String::new());
+                continue;
+            }
+            wrap_line_into(line, width, &mut out);
+        }
+        out
+    }
+
+    /// Render the block into `area` of `buf`, top-down. Returns the
+    /// number of visual rows actually written (clamped to
+    /// `area.height`).
+    ///
+    /// Lines past the available height are silently clipped; SPEC §6
+    /// forbids panicking on small areas, and a body that overflows its
+    /// slot is a layout decision for the caller (compact unboxed and
+    /// bordered modes both clip — see Task 5e). The unused `style`
+    /// field is reserved for the Task 5f theme integration; rendering
+    /// today writes cells with the buffer's default style so test
+    /// assertions stay deterministic without the theme present.
+    pub fn render(&self, area: Rect, buf: &mut Buffer) -> u16 {
+        if area.width == 0 || area.height == 0 {
+            return 0;
+        }
+        let rows = self.wrapped_rows(area.width);
+        let drawn = rows.len().min(area.height as usize);
+        for (i, row) in rows.iter().take(drawn).enumerate() {
+            // `set_stringn` truncates if the wrapper produced a row
+            // wider than `area.width` (defence in depth — the wrapper
+            // already enforces this, but a hard-break on a multibyte
+            // boundary would still be safe through `set_stringn`).
+            let y = area.y + i as u16;
+            buf.set_stringn(
+                area.x,
+                y,
+                row,
+                area.width as usize,
+                ratatui::style::Style::default(),
+            );
+        }
+        drawn as u16
+    }
+}
+
+/// Greedy whitespace-boundary wrap for one non-empty logical line.
+///
+/// Pushed-in style avoids a transient `Vec` per line; the caller already
+/// owns the output vector and we just append visual rows. Words longer
+/// than `width` are hard-broken at the width boundary so the renderer
+/// never has to decide between dropping characters and overflowing the
+/// area — SPEC §6's "truncation or wrapping at terminal width"
+/// requirement is satisfied by always wrapping.
+fn wrap_line_into(line: &str, width: usize, out: &mut Vec<String>) {
+    let mut current = String::new();
+    let mut current_width: usize = 0;
+
+    // Token stream: alternating runs of whitespace and non-whitespace.
+    // We greedily fit non-whitespace runs ("words") onto the current
+    // visual row, separated by a single ' ' when both fit. Multiple
+    // spaces between words collapse to one because terminal rendering
+    // does not preserve internal whitespace runs visually anyway, and
+    // the author intent is captured by explicit blank lines.
+    for word in line.split_whitespace() {
+        let word_len = word.chars().count();
+        if word_len > width {
+            // Word doesn't fit even on its own row — flush whatever we
+            // have and hard-break the word at width chunks. This keeps
+            // SPEC §6's "no silent drop" promise; URLs and long IDs
+            // remain visible.
+            if !current.is_empty() {
+                out.push(std::mem::take(&mut current));
+            }
+            let mut buf = String::new();
+            let mut buf_width = 0;
+            for ch in word.chars() {
+                if buf_width == width {
+                    out.push(std::mem::take(&mut buf));
+                    buf_width = 0;
+                }
+                buf.push(ch);
+                buf_width += 1;
+            }
+            current = buf;
+            current_width = buf_width;
+            continue;
+        }
+        let needs_space = !current.is_empty();
+        let projected = current_width + if needs_space { 1 } else { 0 } + word_len;
+        if projected > width {
+            out.push(std::mem::take(&mut current));
+            current.push_str(word);
+            current_width = word_len;
+        } else {
+            if needs_space {
+                current.push(' ');
+                current_width += 1;
+            }
+            current.push_str(word);
+            current_width += word_len;
+        }
+    }
+    // Flush any partial row. If the input line was whitespace-only
+    // (`split_whitespace` produced zero words), push a single blank
+    // row so the author's vertical spacing still shows up — that is
+    // what SPEC §4.7's "preserve explicit blank lines" calls for, and
+    // it keeps `wrapped_rows` returning at least one row per logical
+    // line.
+    out.push(current);
 }
 
 #[cfg(test)]
@@ -2234,6 +2475,168 @@ mod tests {
             );
             assert_eq!(prompt.selected, Some(0));
         }
+    }
+
+    // -- Task 5a: TextBlock wrapping & blank-line preservation -------
+
+    fn render_textblock_to_strings(block: &TextBlock, w: u16, h: u16) -> Vec<String> {
+        // Drive the renderer through a real Ratatui `TestBackend` so we
+        // exercise the SPEC §6 "deterministic output under TestBackend"
+        // path, not just the wrap helper. Returns one trimmed-trailing
+        // `String` per backend row so assertions read naturally.
+        use ratatui::{backend::TestBackend, Terminal};
+        let backend = TestBackend::new(w, h);
+        let mut term = Terminal::new(backend).expect("test backend");
+        term.draw(|frame| {
+            let area = frame.area();
+            block.render(area, frame.buffer_mut());
+        })
+        .expect("draw");
+        let buf = term.backend().buffer().clone();
+        (0..h)
+            .map(|y| {
+                let mut row = String::new();
+                for x in 0..w {
+                    row.push_str(buf[(x, y)].symbol());
+                }
+                row.trim_end().to_string()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn textblock_wraps_long_line_at_word_boundary() {
+        // Greedy wrap — "the quick brown fox" into width 10 splits as
+        // ["the quick", "brown fox"] (10 + nothing-extra fits "the
+        // quick"; "brown fox" together is 9). SPEC §4.7 requires
+        // wrapping at the available width.
+        let block = TextBlock::new("the quick brown fox");
+        let rows = block.wrapped_rows(10);
+        assert_eq!(rows, vec!["the quick".to_string(), "brown fox".to_string()]);
+    }
+
+    #[test]
+    fn textblock_preserves_explicit_blank_lines() {
+        // SPEC §4.7: "Preserve explicit blank lines." Two paragraphs
+        // separated by `\n\n` MUST produce a blank visual row between
+        // them after wrapping.
+        let block = TextBlock::new("first paragraph\n\nsecond paragraph");
+        let rows = block.wrapped_rows(40);
+        assert_eq!(
+            rows,
+            vec![
+                "first paragraph".to_string(),
+                String::new(),
+                "second paragraph".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn textblock_hard_breaks_word_longer_than_width() {
+        // SPEC §6 forbids silently dropping content. A word longer
+        // than the width must hard-break rather than overflow or
+        // disappear.
+        let block = TextBlock::new("antidisestablishmentarianism");
+        let rows = block.wrapped_rows(10);
+        // 28 chars / 10 = 3 rows: "antidisest", "ablishment", "arianism"
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].chars().count(), 10);
+        assert_eq!(rows[1].chars().count(), 10);
+        assert_eq!(rows[2], "arianism");
+        // Concatenating the rows MUST reproduce the original word —
+        // "no silent drop" is the load-bearing invariant.
+        let joined: String = rows.join("");
+        assert_eq!(joined, "antidisestablishmentarianism");
+    }
+
+    #[test]
+    fn textblock_zero_width_returns_no_rows_and_does_not_panic() {
+        // SPEC §6: prompt rendering MUST NOT panic on small areas.
+        let block = TextBlock::new("anything");
+        assert!(block.wrapped_rows(0).is_empty());
+    }
+
+    #[test]
+    fn textblock_renders_under_test_backend_with_wrapped_rows() {
+        // SPEC §6: deterministic output under TestBackend. Drives the
+        // full `render` path (not just the helper) so we catch buffer
+        // off-by-ones now rather than during prompt integration in 5b.
+        let block = TextBlock::new("the quick brown fox jumps");
+        let rows = render_textblock_to_strings(&block, 10, 4);
+        // Expected greedy wrap into width 10:
+        //   "the quick"      (9)
+        //   "brown fox"      (9)
+        //   "jumps"          (5)
+        //   ""               (unused row)
+        assert_eq!(
+            rows,
+            vec![
+                "the quick".to_string(),
+                "brown fox".to_string(),
+                "jumps".to_string(),
+                String::new(),
+            ]
+        );
+    }
+
+    #[test]
+    fn textblock_render_clips_when_height_exceeded() {
+        // SPEC §6: clip rather than panic when the body is taller than
+        // the slot. Returns the actually-drawn row count so the caller
+        // can layout the rest of the prompt.
+        let block = TextBlock::new("alpha\nbeta\ngamma\ndelta");
+        let area = Rect::new(0, 0, 10, 2);
+        let mut buf = Buffer::empty(area);
+        let drawn = block.render(area, &mut buf);
+        assert_eq!(drawn, 2);
+        // Only the first two lines made it onto the buffer.
+        let row0: String = (0..area.width).map(|x| buf[(x, 0)].symbol()).collect();
+        let row1: String = (0..area.width).map(|x| buf[(x, 1)].symbol()).collect();
+        assert_eq!(row0.trim_end(), "alpha");
+        assert_eq!(row1.trim_end(), "beta");
+    }
+
+    #[test]
+    fn textblock_render_zero_area_is_a_noop() {
+        // Defensive — the bordered modal renderer in 5e may compute a
+        // 0×0 inner rect on a tiny terminal. `render` MUST quietly do
+        // nothing rather than panic.
+        let block = TextBlock::new("anything");
+        let area = Rect::new(0, 0, 0, 0);
+        let mut buf = Buffer::empty(Rect::new(0, 0, 4, 4));
+        assert_eq!(block.render(area, &mut buf), 0);
+    }
+
+    #[test]
+    fn textblock_strips_trailing_carriage_returns() {
+        // Windows-authored content uses `\r\n`; the split-on-`\n`
+        // constructor MUST normalise away the trailing `\r` so it does
+        // not show up as a stray cell in the buffer.
+        let block = TextBlock::new("alpha\r\nbeta\r\n");
+        assert_eq!(
+            block.lines(),
+            &["alpha".to_string(), "beta".to_string(), String::new()]
+        );
+    }
+
+    #[test]
+    fn textblock_with_style_records_role_for_theme_layer() {
+        // Task 5f will read this; today it just needs to round-trip.
+        let block = TextBlock::new("status").with_style(StyleRole::Success);
+        assert_eq!(block.style(), Some(StyleRole::Success));
+    }
+
+    #[test]
+    fn textblock_from_lines_preserves_input_order_and_blanks() {
+        // `from_lines` is the constructor for callers that have
+        // already split (e.g. composing a status block from a `Vec`).
+        // It MUST NOT re-collapse blank entries.
+        let block = TextBlock::from_lines(["one", "", "two"]);
+        assert_eq!(
+            block.wrapped_rows(40),
+            vec!["one".to_string(), String::new(), "two".to_string()]
+        );
     }
 
     #[test]
