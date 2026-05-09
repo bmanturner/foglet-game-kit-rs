@@ -443,8 +443,8 @@ mod tests {
                 "outcome must not depend on hotkey case"
             );
             assert_eq!(
-                lower_slots.snapshot(),
-                upper_slots.snapshot(),
+                lower_slots.save.snapshot(),
+                upper_slots.save.snapshot(),
                 "post-apply state must not depend on hotkey case for {expected:?}"
             );
         }
@@ -603,7 +603,7 @@ mod tests {
             .inventory
             .borrow_mut()
             .insert(MapScreen::ROOM_7_KEY_ID.to_string());
-        let before = slots.snapshot();
+        let before = slots.save.snapshot();
 
         let prompt = lost_and_found_drawer_prompt_with_state(true);
 
@@ -625,7 +625,7 @@ mod tests {
         // ROOM_7_KEY_ID inserted (BTreeSet would dedupe anyway, but a
         // future Vec-based inventory must not regress this).
         assert_eq!(
-            slots.snapshot(),
+            slots.save.snapshot(),
             before,
             "disabled (K) press must not mutate any slot"
         );
@@ -725,11 +725,11 @@ mod tests {
         // strongest possible assertion that no slot was touched.
         let slots = SharedSlots::default();
         slots.reset(7, 3);
-        let before = slots.snapshot();
+        let before = slots.save.snapshot();
         let outcome = apply_lost_and_found_choice(&slots, LostAndFoundChoice::Leave);
         assert_eq!(outcome, LostAndFoundOutcome::Left);
         assert_eq!(
-            slots.snapshot(),
+            slots.save.snapshot(),
             before,
             "Leave must not mutate inventory, flags, or player state"
         );
@@ -887,7 +887,7 @@ mod tests {
         // matchbook bonus from a hesitant press.
         let slots = SharedSlots::default();
         slots.reset(0, 0);
-        let before = slots.snapshot();
+        let before = slots.save.snapshot();
         let mut screen = lost_and_found_drawer_screen(slots.clone());
 
         let cfg = fixture_config();
@@ -895,7 +895,7 @@ mod tests {
         let mut ctx = GameContext::new(&cfg, &fc, (80, 24));
         let cmd = screen.handle_input(&mut ctx, Input::Esc);
         assert!(matches!(cmd, ScreenCommand::Pop));
-        assert_eq!(slots.snapshot(), before);
+        assert_eq!(slots.save.snapshot(), before);
         assert!(slots.feedback.borrow().is_none());
     }
 }

@@ -96,12 +96,18 @@ fn main() -> anyhow::Result<()> {
         },
         process_env,
     )?;
-    let slots = SharedSlots::default();
-    if let Some(path) = save_path.as_deref() {
-        if let Some(loaded) = read_save::<SaveState>(path)? {
-            slots.apply(loaded);
-        }
-    }
+    // SPEC_v2_1 §Task 5b: build the runtime slots directly from the
+    // loaded save (when present) so the per-field aliases share Rc
+    // identity with the slot's inner SaveState from frame zero —
+    // calling `slots.save.apply(loaded)` after-the-fact would orphan
+    // those aliases for the rest of the run.
+    let slots = match save_path.as_deref() {
+        Some(path) => match read_save::<SaveState>(path)? {
+            Some(loaded) => SharedSlots::with_save_state(loaded),
+            None => SharedSlots::default(),
+        },
+        None => SharedSlots::default(),
+    };
 
     Game::new(config.game.title.clone())
         .min_size(config.game.min_width, config.game.min_height)
@@ -118,7 +124,7 @@ fn main() -> anyhow::Result<()> {
     // tore the guard down — so the operator sees a clean message
     // rather than a scrambled one.
     if let Some(path) = save_path {
-        write_atomic(&path, &slots.snapshot())?;
+        write_atomic(&path, &slots.save.snapshot())?;
     }
     Ok(())
 }

@@ -7,8 +7,12 @@
 //! [`foglet_game::SaveSlot`] — `SharedSlots::save` is the typed slot
 //! the runtime save handler reads, and the per-field Rcs in
 //! [`SharedSlots`] are aliases cloned from the slot's inner state so
-//! existing screen code keeps compiling unchanged. Tasks 5b–5d migrate
-//! consumers off the aliases and onto `slots.save.borrow().<field>`.
+//! existing screen code keeps compiling unchanged. v2.1 §Task 5b
+//! deletes the hand-written `SharedSlots::snapshot` / `apply` glue —
+//! callers now go through [`SaveSlot::snapshot`] directly, and a new
+//! [`SharedSlots::with_save_state`] constructor handles the
+//! load-then-resume path so aliases never get orphaned. Tasks 5c–5d
+//! migrate the remaining consumers off the per-field aliases.
 
 use std::cell::RefCell;
 use std::collections::BTreeSet;
@@ -333,6 +337,31 @@ impl Default for SharedSlots {
 }
 
 impl SharedSlots {
+    /// Build a [`SharedSlots`] whose persistence slot starts at `save`.
+    ///
+    /// Used by `main` when a previous run wrote a save file: we want
+    /// the slot's inner [`SaveState`] (and the per-field aliases that
+    /// clone its Rcs) to point at the loaded data from the start, so
+    /// no `apply` step is needed and no aliases are ever orphaned.
+    /// Tests use the same constructor to set up "restored" slots
+    /// in the snapshot/apply round-trip checks.
+    pub fn with_save_state(save: SaveState) -> Self {
+        let flags = Rc::clone(&save.flags);
+        let inventory = Rc::clone(&save.inventory);
+        let player = Rc::clone(&save.player);
+        let map_name = Rc::clone(&save.map_name);
+        Self {
+            save: SaveSlot::new(save),
+            flags,
+            inventory,
+            player,
+            feedback: Rc::new(RefCell::new(None)),
+            map_name,
+            date_provider: Rc::new(SystemDateProvider),
+            pending_clue_events: Rc::new(RefCell::new(Vec::new())),
+        }
+    }
+
     /// Replace [`Self::date_provider`] with a caller-supplied handle.
     /// Returns `self` so the call composes with [`Self::default`] for
     /// tests that want a fixed clock without writing into the field
@@ -398,46 +427,6 @@ impl SharedSlots {
         // wipe entirely.
         let _ = self.save.borrow_mut();
     }
-
-    /// Build a [`SaveState`] snapshot of the current slot contents.
-    ///
-    /// Delegates to [`SaveSlot::snapshot`] so the returned value is
-    /// independent of the live state — mutating the snapshot's fields
-    /// will not bleed back through the aliased Rcs in [`Self`]. Adopted
-    /// in SPEC_v2_1 §Task 5a as a thin wrapper; SPEC_v2_1 §Task 5b
-    /// removes this method and inlines `slots.save.snapshot()` at the
-    /// call sites.
-    pub fn snapshot(&self) -> SaveState {
-        self.save.snapshot()
-    }
-
-    /// Overwrite slot contents from a loaded [`SaveState`].
-    ///
-    /// Mutates each field's `RefCell` **in place** rather than calling
-    /// [`SaveSlot::apply`]. The aliases in [`Self::flags`] /
-    /// [`Self::inventory`] / [`Self::player`] / [`Self::map_name`]
-    /// share Rc identity with the slot's inner `SaveState` — a
-    /// wholesale `apply` would swap that `SaveState` for a different
-    /// one, leaving the aliases pointing at orphaned cells. In-place
-    /// updates preserve the shared-handle invariant. The SaveSlot's
-    /// dirty flag is flipped so the next save attempt actually writes.
-    pub fn apply(&self, state: SaveState) {
-        // Pull values out of the loaded state's cells (which the
-        // SaveStateWire deserializer just constructed) and copy them
-        // into our own. The loaded SaveState's Rcs are dropped at the
-        // end of the call.
-        {
-            let mut p = self.player.borrow_mut();
-            *p = *state.player.borrow();
-        }
-        *self.flags.borrow_mut() = state.flags.borrow().clone();
-        *self.inventory.borrow_mut() = state.inventory.borrow().clone();
-        *self.map_name.borrow_mut() = state.map_name.borrow().clone();
-        // Mark the slot dirty so a "save on dirty" loop persists the
-        // applied state (e.g. on the next clean Quit). See `reset` for
-        // the matching rationale.
-        let _ = self.save.borrow_mut();
-    }
 }
 
 #[cfg(test)]
@@ -466,10 +455,9 @@ mod tests {
             p.y = 4;
             p.won = true;
         }
-        let snap = original.snapshot();
+        let snap = original.save.snapshot();
 
-        let restored = SharedSlots::default();
-        restored.apply(snap);
+        let restored = SharedSlots::with_save_state(snap);
         let p = restored.player.borrow();
         assert_eq!((p.x, p.y, p.won), (43, 4, true));
         drop(p);
@@ -549,8 +537,7 @@ mod tests {
         // future failure points at exactly the new field.
         let original = SharedSlots::default();
         original.player.borrow_mut().cash = 137;
-        let restored = SharedSlots::default();
-        restored.apply(original.snapshot());
+        let restored = SharedSlots::with_save_state(original.save.snapshot());
         assert_eq!(restored.player.borrow().cash, 137);
     }
 
@@ -598,8 +585,7 @@ mod tests {
         // exactly the new field.
         let original = SharedSlots::default();
         *original.map_name.borrow_mut() = "room_7".to_string();
-        let restored = SharedSlots::default();
-        restored.apply(original.snapshot());
+        let restored = SharedSlots::with_save_state(original.save.snapshot());
         assert_eq!(restored.map_name.borrow().as_str(), "room_7");
     }
 

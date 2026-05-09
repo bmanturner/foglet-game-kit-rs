@@ -712,7 +712,7 @@ mod tests {
         // gated yet.
         let slots = SharedSlots::default();
         slots.reset(0, 0);
-        let before = slots.snapshot();
+        let before = slots.save.snapshot();
         let starting_cash = slots.player.borrow().cash;
         assert!(
             starting_cash < RUMOR_TIP_PRICE,
@@ -737,7 +737,7 @@ mod tests {
         // regression that adds a `TipForRumor` apply branch without
         // also re-checking the prompt-layer gate.
         assert_eq!(
-            slots.snapshot(),
+            slots.save.snapshot(),
             before,
             "disabled (T) press must not mutate any slot"
         );
@@ -765,7 +765,7 @@ mod tests {
         for key in ['n', 'N'] {
             let slots = SharedSlots::default();
             slots.reset(0, 0);
-            let before = slots.snapshot();
+            let before = slots.save.snapshot();
             let starting_cash = slots.player.borrow().cash;
             let prompt = night_clerk_vendor_prompt(starting_cash);
 
@@ -791,7 +791,7 @@ mod tests {
             // future no-thanks side-effect (e.g. an `npc_visited` flag)
             // sneaking in without an explicit SPEC update.
             assert_eq!(
-                slots.snapshot(),
+                slots.save.snapshot(),
                 before,
                 "NoThanks press for `{key}` must not mutate any slot"
             );
@@ -959,7 +959,7 @@ mod tests {
         // *transactional* outcomes, not polite refusal.
         let slots = SharedSlots::default();
         slots.reset(0, 0);
-        let before = slots.snapshot();
+        let before = slots.save.snapshot();
         let mut screen = night_clerk_vendor_screen(slots.clone());
 
         let cfg = fixture_config();
@@ -967,7 +967,7 @@ mod tests {
         let mut ctx = GameContext::new(&cfg, &fc, (80, 24));
         let cmd = screen.handle_input(&mut ctx, Input::Char('n'));
         assert!(matches!(cmd, ScreenCommand::Pop));
-        assert_eq!(slots.snapshot(), before);
+        assert_eq!(slots.save.snapshot(), before);
         assert!(slots.feedback.borrow().is_none());
     }
 
@@ -1005,7 +1005,7 @@ mod tests {
         // every slot stays at its pre-press snapshot.
         let slots = SharedSlots::default();
         slots.reset(0, 0);
-        let before = slots.snapshot();
+        let before = slots.save.snapshot();
         let mut screen = night_clerk_vendor_screen(slots.clone());
 
         let cfg = fixture_config();
@@ -1013,7 +1013,7 @@ mod tests {
         let mut ctx = GameContext::new(&cfg, &fc, (80, 24));
         let cmd = screen.handle_input(&mut ctx, Input::Esc);
         assert!(matches!(cmd, ScreenCommand::Pop));
-        assert_eq!(slots.snapshot(), before);
+        assert_eq!(slots.save.snapshot(), before);
         assert!(slots.feedback.borrow().is_none());
     }
 }
