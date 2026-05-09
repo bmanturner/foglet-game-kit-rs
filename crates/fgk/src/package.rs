@@ -898,6 +898,46 @@ path = "world.sqlite"
         assert!(!out.join(".keep").exists());
     }
 
+    #[test]
+    fn run_sh_never_touches_world_directory() {
+        // Task 11b: the SPEC §10.4 wrapper must not delete, recreate,
+        // chmod, or otherwise manipulate the bundle's `world/`
+        // directory. The shared-world SQLite file is the live state for
+        // every player who has ever launched the door — wiping it on
+        // launch would destroy the world. This invariant holds today
+        // (the template has no `world` token at all), but encoding it
+        // as a test means a future edit to RUN_SH_TEMPLATE that
+        // accidentally adds, say, `rm -rf "$DIR/world"` for "cleanup"
+        // fails CI before it ever ships.
+        //
+        // We check both the canonical slug and a different one so the
+        // assertion is about the template, not a coincidence of the
+        // substituted slug containing a forbidden substring.
+        for slug in ["murder-motel", "test-game"] {
+            let body = render_run_sh(slug);
+            let lower = body.to_ascii_lowercase();
+            assert!(
+                !lower.contains("world"),
+                "run.sh for `{slug}` references `world` — the wrapper must \
+                 leave the shared-world directory entirely to the runtime: \
+                 {body}"
+            );
+            // Defensive: even if a future edit avoids the literal token
+            // `world`, the wrapper has no business running destructive
+            // filesystem commands at all. Assert the obvious offenders
+            // are absent so reviewers don't have to re-derive the
+            // policy.
+            for forbidden in ["rm ", "rm\t", "rmdir", "mkfs", "dd "] {
+                assert!(
+                    !body.contains(forbidden),
+                    "run.sh for `{slug}` contains forbidden command \
+                     fragment `{forbidden}` — wrappers must not mutate \
+                     the bundle filesystem at launch:\n{body}"
+                );
+            }
+        }
+    }
+
     /// Sanity-check that the produced wrapper is at least syntactically
     /// valid bash. `bash -n` exits non-zero on parse errors without
     /// executing the script.
