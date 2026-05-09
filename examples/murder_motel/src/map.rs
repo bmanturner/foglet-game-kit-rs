@@ -11,7 +11,9 @@ use std::cell::RefCell;
 use std::collections::BTreeSet;
 use std::rc::Rc;
 
-use foglet_game::{parse_map, FlagSet, GameContext, Input, Map, Screen, ScreenCommand, TileLegend};
+use foglet_game::{
+    parse_map, FeedbackLine, FlagSet, GameContext, Input, Map, Screen, ScreenCommand, TileLegend,
+};
 use ratatui::layout::{Alignment, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -792,6 +794,12 @@ impl MapScreen {
         // misses an entry. The kit's terminal-safety contract forbids
         // bubbling DB errors out of `handle_input` because the screen
         // stack is mid-transition.
+        // SPEC_v2 §Task 12c: derive the arrival banner *while* recording
+        // the opening. We compute `arrival_feedback` here (rather than
+        // inside `Room7Screen::with_shared`) so that the world-DB
+        // borrow stays scoped to the current `handle_input` tick — the
+        // forthcoming Room 7 screen does not hold a `&WorldDb`.
+        let mut arrival_feedback: Option<FeedbackLine> = None;
         if let Some(world) = ctx.world_db {
             // Errors are swallowed on purpose: the screen stack is
             // mid-transition, the kit has no logging facility wired
@@ -805,7 +813,10 @@ impl MapScreen {
             // a `let _` keeps the call paths honest about which
             // failures are intentionally non-fatal.
             if let Ok(player) = world.upsert_player(ctx.foglet) {
-                let _ = crate::world::record_room_7_opening(world, player.id);
+                if let Ok(opening) = crate::world::record_room_7_opening(world, player.id) {
+                    arrival_feedback =
+                        crate::world::shared_room_7_arrival_feedback(&opening, player.id);
+                }
             }
         }
         {
@@ -813,11 +824,12 @@ impl MapScreen {
             p.x = crate::room_7::Room7Screen::ARRIVAL_POS.0;
             p.y = crate::room_7::Room7Screen::ARRIVAL_POS.1;
         }
-        // Clear any stale lobby feedback so Room 7 opens with a clean
-        // narration slot — the body's flavour line is the only thing
-        // that should appear there until the player triggers another
-        // prompt.
-        *self.slots.feedback.borrow_mut() = None;
+        // Replace any stale lobby feedback. Either the Task 12c "you
+        // are not the first" banner takes the slot (later opener), or
+        // we clear it so the body's flavour line is the only thing
+        // that appears until the player triggers another prompt
+        // (current player is the opener / world DB unavailable).
+        *self.slots.feedback.borrow_mut() = arrival_feedback;
         ScreenCommand::Replace(Box::new(crate::room_7::Room7Screen::with_shared(
             self.slots.clone(),
         )))
@@ -2144,6 +2156,106 @@ pub(crate) mod tests {
         assert_eq!(
             later.opened_by_player_id, opening.opened_by_player_id,
             "later call must observe the original opener id"
+        );
+    }
+
+    /// SPEC_v2 §Task 12c — when another player has already opened
+    /// Room 7, the *current* player's stairs step must populate
+    /// `SharedSlots::feedback` with the "another investigator already
+    /// unlocked Room 7" banner. Strategy: pre-seed the world DB with
+    /// an opening row for player id 999 (a synthetic opener that is
+    /// *not* the current local-dev player), drive the stairs step, and
+    /// inspect the slots.
+    #[test]
+    fn stairs_step_sets_arrival_feedback_when_someone_else_opened() {
+        use crate::world::{record_room_7_opening, MOTEL_WORLD_STATE_MIGRATION};
+        use foglet_game::WorldDb;
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("world.sqlite");
+        let mut world = WorldDb::open(&db_path).expect("open world db");
+        world
+            .apply_migration(&foglet_game::PLAYERS_MIGRATION)
+            .expect("apply players migration");
+        world
+            .apply_migration(&MOTEL_WORLD_STATE_MIGRATION)
+            .expect("apply motel_world_state migration");
+        // Synthetic prior opener: a player id we know cannot collide
+        // with the local-dev fixture player (which gets a fresh
+        // autoincrement id starting at 1) by jumping the id well past
+        // any single test run could generate.
+        record_room_7_opening(&world, 999).expect("seed prior opening");
+
+        let cfg = fixture_config();
+        let fc = fixture_context();
+        let mut map = fresh_map_screen();
+        {
+            let mut ctx = GameContext::new(&cfg, &fc, (80, 24)).with_world_db(&world);
+            walk_to(&mut map, &mut ctx, 6, 5);
+            map.inventory()
+                .borrow_mut()
+                .insert(MapScreen::ROOM_7_KEY_ID.to_string());
+            walk_to(&mut map, &mut ctx, 43, 1);
+            let cmd = map.handle_input(&mut ctx, Input::Right);
+            assert!(
+                matches!(cmd, ScreenCommand::Replace(_)),
+                "stairs step must still emit Replace; got {cmd:?}"
+            );
+        }
+
+        // Read the feedback the post-move handler stamped into the
+        // shared slots. The Room 7 screen will paint this on its first
+        // frame because it borrows the same `Rc<RefCell<...>>`.
+        let line = map
+            .slots()
+            .feedback
+            .borrow()
+            .clone()
+            .expect("Task 12c: arrival feedback must be set when someone else opened first");
+        let text = line.rendered_text();
+        assert!(
+            text.contains("Another investigator"),
+            "feedback must call out the prior opening: {text}"
+        );
+    }
+
+    /// SPEC_v2 §Task 12c — when the *current* player is the first
+    /// opener, the arrival slot must be cleared (no "someone else got
+    /// here" banner) so Room 7's body line owns the feedback row on
+    /// the first frame after arrival.
+    #[test]
+    fn stairs_step_clears_arrival_feedback_for_first_opener() {
+        use crate::world::MOTEL_WORLD_STATE_MIGRATION;
+        use foglet_game::WorldDb;
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("world.sqlite");
+        let mut world = WorldDb::open(&db_path).expect("open world db");
+        world
+            .apply_migration(&foglet_game::PLAYERS_MIGRATION)
+            .expect("apply players migration");
+        world
+            .apply_migration(&MOTEL_WORLD_STATE_MIGRATION)
+            .expect("apply motel_world_state migration");
+
+        let cfg = fixture_config();
+        let fc = fixture_context();
+        let mut map = fresh_map_screen();
+        {
+            let mut ctx = GameContext::new(&cfg, &fc, (80, 24)).with_world_db(&world);
+            walk_to(&mut map, &mut ctx, 6, 5);
+            map.inventory()
+                .borrow_mut()
+                .insert(MapScreen::ROOM_7_KEY_ID.to_string());
+            walk_to(&mut map, &mut ctx, 43, 1);
+            let _ = map.handle_input(&mut ctx, Input::Right);
+        }
+
+        assert!(
+            map.slots().feedback.borrow().is_none(),
+            "first opener must arrive in Room 7 with a clean feedback slot"
         );
     }
 

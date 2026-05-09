@@ -32,7 +32,7 @@
 //! migration tomorrow doesn't push game versions around — the kit and
 //! the game evolve in independent number bands.
 
-use foglet_game::{WorldDb, WorldMigration};
+use foglet_game::{FeedbackLine, WorldDb, WorldMigration};
 use rusqlite::OptionalExtension;
 
 /// First version number a Murder Motel migration may use. Picked far
@@ -249,6 +249,45 @@ pub fn room_7_opening(world: &WorldDb) -> Result<Option<Room7Opening>, rusqlite:
     }
 }
 
+/// Build the arrival-time feedback line for a player who just stepped
+/// into Room 7. Implements SPEC_v2 §Task 12c's "show later players that
+/// Room 7 was already opened by someone else" surface.
+///
+/// Decision matrix:
+///
+/// - `opening.opened_by_player_id == current_player_id` → returns
+///   `None`. The current player either *just* opened the room
+///   (`first_opening` true) or returned to one they previously opened
+///   themselves; in both cases the lobby's stale feedback was already
+///   cleared, so leaving the slot empty keeps Room 7 quiet on arrival
+///   and lets the body's flavour line (the only narration Room 7
+///   itself emits) own the slot.
+/// - Otherwise → returns `Some(info(...))` with a single-sentence
+///   narration that calls out the prior opening *without* naming the
+///   other investigator. We don't have a player-handle lookup keyed
+///   by `players.id` yet (Task 12 hasn't shipped one), and the kit's
+///   shared-world contract is "first-writer-wins, identities are
+///   advisory" — surfacing the timestamp tells later players "you're
+///   not the first" without leaking another user's handle through a
+///   side channel.
+///
+/// Returned as an `Option` rather than always-`Some` so the caller can
+/// distinguish "no banner to show" from "show this banner" with a
+/// single match — the call site in [`crate::map::MapScreen`] writes
+/// the result straight into [`crate::state::SharedSlots::feedback`].
+pub fn shared_room_7_arrival_feedback(
+    opening: &Room7Opening,
+    current_player_id: i64,
+) -> Option<FeedbackLine> {
+    if opening.opened_by_player_id == current_player_id {
+        return None;
+    }
+    Some(FeedbackLine::info(format!(
+        "Another investigator already unlocked Room 7 (first opened {}).",
+        opening.opened_at
+    )))
+}
+
 #[cfg(test)]
 mod tests {
     //! Migration smoke tests — apply the migration into a temp DB and
@@ -442,6 +481,47 @@ mod tests {
         assert!(
             !observed.first_opening,
             "read path always reports first_opening=false; only the writer learns 'I won the race'"
+        );
+    }
+
+    /// Task 12c: a player whose id matches the opener gets no arrival
+    /// banner. Covers both the "I am the first opener" and the "I came
+    /// back to a room I unlocked previously" flavours, since the
+    /// helper's branching only looks at id equality.
+    #[test]
+    fn shared_room_7_feedback_is_none_when_current_player_is_opener() {
+        let opening = Room7Opening {
+            opened_at: "2026-05-09 12:34:56".to_string(),
+            opened_by_player_id: 42,
+            first_opening: true,
+        };
+        assert!(
+            shared_room_7_arrival_feedback(&opening, 42).is_none(),
+            "opener viewing their own row must get no arrival banner"
+        );
+    }
+
+    /// Task 12c: a *different* player gets a single-line info banner
+    /// that includes the original opening timestamp. The handle of the
+    /// original opener is intentionally not surfaced (the kit has no
+    /// id→handle lookup and identities are advisory per SPEC §4.5).
+    #[test]
+    fn shared_room_7_feedback_is_set_when_someone_else_opened_first() {
+        let opening = Room7Opening {
+            opened_at: "2026-05-09 12:34:56".to_string(),
+            opened_by_player_id: 1,
+            first_opening: false,
+        };
+        let line = shared_room_7_arrival_feedback(&opening, 2)
+            .expect("later player must see the arrival banner");
+        let text = line.rendered_text();
+        assert!(
+            text.contains("Another investigator"),
+            "banner must call out the prior opening explicitly: {text}"
+        );
+        assert!(
+            text.contains("2026-05-09 12:34:56"),
+            "banner must include the original opening timestamp: {text}"
         );
     }
 }
