@@ -432,17 +432,44 @@ pub fn pending_clue_event_for(
     }
 }
 
-/// Drain queued clue-found events into `world_events` (SPEC_v2 §Task
-/// 13c-ii).
+/// Name of the Murder Motel leaderboard that tracks how many major
+/// clues each investigator has logged (SPEC_v2 §Task 13e). Centralised
+/// so [`flush_pending_clue_events`], the upcoming Task 13f leaderboard
+/// screen, and tests all reference the same string. Must match the
+/// `[[leaderboards]]` entry in `assets/game.toml`.
+pub const INVESTIGATORS_LEADERBOARD_NAME: &str = "investigators";
+
+/// How much one `clue_found` event contributes to the
+/// `investigators` leaderboard (SPEC_v2 §Task 13e). One clue = one
+/// rank point; pulled out as a constant so a future "rare clues are
+/// worth more" tweak has a single edit site, and so the test that
+/// asserts the post-flush score has a name to compare against.
+pub const CLUE_FOUND_LEADERBOARD_DELTA: i64 = 1;
+
+/// Drain queued clue-found events into `world_events` and credit the
+/// taking player on the `investigators` leaderboard (SPEC_v2 §Task
+/// 13c-ii / §Task 13e).
 ///
 /// Called from [`crate::map::MapScreen::tick`] once per frame. Resolves
 /// the current player via [`WorldDb::upsert_player`] and writes one
-/// row per queued event with [`CLUE_FOUND_EVENT_KIND`]. Failures are
-/// logged-and-swallowed — same terminal-safety contract as
-/// [`append_room_7_opened_event`]: a transient SQLite hiccup must not
-/// soft-lock the lobby. Successful writes always drain the queue
+/// row per queued event with [`CLUE_FOUND_EVENT_KIND`]. For each row
+/// that lands successfully the helper also increments the
+/// [`INVESTIGATORS_LEADERBOARD_NAME`] board by
+/// [`CLUE_FOUND_LEADERBOARD_DELTA`] so the future Task 13f screen can
+/// rank players by clues found. Failures (event append *or* leaderboard
+/// increment) are logged-and-swallowed — same terminal-safety contract
+/// as [`append_room_7_opened_event`]: a transient SQLite hiccup must
+/// not soft-lock the lobby. Successful writes always drain the queue
 /// regardless of partial-failure shape, so a flaky disk does not
 /// generate duplicate entries on the next tick.
+///
+/// The leaderboard increment is intentionally gated on the
+/// event-append succeeding: the bulletin row is the source of truth for
+/// "this clue was logged", and a board point without a matching row
+/// would be silently un-auditable. Conversely, a missing board point
+/// when the row did land is a self-healing recoverable state — the row
+/// has the kind/metadata needed for an offline backfill — so the helper
+/// records `written` strictly off the event-append path.
 ///
 /// Returns the count of events that landed in the DB. The status UI
 /// does not consume the count today; tests use it to assert "exactly N
@@ -478,6 +505,16 @@ pub fn flush_pending_clue_events(
             .is_ok()
         {
             written += 1;
+            // SPEC_v2 §Task 13e: one row, one point. Errors are
+            // swallowed for the same terminal-safety reason the event
+            // append does — a flaky leaderboard write must not soft-
+            // lock the lobby, and the matching event row is enough to
+            // backfill rank later.
+            let _ = world.increment_score(
+                INVESTIGATORS_LEADERBOARD_NAME,
+                player.id,
+                CLUE_FOUND_LEADERBOARD_DELTA,
+            );
         }
     }
     written
@@ -943,6 +980,14 @@ mod tests {
         world
             .apply_migration(&foglet_game::WORLD_EVENTS_MIGRATION)
             .expect("apply world_events migration");
+        // SPEC_v2 §Task 13e: `flush_pending_clue_events` now also
+        // increments the `investigators` leaderboard, so the event-stack
+        // helper has to bring the leaderboard table along for the ride.
+        // Without it the increment fails silently on `no such table`,
+        // which would make the 13e tests below unprovable.
+        world
+            .apply_migration(&foglet_game::LEADERBOARD_SCORES_MIGRATION)
+            .expect("apply leaderboard_scores migration");
         world
             .apply_migration(&MOTEL_WORLD_STATE_MIGRATION)
             .expect("apply motel_world_state migration");
@@ -1468,5 +1513,137 @@ mod tests {
             .join("|");
         assert!(combined.contains(crate::map::MapScreen::ROOM_7_KEY_ID));
         assert!(combined.contains(crate::map::MapScreen::MATCHBOOK_ID));
+    }
+
+    // ---- SPEC_v2 §Task 13e investigators leaderboard ----------------
+
+    /// Flushing a single pending clue must credit the taking player
+    /// once on the `investigators` board. Pins the seeded score (1)
+    /// and the board name so a future change to either side surfaces
+    /// here.
+    #[test]
+    fn flush_pending_clue_events_credits_investigators_board_per_event() {
+        let dir = tempdir().expect("tempdir");
+        let world = world_with_event_stack(&dir);
+        let slots = SharedSlots::default();
+        let fc = fixture_context();
+
+        slots
+            .pending_clue_events
+            .borrow_mut()
+            .push(PendingClueEvent {
+                item_id: crate::map::MapScreen::ROOM_7_KEY_ID.to_string(),
+                message: CLUE_FOUND_ROOM_7_KEY_MESSAGE.to_string(),
+            });
+
+        let written = flush_pending_clue_events(&world, &fc, &slots);
+        assert_eq!(written, 1);
+
+        // Resolve the same player the helper upserted so we can read
+        // their leaderboard row directly. Going through `upsert_player`
+        // (rather than handcrafting an id) keeps the test honest about
+        // which `players.id` the increment was attributed to.
+        let player = world.upsert_player(&fc).expect("upsert player");
+        let top = world
+            .top_scores(
+                INVESTIGATORS_LEADERBOARD_NAME,
+                foglet_game::LeaderboardSort::Desc,
+                5,
+            )
+            .expect("read top scores");
+        assert_eq!(top.len(), 1, "exactly one investigator row after one clue");
+        assert_eq!(top[0].player_id, player.id);
+        assert_eq!(
+            top[0].score, CLUE_FOUND_LEADERBOARD_DELTA,
+            "first clue must seed the row at the canonical delta"
+        );
+    }
+
+    /// Two queued clues from the same player must accumulate on the
+    /// same row (one rank entry, score = 2 * delta) rather than fan
+    /// out into per-clue rows. Catches a regression where someone
+    /// swaps `increment_score` for `set_score` and silently overwrites
+    /// the prior point.
+    #[test]
+    fn flush_pending_clue_events_accumulates_score_for_repeat_finds() {
+        let dir = tempdir().expect("tempdir");
+        let world = world_with_event_stack(&dir);
+        let slots = SharedSlots::default();
+        let fc = fixture_context();
+
+        slots
+            .pending_clue_events
+            .borrow_mut()
+            .push(PendingClueEvent {
+                item_id: crate::map::MapScreen::ROOM_7_KEY_ID.to_string(),
+                message: CLUE_FOUND_ROOM_7_KEY_MESSAGE.to_string(),
+            });
+        slots
+            .pending_clue_events
+            .borrow_mut()
+            .push(PendingClueEvent {
+                item_id: crate::map::MapScreen::MATCHBOOK_ID.to_string(),
+                message: CLUE_FOUND_MATCHBOOK_MESSAGE.to_string(),
+            });
+
+        let written = flush_pending_clue_events(&world, &fc, &slots);
+        assert_eq!(written, 2);
+
+        let player = world.upsert_player(&fc).expect("upsert player");
+        let rank = world
+            .player_rank(
+                INVESTIGATORS_LEADERBOARD_NAME,
+                foglet_game::LeaderboardSort::Desc,
+                player.id,
+            )
+            .expect("rank lookup");
+        assert_eq!(
+            rank,
+            Some(1),
+            "the only investigator must be ranked first after two clues"
+        );
+
+        // Round-trip the score itself via `top_scores` — `player_rank`
+        // returns position only, so we still need a separate read to
+        // pin the accumulated score and catch a `set_score` regression.
+        let top = world
+            .top_scores(
+                INVESTIGATORS_LEADERBOARD_NAME,
+                foglet_game::LeaderboardSort::Desc,
+                5,
+            )
+            .expect("read top scores");
+        assert_eq!(top.len(), 1, "two clues must collapse onto one row");
+        assert_eq!(
+            top[0].score,
+            2 * CLUE_FOUND_LEADERBOARD_DELTA,
+            "two clues must accumulate, not overwrite"
+        );
+    }
+
+    /// An empty queue must not touch the leaderboard. Without this,
+    /// the upsert path would still bump `updated_at` on a phantom row
+    /// for whichever player happened to be active that frame.
+    #[test]
+    fn flush_pending_clue_events_does_not_touch_board_on_empty_queue() {
+        let dir = tempdir().expect("tempdir");
+        let world = world_with_event_stack(&dir);
+        let slots = SharedSlots::default();
+        let fc = fixture_context();
+
+        let written = flush_pending_clue_events(&world, &fc, &slots);
+        assert_eq!(written, 0);
+
+        let top = world
+            .top_scores(
+                INVESTIGATORS_LEADERBOARD_NAME,
+                foglet_game::LeaderboardSort::Desc,
+                5,
+            )
+            .expect("read top scores");
+        assert!(
+            top.is_empty(),
+            "an empty drain must not seed a leaderboard row"
+        );
     }
 }
