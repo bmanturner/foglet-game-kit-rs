@@ -3,14 +3,15 @@
 //! Both screens hold a [`SharedSlots`] handle so the slots loaded by
 //! `main` survive the title → menu → map pushes without a static.
 
-use foglet_game::{render_menu_list, GameContext, Input, MenuList, Screen, ScreenCommand};
+use foglet_game::{
+    centred_rect, render_menu_list, GameContext, Input, MenuList, Screen, ScreenCommand,
+};
 use ratatui::layout::Alignment;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 
-use crate::layout::centred_rect;
 use crate::map::MapScreen;
 use crate::modals::{HelpScreen, LeaderboardScreen, ProfileScreen};
 use crate::room_7::Room7Screen;

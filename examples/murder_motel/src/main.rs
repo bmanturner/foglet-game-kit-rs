@@ -48,7 +48,6 @@
 #![cfg_attr(not(test), allow(dead_code))]
 
 mod clock;
-mod layout;
 mod map;
 mod modals;
 mod room_7;

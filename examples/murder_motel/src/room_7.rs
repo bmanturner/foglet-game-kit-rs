@@ -22,7 +22,8 @@
 use std::rc::Rc;
 
 use foglet_game::{
-    parse_map, FeedbackLine, GameContext, Input, Map, Screen, ScreenCommand, TileLegend,
+    centred_rect, parse_map, FeedbackLine, GameContext, Input, Map, Screen, ScreenCommand,
+    TileLegend,
 };
 use ratatui::layout::{Alignment, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -230,8 +231,7 @@ impl Room7Screen {
 impl Screen for Room7Screen {
     fn render(&mut self, _ctx: &mut GameContext<'_>, frame: &mut Frame<'_>) {
         // Centre the map inside the frame, same rule the lobby follows.
-        let area =
-            crate::layout::centred_rect(self.map.width + 2, self.map.height + 2, frame.area());
+        let area = centred_rect(self.map.width + 2, self.map.height + 2, frame.area());
 
         let player_glyph_style = Style::default()
             .fg(Color::Yellow)

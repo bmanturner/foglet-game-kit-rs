@@ -12,7 +12,8 @@ use std::collections::BTreeSet;
 use std::rc::Rc;
 
 use foglet_game::{
-    parse_map, FeedbackLine, FlagSet, GameContext, Input, Map, Screen, ScreenCommand, TileLegend,
+    centred_rect, parse_map, FeedbackLine, FlagSet, GameContext, Input, Map, Screen, ScreenCommand,
+    TileLegend,
 };
 use ratatui::layout::{Alignment, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -20,7 +21,6 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 
-use crate::layout::centred_rect;
 use crate::modals::{BulletinScreen, InventoryScreen, WinScreen};
 use crate::scenes::dialog::DialogScreen;
 use crate::scenes::lost_and_found::lost_and_found_drawer_screen;

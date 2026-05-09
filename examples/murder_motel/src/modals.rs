@@ -11,8 +11,8 @@ use std::collections::BTreeSet;
 use std::rc::Rc;
 
 use foglet_game::{
-    render_inventory_list, EventRecord, FogletContext, GameContext, Input, InventoryList,
-    LeaderboardSort, ScoreRecord, Screen, ScreenCommand, WorldDb,
+    centred_rect, render_inventory_list, EventRecord, FogletContext, GameContext, Input,
+    InventoryList, LeaderboardSort, ScoreRecord, Screen, ScreenCommand, WorldDb,
 };
 use ratatui::layout::{Alignment, Rect};
 use ratatui::style::{Color, Style};
@@ -20,7 +20,6 @@ use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph};
 use ratatui::Frame;
 
-use crate::layout::centred_rect;
 use crate::map::MapScreen;
 
 /// Static help / controls reference, pushed from the main menu.
