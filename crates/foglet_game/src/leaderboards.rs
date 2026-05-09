@@ -3,9 +3,10 @@
 //! Task 8a shipped the `leaderboard_scores` migration. Subsequent
 //! sub-tasks layer behavior on top of the schema introduced here:
 //!
-//! - 8b (this iteration) adds [`WorldDb::set_score`] for upserting one
+//! - 8b adds [`WorldDb::set_score`] for upserting one
 //!   `(board, player_id)` row to an absolute value.
-//! - 8c will add `increment_score` for delta updates.
+//! - 8c (this iteration) adds [`WorldDb::increment_score`] for delta
+//!   updates that don't require the caller to know the prior score.
 //! - 8d will add `top_scores(name, n)` for the leaderboard render.
 //! - 8e will add `player_rank(name, player_id)` for "you are #N".
 //!
@@ -312,6 +313,96 @@ RETURNING board, player_id, score, updated_at";
             .query_row(
                 SQL,
                 rusqlite::params![board, player_id, score],
+                row_to_score_record,
+            )
+            .map_err(|source| LeaderboardError::Sqlite { source })
+    }
+
+    /// Add `delta` to one player's score on a named board, creating the
+    /// row at `delta` if it does not yet exist, and return the canonical
+    /// [`ScoreRecord`] SQLite produced (SPEC_v2 §4.8 / §Task 8c).
+    ///
+    /// The contract is "after this call returns, `(board, player_id)`
+    /// has its previous score plus `delta` — and if there was no
+    /// previous score, the row exists with `delta` as its score". This
+    /// is SPEC §4.8's "increment score" verb: callers who want to
+    /// register +1 for a clue inspection (Murder Motel Task 13e), or
+    /// any other event-driven score change, shouldn't have to do a
+    /// read-modify-write dance from Rust — that would race with another
+    /// process touching the same row.
+    ///
+    /// `delta` is `i64` rather than `u64` so callers can decrement a
+    /// score (e.g. a penalty) with the same helper. The score column is
+    /// `INTEGER NOT NULL` and SPEC §4.8 imposes no non-negative
+    /// constraint, so a negative result is a valid game-author choice
+    /// rather than a kit-level error. Overflow is not guarded: SPEC
+    /// §4.8 scores are integral and SQLite stores them as 64-bit, which
+    /// is enough headroom for any door game's lifetime; pretending to
+    /// guard a 64-bit counter would be theatre.
+    ///
+    /// We use SQLite's `RETURNING` clause (≥ 3.35) so the caller gets
+    /// the canonical row — including the post-increment score and the
+    /// SQL-side `CURRENT_TIMESTAMP` — without a second round-trip,
+    /// mirroring [`Self::set_score`] and [`Self::append_event`]. The
+    /// upsert resolves on the existing `(board, player_id)` primary key
+    /// the migration ships with, so no extra index is needed.
+    ///
+    /// `board` is validated before the SQL round-trip — empty or
+    /// whitespace-only inputs fail fast with
+    /// [`LeaderboardError::EmptyBoardName`], same as [`Self::set_score`]
+    /// — so the validator is the single source of truth for the rule.
+    /// `player_id` and `delta` are intentionally not validated: a
+    /// non-existent `player_id` is caught at the FK layer once Task 10
+    /// enables `PRAGMA foreign_keys = ON`, and `delta` ranges
+    /// (including zero, which is a no-op that still bumps `updated_at`)
+    /// are the game-author's domain.
+    ///
+    /// # Concurrency
+    ///
+    /// Takes `&self`: the upsert is a single atomic statement, so two
+    /// concurrent `increment_score` calls against the same row will
+    /// serialize on the busy-timeout path rather than racing through a
+    /// read-modify-write window. That is the whole reason this helper
+    /// exists alongside [`Self::set_score`] — a Rust-side
+    /// `set_score(get_score() + 1)` would silently lose increments
+    /// under contention.
+    pub fn increment_score(
+        &self,
+        board: &str,
+        player_id: i64,
+        delta: i64,
+    ) -> Result<ScoreRecord, LeaderboardError> {
+        // Same validation contract as `set_score` — a blank board is a
+        // caller bug regardless of which verb the caller invoked.
+        validate_board_name(board)?;
+
+        // Insert path seeds the row with `delta` as the starting score
+        // (matching the schema's `DEFAULT 0` plus a single increment;
+        // we encode the addition explicitly rather than relying on the
+        // default + a follow-up update so the "first write" case lands
+        // in one statement). Conflict path adds `excluded.score` —
+        // which is the proposed insert value, i.e. `delta` — to the
+        // existing `score` column. The same `?3` parameter is used in
+        // both code paths via `excluded`, keeping the "by how much"
+        // value bound exactly once.
+        //
+        // `updated_at = CURRENT_TIMESTAMP` overrides the column default
+        // on the update path: even a no-op `+0` increment touches the
+        // row, so an operator inspecting the table can see that the
+        // increment ran. Mirrors `set_score`'s behavior so both verbs
+        // leave a consistent audit trail.
+        const SQL: &str = "\
+INSERT INTO leaderboard_scores (board, player_id, score, updated_at) \
+VALUES (?1, ?2, ?3, CURRENT_TIMESTAMP) \
+ON CONFLICT(board, player_id) DO UPDATE SET \
+    score = score + excluded.score, \
+    updated_at = CURRENT_TIMESTAMP \
+RETURNING board, player_id, score, updated_at";
+
+        self.connection()
+            .query_row(
+                SQL,
+                rusqlite::params![board, player_id, delta],
                 row_to_score_record,
             )
             .map_err(|source| LeaderboardError::Sqlite { source })
@@ -702,5 +793,167 @@ mod tests {
             })
             .expect("count query runs");
         assert_eq!(count, 0, "rejected set_score calls must not write any rows");
+    }
+
+    /// SPEC_v2 §Task 8c acceptance: incrementing an existing score
+    /// updates the row in place by adding `delta` to the prior value.
+    /// A regression that turned the upsert into a `set` (overwriting
+    /// rather than adding) would flunk here — the post-increment score
+    /// would equal `delta` instead of `prior + delta`.
+    #[test]
+    fn increment_score_increments_existing_row() {
+        let dir = tempdir().expect("tempdir creates");
+        let world = open_world_with_leaderboards(&dir);
+
+        let alice = world
+            .upsert_player(&ctx_with(Some("u-alice"), Some("alice")))
+            .expect("alice upsert succeeds");
+
+        world
+            .set_score("investigators", alice.id, 10)
+            .expect("seed set_score succeeds");
+
+        let after = world
+            .increment_score("investigators", alice.id, 3)
+            .expect("increment_score succeeds");
+
+        assert_eq!(
+            after.score, 13,
+            "increment must add delta to the prior score"
+        );
+
+        // Round-trip through SELECT proves durability — a regression
+        // that synthesized a fake record from arguments without
+        // actually touching the row would still pass the returned-
+        // record assertion above, but flunk this one.
+        let stored: i64 = world
+            .connection()
+            .query_row(
+                "SELECT score FROM leaderboard_scores \
+                 WHERE board = ?1 AND player_id = ?2",
+                rusqlite::params!["investigators", alice.id],
+                |row| row.get(0),
+            )
+            .expect("row reads back");
+        assert_eq!(stored, 13, "stored row must reflect the increment");
+
+        // And exactly one row exists — a regression that turned the
+        // upsert into a plain INSERT (creating a duplicate row instead
+        // of updating in place) would flunk here.
+        let count: i64 = world
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM leaderboard_scores \
+                 WHERE board = ?1 AND player_id = ?2",
+                rusqlite::params!["investigators", alice.id],
+                |row| row.get(0),
+            )
+            .expect("count query runs");
+        assert_eq!(
+            count, 1,
+            "increment must update the existing row, not insert a duplicate"
+        );
+    }
+
+    /// SPEC_v2 §Task 8c acceptance: incrementing a `(board, player_id)`
+    /// pair that has no prior row creates the row with `delta` as the
+    /// starting score. A regression that required a prior row (e.g.
+    /// dropping the `INSERT … ON CONFLICT` upsert in favor of a plain
+    /// `UPDATE`) would flunk here — the call would silently no-op and
+    /// the leaderboard would never register the player.
+    #[test]
+    fn increment_score_creates_missing_row() {
+        let dir = tempdir().expect("tempdir creates");
+        let world = open_world_with_leaderboards(&dir);
+
+        let alice = world
+            .upsert_player(&ctx_with(Some("u-alice"), Some("alice")))
+            .expect("alice upsert succeeds");
+
+        let after = world
+            .increment_score("investigators", alice.id, 5)
+            .expect("increment_score succeeds on fresh row");
+
+        assert_eq!(after.board, "investigators");
+        assert_eq!(after.player_id, alice.id);
+        assert_eq!(after.score, 5, "first increment must seed the row at delta");
+        assert!(!after.updated_at.is_empty(), "updated_at must be set");
+
+        let stored: (i64, String) = world
+            .connection()
+            .query_row(
+                "SELECT score, board FROM leaderboard_scores \
+                 WHERE board = ?1 AND player_id = ?2",
+                rusqlite::params!["investigators", alice.id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("row reads back");
+        assert_eq!(
+            stored,
+            (5, "investigators".to_string()),
+            "missing-row increment must durably create the row"
+        );
+    }
+
+    /// `delta` is signed: negative deltas decrement, and the result
+    /// can legally be negative or zero. SPEC §4.8 imposes no
+    /// non-negative constraint and the kit shouldn't invent one.
+    /// Pinning this here protects callers (e.g. Murder Motel
+    /// penalties) who rely on the signed contract.
+    #[test]
+    fn increment_score_supports_negative_delta() {
+        let dir = tempdir().expect("tempdir creates");
+        let world = open_world_with_leaderboards(&dir);
+
+        let alice = world
+            .upsert_player(&ctx_with(Some("u-alice"), Some("alice")))
+            .expect("alice upsert succeeds");
+
+        world
+            .set_score("investigators", alice.id, 2)
+            .expect("seed set_score succeeds");
+        let after = world
+            .increment_score("investigators", alice.id, -5)
+            .expect("negative increment succeeds");
+
+        assert_eq!(
+            after.score, -3,
+            "negative delta must subtract from the prior score, including past zero"
+        );
+    }
+
+    /// SPEC §4.8's blank-board rule applies to every leaderboard verb,
+    /// not just `set_score`. The shared [`validate_board_name`] guard
+    /// is the single source of truth for the rule; this test pins that
+    /// `increment_score` uses it.
+    #[test]
+    fn increment_score_rejects_empty_board_name() {
+        let dir = tempdir().expect("tempdir creates");
+        let world = open_world_with_leaderboards(&dir);
+
+        let alice = world
+            .upsert_player(&ctx_with(Some("u-alice"), Some("alice")))
+            .expect("alice upsert succeeds");
+
+        for blank in ["", "   ", "\n\t"] {
+            let err = world
+                .increment_score(blank, alice.id, 1)
+                .expect_err("blank board name must be rejected");
+            assert!(
+                matches!(err, LeaderboardError::EmptyBoardName),
+                "expected EmptyBoardName for {blank:?}, got {err:?}"
+            );
+        }
+
+        let count: i64 = world
+            .connection()
+            .query_row("SELECT COUNT(*) FROM leaderboard_scores", [], |row| {
+                row.get(0)
+            })
+            .expect("count query runs");
+        assert_eq!(
+            count, 0,
+            "rejected increment_score calls must not write any rows"
+        );
     }
 }
