@@ -54,7 +54,7 @@ pub mod world_db;
 
 pub use config::{
     ConfigError, GameConfig, GameSection, LeaderboardSection, LeaderboardSort, ManifestSection,
-    SaveSection, SaveStrategy, TurnReset, TurnsSection, WorldSection,
+    MultiplayerSection, SaveSection, SaveStrategy, TurnReset, TurnsSection, WorldSection,
 };
 pub use dialog::{
     dialog_choice_prompt, dialog_handle_prompt_input, load_dialog, Choice, ChoiceError, Dialog,

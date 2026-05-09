@@ -74,6 +74,18 @@ pub struct GameConfig {
     /// the vec; an empty vec is the natural off signal.
     #[serde(default, rename = "leaderboards")]
     pub leaderboards: Vec<LeaderboardSection>,
+    /// `[multiplayer]` section — v3 BBS-native async multiplayer
+    /// primitives (SPEC v3 §5.2).
+    ///
+    /// Modeled as `Option` rather than a defaulted struct because
+    /// SPEC v3 §5.2 says "Every primitive is opt-in" and "Generated
+    /// v1/v2 projects are not forced to ship multiplayer screens":
+    /// fabricating a default block for a game that did not request
+    /// multiplayer would silently expose mailbox / market / bounty
+    /// surface area the author never asked for. `None` is the off
+    /// signal the runtime checks before wiring any v3 primitive.
+    #[serde(default)]
+    pub multiplayer: Option<MultiplayerSection>,
 }
 
 /// `[game]` section: every field is required.
@@ -299,6 +311,67 @@ pub enum TurnReset {
     /// Roll the ledger over at the operator's local midnight.
     #[default]
     LocalMidnight,
+}
+
+/// `[multiplayer]` section: v3 BBS-native async multiplayer toggles
+/// (SPEC v3 §5.2).
+///
+/// Each `bool` controls whether the corresponding primitive is wired
+/// up at runtime. They default to `false` so that an author who writes
+/// `[multiplayer]\nnotices = true` does *not* accidentally light up
+/// challenges, the market, factions, and bounties as well — opting
+/// into one primitive should not opt the door into all of them.
+///
+/// `max_notice_body_chars` is field-level optional with a SPEC-derived
+/// default. SPEC v3 §7 requires player-authored text to be bounded;
+/// 1000 chars matches the example in SPEC v3 §5.2 and is small enough
+/// to render safely in an 80×24 terminal without sanitization
+/// surprises. We keep it on this section (rather than a dedicated
+/// `[limits]` block) so the cap travels alongside the toggle that
+/// enables the surface where it applies.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MultiplayerSection {
+    /// Enable v3 notices/mail (Task 3). When `false`, the runtime
+    /// MUST NOT expose notice send/inbox APIs to game code; the kit
+    /// still creates the schema migration to keep the on-disk DB
+    /// shape predictable across operator-driven config changes.
+    #[serde(default)]
+    pub notices: bool,
+    /// Enable v3 challenge lifecycle (Task 4).
+    #[serde(default)]
+    pub challenges: bool,
+    /// Enable v3 shared market listings (Task 5).
+    #[serde(default)]
+    pub market: bool,
+    /// Enable v3 factions and shared goals (Task 6).
+    #[serde(default)]
+    pub factions: bool,
+    /// Enable v3 bounty board (Task 7).
+    #[serde(default)]
+    pub bounties: bool,
+    /// Maximum subject+body length for player-authored notices, in
+    /// characters. SPEC v3 §7 requires bounded text; the default
+    /// (1000) matches the SPEC v3 §5.2 example. Stored as `u32` so a
+    /// negative number is rejected at parse time.
+    #[serde(default = "default_max_notice_body_chars")]
+    pub max_notice_body_chars: u32,
+}
+
+impl Default for MultiplayerSection {
+    fn default() -> Self {
+        Self {
+            notices: false,
+            challenges: false,
+            market: false,
+            factions: false,
+            bounties: false,
+            max_notice_body_chars: default_max_notice_body_chars(),
+        }
+    }
+}
+
+fn default_max_notice_body_chars() -> u32 {
+    1_000
 }
 
 fn default_world_path() -> String {
@@ -1185,6 +1258,144 @@ sort = "asc"
         let reparsed = GameConfig::from_toml_str(&serialized).unwrap();
         assert_eq!(config, reparsed);
         assert_eq!(reparsed.leaderboards.len(), 2);
+    }
+
+    #[test]
+    fn absent_multiplayer_section_disables_all_primitives() {
+        // SPEC v3 §5.2: "Every primitive is opt-in" and v1/v2 projects
+        // must not be forced into multiplayer. We model that as
+        // `None` — the off signal the runtime checks before wiring any
+        // v3 primitive.
+        let v1_style = r#"
+[game]
+title = "No Multiplayer"
+slug = "no-multiplayer"
+description = ""
+min_width = 80
+min_height = 24
+start_map = "lobby"
+start_x = 0
+start_y = 0
+"#;
+        let config = GameConfig::from_toml_str(v1_style).unwrap();
+        assert!(config.multiplayer.is_none());
+    }
+
+    #[test]
+    fn parses_full_multiplayer_section_from_spec_example() {
+        // Verbatim from SPEC v3 §5.2 (minus the [[factions.seed]]
+        // block, which lands in Task 2b). A future SPEC tweak that
+        // breaks compatibility shows up as a failing test.
+        let v3 = r#"
+[game]
+title = "Murder Motel"
+slug = "murder-motel"
+description = ""
+min_width = 80
+min_height = 24
+start_map = "lobby"
+start_x = 0
+start_y = 0
+
+[multiplayer]
+notices = true
+challenges = true
+market = true
+factions = true
+bounties = true
+max_notice_body_chars = 1000
+"#;
+        let config = GameConfig::from_toml_str(v3).unwrap();
+        let mp = config.multiplayer.expect("multiplayer section parsed");
+        assert!(mp.notices);
+        assert!(mp.challenges);
+        assert!(mp.market);
+        assert!(mp.factions);
+        assert!(mp.bounties);
+        assert_eq!(mp.max_notice_body_chars, 1_000);
+    }
+
+    #[test]
+    fn multiplayer_toggles_default_to_false_when_omitted() {
+        // Opting into `[multiplayer]` to set one flag must not silently
+        // light up the others — each primitive is independently opt-in.
+        let partial = r#"
+[game]
+title = "Just Notices"
+slug = "just-notices"
+description = ""
+min_width = 80
+min_height = 24
+start_map = "lobby"
+start_x = 0
+start_y = 0
+
+[multiplayer]
+notices = true
+"#;
+        let config = GameConfig::from_toml_str(partial).unwrap();
+        let mp = config.multiplayer.expect("multiplayer section parsed");
+        assert!(mp.notices);
+        assert!(!mp.challenges);
+        assert!(!mp.market);
+        assert!(!mp.factions);
+        assert!(!mp.bounties);
+        // Default cap kicks in even when only `notices` is set.
+        assert_eq!(mp.max_notice_body_chars, 1_000);
+    }
+
+    #[test]
+    fn multiplayer_section_round_trips_through_toml() {
+        let original = r#"
+[game]
+title = "RT MP"
+slug = "rt-mp"
+description = ""
+min_width = 80
+min_height = 24
+start_map = "lobby"
+start_x = 0
+start_y = 0
+
+[multiplayer]
+notices = true
+challenges = false
+market = true
+factions = true
+bounties = false
+max_notice_body_chars = 500
+"#;
+        let config = GameConfig::from_toml_str(original).unwrap();
+        let serialized = config.to_toml_string();
+        let reparsed = GameConfig::from_toml_str(&serialized).unwrap();
+        assert_eq!(config, reparsed);
+        let mp = reparsed.multiplayer.unwrap();
+        assert_eq!(mp.max_notice_body_chars, 500);
+        assert!(mp.market);
+        assert!(!mp.bounties);
+    }
+
+    #[test]
+    fn multiplayer_section_rejects_negative_char_cap_at_parse_time() {
+        // `u32` rejects negatives at parse time — the field name should
+        // land in the error so the author knows where to look.
+        let bad = r#"
+[game]
+title = "Negative Cap"
+slug = "negative-cap"
+description = ""
+min_width = 80
+min_height = 24
+start_map = "lobby"
+start_x = 0
+start_y = 0
+
+[multiplayer]
+notices = true
+max_notice_body_chars = -1
+"#;
+        let err = GameConfig::from_toml_str(bad).unwrap_err();
+        assert!(matches!(err, ConfigError::Parse(_)), "got {err:?}");
     }
 
     #[test]
