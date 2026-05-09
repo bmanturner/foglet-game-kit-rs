@@ -60,8 +60,7 @@ mod world;
 mod test_support;
 
 use foglet_game::{
-    load_context, process_env, read_save, resolve_save_path, write_atomic, Game, GameConfig,
-    SavePathInputs,
+    load_context, process_env, read_save, resolve_save_path, Game, GameConfig, SavePathInputs,
 };
 
 use crate::state::{SaveState, SharedSlots};
@@ -108,22 +107,19 @@ fn main() -> anyhow::Result<()> {
         None => SharedSlots::default(),
     };
 
+    // SPEC_v2_1 §Task 8a: the manual post-`run` `write_atomic` tail is
+    // gone. Persistence on clean exit moves to `Game::with_save_handler`
+    // in §Task 8b, which fires the same `SaveSlot::save_handler` closure
+    // from inside the runtime's Quit drain — *before* the terminal
+    // guard tears down — instead of after. `save_path` stays computed
+    // up-front because §Task 8b still needs the resolved path; the
+    // pre-`run` `read_save` also stays so a malformed save still
+    // surfaces as a stderr error before the TUI starts.
     Game::new(config.game.title.clone())
         .min_size(config.game.min_width, config.game.min_height)
         .with_config(config)
         .with_foglet_context(foglet)
         .push_screen(Box::new(TitleScreen::with_slots(slots.clone())))
         .run()?;
-
-    // Persist on clean exit. The runtime returns Ok only when a screen
-    // emitted Quit (or popped to empty), so reaching this line means
-    // the player has finished a session and the slot mutations on
-    // `slots` are the canonical state worth keeping. Errors propagate
-    // *after* the terminal has been restored — `Game::run` already
-    // tore the guard down — so the operator sees a clean message
-    // rather than a scrambled one.
-    if let Some(path) = save_path {
-        write_atomic(&path, &slots.save.snapshot())?;
-    }
     Ok(())
 }
