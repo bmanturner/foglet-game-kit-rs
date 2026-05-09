@@ -773,6 +773,35 @@ pub fn run_built_with_opener(mut built: BuiltGame, open_world: &WorldOpenerFn) -
     result.map(|_reason| ())
 }
 
+/// Invoke the runtime save handler and normalise any error into
+/// [`GameError::Save`].
+///
+/// Task 4e: SPEC_v2_1 §4.4 pins that "a handler error MUST surface as
+/// `GameError::Save(_)`". The handler signature ([`SaveHandler`])
+/// returns `Result<(), GameError>`, so a careless implementation can
+/// hand back any [`GameError`] variant — `EventIo`, `Render`,
+/// `Terminal`, anything. Without this funnel a misclassified error
+/// would bypass the SPEC contract and confuse callers who pattern
+/// match on `Err(GameError::Save(_))` to decide whether to retry the
+/// flush.
+///
+/// We collapse via `Display` (`e.to_string()`) rather than wrapping
+/// the error: [`GameError::Save`] is already a `String` payload and
+/// the original variant's `Display` impl carries the actionable
+/// message. Terminal restoration is unaffected: this helper only
+/// translates the error value; the caller still propagates via `?`,
+/// the loop unwinds back to [`run_built`], and the explicit
+/// `guard.cleanup()` in that path runs regardless of the error kind.
+fn invoke_save(on_save: &mut dyn FnMut() -> Result<(), GameError>) -> GameResult<()> {
+    on_save().map_err(|e| match e {
+        // Already a Save error — pass through verbatim so authors who
+        // intentionally produce `GameError::Save(specific message)`
+        // see their own message rather than a re-stringified copy.
+        GameError::Save(_) => e,
+        other => GameError::Save(other.to_string()),
+    })
+}
+
 /// Drive the runtime loop against caller-supplied I/O.
 ///
 /// This is the testable seam. All the orchestration lives here; the
@@ -797,9 +826,10 @@ pub fn run_built_with_opener(mut built: BuiltGame, open_world: &WorldOpenerFn) -
 /// - **Resize** events update the cached `terminal_size` *before*
 ///   dispatching to the screen, so `on_resize` and the next render
 ///   both see the new dimensions.
-/// - **Side effects**: `Save` calls the `on_save` callback; `Message`
-///   and `Error` are currently swallowed (the status-line widget lives
-///   in Task 9c); `Exit(reason)` returns from the loop.
+/// - **Side effects**: `Save` calls the `on_save` callback; any error
+///   it returns is normalised to [`GameError::Save`] (Task 4e).
+///   `Message` and `Error` are currently swallowed (the status-line
+///   widget lives in Task 9c); `Exit(reason)` returns from the loop.
 #[allow(clippy::too_many_arguments)]
 pub fn run_with_io<B, E>(
     mut built: BuiltGame,
@@ -896,7 +926,7 @@ where
         // ---- Apply ----
         match apply_command(&mut built.screens, cmd) {
             SideEffect::None => {}
-            SideEffect::Save => on_save()?,
+            SideEffect::Save => invoke_save(on_save)?,
             // Message / Error UI lives in Task 9c — for now the
             // status-line slot is unwired and these are swallowed.
             // Errors specifically are not promoted to GameError
@@ -919,7 +949,7 @@ where
                 // here, and a render/IO error still leaves whatever
                 // partial state the game last persisted intact rather
                 // than half-overwriting it on a panicking exit.
-                on_save()?;
+                invoke_save(on_save)?;
                 return Ok(reason);
             }
         }
@@ -1697,6 +1727,111 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, GameError::Save(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn loop_handler_non_save_error_is_normalised_to_save() {
+        // Task 4e: a handler that returns *any* GameError — not just
+        // GameError::Save — must surface to the caller as
+        // GameError::Save(_). SPEC_v2_1 §4.4 line 188 pins this so
+        // downstream `match Err(GameError::Save(_))` arms are reliable.
+        // The original message is preserved via Display.
+        let cfg = fixture_config();
+        let fc = fixture_context();
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let screen = ScriptedScreen::new("only", log, vec![ScreenCommand::Save], vec![], vec![]);
+        let built = make_built(Box::new(screen));
+        let mut term = make_terminal();
+        let mut events = VecEventSource::new(vec![Some(Input::Char('s'))]);
+        let mut on_save: Box<dyn FnMut() -> Result<(), GameError>> =
+            Box::new(|| Err(GameError::EventIo("io oops".into())));
+
+        let err = run_with_io(
+            built,
+            &cfg,
+            &fc,
+            None,
+            (40, 10),
+            &mut term,
+            &mut events,
+            &mut on_save,
+        )
+        .unwrap_err();
+        match err {
+            GameError::Save(msg) => assert!(
+                msg.contains("io oops"),
+                "original error message must survive normalisation; got {msg:?}"
+            ),
+            other => panic!("expected GameError::Save(_), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn loop_handler_save_error_message_passes_through_unchanged() {
+        // Task 4e: when the handler already returns GameError::Save the
+        // runtime must NOT re-stringify it. Authors who craft a
+        // specific Save message rely on it reaching the caller verbatim.
+        let cfg = fixture_config();
+        let fc = fixture_context();
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let screen = ScriptedScreen::new("only", log, vec![ScreenCommand::Save], vec![], vec![]);
+        let built = make_built(Box::new(screen));
+        let mut term = make_terminal();
+        let mut events = VecEventSource::new(vec![Some(Input::Char('s'))]);
+        let mut on_save: Box<dyn FnMut() -> Result<(), GameError>> =
+            Box::new(|| Err(GameError::Save("exact message".into())));
+
+        let err = run_with_io(
+            built,
+            &cfg,
+            &fc,
+            None,
+            (40, 10),
+            &mut term,
+            &mut events,
+            &mut on_save,
+        )
+        .unwrap_err();
+        match err {
+            GameError::Save(msg) => assert_eq!(msg, "exact message"),
+            other => panic!("expected GameError::Save, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn loop_handler_non_save_error_on_quit_drain_normalises_to_save() {
+        // Task 4e + 4d: the Quit-drain invocation must apply the same
+        // normalisation as the SideEffect::Save path. Drive a clean
+        // Quit with a handler that returns a non-Save GameError and
+        // assert the loop returns GameError::Save(_).
+        let cfg = fixture_config();
+        let fc = fixture_context();
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let screen = ScriptedScreen::new("only", log, vec![ScreenCommand::Quit], vec![], vec![]);
+        let built = make_built(Box::new(screen));
+        let mut term = make_terminal();
+        let mut events = VecEventSource::new(vec![Some(Input::Char('q'))]);
+        let mut on_save: Box<dyn FnMut() -> Result<(), GameError>> =
+            Box::new(|| Err(GameError::Render("render oops".into())));
+
+        let err = run_with_io(
+            built,
+            &cfg,
+            &fc,
+            None,
+            (40, 10),
+            &mut term,
+            &mut events,
+            &mut on_save,
+        )
+        .unwrap_err();
+        match err {
+            GameError::Save(msg) => assert!(
+                msg.contains("render oops"),
+                "drain path must normalise via Display too; got {msg:?}"
+            ),
+            other => panic!("expected GameError::Save, got {other:?}"),
+        }
     }
 
     #[test]
