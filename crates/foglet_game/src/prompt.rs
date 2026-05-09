@@ -533,6 +533,119 @@ impl<T> ChoicePrompt<T> {
     }
 }
 
+impl<T: Clone> ChoicePrompt<T> {
+    /// Send one [`Input`] through the prompt and return a typed
+    /// [`PromptAction`] outcome (SPEC_v1_1.md §4.4).
+    ///
+    /// This is the **direct-key reducer entry point** for `ChoicePrompt`.
+    /// Task 3a only wires the dispatch shape: every input currently maps
+    /// to [`PromptAction::None`]. The substantive arms — direct hotkey
+    /// matching, disabled-choice routing, Esc cancellation, the
+    /// non-selection ignore branch — land in Tasks 3b–3e and 4. The
+    /// signature is fixed here so downstream code (the optional
+    /// [`crate::screen::Screen`] adapter, `ConfirmPrompt`, the docs
+    /// examples) can compile against the eventual API immediately.
+    ///
+    /// # Why `&self`, not `&mut self`?
+    ///
+    /// Direct-key prompts have no internal state to mutate — selection
+    /// is whatever the player just pressed, and the reducer's job is to
+    /// classify that press, not remember it. The arrow/Enter navigation
+    /// reducer (Task 4) carries a selected-index cursor; that variant
+    /// will land as a separate `&mut self` method or a state struct, so
+    /// this method stays cheap to call (e.g. from a render path that
+    /// previews "would this key select something?").
+    ///
+    /// # `T: Clone`
+    ///
+    /// `PromptAction::Selected(T)` and `PromptAction::Disabled { id, .. }`
+    /// hand the player a copy of the choice's stable id. Real games use
+    /// small `Copy` enums there, so the `Clone` bound is effectively
+    /// free; constraining it on the impl block (rather than on every
+    /// method) keeps `ChoicePrompt::new`/`body`/`choice`/etc. usable
+    /// with non-`Clone` `T` during construction-only flows like tests
+    /// that introspect the data without ever calling `handle`.
+    pub fn handle(&self, _input: Input) -> PromptAction<T> {
+        // Task 3b–3e fill in: direct-key match against `self.choices`,
+        // disabled-key Disabled branch, Esc → Cancelled when configured,
+        // resize/unknown → None. Until those arms exist, the safe
+        // default is "nothing happened" — no spurious selections.
+        PromptAction::None
+    }
+}
+
+/// Outcome of sending one [`Input`] through a prompt reducer
+/// (SPEC_v1_1.md §4.4).
+///
+/// Generic over the game's stable choice id `T` so the kit stays
+/// decoupled from any particular inventory/shop/dialog vocabulary —
+/// see [`PromptChoice`] for why stable ids beat returning labels.
+///
+/// # Variants and when each is produced
+///
+/// - [`PromptAction::None`] — the input was not prompt-relevant or was
+///   one of the inputs the SPEC says to ignore (resize, unknown keys,
+///   modifier-only events). The caller SHOULD render the prompt
+///   unchanged. `None` covers the SPEC §4.4 rules:
+///   - "`Resize` input MUST NOT select a choice."
+///   - "Unknown keys SHOULD produce `None`."
+/// - [`PromptAction::Selected`] — the player pressed an enabled
+///   choice's hotkey (or pressed Enter on the highlighted choice in the
+///   navigation mode). The wrapped `T` is the stable id of that choice.
+/// - [`PromptAction::Disabled`] — the player pressed a hotkey bound to
+///   a *disabled* choice. SPEC §4.1 requires that disabled choices
+///   reserve their hotkey; rather than swallowing the press silently,
+///   the reducer surfaces it so the game can show a status message
+///   like "can't equip — bag full". `reason` mirrors
+///   `PromptChoice::disabled_reason` so the game does not have to
+///   re-derive the cause.
+/// - [`PromptAction::Cancelled`] — the player pressed Esc on a prompt
+///   that opted into cancellation. Prompts that disable Esc never
+///   produce this variant.
+/// - [`PromptAction::ConfirmRequested`] — the player selected a choice
+///   that is configured to require a follow-up confirmation. The kit
+///   does **not** perform the confirmation itself; it hands the id back
+///   so the game can stage a `ConfirmPrompt` (Task 6a) and decide what
+///   to do on yes/no. Reserving this variant at 3a, even though only
+///   `ConfirmPrompt` will produce it, keeps the public API stable
+///   across the rest of v1.1.
+///
+/// # Why a flat enum, not nested types?
+///
+/// Game match arms read more naturally against a flat enum
+/// (`PromptAction::Selected(id) => ...`) than against a tree (e.g.
+/// `Outcome::Choice(ChoiceOutcome::Selected(id))`). Equality and
+/// `Debug` derives stay cheap, and the variant set is the SPEC's
+/// vocabulary — adding to it is a SPEC-level change.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PromptAction<T> {
+    /// No state-changing outcome — the input was ignored. Includes
+    /// resize, unknown/modifier-only inputs, and (depending on the
+    /// reducer's configuration) Esc when cancellation is disabled.
+    None,
+    /// The player selected an enabled choice; the wrapped value is
+    /// that choice's stable id.
+    Selected(T),
+    /// The player pressed a hotkey bound to a disabled choice.
+    /// Surfaced (not swallowed) so the game can show feedback —
+    /// SPEC §4.1's "disabled rows still reserve their hotkey".
+    Disabled {
+        /// Stable id of the disabled choice the player pressed.
+        id: T,
+        /// Optional human-readable reason carried over from
+        /// [`PromptChoice::disabled_reason`].
+        reason: Option<String>,
+    },
+    /// The player cancelled the prompt (typically via Esc on a
+    /// cancellation-enabled prompt).
+    Cancelled,
+    /// The player selected a choice that requires a follow-up
+    /// confirmation step. Produced only by future variants of the
+    /// reducer (see `ConfirmPrompt`, Task 6a); `ChoicePrompt::handle`
+    /// itself does not currently emit this variant.
+    ConfirmRequested(T),
+}
+
 impl From<char> for PromptKey {
     /// Lift a `char` straight into a [`PromptKey`] via
     /// [`PromptKey::char`] so call sites like
@@ -985,6 +1098,85 @@ mod tests {
         let a: ChoicePrompt<LootAction> = ChoicePrompt::new();
         let b: ChoicePrompt<LootAction> = ChoicePrompt::default();
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn prompt_action_variants_construct_and_compare() {
+        // SPEC §4.4: the action enum carries None / Selected / Disabled
+        // / Cancelled / ConfirmRequested. Verify each variant builds
+        // with the expected payload shape and that equality/Debug derive
+        // correctly — downstream tests rely on `assert_eq!` against
+        // these values across the whole prompt module.
+        let none: PromptAction<LootAction> = PromptAction::None;
+        let selected = PromptAction::Selected(LootAction::Equip);
+        let disabled = PromptAction::Disabled {
+            id: LootAction::Take,
+            reason: Some("full".to_string()),
+        };
+        let cancelled: PromptAction<LootAction> = PromptAction::Cancelled;
+        let confirm = PromptAction::ConfirmRequested(LootAction::Pass);
+
+        // Distinctness: variants are not equal to one another.
+        assert_ne!(none, PromptAction::Selected(LootAction::Equip));
+        assert_ne!(selected, PromptAction::Selected(LootAction::Take));
+        assert_ne!(cancelled, none);
+        assert_ne!(confirm, selected);
+
+        // Disabled carries an optional reason; both `Some` and `None`
+        // forms are valid (Task 3c will exercise the `Some` path).
+        assert_eq!(
+            disabled,
+            PromptAction::Disabled {
+                id: LootAction::Take,
+                reason: Some("full".to_string()),
+            }
+        );
+        assert_ne!(
+            disabled,
+            PromptAction::Disabled {
+                id: LootAction::Take,
+                reason: None,
+            }
+        );
+
+        // Clone round-trips preserve payload — sanity check that the
+        // derive lines up with the `T: Clone` impl bound on `handle`.
+        assert_eq!(selected.clone(), PromptAction::Selected(LootAction::Equip));
+    }
+
+    #[test]
+    fn handle_stub_returns_none_for_every_input_kind() {
+        // Task 3a only wires the dispatch shape. Until 3b–3e add the
+        // direct-key matching, disabled routing, Esc, and ignore arms,
+        // every input must classify as `None` — the safe default so a
+        // half-built prompt never invents a selection.
+        let prompt: ChoicePrompt<LootAction> = ChoicePrompt::new()
+            .body("placeholder")
+            .choice('e', LootAction::Equip, "Equip")
+            .choice('t', LootAction::Take, "Take")
+            .disabled_if(true, "no room");
+
+        for input in [
+            Input::Char('e'),
+            Input::Char('E'),
+            Input::Char('t'),
+            Input::Char('z'),
+            Input::Enter,
+            Input::Esc,
+            Input::Up,
+            Input::Down,
+            Input::Resize {
+                width: 80,
+                height: 24,
+            },
+            Input::Unknown,
+        ] {
+            assert_eq!(
+                prompt.handle(input),
+                PromptAction::None,
+                "stub reducer should classify {input:?} as None until Tasks 3b-3e land",
+            );
+        }
     }
 
     #[test]
