@@ -11,12 +11,13 @@ use std::collections::BTreeSet;
 use std::rc::Rc;
 
 use foglet_game::{
-    render_inventory_list, GameContext, Input, InventoryList, Screen, ScreenCommand,
+    render_inventory_list, EventRecord, GameContext, Input, InventoryList, Screen, ScreenCommand,
+    WorldDb,
 };
 use ratatui::layout::{Alignment, Rect};
 use ratatui::style::{Color, Style};
 use ratatui::text::Line;
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph};
 use ratatui::Frame;
 
 use crate::layout::centred_rect;
@@ -42,6 +43,7 @@ impl HelpScreen {
         "Talk          Enter (when standing next to an NPC)",
         "Select        Enter",
         "Inventory     I",
+        "Bulletin      E   (lobby bulletin / recent events ledger)",
         "Back / Cancel Esc or Backspace",
         "Save          S",
         "Quit          Q  (Ctrl-C also works anywhere)",
@@ -263,6 +265,206 @@ impl Screen for InventoryScreen {
             Input::Down | Input::Char('j') | Input::Char('J') => {
                 let len = self.inventory.borrow().len();
                 if len > 0 && self.selected + 1 < len {
+                    self.selected += 1;
+                }
+                ScreenCommand::None
+            }
+            _ => ScreenCommand::None,
+        }
+    }
+}
+
+/// Lobby bulletin / recent-events ledger (SPEC_v2 §Task 13d).
+///
+/// Snapshots the newest [`BulletinScreen::EVENT_LIMIT`] rows from the
+/// kit's `world_events` table at the moment the player presses `E` and
+/// renders them as a scrollable list. The query happens at construction
+/// rather than per-frame because [`Screen::render`] forbids blocking
+/// world queries (SPEC §Task 10d) — the modal is push-on-demand, so a
+/// single read on construction matches what the player just asked for.
+///
+/// "System" events (rows with `NULL` `player_id`) are included on
+/// purpose: the lobby bulletin is the global feed, and Murder Motel
+/// uses player-attributed rows today. If the future bulletin grows a
+/// per-player view it can call [`WorldDb::player_events`] from a
+/// sibling screen.
+///
+/// ## Render contract
+///
+/// - One row per event: `[HH:MM:SS] kind — message`. The timestamp is
+///   the raw SQLite text (UTC `YYYY-MM-DD HH:MM:SS`) trimmed to the
+///   `HH:MM:SS` slice; the kit deliberately stores ISO text so the
+///   operator-facing `sqlite3` story matches the runtime view, and the
+///   modal mirrors that.
+/// - When the world DB is absent or returns no events, the screen
+///   renders the [`Self::EMPTY_HINT`] line so the affordance never
+///   feels broken. Callers that pass `None` (no `[world]` configured,
+///   tests that don't stand a DB up) reach the same code path.
+///
+/// ## Input contract
+///
+/// - `Up` / `Down` (and `j`/`k`) move the highlight cursor.
+/// - `Esc` / `Backspace` / `e` / `E` pop back to the map.
+/// - `Q` / `Ctrl-C` still hard-quit, matching every other screen.
+pub struct BulletinScreen {
+    /// Snapshot of recent events, newest first. Owned by the screen so
+    /// the world DB can be released after construction — the bulletin
+    /// is a frozen read of "what was true when you opened it" rather
+    /// than a live tail.
+    events: Vec<EventRecord>,
+    /// Highlighted row. Clamped at render time against the live event
+    /// count so an empty bulletin never points the cursor past zero.
+    selected: usize,
+}
+
+impl BulletinScreen {
+    /// Block title rendered on the bordered modal.
+    pub const TITLE: &'static str = "Bulletin";
+    /// Empty-state hint shown when the bulletin holds no rows. Pulled
+    /// out as a constant so tests can assert it without binding to
+    /// incidental wording.
+    pub const EMPTY_HINT: &'static str = "(no bulletin entries yet)";
+    /// Maximum rows fetched from `world_events` on open. 50 is enough
+    /// to cover several days of Murder Motel play on an 80x24 terminal
+    /// and well under SPEC §Task 7c's "newest-N" intent — the modal
+    /// re-queries each time the player opens it, so a hard cap is the
+    /// right tradeoff against pulling thousands of rows on a long-
+    /// running door.
+    pub const EVENT_LIMIT: u32 = 50;
+
+    /// Build a bulletin screen by querying `world` for the newest
+    /// [`Self::EVENT_LIMIT`] events. `None` (or a DB that returns an
+    /// error) yields an empty bulletin — the screen renders the
+    /// empty-state hint and the player can still close it cleanly.
+    ///
+    /// Errors from `recent_events` are deliberately swallowed: the
+    /// SPEC §13.x terminal-safety contract forbids panicking out of
+    /// the input handler that pushes us, and a transient SQLite error
+    /// shouldn't soft-lock the player at the lobby. The kit logs the
+    /// underlying error through `tracing` already (Task 7); the modal
+    /// just shows nothing rather than the error message.
+    pub fn from_world_db(world: Option<&WorldDb>) -> Self {
+        let events = world
+            .and_then(|w| w.recent_events(Self::EVENT_LIMIT).ok())
+            .unwrap_or_default();
+        Self {
+            events,
+            selected: 0,
+        }
+    }
+
+    /// Construct directly from an event vector. Used by the tests so
+    /// they can drive the screen without standing up a `WorldDb`; also
+    /// the building block [`Self::from_world_db`] funnels through.
+    pub fn from_events(events: Vec<EventRecord>) -> Self {
+        Self {
+            events,
+            selected: 0,
+        }
+    }
+
+    /// Format one event row for display. Pulled out of `render` so the
+    /// formatting contract is unit-testable (SPEC §Task 13d's
+    /// "deterministic tie ordering" lives in the kit's
+    /// `recent_events`; this helper just renders what we got).
+    ///
+    /// Format: `[HH:MM:SS] kind — message`. If the SQLite timestamp
+    /// doesn't contain a space (corrupt or hand-edited row) the whole
+    /// stored value is shown so an operator can still see what's there.
+    pub fn format_row(event: &EventRecord) -> String {
+        let time = event
+            .created_at
+            .split(' ')
+            .nth(1)
+            .unwrap_or(event.created_at.as_str());
+        format!("[{time}] {} — {}", event.kind, event.message)
+    }
+}
+
+impl Screen for BulletinScreen {
+    fn render(&mut self, _ctx: &mut GameContext<'_>, frame: &mut Frame<'_>) {
+        // Centre a tall modal so the list can hold the full snapshot on
+        // a 24-row terminal without scrolling: 18 body rows + 2 border
+        // + 1 hint row fits comfortably under SPEC §13.1's 80x24 floor.
+        let outer = frame.area();
+        let area = centred_rect(72, 21, outer);
+
+        // Reserve a one-row hint band at the bottom of the modal so
+        // the controls are always visible — same pattern as
+        // `InventoryScreen`.
+        let hint_h = 1.min(area.height);
+        let body_h = area.height.saturating_sub(hint_h);
+        let body = Rect {
+            x: area.x,
+            y: area.y,
+            width: area.width,
+            height: body_h,
+        };
+        let hint = Rect {
+            x: area.x,
+            y: area.y + body_h,
+            width: area.width,
+            height: hint_h,
+        };
+
+        if self.events.is_empty() {
+            // Empty bulletin: render the hint inside the bordered
+            // block so the screen doesn't just look like a blank box.
+            // Players who arrive before any events fire (fresh world
+            // DB, single-player runs) see "(no bulletin entries yet)"
+            // rather than a void.
+            let widget = Paragraph::new(Self::EMPTY_HINT)
+                .alignment(Alignment::Center)
+                .style(Style::default().fg(Color::DarkGray))
+                .block(Block::default().borders(Borders::ALL).title(Self::TITLE));
+            frame.render_widget(widget, body);
+        } else {
+            // Clamp the cursor against the live count so a row removed
+            // between renders (impossible today — events are append-
+            // only — but cheap insurance) never points off the end.
+            let selected = self.selected.min(self.events.len() - 1);
+            let items: Vec<ListItem<'_>> = self
+                .events
+                .iter()
+                .enumerate()
+                .map(|(idx, event)| {
+                    let mut line = Line::from(Self::format_row(event));
+                    if idx == selected {
+                        line = line.style(Style::default().fg(Color::Black).bg(Color::White));
+                    }
+                    ListItem::new(line)
+                })
+                .collect();
+            let list =
+                List::new(items).block(Block::default().borders(Borders::ALL).title(Self::TITLE));
+            frame.render_widget(list, body);
+        }
+        if hint_h > 0 {
+            let widget = Paragraph::new("[Up/Down] scroll    [Esc/E] close")
+                .alignment(Alignment::Center)
+                .style(Style::default().fg(Color::DarkGray));
+            frame.render_widget(widget, hint);
+        }
+    }
+
+    fn handle_input(&mut self, _ctx: &mut GameContext<'_>, input: Input) -> ScreenCommand {
+        match input {
+            // Always-on hard-quit affordances.
+            Input::Char('q') | Input::Char('Q') | Input::Ctrl('c') => ScreenCommand::Quit,
+            // Esc / Backspace / `e` close the modal — `e` toggles so
+            // the same keystroke that opens the bulletin also closes
+            // it, matching the inventory's `i` toggle pattern.
+            Input::Esc | Input::Backspace | Input::Char('e') | Input::Char('E') => {
+                ScreenCommand::Pop
+            }
+            Input::Up | Input::Char('k') | Input::Char('K') => {
+                if self.selected > 0 {
+                    self.selected -= 1;
+                }
+                ScreenCommand::None
+            }
+            Input::Down | Input::Char('j') | Input::Char('J') => {
+                if !self.events.is_empty() && self.selected + 1 < self.events.len() {
                     self.selected += 1;
                 }
                 ScreenCommand::None
@@ -596,5 +798,265 @@ mod tests {
             screen.handle_input(&mut ctx, Input::Up);
         }
         assert_eq!(screen.selected, 0, "cursor must clamp at top row");
+    }
+
+    // ---- BulletinScreen ----------------------------------------------
+
+    /// Build a synthetic [`EventRecord`] for the bulletin tests. Pulled
+    /// out as a helper so we can assert on real fields without standing
+    /// up a `WorldDb` for each case.
+    fn synthetic_event(id: i64, created_at: &str, kind: &str, message: &str) -> EventRecord {
+        EventRecord {
+            id,
+            created_at: created_at.to_string(),
+            kind: kind.to_string(),
+            player_id: Some(1),
+            message: message.to_string(),
+            metadata: None,
+        }
+    }
+
+    #[test]
+    fn bulletin_format_row_extracts_time_slice() {
+        // The kit stores `YYYY-MM-DD HH:MM:SS` text; the bulletin pulls
+        // the time slice for compactness on an 80-column modal.
+        let event = synthetic_event(
+            1,
+            "2026-05-09 12:34:56",
+            "room_7_opened",
+            "alice opened Room 7",
+        );
+        assert_eq!(
+            BulletinScreen::format_row(&event),
+            "[12:34:56] room_7_opened — alice opened Room 7"
+        );
+    }
+
+    #[test]
+    fn bulletin_format_row_falls_back_when_timestamp_lacks_space() {
+        // Defensive: a hand-edited or future-format timestamp without
+        // the canonical date/time split should still surface in the
+        // modal so an operator can see what's there.
+        let event = synthetic_event(1, "2026-05-09T12:34:56Z", "kind", "msg");
+        assert_eq!(
+            BulletinScreen::format_row(&event),
+            "[2026-05-09T12:34:56Z] kind — msg"
+        );
+    }
+
+    #[test]
+    fn bulletin_empty_no_world_db_renders_hint() {
+        // `from_world_db(None)` is the no-`[world]` / single-player
+        // path. The screen must still render cleanly, with the
+        // documented empty hint.
+        let cfg = fixture_config();
+        let fc = fixture_context();
+        let mut ctx = GameContext::new(&cfg, &fc, (80, 24));
+        let mut screen = BulletinScreen::from_world_db(None);
+        let mut term = Terminal::new(TestBackend::new(80, 24)).expect("test backend");
+        term.draw(|frame| screen.render(&mut ctx, frame))
+            .expect("draw");
+        let buf = term.backend().buffer().clone();
+        let mut found = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                found.push_str(buf.cell((x, y)).expect("cell").symbol());
+            }
+            found.push('\n');
+        }
+        assert!(
+            found.contains(BulletinScreen::TITLE),
+            "bulletin must paint its title; buffer was:\n{found}"
+        );
+        assert!(
+            found.contains(BulletinScreen::EMPTY_HINT),
+            "empty bulletin must surface the empty-state hint; buffer was:\n{found}"
+        );
+    }
+
+    #[test]
+    fn bulletin_renders_event_rows_into_test_backend() {
+        // Two synthetic events, newest-first as `recent_events` would
+        // return them. Both messages must appear in the modal.
+        let cfg = fixture_config();
+        let fc = fixture_context();
+        let mut ctx = GameContext::new(&cfg, &fc, (80, 24));
+        let mut screen = BulletinScreen::from_events(vec![
+            synthetic_event(
+                2,
+                "2026-05-09 12:35:00",
+                "clue_found",
+                "alice took the matchbook",
+            ),
+            synthetic_event(
+                1,
+                "2026-05-09 12:34:56",
+                "room_7_opened",
+                "alice opened Room 7",
+            ),
+        ]);
+        let mut term = Terminal::new(TestBackend::new(80, 24)).expect("test backend");
+        term.draw(|frame| screen.render(&mut ctx, frame))
+            .expect("draw");
+        let buf = term.backend().buffer().clone();
+        let mut found = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                found.push_str(buf.cell((x, y)).expect("cell").symbol());
+            }
+            found.push('\n');
+        }
+        assert!(found.contains("clue_found"), "first row missing: {found}");
+        assert!(
+            found.contains("alice took the matchbook"),
+            "msg missing: {found}"
+        );
+        assert!(
+            found.contains("room_7_opened"),
+            "second row missing: {found}"
+        );
+        assert!(
+            !found.contains(BulletinScreen::EMPTY_HINT),
+            "non-empty bulletin must not paint the empty hint: {found}"
+        );
+    }
+
+    #[test]
+    fn bulletin_esc_pops() {
+        let cfg = fixture_config();
+        let fc = fixture_context();
+        let mut ctx = GameContext::new(&cfg, &fc, (80, 24));
+        let mut screen = BulletinScreen::from_events(Vec::new());
+        assert!(matches!(
+            screen.handle_input(&mut ctx, Input::Esc),
+            ScreenCommand::Pop
+        ));
+    }
+
+    #[test]
+    fn bulletin_e_toggles_closed() {
+        // Same muscle-memory contract as the inventory `i` toggle: the
+        // key that opens the bulletin also closes it.
+        let cfg = fixture_config();
+        let fc = fixture_context();
+        let mut ctx = GameContext::new(&cfg, &fc, (80, 24));
+        let mut screen = BulletinScreen::from_events(Vec::new());
+        for key in [Input::Char('e'), Input::Char('E'), Input::Backspace] {
+            let mut s = BulletinScreen::from_events(Vec::new());
+            assert!(
+                matches!(s.handle_input(&mut ctx, key), ScreenCommand::Pop),
+                "{key:?} should pop the bulletin"
+            );
+        }
+        // Sanity: the loop above shadowed `screen` per-iteration; we
+        // also need the original `screen` handle to still respond.
+        assert!(matches!(
+            screen.handle_input(&mut ctx, Input::Char('e')),
+            ScreenCommand::Pop
+        ));
+    }
+
+    #[test]
+    fn bulletin_quit_keys_quit() {
+        let cfg = fixture_config();
+        let fc = fixture_context();
+        let mut ctx = GameContext::new(&cfg, &fc, (80, 24));
+        let mut screen = BulletinScreen::from_events(Vec::new());
+        for key in [Input::Char('q'), Input::Char('Q'), Input::Ctrl('c')] {
+            assert!(
+                matches!(screen.handle_input(&mut ctx, key), ScreenCommand::Quit),
+                "{key:?} should quit the bulletin"
+            );
+        }
+    }
+
+    #[test]
+    fn bulletin_cursor_clamps() {
+        // Selection cursor must not advance past the live row count
+        // and must not underflow at zero — same contract as the
+        // inventory clamp test.
+        let cfg = fixture_config();
+        let fc = fixture_context();
+        let mut ctx = GameContext::new(&cfg, &fc, (80, 24));
+        let mut screen = BulletinScreen::from_events(vec![
+            synthetic_event(2, "2026-05-09 12:35:00", "k", "two"),
+            synthetic_event(1, "2026-05-09 12:34:56", "k", "one"),
+        ]);
+        for _ in 0..10 {
+            screen.handle_input(&mut ctx, Input::Down);
+        }
+        assert_eq!(screen.selected, 1, "cursor must clamp at last row");
+        for _ in 0..10 {
+            screen.handle_input(&mut ctx, Input::Up);
+        }
+        assert_eq!(screen.selected, 0, "cursor must clamp at top row");
+    }
+
+    #[test]
+    fn bulletin_cursor_is_inert_when_empty() {
+        // Down on an empty bulletin must not advance past zero — the
+        // empty-state branch in render relies on `selected == 0`.
+        let cfg = fixture_config();
+        let fc = fixture_context();
+        let mut ctx = GameContext::new(&cfg, &fc, (80, 24));
+        let mut screen = BulletinScreen::from_events(Vec::new());
+        screen.handle_input(&mut ctx, Input::Down);
+        assert_eq!(screen.selected, 0);
+    }
+
+    #[test]
+    fn bulletin_from_world_db_reads_recent_events() {
+        // Stand up a real WorldDb, append two events, and confirm the
+        // bulletin snapshot matches `recent_events`'s newest-first
+        // ordering. This is the integration touch-point that proves
+        // SPEC §Task 13d's "lists recent events" contract.
+        use foglet_game::WorldDb;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("world.sqlite");
+        let mut world = WorldDb::open(&db_path).expect("open world db");
+        world
+            .apply_migration(&foglet_game::PLAYERS_MIGRATION)
+            .expect("apply players migration");
+        world
+            .apply_migration(&foglet_game::WORLD_EVENTS_MIGRATION)
+            .expect("apply world_events migration");
+        world
+            .connection()
+            .execute(
+                "INSERT INTO players (foglet_user_id, handle, role, security_level, \
+                 first_seen_at, last_seen_at) \
+                 VALUES (NULL, 'alice', 'user', 50, \
+                         CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+                [],
+            )
+            .expect("seed alice");
+        let alice_id: i64 = world
+            .connection()
+            .query_row("SELECT id FROM players WHERE handle = 'alice'", [], |r| {
+                r.get(0)
+            })
+            .expect("read alice id");
+        world
+            .append_event("room_7_opened", Some(alice_id), "alice opened Room 7", None)
+            .expect("append first event");
+        world
+            .append_event(
+                "clue_found",
+                Some(alice_id),
+                "alice found a matchbook",
+                None,
+            )
+            .expect("append second event");
+
+        let screen = BulletinScreen::from_world_db(Some(&world));
+        assert_eq!(
+            screen.events.len(),
+            2,
+            "bulletin must surface both appended events"
+        );
+        // recent_events orders newest-first; the matchbook event was
+        // appended second, so it should land at index 0.
+        assert_eq!(screen.events[0].kind, "clue_found");
+        assert_eq!(screen.events[1].kind, "room_7_opened");
     }
 }

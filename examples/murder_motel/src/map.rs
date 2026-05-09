@@ -21,7 +21,7 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 
 use crate::layout::centred_rect;
-use crate::modals::{InventoryScreen, WinScreen};
+use crate::modals::{BulletinScreen, InventoryScreen, WinScreen};
 use crate::scenes::dialog::DialogScreen;
 use crate::scenes::lost_and_found::lost_and_found_drawer_screen;
 use crate::scenes::night_clerk::night_clerk_vendor_screen;
@@ -411,7 +411,7 @@ impl MapScreen {
     /// any contextual verbs by [`Self::hint_line`] to form the full
     /// hint shown beneath the map.
     const HINT_BASE_PREFIX: &'static str = "Move: arrows/hjkl";
-    const HINT_BASE_SUFFIX: &'static str = "Inv: I  Back: Esc  Quit: Q";
+    const HINT_BASE_SUFFIX: &'static str = "Inv: I  Bulletin: E  Back: Esc  Quit: Q";
 
     /// Build a lobby map screen with fresh, unshared slots. Used by
     /// tests that want an isolated screen instance and by callers that
@@ -1232,6 +1232,15 @@ impl Screen for MapScreen {
             Input::Char('i') | Input::Char('I') => {
                 ScreenCommand::Push(Box::new(InventoryScreen::new(self.inventory())))
             }
+            // SPEC_v2 §Task 13d: open the lobby bulletin / recent
+            // events ledger. We snapshot `recent_events` at push time
+            // (here, in `handle_input`) rather than per-frame because
+            // SPEC §Task 10d forbids blocking world queries on the
+            // render path. Worlds without a `[world]` section pass
+            // `None` and the screen renders the empty-state hint.
+            Input::Char('e') | Input::Char('E') => {
+                ScreenCommand::Push(Box::new(BulletinScreen::from_world_db(ctx.world_db)))
+            }
             // Vendor affordance (Task 11g). When the player stands
             // next to the Night Clerk, `b`/`B` ("buy") opens the SPEC
             // §9 step 4 vendor prompt; everywhere else the key is
@@ -1923,6 +1932,22 @@ pub(crate) mod tests {
             matches!(cmd, ScreenCommand::Push(_)),
             "`i` must push the inventory screen, got {cmd:?}"
         );
+    }
+
+    /// SPEC_v2 §Task 13d: `e` / `E` from the lobby push the bulletin
+    /// modal even when no `[world]` DB is attached — the screen is
+    /// constructed with `from_world_db(None)` and the player can close
+    /// it cleanly. We assert both casings so a future `match` rewrite
+    /// can't silently drop the uppercase variant.
+    #[test]
+    fn map_e_key_pushes_bulletin_screen() {
+        for key in [Input::Char('e'), Input::Char('E')] {
+            let (_, cmd) = dispatch_map(key);
+            assert!(
+                matches!(cmd, ScreenCommand::Push(_)),
+                "{key:?} must push the bulletin screen, got {cmd:?}"
+            );
+        }
     }
 
     #[test]
