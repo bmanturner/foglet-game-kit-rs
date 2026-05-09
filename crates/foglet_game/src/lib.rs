@@ -87,7 +87,7 @@ pub use runtime::{
 };
 pub use save::{
     read_save, resolve_save_path, write_atomic, SaveIoError, SavePathError, SavePathInputs,
-    SAVE_DIR_ENV, SAVE_FILENAME,
+    SaveSlot, SAVE_DIR_ENV, SAVE_FILENAME,
 };
 pub use screen::{
     apply_command, ExitReason, GameContext, Screen, ScreenCommand, ScreenStack, SideEffect,
