@@ -531,6 +531,58 @@ impl<T> SaveSlot<T> {
     }
 }
 
+impl<T: DeserializeOwned> SaveSlot<T> {
+    /// Load a slot from `path`, returning `Ok(None)` if no save exists.
+    ///
+    /// Thin typed wrapper over [`read_save`]: the v1 reliability bar
+    /// (atomic rename, distinct corrupt-vs-missing errors) keeps
+    /// applying because the actual byte-level read is delegated. The
+    /// only addition over `read_save` is wrapping the deserialised
+    /// value in a fresh, **clean** [`SaveSlot`] so the runtime's
+    /// "save on dirty" hook (Task 4) doesn't immediately rewrite a
+    /// just-loaded file.
+    ///
+    /// Returns:
+    /// - `Ok(Some(slot))` when `path` exists and parses successfully.
+    /// - `Ok(None)` when `path` does not exist (the brand-new-player
+    ///   path — same semantics as `read_save`).
+    /// - `Err(SaveIoError::Read | Deserialize | …)` for any other
+    ///   failure (permission denied, corrupt JSON, etc.).
+    ///
+    /// Authors who want a default-on-missing behaviour should reach
+    /// for [`SaveSlot::load_or_default`] instead.
+    pub fn load(path: &Path) -> Result<Option<SaveSlot<T>>, SaveIoError> {
+        match read_save::<T>(path)? {
+            Some(value) => Ok(Some(SaveSlot::new(value))),
+            None => Ok(None),
+        }
+    }
+
+    /// Load a slot from `path`, falling back to `T::default()` on
+    /// missing file.
+    ///
+    /// The 90% authoring path: a brand-new player has no save on disk,
+    /// so the game starts from `T::default()`; a returning player gets
+    /// their previous state. Corrupt or unreadable saves still surface
+    /// as `Err` — silently overwriting a player's broken save with a
+    /// fresh default would be a data-loss bug.
+    ///
+    /// The returned slot is always **clean**: a default-constructed
+    /// slot has no unsaved changes, and a freshly-loaded slot's bytes
+    /// are already on disk by definition. This pairs with Task 1d's
+    /// `save` (which clears the flag) so a "save iff dirty" loop is
+    /// well-behaved from the first launch.
+    pub fn load_or_default(path: &Path) -> Result<SaveSlot<T>, SaveIoError>
+    where
+        T: Default,
+    {
+        match Self::load(path)? {
+            Some(slot) => Ok(slot),
+            None => Ok(SaveSlot::new(T::default())),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -807,7 +859,13 @@ mod tests {
     /// Tiny stand-in for an authored game's save state. Fields cover
     /// the shapes a real game cares about (scalar, string, sequence,
     /// nested) so the round-trip test exercises serde's normal paths.
-    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    // `Default` derive lets the Task 1c `load_or_default` tests use
+    // `SaveFixture::default()` for the brand-new-player branch. The
+    // derived value is `version: 0`, empty player/inventory/flags —
+    // deliberately distinct from `fixture_v1` (which uses `version: 1`)
+    // so a test failure can distinguish "we hit the default path" from
+    // "we loaded v1 from disk".
+    #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
     struct SaveFixture {
         version: u32,
         player: String,
@@ -1078,6 +1136,95 @@ mod tests {
         slot.apply(fixture_v2());
         assert_eq!(*via_handle.borrow(), fixture_v2());
         assert_eq!(*via_clone.borrow(), fixture_v2());
+    }
+
+    // ----- SaveSlot::load / load_or_default tests (Task 1c) ---------
+
+    #[test]
+    fn save_slot_load_returns_none_for_missing_file() {
+        // Mirror of `read_returns_none_for_missing_file` at the typed
+        // slot layer: `load` propagates the `None` so authors can
+        // distinguish "no save yet" from "save exists but unreadable".
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("never-written.json");
+
+        let loaded = SaveSlot::<SaveFixture>::load(&path).unwrap();
+        assert!(loaded.is_none(), "missing file must surface as Ok(None)");
+    }
+
+    #[test]
+    fn save_slot_load_round_trips_existing_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("save.json");
+        let original = fixture_v1();
+        write_atomic(&path, &original).unwrap();
+
+        let slot = SaveSlot::<SaveFixture>::load(&path)
+            .unwrap()
+            .expect("file written above; load must yield Some");
+        assert_eq!(*slot.borrow(), original);
+        assert!(
+            !slot.is_dirty(),
+            "freshly-loaded slot must be clean — its bytes are already on disk",
+        );
+    }
+
+    #[test]
+    fn save_slot_load_surfaces_deserialize_error() {
+        // Corrupt JSON must not be silently swallowed: that would
+        // shadow real data corruption behind a fresh default and
+        // surprise the operator reading the door log. Mirrors the
+        // free-function `read_surfaces_deserialize_error_for_corrupt_json`
+        // test for the typed slot path.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("save.json");
+        fs::write(&path, b"{ not valid json").unwrap();
+
+        let err = SaveSlot::<SaveFixture>::load(&path).unwrap_err();
+        assert!(matches!(err, SaveIoError::Deserialize(_)));
+    }
+
+    #[test]
+    fn save_slot_load_or_default_uses_default_when_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("never-written.json");
+
+        let slot = SaveSlot::<SaveFixture>::load_or_default(&path).unwrap();
+        assert_eq!(*slot.borrow(), SaveFixture::default());
+        assert!(
+            !slot.is_dirty(),
+            "default-constructed slot starts clean — Task 1b contract",
+        );
+    }
+
+    #[test]
+    fn save_slot_load_or_default_loads_existing_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("save.json");
+        write_atomic(&path, &fixture_v1()).unwrap();
+
+        let slot = SaveSlot::<SaveFixture>::load_or_default(&path).unwrap();
+        assert_eq!(*slot.borrow(), fixture_v1());
+        assert!(
+            !slot.is_dirty(),
+            "loaded slot must be clean so save-on-dirty doesn't rewrite immediately",
+        );
+    }
+
+    #[test]
+    fn save_slot_load_or_default_surfaces_corrupt_save_error() {
+        // Critical: a corrupt save must NOT be silently replaced with
+        // a default. The player's broken file is the only evidence
+        // they ever played; overwriting it with a default would be a
+        // data-loss bug. Authors handle the error explicitly (e.g.
+        // back up the corrupt file, prompt the player) before deciding
+        // whether to start fresh.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("save.json");
+        fs::write(&path, b"\x00not json at all").unwrap();
+
+        let err = SaveSlot::<SaveFixture>::load_or_default(&path).unwrap_err();
+        assert!(matches!(err, SaveIoError::Deserialize(_)));
     }
 
     #[test]
