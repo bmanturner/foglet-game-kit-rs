@@ -38,11 +38,49 @@
 //! inside `tick`; widening this to a builder knob waits for a real
 //! authoring need.
 //!
+//! ## Save handler contract (SPEC_v2_1 §4.4)
+//!
+//! Authors install persistence via [`Game::with_save_handler`], which
+//! takes a [`SaveHandler`] — a `Box<dyn FnMut() -> Result<(), GameError>>`.
+//! The runtime invokes the handler in two situations:
+//!
+//! 1. Whenever a screen emits [`crate::ScreenCommand::Save`], so that
+//!    [`SideEffect::Save`] flushes synchronously before the next render
+//!    (Task 4c).
+//! 2. Exactly once on a clean Quit drain — either an explicit
+//!    [`crate::ScreenCommand::Quit`] or the screen stack going empty
+//!    (Task 4d). The drain is *skipped* when the loop exits via error,
+//!    so a half-broken game cannot overwrite a known-good save with a
+//!    half-built state.
+//!
+//! The handler is called **inside** the [`TerminalGuard`]'s lifetime,
+//! while the runtime owns raw mode and the alternate screen. That has
+//! three consequences worth pinning here so they are not rediscovered
+//! per-author:
+//!
+//! - **No stdout / stderr writes from the handler.** Anything written
+//!   to the inherited TTY corrupts the alternate screen and leaks past
+//!   teardown. Persist via files, sockets, or `tracing` with a file
+//!   appender. The same rule already applies to the rest of the TUI
+//!   path (SPEC §13.2); the save handler is no exception.
+//! - **Errors normalise to [`GameError::Save`].** A handler that
+//!   returns `Err(_)` aborts the loop, but the guard's `cleanup()`
+//!   still runs (the result threads back through
+//!   [`run_built_with_opener`] *after* the guard's `Drop`), so the
+//!   terminal is restored before the error reaches the operator.
+//! - **Replacement, not stacking.** Calling `with_save_handler` twice
+//!   replaces the previous handler; the runtime owns exactly one save
+//!   effect at a time so the Quit drain can be idempotent. Authors who
+//!   need fan-out (e.g. write JSON *and* publish a metric) compose the
+//!   effects inside one closure.
+//!
+//! The canonical handler comes from [`crate::SaveSlot::save_handler`]:
+//! the typed wrapper captures the slot via `Rc` and reuses
+//! [`crate::write_atomic`], so the persistence path is identical to
+//! the manual `write_atomic` games wrote in v2.
+//!
 //! ## What the loop does **not** do (yet)
 //!
-//! - Save persistence: today we surface [`SideEffect::Save`] to a
-//!   caller-supplied callback. Wiring it to the actual on-disk save
-//!   manager is Task 8b.
 //! - Message / error UI: [`SideEffect::Message`] and
 //!   [`SideEffect::Error`] are routed to a no-op stub. The real status
 //!   line lands with the widget primitives in Task 9c.
