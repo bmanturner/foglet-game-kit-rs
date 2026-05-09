@@ -343,3 +343,74 @@ while keeping the durable state in the same file.
 
 For now, the v2 contract is, and remains: **shared state, async
 semantics, single SQLite file, no network.**
+
+## 8. v3 schema namespace notes
+
+[`SPEC_v3.md`](../SPEC_v3.md) builds BBS-native async multiplayer
+primitives — notices/mail, challenges, market listings, factions and
+shared goals, bounties — directly on top of the v2 shared-world DB.
+Authors and reviewers landing v3 work need to know what the v2 schema
+namespace already occupies so v3 migrations and tables don't collide
+with anything v2 ships. This section pins that down once.
+
+### 8.1 v2 occupies migration versions 1–5
+
+The kit-shipped v2 migrations are, in apply order:
+
+- `1` — reserved for `world_migrations` bootstrap (SPEC_v2 §4.3).
+- `2` — `create_players` (`crates/foglet_game/src/players.rs`).
+- `3` — `create_turn_ledger` (`crates/foglet_game/src/turns.rs`).
+- `4` — `create_world_events` (`crates/foglet_game/src/events.rs`).
+- `5` — `create_leaderboard_scores`
+  (`crates/foglet_game/src/leaderboards.rs`).
+
+v3 primitives MUST therefore claim version numbers `6` and above,
+and SHOULD keep them dense and grouped per primitive (one migration
+per `Notice`, `Challenge`, `MarketListing`, `Faction` family,
+`Bounty`). This matches the v2 convention: one migration per
+top-level concept, named `create_<table>`. Game-authored migrations
+(e.g. Murder Motel's own clue/world tables) keep their existing
+ranges; nothing in v3 forces an author to renumber.
+
+### 8.2 v3 table namespace is reserved for the kit
+
+The following table names are owned by `foglet_game` and MUST NOT
+be redefined by game-authored migrations:
+
+- `notices`
+- `challenges`
+- `market_listings`
+- `factions`
+- `faction_memberships`
+- `shared_goals`
+- `bounties`
+
+If a game already ships a table with one of these names, the migration
+chain will fail loudly at apply time — that is the correct outcome,
+not a bug to work around. Game-specific equivalents should pick a
+different name (e.g. `mm_clue_bounties`).
+
+### 8.3 v3 inherits every v2 rule
+
+Every constraint in this document — atomic writes only via the
+transaction wrapper, no Foglet context fields in any column, bounded
+busy timeout, file-locked single-writer model, no cross-door shared
+state — applies unchanged to v3 tables. v3 adds new state machines on
+top of the same primitives; it does not change the contract.
+
+In particular:
+
+- v3 multiplayer state transitions (challenge accept/resolve, market
+  buy, faction contribute, bounty claim/complete) MUST run inside a
+  single SQLite transaction so a failed buyer or balance callback
+  leaves no partial debit (SPEC_v3 §7).
+- Player-authored text (notice subject/body, listing display name,
+  bounty title/description) MUST be length-bounded per
+  `[multiplayer]` config and sanitized before TUI rendering
+  (SPEC_v3 §7).
+- v3 still has no real-time multiplayer (SPEC_v3 §2.2). Async screens
+  refresh on navigation; no daemon, poller, or background thread is
+  added.
+- Every primitive is opt-in via the new `[multiplayer]` block in
+  `assets/game.toml`. Generated v1/v2 projects keep their existing
+  config and ship no multiplayer screens.
