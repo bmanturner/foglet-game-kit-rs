@@ -18,7 +18,7 @@ One unchecked item per iteration. Dependencies in `[brackets]` must be checked o
 
 - [x] **3a** — Create `crates/foglet_game/src/world_db.rs` with `WorldDb` type and module docs. Test: opens SQLite under a temp dir. [Task 1]
 - [x] **3b** — Create parent directories before opening the DB. Test: nested `world/world.sqlite` path is created. [3a]
-- [ ] **3c** — Apply busy timeout from config. Test: connection reports configured timeout behavior or exposes stored setting. [3a]
+- [x] **3c** — Apply busy timeout from config. Test: connection reports configured timeout behavior or exposes stored setting. [3a]
 - [ ] **3d** — Apply WAL journal mode when configured and supported. Test: querying `PRAGMA journal_mode` returns `wal` or documented fallback. [3a]
 
 ### Task 4 — Migration foundation

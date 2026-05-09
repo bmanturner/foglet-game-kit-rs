@@ -92,7 +92,7 @@ pub use widgets::{
     render_inventory_list, render_menu_list, render_message_line, InventoryList, MenuList,
     MessageKind, MessageLine,
 };
-pub use world_db::{WorldDb, WorldDbError};
+pub use world_db::{WorldDb, WorldDbError, WorldDbOptions};
 
 /// Crate version string, sourced from `Cargo.toml` at build time.
 ///

@@ -9,10 +9,10 @@
 //!
 //! # What lands here, and when
 //!
-//! Task 3b (this commit) extends the open path so missing parent
-//! directories are created up-front. It still deliberately does not:
+//! Task 3c (this commit) wires the `[world].busy_timeout_ms` config
+//! into the open path via [`WorldDbOptions`]. It still deliberately
+//! does not:
 //!
-//! - apply the `[world].busy_timeout_ms` config — Task 3c;
 //! - apply the `[world].journal_mode` config — Task 3d;
 //! - run any migrations — Task 4.
 //!
@@ -42,9 +42,59 @@
 
 use std::fs;
 use std::path::Path;
+use std::time::Duration;
 
 use rusqlite::Connection;
 use thiserror::Error;
+
+/// Tunables applied to the SQLite connection at open time.
+///
+/// Task 3c introduces `busy_timeout_ms`; Task 3d will add a journal
+/// mode field on this same struct so the open path keeps a single
+/// argument shape. Authors normally build this from the
+/// [`crate::config::WorldSection`] via [`From`] (below) so a `[world]`
+/// TOML edit propagates without code changes.
+///
+/// `Default` matches the SPEC v2 §5 documented defaults — 5 seconds of
+/// retry — so unit tests and ad-hoc callers (Task 4 migration tests,
+/// for example) can spell `WorldDbOptions::default()` without
+/// rediscovering the SPEC's numbers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorldDbOptions {
+    /// Milliseconds SQLite spends retrying a locked database before
+    /// returning `SQLITE_BUSY`. Translates to
+    /// `sqlite3_busy_timeout(ms)` via [`Connection::busy_timeout`].
+    ///
+    /// `0` disables the busy handler entirely (immediate `BUSY`
+    /// errors). v2 ships a non-zero default because contention is
+    /// expected: a local-dev session running two Murder Motel
+    /// instances against the same SQLite file would otherwise see
+    /// spurious lock errors on the second writer.
+    pub busy_timeout_ms: u64,
+}
+
+impl Default for WorldDbOptions {
+    fn default() -> Self {
+        // 5 seconds matches SPEC v2 §5 and `default_world_busy_timeout_ms`
+        // in `config.rs`; the duplication is deliberate so this struct
+        // works in tests that don't touch `GameConfig` parsing.
+        Self {
+            busy_timeout_ms: 5_000,
+        }
+    }
+}
+
+impl From<&crate::config::WorldSection> for WorldDbOptions {
+    /// Bridge `[world]` TOML config to the open-time tunables. Lives
+    /// here (not on `WorldSection`) so the config module stays free of
+    /// `rusqlite` knowledge — `WorldSection` is also serialised back
+    /// out by `fgk new`, and we want it to stay a pure data type.
+    fn from(section: &crate::config::WorldSection) -> Self {
+        Self {
+            busy_timeout_ms: section.busy_timeout_ms,
+        }
+    }
+}
 
 /// Handle to a shared-world SQLite database.
 ///
@@ -90,11 +140,35 @@ impl WorldDb {
     /// "filesystem rejected `mkdir`" (permission/disk-full) from
     /// "SQLite rejected the open" (corrupt file, locked DB).
     ///
-    /// # Out of scope for Task 3b
+    /// # Out of scope for Task 3c
     ///
-    /// This constructor still does not apply busy timeout (3c) or
-    /// journal mode (3d). Those follow in their own iterations.
+    /// This constructor still does not apply journal mode (3d). That
+    /// follows in its own iteration.
+    ///
+    /// Equivalent to [`Self::open_with_options`] using
+    /// [`WorldDbOptions::default`]. Kept as a convenience because the
+    /// majority of unit-test call sites (and the test fixtures that
+    /// land in Task 4+) don't care about the busy-timeout knob.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, WorldDbError> {
+        Self::open_with_options(path, WorldDbOptions::default())
+    }
+
+    /// Open the SQLite database and apply the supplied tunables.
+    ///
+    /// Currently honours [`WorldDbOptions::busy_timeout_ms`]; Task 3d
+    /// will extend this to apply journal mode here as well so the
+    /// runtime layer (Task 10) only ever calls a single constructor.
+    ///
+    /// The busy timeout is applied *after* [`Connection::open`] so a
+    /// failure to set the pragma surfaces as
+    /// [`WorldDbError::ApplyBusyTimeout`] rather than masquerading as a
+    /// generic open error — operationally these are very different
+    /// conditions (the file is fine, the connection just couldn't be
+    /// configured).
+    pub fn open_with_options(
+        path: impl AsRef<Path>,
+        options: WorldDbOptions,
+    ) -> Result<Self, WorldDbError> {
         let path_ref = path.as_ref();
 
         // Create the parent chain when one is named. `Path::parent`
@@ -115,6 +189,19 @@ impl WorldDb {
             path: path_ref.display().to_string(),
             source,
         })?;
+
+        // `busy_timeout` calls `sqlite3_busy_timeout`, which installs a
+        // retry handler so contended writes (two local-dev sessions on
+        // the same file) wait instead of erroring. We apply it
+        // unconditionally — including for `0` — so callers who
+        // explicitly want the no-retry behavior get it without having
+        // to know that "skip the call" and "pass 0" coincide today.
+        conn.busy_timeout(Duration::from_millis(options.busy_timeout_ms))
+            .map_err(|source| WorldDbError::ApplyBusyTimeout {
+                busy_timeout_ms: options.busy_timeout_ms,
+                source,
+            })?;
+
         Ok(Self { conn })
     }
 
@@ -145,6 +232,21 @@ pub enum WorldDbError {
         /// Path the caller asked us to open, echoed back so the
         /// operator-facing error names a concrete file.
         path: String,
+        /// Underlying `rusqlite` error.
+        #[source]
+        source: rusqlite::Error,
+    },
+
+    /// `Connection::busy_timeout` rejected the configured value. In
+    /// practice this is rare — `sqlite3_busy_timeout` accepts any
+    /// non-negative integer — but surfacing it as its own variant
+    /// keeps "the file is fine, the knob isn't" diagnosable separately
+    /// from a real open failure.
+    #[error("failed to apply world database busy_timeout={busy_timeout_ms}ms: {source}")]
+    ApplyBusyTimeout {
+        /// Value the caller asked us to apply, echoed back so the
+        /// operator-facing error names the offending knob.
+        busy_timeout_ms: u64,
         /// Underlying `rusqlite` error.
         #[source]
         source: rusqlite::Error,
@@ -195,6 +297,76 @@ mod tests {
             .query_row("SELECT 1", [], |row| row.get(0))
             .expect("trivial query runs against an open connection");
         assert_eq!(one, 1);
+    }
+
+    /// SPEC_v2 §Task 3c acceptance: the configured busy timeout is
+    /// actually applied to the SQLite connection. We verify by
+    /// querying `PRAGMA busy_timeout`, which echoes back the current
+    /// `sqlite3_busy_timeout` value in milliseconds. Reading it
+    /// directly (rather than trusting that `Connection::busy_timeout`
+    /// returned `Ok`) guards against a future regression where the
+    /// open path silently drops the option on the floor.
+    #[test]
+    fn open_with_options_applies_busy_timeout() {
+        let dir = tempdir().expect("tempdir creates");
+        let db_path = dir.path().join("world.sqlite");
+
+        // 7500ms is intentionally not the default (5000) so a
+        // regression that ignored the option and left rusqlite's
+        // built-in default in place would still flunk the assertion.
+        let world = WorldDb::open_with_options(
+            &db_path,
+            WorldDbOptions {
+                busy_timeout_ms: 7_500,
+            },
+        )
+        .expect("open succeeds with explicit busy timeout");
+
+        let configured: i64 = world
+            .connection()
+            .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+            .expect("busy_timeout pragma is queryable");
+        assert_eq!(
+            configured, 7_500,
+            "PRAGMA busy_timeout must echo the value we applied at open time"
+        );
+    }
+
+    /// SPEC_v2 §Task 3c follow-up: the convenience [`WorldDb::open`]
+    /// must still produce a non-zero busy timeout matching
+    /// [`WorldDbOptions::default`]. Without this the most common
+    /// caller (Task 4 migration tests, Task 10 runtime startup) would
+    /// inherit rusqlite's bare-`Connection::open` default of "no busy
+    /// handler" — exactly the brittle behavior 3c exists to prevent.
+    #[test]
+    fn open_applies_default_busy_timeout() {
+        let dir = tempdir().expect("tempdir creates");
+        let db_path = dir.path().join("world.sqlite");
+        let world = WorldDb::open(&db_path).expect("default open succeeds");
+
+        let configured: i64 = world
+            .connection()
+            .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+            .expect("busy_timeout pragma is queryable");
+        assert_eq!(
+            configured,
+            i64::from(WorldDbOptions::default().busy_timeout_ms as i32),
+            "default open path must apply the documented default busy timeout"
+        );
+    }
+
+    /// `WorldSection` -> `WorldDbOptions` is a thin bridge but it's
+    /// worth a regression guard: a typo there would silently fall back
+    /// to the `Default` value and we'd never notice in higher-level
+    /// tests that don't exercise non-default config.
+    #[test]
+    fn options_from_world_section_carries_busy_timeout() {
+        let section = crate::config::WorldSection {
+            busy_timeout_ms: 12_345,
+            ..crate::config::WorldSection::default()
+        };
+        let options: WorldDbOptions = (&section).into();
+        assert_eq!(options.busy_timeout_ms, 12_345);
     }
 
     /// SPEC_v2 §Task 3b acceptance: a nested `world/world.sqlite`
