@@ -59,6 +59,7 @@ use crate::screen::{apply_command, ExitReason, GameContext, Screen, ScreenStack,
 use crate::terminal::{
     arm_panic_hook, install_panic_hook, CrosstermBackend as TermCrosstermBackend, TerminalGuard,
 };
+use crate::world_db::{WorldDb, WorldDbError, WorldDbOptions};
 
 /// How long the runtime is willing to wait on the event source before
 /// firing a [`Screen::tick`].
@@ -188,6 +189,16 @@ pub enum GameError {
     /// ergonomic.
     #[error(transparent)]
     Terminal(#[from] crate::terminal::TerminalError),
+
+    /// Opening or bootstrapping the shared-world SQLite database failed
+    /// during startup. Wraps [`WorldDbError`] so the runtime can
+    /// `?`-propagate the underlying world-db error without reaching for
+    /// `anyhow` inside the library. Task 10c will arrange for this
+    /// failure to surface *after* terminal restoration; today the open
+    /// happens before the guard arms, so a clean error message reaches
+    /// the operator without any raw-mode side effects.
+    #[error(transparent)]
+    WorldOpen(#[from] WorldDbError),
 }
 
 /// Convenience alias matching SPEC §8.1's `GameResult<T>`.
@@ -495,6 +506,34 @@ impl BuiltGame {
     }
 }
 
+/// Open the shared-world SQLite DB for this run, *only* when the
+/// loaded config opted in via `[world].enabled = true`.
+///
+/// This is the Task 10b seam. Splitting it out from [`run_built`] gives
+/// us:
+///
+/// - a unit-testable function that exercises both branches (enabled
+///   vs. disabled) without spinning up a TUI, and
+/// - a clean place for Task 10c to swap in an injectable opener so a
+///   simulated DB-open failure can verify the post-guard error path
+///   restores the terminal first.
+///
+/// Returns `Ok(None)` when the world layer is disabled or the section
+/// is missing entirely (`WorldSection::default().enabled == false`),
+/// so a v1 game with no `[world]` block keeps booting unchanged.
+///
+/// Errors propagate as [`GameError::WorldOpen`] — see SPEC §5.1
+/// "clear-error" path: the runtime never silently degrades a
+/// world-enabled config to a no-op.
+pub fn open_world_db_if_enabled(config: &GameConfig) -> GameResult<Option<WorldDb>> {
+    if !config.world.enabled {
+        return Ok(None);
+    }
+    let options = WorldDbOptions::from(&config.world);
+    let db = WorldDb::open_with_options(&config.world.path, options)?;
+    Ok(Some(db))
+}
+
 /// Run the validated game against production I/O — terminal guard, a
 /// ratatui terminal over crossterm, and the crossterm event source.
 ///
@@ -525,6 +564,14 @@ pub fn run_built(mut built: BuiltGame) -> GameResult<()> {
     // borrowed config + foglet outlive the call.
     let config = built.config.take().ok_or(GameError::MissingConfig)?;
     let foglet = built.foglet.take().ok_or(GameError::MissingContext)?;
+
+    // Open the shared-world DB *before* engaging the terminal guard.
+    // Task 10b: when `[world].enabled = false` (or the section is
+    // missing entirely) this short-circuits to `None` and the runtime
+    // behaves exactly like a v1 game. A failure here surfaces as a
+    // plain `GameError::WorldOpen` with no terminal state to restore;
+    // Task 10c will harden the post-guard ordering separately.
+    let world_db = open_world_db_if_enabled(&config)?;
 
     // Live terminal size. crossterm::terminal::size works on a TTY
     // before raw mode is engaged; using it here keeps the size check
@@ -568,6 +615,7 @@ pub fn run_built(mut built: BuiltGame) -> GameResult<()> {
         built,
         &config,
         &foglet,
+        world_db.as_ref(),
         (w, h),
         &mut terminal,
         &mut events,
@@ -610,10 +658,12 @@ pub fn run_built(mut built: BuiltGame) -> GameResult<()> {
 /// - **Side effects**: `Save` calls the `on_save` callback; `Message`
 ///   and `Error` are currently swallowed (the status-line widget lives
 ///   in Task 9c); `Exit(reason)` returns from the loop.
+#[allow(clippy::too_many_arguments)]
 pub fn run_with_io<B, E>(
     mut built: BuiltGame,
     config: &GameConfig,
     foglet: &FogletContext,
+    world_db: Option<&WorldDb>,
     initial_size: (u16, u16),
     terminal: &mut Terminal<B>,
     events: &mut E,
@@ -650,6 +700,9 @@ where
                 .last_mut()
                 .expect("non-empty: checked above and after every transition");
             let mut ctx = GameContext::new(config, foglet, size);
+            if let Some(db) = world_db {
+                ctx = ctx.with_world_db(db);
+            }
             terminal
                 .draw(|frame| top.render(&mut ctx, frame))
                 .map_err(|e| GameError::Render(e.to_string()))?;
@@ -671,11 +724,17 @@ where
                 size = (width, height);
                 let top = built.screens.last_mut().expect("non-empty");
                 let mut ctx = GameContext::new(config, foglet, size);
+                if let Some(db) = world_db {
+                    ctx = ctx.with_world_db(db);
+                }
                 top.on_resize(&mut ctx, width, height)
             }
             Some(other) => {
                 let top = built.screens.last_mut().expect("non-empty");
                 let mut ctx = GameContext::new(config, foglet, size);
+                if let Some(db) = world_db {
+                    ctx = ctx.with_world_db(db);
+                }
                 top.handle_input(&mut ctx, other)
             }
             None => {
@@ -685,6 +744,9 @@ where
                 next_tick = Instant::now() + TICK_INTERVAL;
                 let top = built.screens.last_mut().expect("non-empty");
                 let mut ctx = GameContext::new(config, foglet, size);
+                if let Some(db) = world_db {
+                    ctx = ctx.with_world_db(db);
+                }
                 top.tick(&mut ctx)
             }
         };
@@ -1095,6 +1157,7 @@ mod tests {
             built,
             &cfg,
             &fc,
+            None,
             (40, 10),
             &mut term,
             &mut events,
@@ -1131,6 +1194,7 @@ mod tests {
             built,
             &cfg,
             &fc,
+            None,
             (40, 10),
             &mut term,
             &mut events,
@@ -1168,6 +1232,7 @@ mod tests {
             built,
             &cfg,
             &fc,
+            None,
             (40, 10),
             &mut term,
             &mut events,
@@ -1203,6 +1268,7 @@ mod tests {
             built,
             &cfg,
             &fc,
+            None,
             (40, 10),
             &mut term,
             &mut events,
@@ -1244,6 +1310,7 @@ mod tests {
             built,
             &cfg,
             &fc,
+            None,
             (40, 10),
             &mut term,
             &mut events,
@@ -1292,6 +1359,7 @@ mod tests {
             built,
             &cfg,
             &fc,
+            None,
             (40, 10),
             &mut term,
             &mut events,
@@ -1329,6 +1397,7 @@ mod tests {
             built,
             &cfg,
             &fc,
+            None,
             (40, 10),
             &mut term,
             &mut events,
@@ -1370,6 +1439,7 @@ mod tests {
             built,
             &cfg,
             &fc,
+            None,
             (40, 10),
             &mut term,
             &mut events,
@@ -1440,6 +1510,7 @@ mod tests {
             built,
             &cfg,
             &fc,
+            None,
             (40, 10),
             &mut term,
             &mut events,
@@ -1480,6 +1551,7 @@ mod tests {
             built,
             &cfg,
             &fc,
+            None,
             (40, 10),
             &mut term,
             &mut events,
@@ -1503,5 +1575,200 @@ mod tests {
         // we don't call it.)
         let _ = CrosstermEventSource::new();
         let _: CrosstermEventSource = Default::default();
+    }
+
+    // -------------------------------------------------------------
+    // Task 10b — world DB startup wiring
+    // -------------------------------------------------------------
+
+    /// A world-disabled config (the `fixture_config` baseline) MUST
+    /// short-circuit to `Ok(None)` so v1 games keep booting unchanged.
+    #[test]
+    fn open_world_db_if_enabled_returns_none_when_disabled() {
+        let cfg = fixture_config();
+        assert!(!cfg.world.enabled, "fixture baseline is world-off");
+        let result = open_world_db_if_enabled(&cfg).expect("disabled path must not error");
+        assert!(
+            result.is_none(),
+            "disabled `[world]` must yield no DB handle"
+        );
+    }
+
+    /// When `[world].enabled = true` the helper opens (and bootstraps)
+    /// a SQLite file at the configured path. Routing `path` through a
+    /// `tempdir` here proves the helper honours the configured path
+    /// rather than a hard-coded location.
+    #[test]
+    fn open_world_db_if_enabled_opens_db_when_enabled() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut cfg = fixture_config();
+        cfg.world.enabled = true;
+        cfg.world.path = tmp
+            .path()
+            .join("world.sqlite")
+            .to_string_lossy()
+            .into_owned();
+
+        let db = open_world_db_if_enabled(&cfg)
+            .expect("enabled path must succeed for a valid temp path")
+            .expect("Some(db) when enabled");
+        // Sanity: the DB is usable end-to-end (busy timeout was applied
+        // and journal_mode came back as one of the documented modes).
+        let mode = db.journal_mode();
+        assert!(
+            matches!(
+                mode,
+                "wal" | "delete" | "memory" | "truncate" | "persist" | "off"
+            ),
+            "unexpected journal_mode: {mode}"
+        );
+    }
+
+    /// World-enabled but pointed at a path SQLite cannot create:
+    /// resolves to a `WorldOpen` error rather than a panic or a silent
+    /// downgrade. The "/" parent for a nested file is what trips up
+    /// `create_dir_all` on the macOS sandbox; using a path beneath a
+    /// real *file* (not a directory) is a portable way to force the
+    /// failure.
+    #[test]
+    fn open_world_db_if_enabled_propagates_open_failure() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        // Create a regular file, then ask the helper to use a path
+        // that treats it as a directory. `create_dir_all` rejects this
+        // on every supported platform.
+        let blocker = tmp.path().join("not-a-dir");
+        std::fs::write(&blocker, b"x").expect("create blocker file");
+        let mut cfg = fixture_config();
+        cfg.world.enabled = true;
+        cfg.world.path = blocker
+            .join("nested")
+            .join("world.sqlite")
+            .to_string_lossy()
+            .into_owned();
+
+        let err = open_world_db_if_enabled(&cfg).expect_err("must surface open failure");
+        assert!(
+            matches!(err, GameError::WorldOpen(_)),
+            "unexpected variant: {err:?}"
+        );
+    }
+
+    /// When `run_with_io` is given `Some(world_db)`, every per-frame
+    /// `GameContext` must carry the same handle so screens can reach
+    /// the world layer via `ctx.world_db`. We verify by recording the
+    /// `is_some()` result from inside `render`, `tick`, and
+    /// `handle_input` and asserting all three saw the handle.
+    #[test]
+    fn run_with_io_threads_world_db_into_context() {
+        struct Probe {
+            sightings: Rc<RefCell<Vec<&'static str>>>,
+            inputs: VecDeque<ScreenCommand>,
+            ticks: VecDeque<ScreenCommand>,
+        }
+        impl Screen for Probe {
+            fn render(&mut self, ctx: &mut GameContext<'_>, _frame: &mut ratatui::Frame<'_>) {
+                if ctx.world_db.is_some() {
+                    self.sightings.borrow_mut().push("render");
+                }
+            }
+            fn handle_input(&mut self, ctx: &mut GameContext<'_>, _input: Input) -> ScreenCommand {
+                if ctx.world_db.is_some() {
+                    self.sightings.borrow_mut().push("input");
+                }
+                self.inputs.pop_front().unwrap_or(ScreenCommand::None)
+            }
+            fn tick(&mut self, ctx: &mut GameContext<'_>) -> ScreenCommand {
+                if ctx.world_db.is_some() {
+                    self.sightings.borrow_mut().push("tick");
+                }
+                self.ticks.pop_front().unwrap_or(ScreenCommand::None)
+            }
+        }
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db = WorldDb::open(tmp.path().join("world.sqlite")).expect("open db");
+
+        let cfg = fixture_config();
+        let fc = fixture_context();
+        let sightings = Rc::new(RefCell::new(Vec::new()));
+        let probe = Probe {
+            sightings: sightings.clone(),
+            inputs: VecDeque::from(vec![ScreenCommand::Quit]),
+            ticks: VecDeque::from(vec![ScreenCommand::None]),
+        };
+        let built = make_built(Box::new(probe));
+        let mut term = make_terminal();
+        // None = tick, then Char('q') triggers handle_input → Quit.
+        let mut events = VecEventSource::new(vec![None, Some(Input::Char('q'))]);
+        let mut on_save: Box<dyn FnMut() -> Result<(), GameError>> = Box::new(|| Ok(()));
+
+        let reason = run_with_io(
+            built,
+            &cfg,
+            &fc,
+            Some(&db),
+            (40, 10),
+            &mut term,
+            &mut events,
+            &mut on_save,
+        )
+        .expect("loop ok");
+
+        assert_eq!(reason, ExitReason::Quit);
+        let seen = sightings.borrow();
+        // All three dispatch sites observed the handle. (Render fires
+        // multiple times — once per loop iteration — so we just check
+        // each tag appeared at least once.)
+        assert!(seen.contains(&"render"), "render saw no world_db: {seen:?}");
+        assert!(seen.contains(&"tick"), "tick saw no world_db: {seen:?}");
+        assert!(seen.contains(&"input"), "input saw no world_db: {seen:?}");
+    }
+
+    /// Symmetric check: when `world_db` is `None`, contexts MUST NOT
+    /// fabricate a handle. This guards against an accidental
+    /// `unwrap_or(default)` regression in the threading helper.
+    #[test]
+    fn run_with_io_leaves_world_db_none_when_unset() {
+        struct Probe {
+            saw_some: Rc<RefCell<bool>>,
+        }
+        impl Screen for Probe {
+            fn render(&mut self, ctx: &mut GameContext<'_>, _frame: &mut ratatui::Frame<'_>) {
+                if ctx.world_db.is_some() {
+                    *self.saw_some.borrow_mut() = true;
+                }
+            }
+            fn handle_input(&mut self, _ctx: &mut GameContext<'_>, _input: Input) -> ScreenCommand {
+                ScreenCommand::Quit
+            }
+        }
+
+        let cfg = fixture_config();
+        let fc = fixture_context();
+        let saw_some = Rc::new(RefCell::new(false));
+        let probe = Probe {
+            saw_some: saw_some.clone(),
+        };
+        let built = make_built(Box::new(probe));
+        let mut term = make_terminal();
+        let mut events = VecEventSource::new(vec![Some(Input::Char('q'))]);
+        let mut on_save: Box<dyn FnMut() -> Result<(), GameError>> = Box::new(|| Ok(()));
+
+        run_with_io(
+            built,
+            &cfg,
+            &fc,
+            None,
+            (40, 10),
+            &mut term,
+            &mut events,
+            &mut on_save,
+        )
+        .expect("loop ok");
+
+        assert!(
+            !*saw_some.borrow(),
+            "ctx.world_db must remain None when run_with_io is given None"
+        );
     }
 }
