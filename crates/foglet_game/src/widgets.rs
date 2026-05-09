@@ -40,11 +40,13 @@
 //! truncation works) without locking in incidental whitespace.
 
 use ratatui::buffer::Buffer;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Widget};
 use ratatui::Frame;
+
+use crate::prompt::{StyleRole, Theme};
 
 /// Centre a `width × height` rectangle inside `outer`, clamping the
 /// inner size if `outer` is smaller than the requested dimensions.
@@ -219,6 +221,49 @@ pub fn render_modal(frame: &mut Frame<'_>, area: Rect, title: Option<&str>, body
     let lines: Vec<Line<'_>> = body.split('\n').map(Line::from).collect();
     let para = Paragraph::new(lines).alignment(ratatui::layout::Alignment::Left);
     frame.render_widget(para, padded);
+}
+
+/// Render a single-line hint footer styled with the kit's
+/// [`StyleRole::Hint`] under the default [`Theme`].
+///
+/// SPEC_v2_1 §4.3 fixes the contract: hint lines are one row, centred,
+/// styled by the kit's standard hint role rather than by whatever
+/// `Theme` the calling screen happens to hold. That keeps the helper
+/// composable from any screen — including ones that never plumb a
+/// `Theme` through their state — while still matching the visual
+/// weight authors get from [`MessageLine`] with [`MessageKind::Hint`].
+///
+/// `area.height` SHOULD be 1; extra rows are left blank, matching
+/// [`render_message_line`]'s tolerant behaviour. The text is
+/// horizontally centred within `area.width` and right-truncated by
+/// `Paragraph` if the hint overflows. No prefix is added: the helper
+/// renders the author's literal string so the example's existing
+/// `"[Enter] continue"` / `"[Esc] leave"` conventions survive the move
+/// from hand-rolled `Paragraph` calls into the shared widget.
+///
+/// The style is resolved through `Theme::default().style(StyleRole::Hint)`
+/// rather than a hard-coded `Style::default().add_modifier(Modifier::DIM)`
+/// so the helper automatically tracks any future change to the
+/// SPEC-defined default theme without each caller re-deriving the
+/// styling.
+pub fn render_hint_line(frame: &mut Frame<'_>, area: Rect, hint: &str) {
+    if area.width == 0 || area.height == 0 {
+        // No room to render. Bail out before constructing the
+        // `Paragraph` so a zero-sized `TestBackend` rect can't trigger
+        // an underflow inside ratatui's layout math.
+        return;
+    }
+    let style = Theme::default().style(StyleRole::Hint);
+    let para = Paragraph::new(Line::from(Span::styled(hint, style)))
+        .alignment(Alignment::Center)
+        .style(style);
+    let band = Rect {
+        x: area.x,
+        y: area.y,
+        width: area.width,
+        height: area.height.min(1),
+    };
+    frame.render_widget(para, band);
 }
 
 /// Render a [`MenuList`] into `area`. Pure: state is borrowed,
@@ -766,6 +811,80 @@ mod tests {
         let bot = row_text(&buf, 1);
         assert!(!top.contains("body"));
         assert!(!bot.contains("body"));
+    }
+
+    // ---- render_hint_line -------------------------------------------
+
+    #[test]
+    fn render_hint_line_centres_text_in_area() {
+        let buf = draw(20, 1, |f| {
+            render_hint_line(f, full_area(20, 1), "[Enter] continue")
+        });
+        // 16-char hint inside a 20-wide area → 2 cells of left padding,
+        // 2 cells of right padding for `Alignment::Center`.
+        assert_eq!(row_text(&buf, 0), "  [Enter] continue");
+    }
+
+    #[test]
+    fn render_hint_line_uses_theme_hint_style() {
+        let buf = draw(10, 1, |f| render_hint_line(f, full_area(10, 1), "hi"));
+        // Find the rendered 'h' and 'i' cells and confirm they carry
+        // the default-theme `StyleRole::Hint` style (DIM).
+        let mut found = 0;
+        for x in 0..buf.area.width {
+            let cell = buf.cell((x, 0)).expect("cell");
+            if cell.symbol() == "h" || cell.symbol() == "i" {
+                assert!(
+                    cell.style().add_modifier.contains(Modifier::DIM),
+                    "hint cell should be DIM, got {:?}",
+                    cell.style()
+                );
+                found += 1;
+            }
+        }
+        assert_eq!(found, 2, "expected both hint chars rendered");
+    }
+
+    #[test]
+    fn render_hint_line_truncates_when_overflowing() {
+        let buf = draw(8, 1, |f| {
+            render_hint_line(f, full_area(8, 1), "this hint is too long")
+        });
+        let row = row_text(&buf, 0);
+        // Centre alignment + truncation: ratatui paints exactly
+        // `area.width` cells when the text overflows.
+        assert_eq!(row.len(), 8);
+        assert!(row.starts_with("this hin"));
+    }
+
+    #[test]
+    fn render_hint_line_only_paints_first_row() {
+        // 3-row area — extra rows below row 0 must remain blank so the
+        // helper can be composed underneath a body widget that owns the
+        // upper rows.
+        let buf = draw(10, 3, |f| render_hint_line(f, full_area(10, 3), "ok"));
+        assert!(row_text(&buf, 0).contains("ok"));
+        assert_eq!(row_text(&buf, 1), "");
+        assert_eq!(row_text(&buf, 2), "");
+    }
+
+    #[test]
+    fn render_hint_line_handles_zero_sized_area() {
+        // Zero-width area must early-out without panicking.
+        let buf = draw(10, 1, |f| {
+            render_hint_line(
+                f,
+                Rect {
+                    x: 0,
+                    y: 0,
+                    width: 0,
+                    height: 1,
+                },
+                "ignored",
+            );
+        });
+        // Nothing painted anywhere; the whole row is blank.
+        assert_eq!(row_text(&buf, 0), "");
     }
 
     #[test]
