@@ -36,9 +36,10 @@ use std::rc::Rc;
 
 use foglet_game::{
     load_context, load_dialog, parse_map, process_env, read_save, render_inventory_list,
-    render_menu_list, resolve_save_path, write_atomic, ChoicePrompt, Dialog, DialogState,
-    FeedbackLine, FlagSet, Game, GameConfig, GameContext, Input, InventoryList, Map, MenuList,
-    PromptAction, PromptScreen, SavePathInputs, Screen, ScreenCommand, TileLegend,
+    render_menu_list, resolve_save_path, write_atomic, AnyKeyOutcome, AnyKeyPrompt, ChoicePrompt,
+    Dialog, DialogState, FeedbackLine, FlagSet, Game, GameConfig, GameContext, Input,
+    InventoryList, Map, MenuList, PromptAction, PromptScreen, SavePathInputs, Screen,
+    ScreenCommand, TileLegend,
 };
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -1663,6 +1664,107 @@ pub fn night_clerk_vendor_feedback(outcome: NightClerkVendorOutcome) -> Option<F
     match outcome {
         NightClerkVendorOutcome::BoughtCoffee => {
             Some(FeedbackLine::success(BOUGHT_COFFEE_FEEDBACK))
+        }
+    }
+}
+
+/// Body line shown on the any-key continuation prompt that follows a
+/// successful night-clerk vendor interaction (SPEC_v1_1.md §9 step 6,
+/// Task 11f).
+///
+/// Matches the SPEC verbatim so a doc-driven reader can grep the
+/// example for the phrase quoted in the spec and find a single source
+/// of truth. The continuation prompt's footer falls back to
+/// [`AnyKeyPrompt`]'s default `"Press any key to continue..."` cue, so
+/// only the narration line lives here.
+pub const NIGHT_CLERK_CONTINUATION_BODY: &str = "The clerk glances toward the staircase.";
+
+/// Build the any-key continuation prompt shown after a vendor
+/// interaction (SPEC_v1_1.md §9 step 6, Task 11f).
+///
+/// Wraps the SPEC narration line in an [`AnyKeyPrompt`] so the prompt
+/// keeps the SPEC §4.6 default footer (`"Press any key to continue..."`)
+/// without re-stating it here. Returning the bare prompt — rather than
+/// the screen — lets tests inspect the body lines without driving a
+/// full [`Screen`] cycle, mirroring how [`night_clerk_vendor_prompt`]
+/// hands back a [`ChoicePrompt`] for the same reason.
+pub fn night_clerk_continuation_prompt() -> AnyKeyPrompt {
+    AnyKeyPrompt::new().body(NIGHT_CLERK_CONTINUATION_BODY)
+}
+
+/// `Screen` adapter wrapping [`night_clerk_continuation_prompt`] so the
+/// vendor flow can push a "press any key to dismiss" pause after a
+/// successful purchase (SPEC_v1_1.md §9 step 6, Task 11f).
+///
+/// We hand-roll this rather than reusing [`PromptScreen`] because
+/// `PromptScreen` is parameterised on a [`ChoicePrompt`]; an any-key
+/// pause has no choice list to drive. The screen is intentionally
+/// state-free — the prompt is recomputed each frame from the
+/// [`AnyKeyPrompt`] reducer, and the screen owns no game state, so a
+/// `Default` impl is the natural constructor. The vendor flow surfaces
+/// the post-purchase [`FeedbackLine`] *before* pushing this screen, so
+/// the continuation just needs to dismiss itself when the player
+/// acknowledges it.
+///
+/// Outcome routing per SPEC §4.6:
+///
+/// - [`Input::Resize`] / [`Input::Unknown`] → [`ScreenCommand::None`].
+///   The pause stays put while the terminal re-lays out, so the player
+///   never loses the cue to a stray geometry event.
+/// - Any other input → [`ScreenCommand::Pop`]. The runtime pops the
+///   continuation back to whatever pushed it (the vendor screen or the
+///   map), satisfying the Task 11f acceptance "any meaningful key
+///   returns to prior screen/map".
+#[derive(Debug, Default)]
+pub struct NightClerkContinuationScreen {
+    prompt: AnyKeyPrompt,
+}
+
+impl NightClerkContinuationScreen {
+    /// Build a fresh continuation screen with the SPEC §9 step 6 body.
+    ///
+    /// Provided as an explicit constructor (alongside the derived
+    /// `Default`) so call sites in the vendor flow read as
+    /// `NightClerkContinuationScreen::new()` rather than relying on
+    /// `Default::default()` — the latter reads ambiguously when the
+    /// surrounding code already builds several other screens via
+    /// `::new()` factories.
+    pub fn new() -> Self {
+        Self {
+            prompt: night_clerk_continuation_prompt(),
+        }
+    }
+
+    /// Borrow the wrapped [`AnyKeyPrompt`]. Exposed for tests that want
+    /// to assert the body lines without going through a `Frame` render.
+    pub fn prompt(&self) -> &AnyKeyPrompt {
+        &self.prompt
+    }
+}
+
+impl Screen for NightClerkContinuationScreen {
+    fn render(&mut self, _ctx: &mut GameContext<'_>, frame: &mut Frame<'_>) {
+        // Compact unboxed render — the continuation is a momentary
+        // narration beat, not a confirmation gate, so the bordered
+        // modal would over-emphasise it. Mirrors how SPEC §9 step 6
+        // formats the example with no surrounding box.
+        let area = frame.area();
+        let buf = frame.buffer_mut();
+        self.prompt.render(area, buf);
+    }
+
+    fn handle_input(&mut self, _ctx: &mut GameContext<'_>, input: Input) -> ScreenCommand {
+        match self.prompt.handle(input) {
+            // SPEC §4.6 says resize is ignored; mapping `None` straight
+            // through to `ScreenCommand::None` keeps the pause on
+            // screen until the player acknowledges it.
+            AnyKeyOutcome::None => ScreenCommand::None,
+            // Any meaningful key dismisses the pause. Pop returns to
+            // whatever pushed the continuation, which is the vendor
+            // screen for the SPEC §9 step 6 flow but nothing here
+            // bakes that assumption in — a future caller can push the
+            // continuation from anywhere.
+            AnyKeyOutcome::Completed => ScreenCommand::Pop,
         }
     }
 }
@@ -4695,6 +4797,121 @@ mod tests {
                 "cash must be unchanged after a NoThanks press for `{key}`"
             );
         }
+    }
+
+    // ---- Night-clerk continuation prompt (SPEC §9 step 6, Task 11f) --
+
+    #[test]
+    fn night_clerk_continuation_prompt_carries_spec_body_and_default_footer() {
+        // SPEC §9 step 6 quotes the body line verbatim and falls back
+        // to the SPEC §4.6 default footer. We assert both via the
+        // reducer's accessors so a future copy-edit to either string
+        // shows up here, not in a screenshot diff.
+        let prompt = night_clerk_continuation_prompt();
+        assert_eq!(
+            prompt.body_lines(),
+            &[NIGHT_CLERK_CONTINUATION_BODY.to_string()]
+        );
+        assert!(
+            prompt.footer_text().is_none(),
+            "continuation prompt must inherit the SPEC §4.6 default footer (got override {:?})",
+            prompt.footer_text()
+        );
+    }
+
+    #[test]
+    fn night_clerk_continuation_screen_ignores_resize() {
+        // SPEC §4.6 + Task 11f acceptance: resize is *not* a meaningful
+        // key, so the continuation must stay on screen until the player
+        // acknowledges it. We dispatch a synthetic resize and assert
+        // the screen returns `ScreenCommand::None` — anything else
+        // (Pop, Replace, Quit) would dismiss the pause prematurely.
+        let cfg = fixture_config();
+        let fc = fixture_context();
+        let mut ctx = GameContext::new(&cfg, &fc, (80, 24));
+        let mut screen = NightClerkContinuationScreen::new();
+
+        let cmd = screen.handle_input(
+            &mut ctx,
+            Input::Resize {
+                width: 100,
+                height: 30,
+            },
+        );
+
+        assert!(
+            matches!(cmd, ScreenCommand::None),
+            "resize must not dismiss the continuation pause, got {cmd:?}"
+        );
+    }
+
+    #[test]
+    fn night_clerk_continuation_screen_pops_on_meaningful_key() {
+        // Task 11f acceptance: "any meaningful key returns to prior
+        // screen/map". Drive a representative sample of meaningful
+        // inputs (Enter, Space, Esc, an arrow, a `Char`) through the
+        // screen and assert each one resolves to `ScreenCommand::Pop`.
+        // Covering several variants pins the contract that the screen
+        // forwards the SPEC §4.6 "any meaningful key" classifier
+        // unchanged — a future regression that filters one input
+        // (e.g. swallowing arrows) would flip exactly one row here.
+        let cfg = fixture_config();
+        let fc = fixture_context();
+
+        for input in [
+            Input::Enter,
+            Input::Char(' '),
+            Input::Esc,
+            Input::Up,
+            Input::Char('q'),
+        ] {
+            let mut ctx = GameContext::new(&cfg, &fc, (80, 24));
+            let mut screen = NightClerkContinuationScreen::new();
+            let cmd = screen.handle_input(&mut ctx, input.clone());
+            assert!(
+                matches!(cmd, ScreenCommand::Pop),
+                "meaningful input {input:?} must Pop the continuation, got {cmd:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn night_clerk_continuation_screen_renders_body_and_default_footer() {
+        // Smoke-test the render path through `TestBackend` so a future
+        // refactor that forgets to wire the prompt to the buffer is
+        // caught here. We assert the SPEC §9 step 6 body line is on
+        // screen and that the SPEC §4.6 default footer survives the
+        // round-trip — together they prove the screen renders the
+        // continuation prompt rather than an empty buffer.
+        let cfg = fixture_config();
+        let fc = fixture_context();
+        let mut ctx = GameContext::new(&cfg, &fc, (80, 24));
+        let mut screen = NightClerkContinuationScreen::new();
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).expect("test backend constructs");
+        terminal
+            .draw(|frame| screen.render(&mut ctx, frame))
+            .expect("render succeeds against TestBackend");
+
+        let buffer = terminal.backend().buffer().clone();
+        let rows: Vec<String> = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect();
+        let rendered = rows.join("\n");
+
+        assert!(
+            rendered.contains(NIGHT_CLERK_CONTINUATION_BODY),
+            "rendered buffer must include the SPEC §9 step 6 body line; got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("Press any key to continue"),
+            "rendered buffer must include the SPEC §4.6 default footer; got:\n{rendered}"
+        );
     }
 
     // ---- Lost-and-Found Drawer action handler (SPEC §9 Task 10c) -----
