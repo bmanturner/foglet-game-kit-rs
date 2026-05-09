@@ -1500,9 +1500,18 @@ pub const COFFEE_PRICE: u32 = 25;
 
 /// Cost of the rumor tip, in gold pieces (SPEC_v1_1.md §9 step 4).
 /// Pairs with [`PlayerSlot::STARTING_CASH`] (40g) so the proof scene
-/// always boots into the disabled-`(T)` branch the SPEC requires Task
-/// 11d to demonstrate.
+/// always boots into the disabled-`(T)` branch Task 11d wires up.
 pub const RUMOR_TIP_PRICE: u32 = 50;
+
+/// Disabled-row reason shown next to `(T) Tip the clerk for a rumor`
+/// when the player's wallet is below [`RUMOR_TIP_PRICE`]
+/// (SPEC_v1_1.md §9 step 4: "Tipping is disabled when the player lacks
+/// enough cash and shows `need 50g`"). Centralised so the prompt
+/// builder, the disabled-press regression test, and any future copy
+/// edit share one source of truth — the SPEC pins the wording verbatim,
+/// so a future bump of `RUMOR_TIP_PRICE` deliberately invalidates this
+/// constant rather than silently desyncing the player-facing string.
+pub const NEED_RUMOR_TIP_REASON: &str = "need 50g";
 
 /// Format the priced-row label for the night-clerk vendor prompt
 /// (SPEC_v1_1.md §9 step 4, Task 11b).
@@ -1533,9 +1542,15 @@ fn priced_vendor_label(action: &str, price: u32, cash: u32) -> String {
 /// block deliberately omits a price annotation for the leave path —
 /// adding one would imply a cost the row does not actually charge.
 ///
-/// Task 11d will layer `disabled_if` on top of the `(T)` row when
-/// `cash < RUMOR_TIP_PRICE`; until then every choice ships enabled so
-/// Task 11c's transaction handler can exercise both priced rows.
+/// Task 11d gates the `(T)` row with `disabled_if(cash < RUMOR_TIP_PRICE,
+/// NEED_RUMOR_TIP_REASON)` so the disabled-`(T)` branch fires whenever
+/// the player can't actually afford the tip. The reducer then surfaces
+/// the press as [`foglet_game::PromptAction::Disabled`], which means a
+/// disabled tip can never reach [`apply_night_clerk_vendor_choice`] and
+/// silently decrement cash. `(B)` stays unconditionally enabled — the
+/// 25g coffee always sits within reach of the 40g
+/// [`PlayerSlot::STARTING_CASH`] floor, so a separate gate would just be
+/// unreachable code.
 ///
 /// The choice ordering matches SPEC §9 step 4 verbatim (`B`, `T`, `N`)
 /// so the rendered prompt reads top-to-bottom in the same order an
@@ -1556,6 +1571,12 @@ pub fn night_clerk_vendor_prompt(cash: u32) -> ChoicePrompt<NightClerkVendorChoi
             NightClerkVendorChoice::TipForRumor,
             priced_vendor_label("Tip the clerk for a rumor", RUMOR_TIP_PRICE, cash),
         )
+        // `disabled_if` attaches to the most-recently-added choice, so
+        // this call must sit immediately after the `(T)` row. The
+        // reducer in `foglet_game` then routes the disabled press to
+        // `PromptAction::Disabled` with NEED_RUMOR_TIP_REASON — the
+        // apply handler never sees a TipForRumor it couldn't afford.
+        .disabled_if(cash < RUMOR_TIP_PRICE, NEED_RUMOR_TIP_REASON)
         .choice('N', NightClerkVendorChoice::NoThanks, "No thanks")
 }
 
@@ -4295,25 +4316,31 @@ mod tests {
             "narration must match SPEC §9 step 4 verbatim"
         );
 
-        let expected: &[(char, &str, NightClerkVendorChoice)] = &[
+        // SPEC §9 step 4 pins the priced-row layout. After Task 11d the
+        // `(T)` row is disabled at STARTING_CASH=40g (40 < 50g rumor
+        // price), so the expectation table tracks the post-11d enabled
+        // flag per row instead of asserting blanket enabled-ness.
+        let expected: &[(char, &str, NightClerkVendorChoice, bool)] = &[
             (
                 'b',
                 "Buy a black coffee: 25g | You have: 40g",
                 NightClerkVendorChoice::BuyCoffee,
+                true,
             ),
             (
                 't',
                 "Tip the clerk for a rumor: 50g | You have: 40g",
                 NightClerkVendorChoice::TipForRumor,
+                false,
             ),
-            ('n', "No thanks", NightClerkVendorChoice::NoThanks),
+            ('n', "No thanks", NightClerkVendorChoice::NoThanks, true),
         ];
         assert_eq!(
             prompt.choices.len(),
             expected.len(),
             "Night-clerk vendor must expose the three SPEC §9 choices"
         );
-        for (choice, (key, label, value)) in prompt.choices.iter().zip(expected) {
+        for (choice, (key, label, value, enabled)) in prompt.choices.iter().zip(expected) {
             assert_eq!(
                 choice.key,
                 PromptKey::char(*key),
@@ -4321,9 +4348,9 @@ mod tests {
             );
             assert_eq!(choice.label, *label, "label for {key} drifted from SPEC §9");
             assert_eq!(choice.value, *value, "value for {label:?} drifted");
-            assert!(
-                choice.enabled,
-                "Task 11a ships every choice enabled; Task 11d adds the disabled-(T) branch"
+            assert_eq!(
+                choice.enabled, *enabled,
+                "enabled flag for {key} drifted from SPEC §9 step 4 / Task 11d"
             );
         }
     }
@@ -4362,9 +4389,12 @@ mod tests {
                 "rendered prompt missing SPEC §9 step 4 fragment {fragment:?}; got:\n{rendered}"
             );
         }
-        // Each choice row must surface its `(X)` hotkey marker plus the
-        // SPEC §9 label so monochrome terminals stay legible.
-        for marker in ["(B)", "(T)", "(N)"] {
+        // Each choice row must surface its hotkey marker plus the SPEC
+        // §9 label so monochrome terminals stay legible. After Task 11d
+        // the `(T)` row is disabled at STARTING_CASH=40g, so it renders
+        // with the SPEC §4.2 disabled marker `- [T]` and the
+        // `(need 50g)` reason instead of the enabled `(T)` form.
+        for marker in ["(B)", "- [T]", "(N)"] {
             assert!(
                 rendered.contains(marker),
                 "missing hotkey marker {marker} in rendered prompt:\n{rendered}"
@@ -4380,6 +4410,11 @@ mod tests {
                 "missing label {label:?} in rendered prompt:\n{rendered}"
             );
         }
+        // SPEC §9 step 4 pins the disabled-tip reason verbatim.
+        assert!(
+            rendered.contains("(need 50g)"),
+            "disabled (T) row must surface NEED_RUMOR_TIP_REASON; got:\n{rendered}"
+        );
     }
 
     #[test]
@@ -4484,6 +4519,125 @@ mod tests {
                 "case-folded `{key}` must produce the same wallet delta",
             );
         }
+    }
+
+    // ---- Night-clerk vendor: disabled tip branch (SPEC §9 Task 11d) ----
+
+    #[test]
+    fn night_clerk_vendor_disables_tip_when_cash_below_rumor_price() {
+        // SPEC §9 step 4: "Tipping is disabled when the player lacks
+        // enough cash and shows `need 50g`." Pin both halves — the
+        // `enabled` flag and the verbatim reason — at the documented
+        // 40g starting balance so a future copy-edit to either has to
+        // come through here. Inspecting the typed prompt (rather than
+        // the rendered buffer) keeps the test cheap; the renderer
+        // surface is already covered by
+        // `night_clerk_vendor_prompt_renders_body_and_hotkeys` above.
+        let prompt = night_clerk_vendor_prompt(PlayerSlot::STARTING_CASH);
+
+        let tip = prompt
+            .choices
+            .iter()
+            .find(|c| c.value == NightClerkVendorChoice::TipForRumor)
+            .expect("(T) choice must remain present so the player sees the gated row");
+        assert!(
+            !tip.enabled,
+            "(T) must be disabled when cash < RUMOR_TIP_PRICE"
+        );
+        assert_eq!(
+            tip.disabled_reason.as_deref(),
+            Some(NEED_RUMOR_TIP_REASON),
+            "disabled-tip reason must match SPEC §9 step 4 verbatim"
+        );
+
+        // Sibling rows must stay enabled — Task 11d only gates `(T)`.
+        for value in [
+            NightClerkVendorChoice::BuyCoffee,
+            NightClerkVendorChoice::NoThanks,
+        ] {
+            let choice = prompt
+                .choices
+                .iter()
+                .find(|c| c.value == value)
+                .unwrap_or_else(|| panic!("{value:?} missing from vendor prompt"));
+            assert!(choice.enabled, "{value:?} must remain enabled at 40g");
+            assert!(choice.disabled_reason.is_none());
+        }
+    }
+
+    #[test]
+    fn night_clerk_vendor_enables_tip_when_cash_meets_rumor_price() {
+        // Mirror of the disabled case so a regression that flips the
+        // comparison (`<=` vs `<`, or hardcoding 40g) lights up here
+        // rather than masquerading as a manifest-level bug. RUMOR_TIP_PRICE
+        // is the boundary — the row should be enabled at exactly 50g
+        // (the player can afford the tip) and at any larger balance.
+        for cash in [RUMOR_TIP_PRICE, RUMOR_TIP_PRICE + 25, 999] {
+            let prompt = night_clerk_vendor_prompt(cash);
+            let tip = prompt
+                .choices
+                .iter()
+                .find(|c| c.value == NightClerkVendorChoice::TipForRumor)
+                .expect("(T) choice present");
+            assert!(
+                tip.enabled,
+                "(T) must be enabled at cash={cash} (>= RUMOR_TIP_PRICE)"
+            );
+            assert!(tip.disabled_reason.is_none());
+        }
+    }
+
+    #[test]
+    fn night_clerk_vendor_pressing_disabled_tip_does_not_decrement_cash() {
+        // SPEC §9 step 4 + CHECKLIST Task 11d: "starting 40g disables
+        // tip and selecting `t` does not decrement cash." Drive the
+        // reducer with both lowercase and uppercase to mirror the SPEC
+        // §9 step 7 case-folding contract — a disabled hotkey must
+        // route through `PromptAction::Disabled` regardless of case so a
+        // future regression that only folds the enabled path lights up
+        // here. The post-press snapshot equality is the guarantee that
+        // the disabled branch never reaches `apply_night_clerk_vendor_choice`
+        // (which would `-=` COFFEE_PRICE — wrong amount, but still a
+        // mutation) or some hypothetical tip-applier that hasn't been
+        // gated yet.
+        use foglet_game::PromptAction;
+
+        let slots = SharedSlots::default();
+        slots.reset(0, 0);
+        let before = slots.snapshot();
+        let starting_cash = slots.player.borrow().cash;
+        assert!(
+            starting_cash < RUMOR_TIP_PRICE,
+            "test invariant: STARTING_CASH must trigger the disabled-(T) branch"
+        );
+        let prompt = night_clerk_vendor_prompt(starting_cash);
+
+        for key in ['t', 'T'] {
+            let action = prompt.handle(Input::Char(key));
+            match action {
+                PromptAction::Disabled { reason, .. } => assert_eq!(
+                    reason.as_deref(),
+                    Some(NEED_RUMOR_TIP_REASON),
+                    "disabled reason for {key} drifted from SPEC §9 step 4"
+                ),
+                other => panic!("expected PromptAction::Disabled for `{key}`, got {other:?}"),
+            }
+        }
+
+        // Reducer never reached the apply handler → state is byte-
+        // identical to the pre-press snapshot. Guards against a future
+        // regression that adds a `TipForRumor` apply branch without
+        // also re-checking the prompt-layer gate.
+        assert_eq!(
+            slots.snapshot(),
+            before,
+            "disabled (T) press must not mutate any slot"
+        );
+        assert_eq!(
+            slots.player.borrow().cash,
+            starting_cash,
+            "cash must be unchanged after a disabled (T) press"
+        );
     }
 
     // ---- Lost-and-Found Drawer action handler (SPEC §9 Task 10c) -----
