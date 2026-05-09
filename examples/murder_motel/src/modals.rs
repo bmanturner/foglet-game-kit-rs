@@ -107,15 +107,13 @@ impl WinScreen {
 
 impl Screen for WinScreen {
     fn render(&mut self, _ctx: &mut GameContext<'_>, frame: &mut Frame<'_>) {
-        // Centre the modal. Width matches the longest line plus border
-        // padding; height is the line count plus two for the border so
-        // every line is visible on an exactly-80x24 terminal.
+        // SPEC_v2_1 §4.3 modal: bordered, titled, left-aligned body.
+        // Width matches the longest line plus border padding; height is
+        // the line count plus two for the border so every line is
+        // visible on an exactly-80x24 terminal.
         let area = centred_rect(72, (Self::LINES.len() as u16) + 2, frame.area());
-        let lines: Vec<Line<'_>> = Self::LINES.iter().map(|s| Line::from(*s)).collect();
-        let widget = Paragraph::new(lines)
-            .alignment(Alignment::Center)
-            .block(Block::default().borders(Borders::ALL).title(Self::TITLE));
-        frame.render_widget(widget, area);
+        let body = Self::LINES.join("\n");
+        render_modal(frame, area, Some(Self::TITLE), &body);
     }
 
     fn handle_input(&mut self, _ctx: &mut GameContext<'_>, _input: Input) -> ScreenCommand {
