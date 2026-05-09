@@ -65,6 +65,15 @@ pub struct GameConfig {
     /// "off" signal the runtime checks before opening a ledger.
     #[serde(default)]
     pub turns: Option<TurnsSection>,
+    /// `[[leaderboards]]` array — built-in leaderboards (SPEC v2 §5).
+    ///
+    /// Modeled as a `Vec` defaulted to empty rather than `Option<Vec>`
+    /// because "no leaderboards" and "an empty list of leaderboards"
+    /// are the same SPEC-level statement ("Missing `[[leaderboards]]`
+    /// means no built-in leaderboards"). Downstream consumers iterate
+    /// the vec; an empty vec is the natural off signal.
+    #[serde(default, rename = "leaderboards")]
+    pub leaderboards: Vec<LeaderboardSection>,
 }
 
 /// `[game]` section: every field is required.
@@ -240,6 +249,45 @@ pub struct TurnsSection {
     pub carryover_max: u32,
 }
 
+/// `[[leaderboards]]` entry: one named scoreboard (SPEC v2 §5).
+///
+/// `name` is the stable identifier used by the eventual leaderboard
+/// helpers (Task 8) to scope writes and reads — duplicates would make
+/// "increment score on board X" ambiguous, so they're rejected at
+/// load time rather than silently coalescing entries.
+///
+/// `sort` is a closed enum because the only meaningful values for a
+/// scoreboard are "highest is best" or "lowest is best"; an
+/// unrecognised string almost certainly means the author misspelled
+/// one of those, not that they want a third behavior.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LeaderboardSection {
+    /// Stable identifier used to scope reads/writes. Validated as
+    /// non-empty at load time; the helpers in Task 8 will further key
+    /// SQL rows by this string, so a typo here would silently shard
+    /// the scoreboard.
+    pub name: String,
+    /// Sort direction. `Desc` is the default because the typical
+    /// scoreboard ranks "highest score first"; `Asc` exists for
+    /// time-trial-style boards where lower is better.
+    #[serde(default)]
+    pub sort: LeaderboardSort,
+}
+
+/// Sort directions understood by leaderboard helpers.
+///
+/// Closed enum so an unrecognised value in `assets/game.toml` is a
+/// load-time error, not a silent fallback to "descending".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum LeaderboardSort {
+    /// Highest score first (the typical case).
+    #[default]
+    Desc,
+    /// Lowest score first (time trials, golf-style scoring).
+    Asc,
+}
+
 /// Reset cadences understood by the turn ledger.
 ///
 /// Closed enum: an unrecognised value in `assets/game.toml` is a
@@ -391,6 +439,25 @@ impl GameConfig {
                     "[turns].daily_allowance must be greater than zero".into(),
                 ));
             }
+        }
+        // Leaderboard names must be non-empty and unique. Task 8 will
+        // key SQL rows by `name`, so a duplicate would silently merge
+        // two boards that the author intended to keep separate, and an
+        // empty name would produce ambiguous error messages downstream.
+        let mut seen: Vec<&str> = Vec::with_capacity(self.leaderboards.len());
+        for board in &self.leaderboards {
+            if board.name.trim().is_empty() {
+                return Err(ConfigError::Validate(
+                    "[[leaderboards]].name must not be empty".into(),
+                ));
+            }
+            if seen.contains(&board.name.as_str()) {
+                return Err(ConfigError::Validate(format!(
+                    "duplicate [[leaderboards]].name `{}`",
+                    board.name
+                )));
+            }
+            seen.push(board.name.as_str());
         }
         Ok(())
     }
@@ -920,6 +987,204 @@ carryover_max = 7
         let turns = reparsed.turns.unwrap();
         assert_eq!(turns.daily_allowance, 25);
         assert_eq!(turns.carryover_max, 7);
+    }
+
+    #[test]
+    fn absent_leaderboards_means_no_built_in_boards() {
+        // SPEC v2 §5: "Missing `[[leaderboards]]` means no built-in
+        // leaderboards." We model that as an empty vec rather than an
+        // `Option`, so consumers iterate uniformly.
+        let v1_style = r#"
+[game]
+title = "No Boards"
+slug = "no-boards"
+description = ""
+min_width = 80
+min_height = 24
+start_map = "lobby"
+start_x = 0
+start_y = 0
+"#;
+        let config = GameConfig::from_toml_str(v1_style).unwrap();
+        assert!(config.leaderboards.is_empty());
+    }
+
+    #[test]
+    fn parses_full_leaderboards_section_from_spec_example() {
+        // Verbatim from SPEC v2 §5 so a future SPEC tweak surfaces as
+        // a failing test rather than silent drift.
+        let v2 = r#"
+[game]
+title = "Murder Motel"
+slug = "murder-motel"
+description = ""
+min_width = 80
+min_height = 24
+start_map = "lobby"
+start_x = 0
+start_y = 0
+
+[[leaderboards]]
+name = "investigators"
+sort = "desc"
+"#;
+        let config = GameConfig::from_toml_str(v2).unwrap();
+        assert_eq!(config.leaderboards.len(), 1);
+        assert_eq!(config.leaderboards[0].name, "investigators");
+        assert_eq!(config.leaderboards[0].sort, LeaderboardSort::Desc);
+    }
+
+    #[test]
+    fn leaderboard_sort_defaults_to_desc_when_omitted() {
+        // The typical scoreboard ranks highest-first; an author who
+        // omits `sort` should get that without ceremony.
+        let partial = r#"
+[game]
+title = "Default Sort"
+slug = "default-sort"
+description = ""
+min_width = 80
+min_height = 24
+start_map = "lobby"
+start_x = 0
+start_y = 0
+
+[[leaderboards]]
+name = "investigators"
+"#;
+        let config = GameConfig::from_toml_str(partial).unwrap();
+        assert_eq!(config.leaderboards[0].sort, LeaderboardSort::Desc);
+    }
+
+    #[test]
+    fn parses_multiple_leaderboards_with_mixed_sort() {
+        let multi = r#"
+[game]
+title = "Multi"
+slug = "multi"
+description = ""
+min_width = 80
+min_height = 24
+start_map = "lobby"
+start_x = 0
+start_y = 0
+
+[[leaderboards]]
+name = "investigators"
+sort = "desc"
+
+[[leaderboards]]
+name = "fastest_solve"
+sort = "asc"
+"#;
+        let config = GameConfig::from_toml_str(multi).unwrap();
+        assert_eq!(config.leaderboards.len(), 2);
+        assert_eq!(config.leaderboards[1].name, "fastest_solve");
+        assert_eq!(config.leaderboards[1].sort, LeaderboardSort::Asc);
+    }
+
+    #[test]
+    fn duplicate_leaderboard_names_are_rejected() {
+        // Task 8 will key SQL rows by `name` — a duplicate would
+        // silently merge boards the author meant to keep separate.
+        let bad = r#"
+[game]
+title = "Dup"
+slug = "dup"
+description = ""
+min_width = 80
+min_height = 24
+start_map = "lobby"
+start_x = 0
+start_y = 0
+
+[[leaderboards]]
+name = "investigators"
+sort = "desc"
+
+[[leaderboards]]
+name = "investigators"
+sort = "asc"
+"#;
+        let err = GameConfig::from_toml_str(bad).unwrap_err();
+        match err {
+            ConfigError::Validate(msg) => {
+                assert!(msg.contains("investigators"), "{msg}");
+                assert!(msg.contains("duplicate"), "{msg}");
+            }
+            other => panic!("expected Validate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn empty_leaderboard_name_is_rejected() {
+        let bad = r#"
+[game]
+title = "Empty Name"
+slug = "empty-name"
+description = ""
+min_width = 80
+min_height = 24
+start_map = "lobby"
+start_x = 0
+start_y = 0
+
+[[leaderboards]]
+name = ""
+sort = "desc"
+"#;
+        let err = GameConfig::from_toml_str(bad).unwrap_err();
+        assert!(matches!(err, ConfigError::Validate(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn unknown_leaderboard_sort_is_a_parse_error() {
+        // `LeaderboardSort` is intentionally a closed enum.
+        let bad = r#"
+[game]
+title = "Bad Sort"
+slug = "bad-sort"
+description = ""
+min_width = 80
+min_height = 24
+start_map = "lobby"
+start_x = 0
+start_y = 0
+
+[[leaderboards]]
+name = "investigators"
+sort = "sideways"
+"#;
+        let err = GameConfig::from_toml_str(bad).unwrap_err();
+        assert!(matches!(err, ConfigError::Parse(_)));
+    }
+
+    #[test]
+    fn leaderboards_round_trip_through_toml() {
+        let original = r#"
+[game]
+title = "RT Boards"
+slug = "rt-boards"
+description = ""
+min_width = 80
+min_height = 24
+start_map = "lobby"
+start_x = 0
+start_y = 0
+
+[[leaderboards]]
+name = "investigators"
+sort = "desc"
+
+[[leaderboards]]
+name = "fastest_solve"
+sort = "asc"
+"#;
+        let config = GameConfig::from_toml_str(original).unwrap();
+        let serialized = config.to_toml_string();
+        let reparsed = GameConfig::from_toml_str(&serialized).unwrap();
+        assert_eq!(config, reparsed);
+        assert_eq!(reparsed.leaderboards.len(), 2);
     }
 
     #[test]

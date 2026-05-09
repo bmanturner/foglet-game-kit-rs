@@ -236,6 +236,7 @@ mod tests {
             },
             world: Default::default(),
             turns: None,
+            leaderboards: Vec::new(),
         }
     }
 
