@@ -171,6 +171,56 @@ pub struct MessageLine<'a> {
     pub text: &'a str,
 }
 
+/// Render a bordered, optionally titled modal frame with `body`
+/// painted inside its inner rect.
+///
+/// Pulled into the kit because every game's "press a key to dismiss"
+/// modal — help screens, win screens, role/profile read-outs, the
+/// `murder_motel` Lost & Found and Night Clerk panes — all reach for
+/// the same construction: `Block::default().borders(Borders::ALL)`,
+/// optional `.title(...)`, and a left-aligned `Paragraph` body. SPEC
+/// §4.3 pins the contract: single bordered block, title in the top
+/// border, body left-aligned with one cell of padding.
+///
+/// `body` is `&str` so the helper handles the common case (a static
+/// chunk of dialogue or read-only blurb) without forcing the caller
+/// to build `Vec<Line>`. Embedded `\n` characters split into multiple
+/// rows; word-wrap is intentionally disabled so the caller controls
+/// where breaks happen — the modal frame is small enough that
+/// surprise wraps would shift recorded snapshots.
+///
+/// The "one cell of padding" requirement is satisfied by deriving the
+/// inner area from `Block::inner` (which already accounts for the
+/// border) and then horizontally indenting one column on each side
+/// before rendering the paragraph. Vertical padding is **not** added:
+/// callers tend to size `area` exactly to `body.lines().count() + 2`
+/// (border rows), so trimming the first and last inner rows would
+/// drop body content. Vertical centring is the caller's job via
+/// [`centred_rect`].
+pub fn render_modal(frame: &mut Frame<'_>, area: Rect, title: Option<&str>, body: &str) {
+    let block = bordered_block(title);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.width <= 2 || inner.height == 0 {
+        // No room for body once the one-cell horizontal padding is
+        // applied; the border alone is the modal. Bail out so a tiny
+        // `TestBackend` rect doesn't trigger a zero-width render.
+        return;
+    }
+    // One cell of padding on the left and right so body text never
+    // butts against the border. Top/bottom are flush against the
+    // border for the reason in the doc comment above.
+    let padded = Rect {
+        x: inner.x + 1,
+        y: inner.y,
+        width: inner.width - 2,
+        height: inner.height,
+    };
+    let lines: Vec<Line<'_>> = body.split('\n').map(Line::from).collect();
+    let para = Paragraph::new(lines).alignment(ratatui::layout::Alignment::Left);
+    frame.render_widget(para, padded);
+}
+
 /// Render a [`MenuList`] into `area`. Pure: state is borrowed,
 /// nothing is mutated.
 ///
@@ -674,6 +724,48 @@ mod tests {
         ] {
             assert_eq!(centred_rect(w, h, outer), legacy(w, h, outer));
         }
+    }
+
+    // ---- render_modal -----------------------------------------------
+
+    #[test]
+    fn render_modal_draws_border_title_and_padded_body() {
+        let buf = draw(20, 5, |f| {
+            render_modal(f, full_area(20, 5), Some("Help"), "line one\nline two")
+        });
+        // Top border carries the title.
+        assert!(row_text(&buf, 0).contains("Help"));
+        // Body sits left-aligned with one cell of padding inside the
+        // border (column 0 = border, column 1 = padding, column 2 = first
+        // body char).
+        assert_eq!(row_text(&buf, 1), "│ line one         │");
+        assert_eq!(row_text(&buf, 2), "│ line two         │");
+        // Bottom border row.
+        assert!(row_text(&buf, 4).starts_with('└'));
+    }
+
+    #[test]
+    fn render_modal_omits_title_when_none() {
+        let buf = draw(15, 4, |f| render_modal(f, full_area(15, 4), None, "hi"));
+        // Top border is uninterrupted by a title label.
+        let top = row_text(&buf, 0);
+        assert!(top.starts_with('┌') && top.ends_with('┐'));
+        assert!(!top.contains("Help"));
+        assert_eq!(row_text(&buf, 1), "│ hi          │");
+    }
+
+    #[test]
+    fn render_modal_handles_tiny_area_without_panic() {
+        // 2x2 area: inner is 0x0 after the border, so render must early
+        // out instead of panicking on the negative-width padded rect.
+        let buf = draw(2, 2, |f| {
+            render_modal(f, full_area(2, 2), Some("ignored"), "body")
+        });
+        // Only the border corners render; no body text leaks.
+        let top = row_text(&buf, 0);
+        let bot = row_text(&buf, 1);
+        assert!(!top.contains("body"));
+        assert!(!bot.contains("body"));
     }
 
     #[test]
