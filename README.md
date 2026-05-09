@@ -1,6 +1,6 @@
 # foglet-game-kit-rs
 
-A Rust authoring kit for [Foglet](https://github.com/foglet/foglet_bbs)
+A Rust authoring kit for [Foglet](https://github.com/bmanturner/foglet-bbs)
 door games. It ships a library crate (`foglet_game`) for building the
 game itself and a CLI (`fgk`) for scaffolding, packaging, and emitting
 the Foglet operator manifest.
