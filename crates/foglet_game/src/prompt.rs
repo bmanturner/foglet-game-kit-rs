@@ -142,6 +142,174 @@ impl PromptKey {
     }
 }
 
+/// Semantic style role for prompt text and choices (SPEC_v1_1.md §4.7).
+///
+/// Prompts attach roles, not raw ANSI. The render layer (Task 5f) maps
+/// roles to a Ratatui `Style`, which keeps two properties that the
+/// SPEC requires:
+///
+/// 1. **Color is never the only carrier of meaning** — disabled rows
+///    still render visibly different in monochrome because the
+///    renderer adds a marker/prefix when it sees `StyleRole::Disabled`,
+///    not just because the text is dim.
+/// 2. **Themes are overridable** — a game (or a future operator config)
+///    can swap the role-to-`Style` mapping without touching the prompt
+///    data, because the data only carries the role enum.
+///
+/// The variants are the SPEC-listed initial roles. Adding a role is a
+/// SPEC-level change; do not extend this enum to carry per-prompt
+/// styling — use `hint` / `disabled_reason` text instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum StyleRole {
+    /// Default text style. Body lines, footers, plain choice labels.
+    Normal,
+    /// Title text — modal headers, section banners.
+    Title,
+    /// Emphasised inline text (warnings, callouts) without escalating
+    /// to `Error`.
+    Emphasis,
+    /// De-emphasised text — secondary lines, footnote-style hints.
+    Muted,
+    /// Inline hint text attached to a choice (e.g. `"need 50g"`).
+    Hint,
+    /// Error feedback text — selecting a disabled choice, validation
+    /// messages.
+    Error,
+    /// Success feedback text — `"Moved Room 7 key to inventory."`.
+    Success,
+    /// Numeric currency / cost annotations.
+    Currency,
+    /// Disabled choice rows. Renderer pairs this with a monochrome
+    /// marker (Task 5c) so the disabled state survives a black/white
+    /// terminal.
+    Disabled,
+    /// Highlighted hotkey character inside a choice marker like `(E)`.
+    Hotkey,
+}
+
+/// One selectable option inside a `ChoicePrompt` (SPEC_v1_1.md §4.2).
+///
+/// `T` is the game-facing **stable id** the prompt returns when the
+/// player selects this choice — usually a small `enum` defined by the
+/// game. Stable ids decouple the *display* of a prompt (which changes
+/// when localisation, copy edits, or dynamic labels arrive) from the
+/// *semantics* of a selection (which the game's state machine wants
+/// to stay constant). Compare with returning the label string: a copy
+/// tweak from `"Take"` to `"Pick up"` would silently break a `match`.
+///
+/// # Building one
+///
+/// Construction goes through [`PromptChoice::new`] so the common path
+/// (an enabled choice with a hotkey, a label, and an id) stays a
+/// one-liner. Optional fields — `disabled_reason`, `hint`, `style` —
+/// are set with `with_*` chain methods. The richer
+/// `disabled_if`/`.choice(...)` builder helpers land in Task 2d on top
+/// of this same data.
+///
+/// # Disabled choices
+///
+/// `enabled` defaults to `true`. Setting `enabled = false` SHOULD be
+/// paired with [`PromptChoice::with_disabled_reason`] so the renderer
+/// (Task 5c) can show *why* the option is unavailable in monochrome —
+/// e.g. `- [M] Mana potions ... (full)`. The reducer (Task 3c) returns
+/// the same reason string in `PromptAction::Disabled`, so the game can
+/// surface it as feedback without re-deriving the cause.
+///
+/// # What this type intentionally does NOT do
+///
+/// - It does not hold game state (gold, inventory). The author wires
+///   `enabled = gold >= price` at construction time; the prompt does
+///   not re-evaluate predicates on its own.
+/// - It does not validate hotkey uniqueness. Duplicate-key detection
+///   is a `ChoicePrompt`-level concern (Task 2c) because it depends on
+///   the *set* of active choices.
+/// - It does not own a confirmation policy yet. SPEC §4.2 reserves a
+///   `confirm` field; it lands when `ConfirmPrompt` does (Task 6a) so
+///   the data and the reducer arrive together.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PromptChoice<T> {
+    /// Direct-input hotkey. Stored normalised — see [`PromptKey::char`].
+    pub key: PromptKey,
+    /// Display label. Renderer wraps and styles this; MUST NOT contain
+    /// raw terminal control sequences (SPEC §4.2).
+    pub label: String,
+    /// Stable game-facing id returned by the reducer on selection.
+    /// Typically a small game-defined enum.
+    pub value: T,
+    /// `true` (default) means the player can select this choice.
+    /// `false` makes the choice render as disabled and selecting it
+    /// returns `PromptAction::Disabled` rather than `Selected`.
+    pub enabled: bool,
+    /// Optional human-readable reason shown next to a disabled choice
+    /// and echoed back through `PromptAction::Disabled`. Empty when
+    /// the choice is enabled.
+    pub disabled_reason: Option<String>,
+    /// Optional inline hint shown after the label — e.g. cost or
+    /// capacity (`"50g"`, `"0/26"`). Independent of `disabled_reason`
+    /// because an enabled choice can still want a hint.
+    pub hint: Option<String>,
+    /// Optional semantic style role override. `None` means the
+    /// renderer picks the default for the choice's enabled/disabled
+    /// state.
+    pub style: Option<StyleRole>,
+}
+
+impl<T> PromptChoice<T> {
+    /// Build an enabled choice with the three always-required fields.
+    ///
+    /// `key` accepts anything that converts into a [`PromptKey`] —
+    /// most commonly a `char`, which goes through `PromptKey::char`
+    /// and lowercases ASCII letters automatically. `label` accepts any
+    /// `Into<String>` so callers can pass `&str` or `String`.
+    pub fn new(key: impl Into<PromptKey>, label: impl Into<String>, value: T) -> Self {
+        Self {
+            key: key.into(),
+            label: label.into(),
+            value,
+            // SPEC §4.2: "`enabled` bool, default `true`". Centralising
+            // the default here means the rest of the codebase never has
+            // to remember it.
+            enabled: true,
+            disabled_reason: None,
+            hint: None,
+            style: None,
+        }
+    }
+
+    /// Mark this choice disabled and attach the reason. Pairs with
+    /// SPEC §4.2's "disabled choices MUST render visibly distinct" by
+    /// giving the renderer a non-empty string to surface.
+    pub fn with_disabled_reason(mut self, reason: impl Into<String>) -> Self {
+        self.enabled = false;
+        self.disabled_reason = Some(reason.into());
+        self
+    }
+
+    /// Attach an inline hint (cost, capacity, side note). Does not
+    /// touch `enabled` — disabled hints are valid (`"need 50g"`).
+    pub fn with_hint(mut self, hint: impl Into<String>) -> Self {
+        self.hint = Some(hint.into());
+        self
+    }
+
+    /// Override the semantic style role. Use sparingly — the renderer
+    /// already picks sensible defaults from `enabled` and the choice's
+    /// position; manual overrides are for emphasis/error/success rows.
+    pub fn with_style(mut self, role: StyleRole) -> Self {
+        self.style = Some(role);
+        self
+    }
+}
+
+impl From<char> for PromptKey {
+    /// Lift a `char` straight into a [`PromptKey`] via
+    /// [`PromptKey::char`] so call sites like
+    /// `PromptChoice::new('e', "Equip", Action::Equip)` stay terse.
+    fn from(c: char) -> Self {
+        PromptKey::char(c)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -217,5 +385,85 @@ mod tests {
         ] {
             assert_eq!(PromptKey::from_input(input), None, "{input:?}");
         }
+    }
+
+    /// Game-defined stable id used in the choice-model tests. Mirrors
+    /// the shape an actual game would use — small enum, `Eq`, copy.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum LootAction {
+        Equip,
+        Take,
+        Pass,
+    }
+
+    #[test]
+    fn choice_new_defaults_enabled_true_with_no_metadata() {
+        // SPEC §4.2: `enabled` defaults to true; metadata fields stay
+        // unset until the author opts in. This is the path 99% of
+        // prompt choices take, so it has to stay a one-liner.
+        let choice = PromptChoice::new('e', "Equip immediately", LootAction::Equip);
+
+        assert_eq!(choice.key, PromptKey::Char('e'));
+        assert_eq!(choice.label, "Equip immediately");
+        assert_eq!(choice.value, LootAction::Equip);
+        assert!(choice.enabled);
+        assert_eq!(choice.disabled_reason, None);
+        assert_eq!(choice.hint, None);
+        assert_eq!(choice.style, None);
+    }
+
+    #[test]
+    fn choice_new_lowercases_ascii_hotkey_via_from_char() {
+        // The `From<char> for PromptKey` impl funnels through
+        // `PromptKey::char`, so `'E'` and `'e'` produce the same key
+        // without callers thinking about it.
+        let upper = PromptChoice::new('E', "Equip", LootAction::Equip);
+        let lower = PromptChoice::new('e', "Equip", LootAction::Equip);
+        assert_eq!(upper.key, lower.key);
+    }
+
+    #[test]
+    fn with_disabled_reason_preserves_reason_and_flips_enabled() {
+        // SPEC §4.2: disabled choices carry a reason that the renderer
+        // and reducer both surface. Setting the reason MUST also flip
+        // `enabled = false` — otherwise authors would have to remember
+        // both calls and an inconsistent state could ship.
+        let choice =
+            PromptChoice::new('m', "Mana potions", LootAction::Take).with_disabled_reason("full");
+
+        assert!(!choice.enabled);
+        assert_eq!(choice.disabled_reason.as_deref(), Some("full"));
+    }
+
+    #[test]
+    fn with_hint_does_not_disable_choice() {
+        // Hints (cost, capacity) are independent of disabled state —
+        // `"Coffee — 25g"` is an enabled choice with a hint, not a
+        // disabled one.
+        let choice = PromptChoice::new('b', "Black coffee", LootAction::Take).with_hint("25g");
+
+        assert!(choice.enabled);
+        assert_eq!(choice.hint.as_deref(), Some("25g"));
+        assert_eq!(choice.disabled_reason, None);
+    }
+
+    #[test]
+    fn with_style_overrides_role() {
+        let choice = PromptChoice::new('p', "Pass", LootAction::Pass).with_style(StyleRole::Muted);
+        assert_eq!(choice.style, Some(StyleRole::Muted));
+    }
+
+    #[test]
+    fn builder_chain_combines_disabled_and_hint() {
+        // Realistic vendor case: tip-for-rumor priced at 50g while the
+        // player has 40g — disabled, with both a `disabled_reason`
+        // explaining why and a `hint` carrying the cost.
+        let choice = PromptChoice::new('t', "Tip for rumor", LootAction::Take)
+            .with_hint("50g")
+            .with_disabled_reason("need 50g");
+
+        assert!(!choice.enabled);
+        assert_eq!(choice.hint.as_deref(), Some("50g"));
+        assert_eq!(choice.disabled_reason.as_deref(), Some("need 50g"));
     }
 }
