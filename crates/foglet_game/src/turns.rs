@@ -45,6 +45,10 @@
 //! just the current count. That's not a SPEC requirement, but it's a
 //! free side-effect of the keying choice and worth not throwing away.
 
+use std::fmt;
+
+use thiserror::Error;
+
 use crate::world_db::WorldMigration;
 
 /// Schema for the daily turn ledger — SPEC_v2 §4.6 / §Task 6a.
@@ -128,6 +132,204 @@ CREATE TABLE IF NOT EXISTS turn_ledger (\n\
 );\n\
 ",
 };
+
+/// A local calendar date in `YYYY-MM-DD` form — the value the
+/// `turn_ledger.local_date` column stores and the unit of "today" the
+/// rest of Task 6 keys off.
+///
+/// Wrapped in a newtype rather than passed around as a bare `String`
+/// for two reasons:
+///
+/// 1. **Format invariant.** Once you hold a [`LocalDate`] you know the
+///    string is exactly ten characters long, ASCII, and shaped like
+///    `YYYY-MM-DD`. Task 6c's "today's row" lookup is a literal SQL
+///    parameter bind, so any drift in shape (e.g. `2026-5-8` vs
+///    `2026-05-08`) would silently miss rows. Validating once at the
+///    boundary lets every consumer downstream compare with `==` and
+///    sort lexically without re-checking.
+/// 2. **Testability.** [`DateProvider`] returns `LocalDate`, never a
+///    raw string, so a fixture date in a test is the same shape as a
+///    production date — there is no "test-only string" branch to drift
+///    apart from production.
+///
+/// The internal representation is a 10-byte `String` rather than a
+/// `(year, month, day)` triple because the consumer (SQLite) ultimately
+/// wants the ISO text anyway. Storing the canonical text avoids a
+/// `format!()` allocation on every bind. Calendar math (Task 6f's
+/// "yesterday" lookup) does not happen on `LocalDate` itself — it
+/// happens via the SQL `WHERE local_date < ? ORDER BY local_date DESC
+/// LIMIT 1` query SPEC §4.6 sketches, which only needs lexical
+/// comparison and is exactly what the ISO format gives us for free.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct LocalDate(String);
+
+impl LocalDate {
+    /// Construct a [`LocalDate`] from a string, validating ISO
+    /// `YYYY-MM-DD` shape.
+    ///
+    /// Validation is intentionally **shape-only**: every position is an
+    /// ASCII digit except the two `-` separators, and the string is
+    /// exactly ten bytes long. This catches the realistic regression
+    /// modes — a `format!()` macro that drops the zero pad, an upstream
+    /// API returning `2026/05/08`, a stray newline — without pulling
+    /// in a full calendar implementation that would also reject
+    /// `2026-02-30` etc.
+    ///
+    /// We do *not* validate semantic legality (month <= 12, day-of-
+    /// month bounds, leap years) at this layer because:
+    ///
+    /// - The only production [`DateProvider`] (Task 6c) will compute
+    ///   the date from the system clock, which never produces an
+    ///   illegal date.
+    /// - Test code passing a date through this constructor is
+    ///   deliberately picking it; rejecting `2026-02-30` would force
+    ///   tests to know the calendar to write fixtures, which is busy
+    ///   work without a regression to prevent.
+    /// - SQLite stores the value as opaque text either way; a semantic
+    ///   bug shows up in the test the date is meant to drive, not in a
+    ///   constructor panic.
+    ///
+    /// If a later iteration *does* want strict calendar validation,
+    /// it can be added without breaking callers — the constructor
+    /// already returns `Result`.
+    pub fn parse(input: impl Into<String>) -> Result<Self, TurnError> {
+        let input = input.into();
+        let bytes = input.as_bytes();
+        let shape_ok = bytes.len() == 10
+            && bytes[4] == b'-'
+            && bytes[7] == b'-'
+            && bytes
+                .iter()
+                .enumerate()
+                .all(|(i, b)| matches!(i, 4 | 7) || b.is_ascii_digit());
+        if !shape_ok {
+            return Err(TurnError::InvalidLocalDate { input });
+        }
+        Ok(Self(input))
+    }
+
+    /// Borrow the canonical `YYYY-MM-DD` representation. Use this when
+    /// binding the date as a SQL parameter or comparing dates in tests.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Consume the wrapper and return the owned `YYYY-MM-DD` string.
+    /// Convenient for the SQLite layer when the call site already owns
+    /// the [`LocalDate`] and would otherwise have to clone.
+    pub fn into_string(self) -> String {
+        self.0
+    }
+}
+
+impl fmt::Display for LocalDate {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// Library-internal turn-ledger errors — SPEC_v2 §Task 6.
+///
+/// `thiserror`-derived per the architecture tenet "thiserror inside
+/// libraries". Variants are added as Tasks 6c–6f land. Task 6b only
+/// needs the validation variant for [`LocalDate::parse`].
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum TurnError {
+    /// A date string was handed to [`LocalDate::parse`] that did not
+    /// match `YYYY-MM-DD`. Surfaces the offending input verbatim so
+    /// authors writing fixtures see *why* their date was rejected
+    /// without having to re-derive the format from the doc comment.
+    #[error("invalid local date {input:?}; expected YYYY-MM-DD")]
+    InvalidLocalDate {
+        /// The string that failed validation.
+        input: String,
+    },
+}
+
+/// Source of "what is today's local date" for the turn ledger.
+///
+/// SPEC_v2 §4.6 specifies daily allowance, atomic spend, midnight
+/// reset, and capped carryover — every one of those behaviors is
+/// gated on knowing today's date. Reading the system clock directly
+/// inside the ledger code would make those behaviors untestable
+/// (you'd have to wait until midnight to test reset). Routing the
+/// answer through a trait lets:
+///
+/// - Production code use a system-clock-backed provider (introduced
+///   in Task 6c when the first ledger-writing path actually consumes
+///   it; deliberately not pre-built here to avoid landing dead code).
+/// - Tests use [`FixedDateProvider`] to assert "first call on day 1
+///   creates the row, second call on day 2 resets it" without
+///   touching real wall-clock time.
+///
+/// # Why a trait rather than a function pointer or `dyn Fn`
+///
+/// A `Box<dyn Fn() -> LocalDate>` would also work and would save a
+/// generic bound on every consumer. A trait is preferred because:
+///
+/// 1. The provider is a *role*, not a one-shot. A future iteration
+///    might extend it with `now()` for event timestamps; a trait
+///    accommodates that without rewriting every call site.
+/// 2. Generic bounds (`fn spend<P: DateProvider>(p: &P, …)`) keep the
+///    ledger paths monomorphizable and allocation-free, which matches
+///    the rest of the kit's "library-internal hot paths avoid
+///    `Box<dyn …>`" stance.
+/// 3. Trait impls are self-documenting in `cargo doc` output — a
+///    closure type on a public API is opaque to readers.
+pub trait DateProvider {
+    /// The local calendar date that should be treated as "today" for
+    /// ledger reads/writes happening *right now*.
+    ///
+    /// Implementations must be cheap — the runtime calls this on every
+    /// turn-spend and every screen render that displays remaining
+    /// turns. Caching is the implementation's responsibility (the
+    /// future production system-clock provider reads the clock each
+    /// call; callers needing a single consistent date for a multi-step
+    /// transaction should capture one [`LocalDate`] up front).
+    fn today(&self) -> LocalDate;
+}
+
+/// Test fixture that always reports the same date.
+///
+/// Constructed once per scenario and handed to the ledger code under
+/// test. Mutate via [`FixedDateProvider::set`] to simulate the clock
+/// advancing — useful for the Task 6f "carryover on new day" test that
+/// needs to write yesterday's row, then ask the ledger for today's
+/// balance with a different date in the provider.
+///
+/// Lives in production code (not behind `#[cfg(test)]`) so example
+/// programs and integration tests outside the `foglet_game` crate can
+/// use it. SPEC §6 explicitly calls out that authoring code should be
+/// able to drive the runtime deterministically; this is the date-side
+/// piece of that contract.
+#[derive(Debug, Clone)]
+pub struct FixedDateProvider {
+    date: LocalDate,
+}
+
+impl FixedDateProvider {
+    /// Build a fixed-date provider returning `date` from every
+    /// [`DateProvider::today`] call until [`FixedDateProvider::set`]
+    /// changes it.
+    pub fn new(date: LocalDate) -> Self {
+        Self { date }
+    }
+
+    /// Replace the reported date. Used by Task 6f-flavored tests to
+    /// simulate "the next day" without spinning up a second provider.
+    /// Takes `&mut self` (rather than interior mutability) because the
+    /// only callers are tests that own the provider; introducing a
+    /// `Cell`/`Mutex` would buy nothing and obscure the simple shape.
+    pub fn set(&mut self, date: LocalDate) {
+        self.date = date;
+    }
+}
+
+impl DateProvider for FixedDateProvider {
+    fn today(&self) -> LocalDate {
+        self.date.clone()
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -305,5 +507,103 @@ mod tests {
             msg.to_lowercase().contains("turn_ledger") || msg.to_lowercase().contains("unique"),
             "duplicate insert error should mention turn_ledger or uniqueness, got: {msg}"
         );
+    }
+
+    /// Canonical `YYYY-MM-DD` strings round-trip through
+    /// [`LocalDate::parse`] without modification. The parsed value's
+    /// `as_str()` matches the input verbatim — this is the contract the
+    /// SQL parameter binder relies on (Task 6c–6f: bind today's date,
+    /// match yesterday's row by lexical comparison).
+    #[test]
+    fn local_date_parse_accepts_canonical_iso_form() {
+        let date = LocalDate::parse("2026-05-08").expect("canonical date parses");
+        assert_eq!(date.as_str(), "2026-05-08");
+        // Display matches as_str so format!() in messages is safe.
+        assert_eq!(format!("{date}"), "2026-05-08");
+        // into_string yields the same canonical text without copying.
+        assert_eq!(date.into_string(), "2026-05-08");
+    }
+
+    /// [`LocalDate::parse`] rejects every realistic shape regression we
+    /// expect to see: missing zero pad, alternate separators, extra
+    /// whitespace, wrong length, non-digit content. Each case has a
+    /// real-world failure mode behind it (manual `format!()`,
+    /// upstream API drift, copy-paste from a log line) so a regression
+    /// in the validator surfaces as a named scenario rather than a
+    /// vague "string did not parse".
+    #[test]
+    fn local_date_parse_rejects_malformed_inputs() {
+        let bad = [
+            "",            // empty
+            "2026-5-08",   // missing zero pad on month
+            "2026-05-8",   // missing zero pad on day
+            "2026/05/08",  // wrong separator
+            "26-05-08",    // 2-digit year
+            "2026-05-08 ", // trailing whitespace
+            " 2026-05-08", // leading whitespace
+            "2026-05-08T", // length 11
+            "abcd-ef-gh",  // non-digit content
+        ];
+        for input in bad {
+            let err =
+                LocalDate::parse(input).expect_err(&format!("expected {input:?} to be rejected"));
+            let TurnError::InvalidLocalDate { input: got } = &err;
+            assert_eq!(
+                got, input,
+                "InvalidLocalDate should preserve the offending input verbatim"
+            );
+            // The Display impl mentions the input so authors writing
+            // fixtures see why the date was rejected without re-reading
+            // the doc comment.
+            let msg = err.to_string();
+            assert!(
+                msg.contains("YYYY-MM-DD"),
+                "error message should mention expected format, got: {msg}"
+            );
+        }
+    }
+
+    /// [`FixedDateProvider`] returns the configured date from every
+    /// [`DateProvider::today`] call. This is the bedrock contract Task
+    /// 6c–6f tests rely on: hand the ledger a fixed provider, drive
+    /// it, observe deterministic behavior.
+    #[test]
+    fn fixed_date_provider_returns_configured_date() {
+        let provider =
+            FixedDateProvider::new(LocalDate::parse("2026-05-08").expect("fixture date parses"));
+        assert_eq!(provider.today().as_str(), "2026-05-08");
+        // Repeated calls return the same value — no hidden mutation.
+        assert_eq!(provider.today().as_str(), "2026-05-08");
+    }
+
+    /// [`FixedDateProvider::set`] simulates the clock advancing — the
+    /// shape Task 6f's "carryover on a new day" test will use to
+    /// write yesterday's row, advance the clock, then ask for today's
+    /// balance and assert the carryover ran. Asserting the behavior
+    /// here pins the contract before the consumer lands.
+    #[test]
+    fn fixed_date_provider_set_advances_reported_date() {
+        let mut provider =
+            FixedDateProvider::new(LocalDate::parse("2026-05-08").expect("first date parses"));
+        assert_eq!(provider.today().as_str(), "2026-05-08");
+
+        provider.set(LocalDate::parse("2026-05-09").expect("second date parses"));
+        assert_eq!(provider.today().as_str(), "2026-05-09");
+    }
+
+    /// [`DateProvider`] is dispatchable through a generic bound — the
+    /// shape Task 6c+ ledger functions will use (`fn ensure_today<P:
+    /// DateProvider>(p: &P, …)`). A regression that accidentally tied
+    /// the trait to a `Self: Sized` bound or otherwise broke generic
+    /// usage would be caught here rather than in a downstream
+    /// consumer.
+    #[test]
+    fn date_provider_is_usable_through_generic_bound() {
+        fn read<P: DateProvider>(p: &P) -> String {
+            p.today().into_string()
+        }
+        let provider =
+            FixedDateProvider::new(LocalDate::parse("2026-05-08").expect("fixture date parses"));
+        assert_eq!(read(&provider), "2026-05-08");
     }
 }
