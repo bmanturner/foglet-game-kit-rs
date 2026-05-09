@@ -1327,6 +1327,54 @@ mod tests {
     }
 
     #[test]
+    fn handle_non_prompt_inputs_do_not_mutate_selection() {
+        // Task 3e: SPEC_v1_1.md §4.4 requires resize and unknown inputs
+        // be inert — no selection invented, and crucially no latent
+        // state change that would corrupt a follow-up press. The
+        // reducer's `&self` signature already proves immutability at
+        // the type level, but this test pins the *behavioural*
+        // contract: after an arbitrary stream of ignored inputs, the
+        // very next bound hotkey still resolves to the right enabled
+        // choice. When Task 4a adds a `selected_index` cursor, this
+        // test will catch any accidental mutation of it from the
+        // ignored-input path.
+        let prompt: ChoicePrompt<LootAction> = ChoicePrompt::new()
+            .choice('e', LootAction::Equip, "Equip")
+            .choice('t', LootAction::Take, "Take");
+
+        for input in [
+            Input::Resize {
+                width: 80,
+                height: 24,
+            },
+            Input::Resize {
+                width: 1,
+                height: 1,
+            },
+            Input::Up,
+            Input::Down,
+            Input::Backspace,
+            Input::Ctrl('c'),
+            Input::Unknown,
+        ] {
+            // Burn the input — must be a no-op.
+            assert_eq!(prompt.handle(input), PromptAction::None);
+        }
+
+        // Selection still resolves correctly afterwards: nothing about
+        // the prompt's internal state was disturbed by the ignored
+        // stream above.
+        assert_eq!(
+            prompt.handle(Input::Char('e')),
+            PromptAction::Selected(LootAction::Equip),
+        );
+        assert_eq!(
+            prompt.handle(Input::Char('t')),
+            PromptAction::Selected(LootAction::Take),
+        );
+    }
+
+    #[test]
     fn handle_disabled_choice_returns_disabled_with_id_and_reason() {
         // Task 3c: pressing a disabled choice's hotkey MUST NOT silently
         // succeed (would fire the action) and MUST NOT silently drop to
