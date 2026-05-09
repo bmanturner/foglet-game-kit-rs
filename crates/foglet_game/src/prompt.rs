@@ -1977,7 +1977,102 @@ impl AnyKeyPrompt {
             | Input::Ctrl(_) => AnyKeyOutcome::Completed,
         }
     }
+
+    /// Compute the prompt's visual rows at `width`, top-down (Task 6c).
+    ///
+    /// Row order:
+    ///
+    /// 1. Wrapped body lines via [`TextBlock`], so SPEC §4.7's
+    ///    blank-line preservation and hard-break-on-overlong-word rules
+    ///    behave identically to [`ChoicePrompt::rendered_lines`].
+    /// 2. A single blank gap between body and footer when both are
+    ///    non-empty — empty bodies do not push a stray gap onto a
+    ///    top-of-screen pause, mirroring the choice prompt convention.
+    /// 3. The footer cue: either the author override (set via
+    ///    [`AnyKeyPrompt::footer`]) or the SPEC §4.6 default
+    ///    `"Press any key to continue..."`. The footer always renders —
+    ///    a pause without an acknowledgement cue would be a UX trap.
+    ///
+    /// Width `0` returns an empty `Vec` so callers with a degenerate
+    /// area do not panic; SPEC §6 forbids that. The substituted default
+    /// string lives behind [`DEFAULT_ANY_KEY_FOOTER`] so tests and the
+    /// SPEC text agree on a single source of truth.
+    pub fn rendered_lines(&self, width: u16) -> Vec<String> {
+        if width == 0 {
+            return Vec::new();
+        }
+        let mut rows: Vec<String> = Vec::new();
+
+        // Body — wrap via TextBlock so blank-line preservation and the
+        // hard-break-on-overlong-word fallback come along for free.
+        let body = TextBlock::from_lines(self.body.iter().cloned());
+        rows.extend(body.wrapped_rows(width));
+
+        // Body→footer gap: only when both are present, matching the
+        // ChoicePrompt body→choices convention.
+        if !rows.is_empty() {
+            rows.push(String::new());
+        }
+
+        // Footer — the author override wins; otherwise we fall back to
+        // the SPEC §4.6 default. Wrapping handles a localized override
+        // that runs longer than the area width.
+        let footer = self.footer.as_deref().unwrap_or(DEFAULT_ANY_KEY_FOOTER);
+        rows.extend(TextBlock::new(footer).wrapped_rows(width));
+
+        rows
+    }
+
+    /// Render the pause into `area` of `buf` in the compact unboxed
+    /// layout (mirrors [`ChoicePrompt::render`]). Returns the number of
+    /// visual rows actually written, clamped to `area.height`.
+    ///
+    /// Lines past the available height are silently clipped — SPEC §6
+    /// forbids panicking on small areas, and bordered-modal overflow
+    /// handling lives in [`AnyKeyPrompt::render_modal`].
+    pub fn render(&self, area: Rect, buf: &mut Buffer) -> u16 {
+        if area.width == 0 || area.height == 0 {
+            return 0;
+        }
+        let rows = self.rendered_lines(area.width);
+        let drawn = rows.len().min(area.height as usize);
+        let style = ratatui::style::Style::default();
+        for (i, row) in rows.iter().take(drawn).enumerate() {
+            let y = area.y + i as u16;
+            buf.set_stringn(area.x, y, row, area.width as usize, style);
+        }
+        drawn as u16
+    }
+
+    /// Render the pause as a bordered modal (SPEC_v1_1.md §4.8). Returns
+    /// the number of inner content rows written, excluding the border.
+    ///
+    /// Same small-area policy as [`ChoicePrompt::render_modal`]: areas
+    /// smaller than 2×2 are a no-op, and inner rects that collapse to
+    /// zero in either dimension still draw the border but write no
+    /// content rows.
+    pub fn render_modal(&self, area: Rect, buf: &mut Buffer) -> u16 {
+        if area.width < 2 || area.height < 2 {
+            return 0;
+        }
+        let mut block = Block::default().borders(Borders::ALL);
+        if let Some(title) = self.title.as_deref() {
+            block = block.title(title);
+        }
+        let inner = block.inner(area);
+        block.render(area, buf);
+        if inner.width == 0 || inner.height == 0 {
+            return 0;
+        }
+        self.render(inner, buf)
+    }
 }
+
+/// SPEC §4.6 default footer cue substituted by
+/// [`AnyKeyPrompt::rendered_lines`] when the author has not set an
+/// override via [`AnyKeyPrompt::footer`]. Lifted to a constant so the
+/// SPEC text and the rendering tests assert against the same string.
+pub const DEFAULT_ANY_KEY_FOOTER: &str = "Press any key to continue...";
 
 /// A reusable narration / status fragment rendered above a prompt
 /// (SPEC_v1_1.md §4.7).
@@ -4726,5 +4821,234 @@ mod tests {
         assert!(prompt.footer_text().is_none());
         assert!(prompt.title_text().is_none());
         assert!(prompt.body_lines().is_empty());
+    }
+
+    // -- Task 6c: AnyKeyPrompt rendering ------------------------------
+
+    /// Drive `AnyKeyPrompt::render` through `TestBackend` so the
+    /// rendering tests assert against actual buffer cells, not just the
+    /// string-helper output. Mirrors `render_prompt_to_strings`.
+    fn render_any_key_to_strings(prompt: &AnyKeyPrompt, w: u16, h: u16) -> Vec<String> {
+        use ratatui::{backend::TestBackend, Terminal};
+        let backend = TestBackend::new(w, h);
+        let mut term = Terminal::new(backend).expect("test backend");
+        term.draw(|frame| {
+            let area = frame.area();
+            prompt.render(area, frame.buffer_mut());
+        })
+        .expect("draw");
+        let buf = term.backend().buffer().clone();
+        (0..h)
+            .map(|y| {
+                let mut row = String::new();
+                for x in 0..w {
+                    row.push_str(buf[(x, y)].symbol());
+                }
+                row.trim_end().to_string()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn any_key_prompt_renders_default_footer_below_body_with_blank_gap() {
+        // SPEC §4.6: body, then `Press any key to continue...`. A blank
+        // gap between body and footer matches the ChoicePrompt
+        // body→choices convention so the two prompt kinds visually
+        // align when an author swaps one for the other mid-scene.
+        let prompt = AnyKeyPrompt::new().body("You feel a chill.");
+        assert_eq!(
+            prompt.rendered_lines(40),
+            vec![
+                "You feel a chill.".to_string(),
+                String::new(),
+                "Press any key to continue...".to_string(),
+            ],
+        );
+    }
+
+    #[test]
+    fn any_key_prompt_default_footer_constant_matches_spec() {
+        // Pin the literal default so a typo in the constant surfaces
+        // here rather than in a Murder Motel screenshot review.
+        assert_eq!(DEFAULT_ANY_KEY_FOOTER, "Press any key to continue...");
+    }
+
+    #[test]
+    fn any_key_prompt_uses_author_footer_override() {
+        // Author override wins; the default cue is suppressed, not
+        // appended. SPEC §4.6 describes the default as a fallback, not a
+        // mandatory line.
+        let prompt = AnyKeyPrompt::new()
+            .body("The lobby fades.")
+            .footer("Press any key to wake up.");
+        assert_eq!(
+            prompt.rendered_lines(40),
+            vec![
+                "The lobby fades.".to_string(),
+                String::new(),
+                "Press any key to wake up.".to_string(),
+            ],
+        );
+    }
+
+    #[test]
+    fn any_key_prompt_renders_footer_alone_when_body_is_empty() {
+        // A pause with no narration is still legal — for example, a
+        // post-modal acknowledgement after a status flash. The footer
+        // renders without a leading blank gap so the cue sits at the
+        // top of its slot rather than orphaned on row 2.
+        let prompt = AnyKeyPrompt::new();
+        assert_eq!(
+            prompt.rendered_lines(40),
+            vec!["Press any key to continue...".to_string()],
+        );
+    }
+
+    #[test]
+    fn any_key_prompt_wraps_body_at_supplied_width() {
+        // Body must wrap on whitespace boundaries, same as TextBlock.
+        // A 20-cell width forces "You feel a sudden cold breath on the
+        // back of your neck." onto multiple visual rows; the footer
+        // still renders unchanged below the wrapped body.
+        let prompt =
+            AnyKeyPrompt::new().body("You feel a sudden cold breath on the back of your neck.");
+        let rows = prompt.rendered_lines(20);
+        assert_eq!(
+            rows,
+            vec![
+                "You feel a sudden".to_string(),
+                "cold breath on the".to_string(),
+                "back of your neck.".to_string(),
+                String::new(),
+                "Press any key to".to_string(),
+                "continue...".to_string(),
+            ],
+        );
+    }
+
+    #[test]
+    fn any_key_prompt_preserves_blank_lines_between_paragraphs() {
+        // Two `.body(...)` calls separated by an explicit empty
+        // paragraph render with one blank visual row between them — the
+        // SPEC §4.7 rule the TextBlock tests already pin. The pause's
+        // blank gap before the footer sits on top of that, so consecutive
+        // blank rows are legal here.
+        let prompt = AnyKeyPrompt::new().body("first").body("").body("second");
+        assert_eq!(
+            prompt.rendered_lines(40),
+            vec![
+                "first".to_string(),
+                String::new(),
+                "second".to_string(),
+                String::new(),
+                "Press any key to continue...".to_string(),
+            ],
+        );
+    }
+
+    #[test]
+    fn any_key_prompt_zero_width_returns_no_rows_and_does_not_panic() {
+        // SPEC §6: rendering MUST NOT panic on small areas. A zero-width
+        // slot is the worst case the bordered-modal path hands us.
+        let prompt = AnyKeyPrompt::new().body("body");
+        assert!(prompt.rendered_lines(0).is_empty());
+    }
+
+    #[test]
+    fn any_key_prompt_render_writes_rows_under_test_backend() {
+        // Drive the full `render` path so an off-by-one in `Buffer`
+        // indexing surfaces here, not in a manual smoke test. The
+        // buffer is 40×4 to leave one trailing blank row beneath the
+        // three rendered ones.
+        let prompt = AnyKeyPrompt::new().body("You feel a chill.");
+        let rows = render_any_key_to_strings(&prompt, 40, 4);
+        assert_eq!(
+            rows,
+            vec![
+                "You feel a chill.".to_string(),
+                String::new(),
+                "Press any key to continue...".to_string(),
+                String::new(),
+            ],
+        );
+    }
+
+    #[test]
+    fn any_key_prompt_render_clips_when_height_is_short() {
+        // SPEC §6: lines past the available height are silently clipped
+        // rather than panicking. Two rows of room → only the body and
+        // the blank-gap row write; the footer is dropped.
+        let prompt = AnyKeyPrompt::new().body("You feel a chill.");
+        let rows = render_any_key_to_strings(&prompt, 40, 2);
+        assert_eq!(rows, vec!["You feel a chill.".to_string(), String::new()],);
+    }
+
+    #[test]
+    fn any_key_prompt_render_zero_dimensions_writes_nothing() {
+        // SPEC §6 small-area policy: 0×0 returns 0 and does not panic.
+        // We exercise both `area.width == 0` and `area.height == 0` via
+        // a 0×0 frame; the TestBackend rejects 0-sized backends, so
+        // call `render` directly with a hand-built buffer.
+        let prompt = AnyKeyPrompt::new().body("body");
+        let mut buf = Buffer::empty(Rect::new(0, 0, 4, 4));
+        let written = prompt.render(Rect::new(0, 0, 0, 4), &mut buf);
+        assert_eq!(written, 0);
+        let written = prompt.render(Rect::new(0, 0, 4, 0), &mut buf);
+        assert_eq!(written, 0);
+    }
+
+    #[test]
+    fn any_key_prompt_render_modal_draws_border_with_title() {
+        // Bordered modal layout (SPEC §4.8): top border carries the
+        // title, content sits inside the 1-cell margin. We assert the
+        // top-left corner glyph plus the title, and that the body and
+        // footer appear on the inner rows.
+        let prompt = AnyKeyPrompt::new().title("Lobby").body("You feel a chill.");
+        let rows = render_any_key_to_strings_modal(&prompt, 30, 6);
+        // Top border with embedded title.
+        assert!(
+            rows[0].starts_with("┌Lobby"),
+            "top border missing title: {:?}",
+            rows[0],
+        );
+        // Body + blank + footer on inner rows 1..=3.
+        assert!(rows[1].contains("You feel a chill."));
+        assert!(rows[3].contains("Press any key to continue..."));
+        // Bottom border closes the box.
+        assert!(rows[5].starts_with('└'));
+    }
+
+    /// Modal-flavored counterpart to [`render_any_key_to_strings`].
+    /// Inlined alongside the test that uses it so a future test for the
+    /// same path stays close to the helper.
+    fn render_any_key_to_strings_modal(prompt: &AnyKeyPrompt, w: u16, h: u16) -> Vec<String> {
+        use ratatui::{backend::TestBackend, Terminal};
+        let backend = TestBackend::new(w, h);
+        let mut term = Terminal::new(backend).expect("test backend");
+        term.draw(|frame| {
+            let area = frame.area();
+            prompt.render_modal(area, frame.buffer_mut());
+        })
+        .expect("draw");
+        let buf = term.backend().buffer().clone();
+        (0..h)
+            .map(|y| {
+                let mut row = String::new();
+                for x in 0..w {
+                    row.push_str(buf[(x, y)].symbol());
+                }
+                row.trim_end().to_string()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn any_key_prompt_render_modal_small_area_is_noop() {
+        // SPEC §6: a 1-cell or smaller modal cannot host a border;
+        // returning 0 without writing keeps the contract honest.
+        let prompt = AnyKeyPrompt::new().body("body");
+        let mut buf = Buffer::empty(Rect::new(0, 0, 4, 4));
+        assert_eq!(prompt.render_modal(Rect::new(0, 0, 1, 4), &mut buf), 0);
+        assert_eq!(prompt.render_modal(Rect::new(0, 0, 4, 1), &mut buf), 0);
     }
 }
