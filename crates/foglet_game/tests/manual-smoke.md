@@ -170,6 +170,48 @@ disabled-by-state choices, and any-key continuation.
 The state transitions are exercised by the `night_clerk_vendor_*`
 tests; this recipe confirms the live-TTY rendering and key path.
 
+## Scenario 9 — Shared Room 7 evidence across two players (v2 / v2.1)
+
+The shared Room 7 scene is the v2 acceptance demo for the SQLite-backed
+shared world. v2.1 keeps the demo behaviourally identical — only the
+example's plumbing changed (`SaveSlot<SaveState>` and
+`Game::with_save_handler` replaced the manual save tail). Re-run this
+recipe whenever `examples/murder_motel/src/{state,map,world}.rs` or any
+v2 shared-world wiring is touched.
+
+1. From a clean scratch dir, launch as Alice:
+   ```bash
+   FGK_SAVE_DIR=$(mktemp -d) \
+     cargo run --example murder_motel -- --local-dev-user alice
+   ```
+2. Title → **New Game**. Walk to Room 7's door, open it (the door
+   transitions to "opened by alice" in the shared world). Quit with `q`.
+3. **Expected:** the terminal restores cleanly and `alice`'s save file
+   is written under `$FGK_SAVE_DIR` (the v2.1 `Game::with_save_handler`
+   wiring fires once on Quit drain — no manual `write_atomic` tail
+   remains in `main.rs`).
+4. Re-launch as Bob against the **same** `FGK_SAVE_DIR`:
+   ```bash
+   cargo run --example murder_motel -- --local-dev-user bob
+   ```
+5. Title → **New Game**. Walk to Room 7. **Expected:**
+   - The door renders as already opened.
+   - The arrival hint surfaces a "shared evidence" feedback line
+     crediting alice as the opener (per
+     `world::shared_room_7_arrival_feedback`).
+   - The shared-world record still attributes the opening to alice's
+     `players.id`, even though bob is the active session.
+6. Quit with `q`. Terminal restores cleanly; bob's save file is written
+   alongside alice's, and the shared-world SQLite db carries the single
+   "alice opened Room 7" row.
+
+The non-interactive proxy for the cross-player invariants is
+`examples/murder_motel/src/map.rs::two_players_share_room_7_evidence`
+(part of the regular `cargo test --workspace` suite). This recipe
+confirms the same behaviour through a real TTY and that the v2.1
+`SaveSlot` / `with_save_handler` refactor did not regress the live
+quit-and-persist path.
+
 ## What this file is not
 
 - Not a substitute for `cargo test` — the unit tests cover the
