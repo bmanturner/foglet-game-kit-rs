@@ -44,7 +44,7 @@ One unchecked item per iteration. Dependencies in `[brackets]` must be checked o
 - [x] **6c** — Implement initial daily allowance creation. Test: new player gets configured allowance. [6b]
 - [x] **6d** — Implement atomic turn spend. Test: spending decrements balance. [6c]
 - [x] **6e** — Reject insufficient turns without changing balance. [6d]
-- [ ] **6f** — Implement carryover cap on new-day reset. Tests cover no carryover and capped carryover. [6d]
+- [x] **6f** — Implement carryover cap on new-day reset. Tests cover no carryover and capped carryover. [6d]
 
 ### Task 7 — Event log
 

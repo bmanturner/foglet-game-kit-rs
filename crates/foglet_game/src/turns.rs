@@ -47,6 +47,7 @@
 
 use std::fmt;
 
+use rusqlite::OptionalExtension;
 use thiserror::Error;
 
 use crate::world_db::{WorldDb, WorldMigration};
@@ -462,10 +463,25 @@ impl WorldDb {
     /// doubles as a "read today's balance" query for callers that
     /// don't care whether the row was just created or already
     /// existed.
+    ///
+    /// # Carryover (SPEC_v2 §Task 6f)
+    ///
+    /// On the very first call of a new day for a player, the
+    /// starting balance is `daily_allowance + carry`, where `carry`
+    /// is the unspent balance from the player's most recent prior
+    /// row, clamped to `carryover_max`. `carryover_max = 0`
+    /// collapses to "no carryover" (the safe default). The most-
+    /// recent prior row is used (rather than strictly "yesterday")
+    /// so a player who skips a day still receives their unspent
+    /// balance, capped — SPEC §4.6 says "carry over up to
+    /// `carryover_max`" without restricting to a single calendar
+    /// day, and capping by the configured maximum keeps a long
+    /// absence from materialising as a windfall.
     pub fn ensure_today_turns<P: DateProvider>(
         &self,
         player_id: i64,
         daily_allowance: u32,
+        carryover_max: u32,
         date_provider: &P,
     ) -> Result<TurnLedgerRow, TurnError> {
         let today = date_provider.today();
@@ -475,18 +491,59 @@ impl WorldDb {
         // i64::MAX`. Doing it here keeps the bind sites below from
         // sprouting `as i64` noise.
         let allowance = i64::from(daily_allowance);
+        let cap = i64::from(carryover_max);
 
-        // INSERT OR IGNORE: if the (player_id, local_date) pair is
-        // already present (because we ran earlier today, or a
-        // sibling render path raced in front of us), this is a
-        // no-op. The follow-up SELECT then returns whichever row is
-        // there — preserving any spend that landed in between.
+        // Look up the most recent prior row for this player so we
+        // can compute today's seed balance. `LIMIT 1` against the
+        // composite primary key is a single index seek; a missing
+        // row (`None`) means the player hasn't played before today,
+        // so there's nothing to carry over.
+        //
+        // We deliberately query "any prior date" rather than
+        // strictly "yesterday": if a player skips a day, SPEC §4.6
+        // still wants their unspent balance carried, capped. The
+        // cap itself prevents a long absence from banking turns
+        // beyond `carryover_max`.
+        let prior_balance: Option<i64> = self
+            .connection()
+            .query_row(
+                "SELECT balance FROM turn_ledger \
+                 WHERE player_id = ?1 AND local_date < ?2 \
+                 ORDER BY local_date DESC LIMIT 1",
+                rusqlite::params![player_id, today.as_str()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|source| TurnError::Sqlite { source })?;
+
+        // `min(prior, cap)` clamps a high prior balance down to the
+        // configured maximum; `max(0)` defends against a negative
+        // `prior` slipping through (the schema doesn't permit it,
+        // but a defensive clamp here means a future schema change
+        // can't quietly turn carryover into a balance subtraction).
+        // `carryover_max = 0` collapses both branches to zero.
+        let carry = prior_balance.unwrap_or(0).min(cap).max(0);
+        let starting_balance = allowance + carry;
+
+        // INSERT OR IGNORE: if today's row is already present
+        // (because we ran earlier today, or a sibling render path
+        // raced in front of us), this is a no-op and the follow-up
+        // SELECT returns whichever row is now there — preserving
+        // any spend that landed in between. The carryover lookup
+        // above is therefore only *applied* once per player per
+        // day; on the no-op branch its result is computed and
+        // discarded, which is harmless because we're not changing
+        // the persisted balance.
+        //
+        // The `daily_allowance` column stores the configured
+        // allowance (without the carry), keeping the column
+        // self-describing for operators reading the ledger cold.
         self.connection()
             .execute(
                 "INSERT OR IGNORE INTO turn_ledger \
                  (player_id, local_date, balance, daily_allowance) \
-                 VALUES (?1, ?2, ?3, ?3)",
-                rusqlite::params![player_id, today.as_str(), allowance],
+                 VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![player_id, today.as_str(), starting_balance, allowance],
             )
             .map_err(|source| TurnError::Sqlite { source })?;
 
@@ -596,6 +653,7 @@ impl WorldDb {
         player_id: i64,
         amount: u32,
         daily_allowance: u32,
+        carryover_max: u32,
         date_provider: &P,
     ) -> Result<TurnLedgerRow, TurnError> {
         // Materialise today's row first (no-op if it already exists).
@@ -603,8 +661,11 @@ impl WorldDb {
         // provider reported, so the subsequent UPDATE binds the same
         // string the row was keyed under — no risk of the provider
         // returning a different value between calls in a misbehaving
-        // implementation.
-        let row = self.ensure_today_turns(player_id, daily_allowance, date_provider)?;
+        // implementation. `carryover_max` is plumbed through so the
+        // first spend of a new day seeds the ledger with the capped
+        // carry from the player's most recent prior row (Task 6f).
+        let row =
+            self.ensure_today_turns(player_id, daily_allowance, carryover_max, date_provider)?;
 
         // Cast amount once — SQLite stores INTEGER as 64-bit signed,
         // u32 → i64 is infallible.
@@ -999,7 +1060,7 @@ mod tests {
             FixedDateProvider::new(LocalDate::parse("2026-05-08").expect("fixture date parses"));
 
         let row = world
-            .ensure_today_turns(player_id, 30, &provider)
+            .ensure_today_turns(player_id, 30, 0, &provider)
             .expect("first ensure creates the row");
 
         assert_eq!(row.player_id, player_id);
@@ -1047,7 +1108,7 @@ mod tests {
             FixedDateProvider::new(LocalDate::parse("2026-05-08").expect("fixture date parses"));
 
         let first = world
-            .ensure_today_turns(player_id, 30, &provider)
+            .ensure_today_turns(player_id, 30, 0, &provider)
             .expect("first ensure creates the row");
         assert_eq!(first.balance, 30);
 
@@ -1062,7 +1123,7 @@ mod tests {
             .expect("simulated spend");
 
         let second = world
-            .ensure_today_turns(player_id, 30, &provider)
+            .ensure_today_turns(player_id, 30, 0, &provider)
             .expect("second ensure is a no-op");
         assert_eq!(
             second.balance, 25,
@@ -1093,10 +1154,10 @@ mod tests {
             FixedDateProvider::new(LocalDate::parse("2026-05-08").expect("fixture date parses"));
 
         let alice = world
-            .ensure_today_turns(alice_id, 30, &provider)
+            .ensure_today_turns(alice_id, 30, 0, &provider)
             .expect("alice row");
         let bob = world
-            .ensure_today_turns(bob_id, 30, &provider)
+            .ensure_today_turns(bob_id, 30, 0, &provider)
             .expect("bob row");
 
         assert_eq!(alice.player_id, alice_id);
@@ -1123,14 +1184,14 @@ mod tests {
             FixedDateProvider::new(LocalDate::parse("2026-05-08").expect("first date parses"));
 
         let day_one = world
-            .ensure_today_turns(player_id, 30, &provider)
+            .ensure_today_turns(player_id, 30, 0, &provider)
             .expect("day one row");
         assert_eq!(day_one.local_date.as_str(), "2026-05-08");
         assert_eq!(day_one.balance, 30);
 
         provider.set(LocalDate::parse("2026-05-09").expect("second date parses"));
         let day_two = world
-            .ensure_today_turns(player_id, 30, &provider)
+            .ensure_today_turns(player_id, 30, 0, &provider)
             .expect("day two row");
         assert_eq!(day_two.local_date.as_str(), "2026-05-09");
         assert_eq!(
@@ -1166,7 +1227,7 @@ mod tests {
             FixedDateProvider::new(LocalDate::parse("2026-05-08").expect("fixture date parses"));
 
         let err = world
-            .ensure_today_turns(1, 30, &provider)
+            .ensure_today_turns(1, 30, 0, &provider)
             .expect_err("missing turn_ledger table must surface as a typed error");
         let TurnError::Sqlite { source } = &err else {
             panic!("expected Sqlite variant, got {err:?}");
@@ -1193,7 +1254,7 @@ mod tests {
             FixedDateProvider::new(LocalDate::parse("2026-05-08").expect("fixture date parses"));
 
         let after = world
-            .spend_turns(player_id, 1, 30, &provider)
+            .spend_turns(player_id, 1, 30, 0, &provider)
             .expect("first spend succeeds");
 
         assert_eq!(after.player_id, player_id);
@@ -1235,12 +1296,12 @@ mod tests {
             FixedDateProvider::new(LocalDate::parse("2026-05-08").expect("fixture date parses"));
 
         let first = world
-            .spend_turns(player_id, 5, 30, &provider)
+            .spend_turns(player_id, 5, 30, 0, &provider)
             .expect("first spend");
         assert_eq!(first.balance, 25);
 
         let second = world
-            .spend_turns(player_id, 5, 30, &provider)
+            .spend_turns(player_id, 5, 30, 0, &provider)
             .expect("second spend");
         assert_eq!(
             second.balance, 20,
@@ -1248,7 +1309,7 @@ mod tests {
         );
 
         let third = world
-            .spend_turns(player_id, 7, 30, &provider)
+            .spend_turns(player_id, 7, 30, 0, &provider)
             .expect("third spend");
         assert_eq!(third.balance, 13, "30 - 5 - 5 - 7 = 13");
     }
@@ -1268,7 +1329,7 @@ mod tests {
             FixedDateProvider::new(LocalDate::parse("2026-05-08").expect("fixture date parses"));
 
         let row = world
-            .spend_turns(player_id, 0, 30, &provider)
+            .spend_turns(player_id, 0, 30, 0, &provider)
             .expect("zero-amount spend is a successful no-op");
 
         assert_eq!(row.balance, 30, "balance unchanged by a zero-amount spend");
@@ -1293,17 +1354,17 @@ mod tests {
         // Materialise Bob's row first so we can assert it is left
         // untouched by Alice's spend.
         let bob_before = world
-            .ensure_today_turns(bob_id, 30, &provider)
+            .ensure_today_turns(bob_id, 30, 0, &provider)
             .expect("bob row");
         assert_eq!(bob_before.balance, 30);
 
         let alice_after = world
-            .spend_turns(alice_id, 4, 30, &provider)
+            .spend_turns(alice_id, 4, 30, 0, &provider)
             .expect("alice spend");
         assert_eq!(alice_after.balance, 26);
 
         let bob_after = world
-            .ensure_today_turns(bob_id, 30, &provider)
+            .ensure_today_turns(bob_id, 30, 0, &provider)
             .expect("bob row readback");
         assert_eq!(
             bob_after.balance, 30,
@@ -1337,7 +1398,7 @@ mod tests {
         assert_eq!(before, 0, "precondition: no ledger row yet");
 
         let after = world
-            .spend_turns(player_id, 3, 30, &provider)
+            .spend_turns(player_id, 3, 30, 0, &provider)
             .expect("lazy-init spend");
         assert_eq!(after.balance, 27, "30 (lazy) - 3 (spent) = 27");
 
@@ -1370,7 +1431,7 @@ mod tests {
             FixedDateProvider::new(LocalDate::parse("2026-05-08").expect("fixture date parses"));
 
         let err = world
-            .spend_turns(1, 1, 30, &provider)
+            .spend_turns(1, 1, 30, 0, &provider)
             .expect_err("missing turn_ledger table must surface as a typed error");
         let TurnError::Sqlite { source } = &err else {
             panic!("expected Sqlite variant, got {err:?}");
@@ -1402,7 +1463,7 @@ mod tests {
         // Allowance = 5, spent = 4 → balance = 1 going into the
         // attempted over-spend.
         let pre = world
-            .spend_turns(player_id, 4, 5, &provider)
+            .spend_turns(player_id, 4, 5, 0, &provider)
             .expect("setup spend succeeds");
         assert_eq!(
             pre.balance, 1,
@@ -1410,7 +1471,7 @@ mod tests {
         );
 
         let err = world
-            .spend_turns(player_id, 2, 5, &provider)
+            .spend_turns(player_id, 2, 5, 0, &provider)
             .expect_err("over-spend must be rejected");
         match err {
             TurnError::InsufficientTurns {
@@ -1459,7 +1520,7 @@ mod tests {
             FixedDateProvider::new(LocalDate::parse("2026-05-08").expect("fixture date parses"));
 
         let after = world
-            .spend_turns(player_id, 5, 5, &provider)
+            .spend_turns(player_id, 5, 5, 0, &provider)
             .expect("spending the exact balance must succeed");
         assert_eq!(
             after.balance, 0,
@@ -1470,7 +1531,7 @@ mod tests {
         // must be rejected — confirms the guard still works at the
         // boundary on the next call.
         let err = world
-            .spend_turns(player_id, 1, 5, &provider)
+            .spend_turns(player_id, 1, 5, 0, &provider)
             .expect_err("any positive spend at zero balance must be rejected");
         assert!(
             matches!(err, TurnError::InsufficientTurns { balance: 0, .. }),
@@ -1493,13 +1554,207 @@ mod tests {
 
         // Drain the balance to exactly zero first.
         let drained = world
-            .spend_turns(player_id, 5, 5, &provider)
+            .spend_turns(player_id, 5, 5, 0, &provider)
             .expect("drain to zero");
         assert_eq!(drained.balance, 0);
 
         let again = world
-            .spend_turns(player_id, 0, 5, &provider)
+            .spend_turns(player_id, 0, 5, 0, &provider)
             .expect("zero-amount spend at zero balance must still succeed");
         assert_eq!(again.balance, 0);
+    }
+
+    /// SPEC_v2 §Task 6f "no carryover" leg: with `carryover_max = 0`,
+    /// a player who finished yesterday with unspent turns sees a
+    /// fresh `daily_allowance` on the new day — yesterday's leftover
+    /// vanishes. This pins the safe default behavior for any game
+    /// that opts in to the turn ledger without explicitly configuring
+    /// carryover.
+    #[test]
+    fn ensure_today_turns_does_not_carry_over_when_max_is_zero() {
+        let dir = tempdir().expect("tempdir creates");
+        let (world, player_id) = world_with_player(&dir);
+        let mut provider =
+            FixedDateProvider::new(LocalDate::parse("2026-05-08").expect("day one parses"));
+
+        // Day one: spend just one turn so 29 sit unspent at end of day.
+        let day_one = world
+            .spend_turns(player_id, 1, 30, 0, &provider)
+            .expect("day one spend");
+        assert_eq!(day_one.balance, 29, "precondition: 29 unspent on day one");
+
+        // Advance to day two and ask for today's row.
+        provider.set(LocalDate::parse("2026-05-09").expect("day two parses"));
+        let day_two = world
+            .ensure_today_turns(player_id, 30, 0, &provider)
+            .expect("day two ensure");
+
+        assert_eq!(day_two.local_date.as_str(), "2026-05-09");
+        assert_eq!(
+            day_two.balance, 30,
+            "carryover_max = 0 means yesterday's leftover does not bank into today"
+        );
+        assert_eq!(
+            day_two.daily_allowance, 30,
+            "stored allowance still equals the configured daily_allowance"
+        );
+    }
+
+    /// SPEC_v2 §Task 6f "capped carryover" leg: when yesterday's
+    /// unspent balance exceeds `carryover_max`, today's starting
+    /// balance is `daily_allowance + carryover_max` — the cap is the
+    /// hard ceiling, regardless of how much went unspent. A
+    /// regression that forgot the cap (e.g. dumping the entire prior
+    /// balance into today) would inflate `day_two.balance` past
+    /// `daily_allowance + cap` and flunk here.
+    #[test]
+    fn ensure_today_turns_caps_carryover_at_carryover_max() {
+        let dir = tempdir().expect("tempdir creates");
+        let (world, player_id) = world_with_player(&dir);
+        let mut provider =
+            FixedDateProvider::new(LocalDate::parse("2026-05-08").expect("day one parses"));
+
+        // Day one: don't spend anything → 30 sit unspent.
+        let day_one = world
+            .ensure_today_turns(player_id, 30, 5, &provider)
+            .expect("day one ensure");
+        assert_eq!(day_one.balance, 30, "precondition: full allowance unspent");
+
+        // Day two with carryover_max = 5 → starting balance must be
+        // capped at daily_allowance (30) + carryover_max (5) = 35,
+        // *not* 30 + 30 = 60.
+        provider.set(LocalDate::parse("2026-05-09").expect("day two parses"));
+        let day_two = world
+            .ensure_today_turns(player_id, 30, 5, &provider)
+            .expect("day two ensure");
+
+        assert_eq!(day_two.local_date.as_str(), "2026-05-09");
+        assert_eq!(
+            day_two.balance, 35,
+            "balance must be daily_allowance + carryover_max, capped"
+        );
+        assert_eq!(
+            day_two.daily_allowance, 30,
+            "stored allowance excludes the carryover so the column stays self-describing"
+        );
+    }
+
+    /// When yesterday's unspent balance is **below** the cap, the
+    /// full prior balance carries (the cap is a ceiling, not a
+    /// floor). Spending 27 of 30 leaves 3 unspent; with
+    /// `carryover_max = 10`, day two starts at `30 + 3 = 33`. This
+    /// pins the `min(prior, cap)` formula — a regression that
+    /// substituted the cap unconditionally would land 40 instead.
+    #[test]
+    fn ensure_today_turns_carries_full_prior_balance_when_below_cap() {
+        let dir = tempdir().expect("tempdir creates");
+        let (world, player_id) = world_with_player(&dir);
+        let mut provider =
+            FixedDateProvider::new(LocalDate::parse("2026-05-08").expect("day one parses"));
+
+        // Spend 27 of 30 on day one → 3 unspent, well under the cap.
+        let _ = world
+            .spend_turns(player_id, 27, 30, 10, &provider)
+            .expect("day one spend");
+
+        provider.set(LocalDate::parse("2026-05-09").expect("day two parses"));
+        let day_two = world
+            .ensure_today_turns(player_id, 30, 10, &provider)
+            .expect("day two ensure");
+
+        assert_eq!(
+            day_two.balance, 33,
+            "balance must equal daily_allowance + min(prior_balance, carryover_max)"
+        );
+    }
+
+    /// A player who skips a day still receives the carryover from
+    /// their **most recent** prior row, not zero. Day 1 leaves 4
+    /// unspent; day 2 has no row at all (player did not log in);
+    /// day 3 starts at `daily_allowance + min(4, cap)`. This is the
+    /// shape SPEC §4.6's "carry over up to carryover_max" implies
+    /// without a "yesterday only" restriction, and the cap keeps a
+    /// long absence from accumulating beyond the configured maximum.
+    #[test]
+    fn ensure_today_turns_carries_from_most_recent_prior_row_across_skipped_days() {
+        let dir = tempdir().expect("tempdir creates");
+        let (world, player_id) = world_with_player(&dir);
+        let mut provider =
+            FixedDateProvider::new(LocalDate::parse("2026-05-08").expect("day one parses"));
+
+        // Day 1: spend 26 of 30 → 4 unspent.
+        let _ = world
+            .spend_turns(player_id, 26, 30, 10, &provider)
+            .expect("day one spend");
+
+        // Day 2 is skipped entirely (no ensure/spend call).
+
+        // Day 3: ensure today's row. Most recent prior row is day 1
+        // with balance 4 — under the cap of 10 → full 4 carries.
+        provider.set(LocalDate::parse("2026-05-10").expect("day three parses"));
+        let day_three = world
+            .ensure_today_turns(player_id, 30, 10, &provider)
+            .expect("day three ensure");
+
+        assert_eq!(day_three.local_date.as_str(), "2026-05-10");
+        assert_eq!(
+            day_three.balance, 34,
+            "carryover applies from the most recent prior row even across skipped days"
+        );
+    }
+
+    /// A brand-new player (no prior row at all) receives exactly
+    /// `daily_allowance` on day one regardless of `carryover_max`.
+    /// Without this test a regression that treated "no prior row"
+    /// as "prior balance = carryover_max" (or otherwise hallucinated
+    /// a carry from nothing) would silently inflate the starting
+    /// balance for first-time players.
+    #[test]
+    fn ensure_today_turns_does_not_carry_over_for_brand_new_player() {
+        let dir = tempdir().expect("tempdir creates");
+        let (world, player_id) = world_with_player(&dir);
+        let provider =
+            FixedDateProvider::new(LocalDate::parse("2026-05-08").expect("day one parses"));
+
+        // Carryover configured but nothing to carry from.
+        let row = world
+            .ensure_today_turns(player_id, 30, 10, &provider)
+            .expect("first ensure");
+
+        assert_eq!(
+            row.balance, 30,
+            "no prior row → no carryover → starting balance equals daily_allowance"
+        );
+    }
+
+    /// `spend_turns` plumbs `carryover_max` through to its lazy-init
+    /// path, so a player whose first action of a new day is a spend
+    /// still receives the capped carryover before the decrement
+    /// lands. Day 1 leaves 8 unspent; day 2's first spend (no
+    /// preceding ensure call) decrements from `30 + min(8, 5) = 35`.
+    #[test]
+    fn spend_turns_lazy_init_applies_carryover_cap() {
+        let dir = tempdir().expect("tempdir creates");
+        let (world, player_id) = world_with_player(&dir);
+        let mut provider =
+            FixedDateProvider::new(LocalDate::parse("2026-05-08").expect("day one parses"));
+
+        // Day 1: spend 22 of 30 → 8 unspent.
+        let _ = world
+            .spend_turns(player_id, 22, 30, 5, &provider)
+            .expect("day one spend");
+
+        // Day 2: spend 1 turn as the very first action. Lazy-init
+        // must seed today's row at 30 + min(8, 5) = 35, then
+        // decrement by 1 → 34.
+        provider.set(LocalDate::parse("2026-05-09").expect("day two parses"));
+        let after = world
+            .spend_turns(player_id, 1, 30, 5, &provider)
+            .expect("day two spend");
+
+        assert_eq!(
+            after.balance, 34,
+            "lazy-init via spend_turns must apply the carryover cap before the decrement"
+        );
     }
 }
