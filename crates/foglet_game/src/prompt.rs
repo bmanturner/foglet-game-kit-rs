@@ -301,6 +301,80 @@ impl<T> PromptChoice<T> {
     }
 }
 
+/// Construction-time error surfaced when a prompt's choice list violates
+/// an invariant the renderer / reducer depend on.
+///
+/// Returned from validators like [`validate_choices`] (Task 2c) and,
+/// later, builder finalisation (Task 2d) and `ChoicePrompt::new`
+/// (Task 3a). Authoring errors are intentionally separate from runtime
+/// `PromptAction` outcomes — a prompt with duplicate hotkeys is never a
+/// player-facing condition, it is a programmer bug that should fail loud
+/// the moment the prompt is built.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum PromptError {
+    /// Two choices in the same prompt share a hotkey after
+    /// case-normalisation. SPEC_v1_1.md §4.1 makes this a hard error
+    /// because disabled choices still *reserve* their hotkey: a
+    /// disabled `(E)` row plus an enabled `(e)` row would either route
+    /// the press to the disabled handler (player gets a "can't do that"
+    /// message for an action they expected to work) or to the enabled
+    /// one (the disabled label silently lies). Refusing to construct
+    /// such a prompt is the only safe option.
+    #[error(
+        "duplicate prompt hotkey {key:?}: choices {first_label:?} and {second_label:?} both bind it"
+    )]
+    DuplicateHotkey {
+        /// The shared, normalised key.
+        key: PromptKey,
+        /// Label of the first choice that registered this key (in
+        /// declaration order).
+        first_label: String,
+        /// Label of the second choice attempting to bind the same key.
+        second_label: String,
+    },
+}
+
+/// Reject a choice list that violates SPEC_v1_1.md §4.1 hotkey rules.
+///
+/// Specifically: **every** choice in the list reserves its hotkey,
+/// regardless of `enabled`. The SPEC's exact wording is "Disabled
+/// choices still reserve their hotkey by default so a disabled option
+/// cannot accidentally trigger another action." That sentence is the
+/// reason this validator does not filter by `enabled` — both
+/// `(E) Equip` (enabled) and `(E) Equip — full` (disabled) compete for
+/// the same `e` press, and the resolution can only ever be "fail at
+/// construction" because either runtime resolution surprises the
+/// player.
+///
+/// Keys are compared after the lowercase normalisation that
+/// [`PromptKey::char`] applies, so `'e'` and `'E'` collide as expected.
+/// `Enter` and `Esc` variants are also compared structurally — a prompt
+/// declaring two `Enter`-keyed choices is rejected for the same reason
+/// even though that combination is exotic.
+///
+/// Returns the *first* duplicate found in declaration order so the
+/// error message points at a deterministic pair, which makes
+/// regression-style tests easy to write.
+pub fn validate_choices<T>(choices: &[PromptChoice<T>]) -> Result<(), PromptError> {
+    // Linear scan with a small Vec — choice lists are short (single
+    // digits in practice; SPEC §4.4 talks about ~5 typical), so the
+    // O(n²) cost is dwarfed by the constant factor of any HashMap and
+    // keeps the implementation allocation-free for the common path of
+    // 2-4 choices that pass validation.
+    for (i, choice) in choices.iter().enumerate() {
+        for prior in &choices[..i] {
+            if prior.key == choice.key {
+                return Err(PromptError::DuplicateHotkey {
+                    key: choice.key,
+                    first_label: prior.label.clone(),
+                    second_label: choice.label.clone(),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
 impl From<char> for PromptKey {
     /// Lift a `char` straight into a [`PromptKey`] via
     /// [`PromptKey::char`] so call sites like
@@ -451,6 +525,141 @@ mod tests {
     fn with_style_overrides_role() {
         let choice = PromptChoice::new('p', "Pass", LootAction::Pass).with_style(StyleRole::Muted);
         assert_eq!(choice.style, Some(StyleRole::Muted));
+    }
+
+    #[test]
+    fn validate_choices_accepts_unique_keys() {
+        // Baseline: a normal loot prompt with three distinct hotkeys
+        // passes validation. Empty lists also pass (a prompt with zero
+        // choices is degenerate but not malformed at this layer).
+        let choices = [
+            PromptChoice::new('e', "Equip", LootAction::Equip),
+            PromptChoice::new('t', "Take", LootAction::Take),
+            PromptChoice::new('p', "Pass", LootAction::Pass),
+        ];
+        assert_eq!(validate_choices(&choices), Ok(()));
+
+        let empty: [PromptChoice<LootAction>; 0] = [];
+        assert_eq!(validate_choices(&empty), Ok(()));
+    }
+
+    #[test]
+    fn validate_choices_rejects_duplicate_active_keys() {
+        // SPEC §4.1: "Duplicate active hotkeys in one prompt MUST be
+        // rejected or produce a clear construction error." The error
+        // points at both labels so the failing test (or the panicking
+        // builder, in Task 2d) names the exact culprits.
+        let choices = [
+            PromptChoice::new('e', "Equip", LootAction::Equip),
+            PromptChoice::new('t', "Take", LootAction::Take),
+            PromptChoice::new('e', "Eat", LootAction::Pass),
+        ];
+        assert_eq!(
+            validate_choices(&choices),
+            Err(PromptError::DuplicateHotkey {
+                key: PromptKey::Char('e'),
+                first_label: "Equip".to_string(),
+                second_label: "Eat".to_string(),
+            }),
+        );
+    }
+
+    #[test]
+    fn validate_choices_normalises_case_before_comparing() {
+        // `'E'` and `'e'` collapse to the same `PromptKey::Char('e')`,
+        // so this is a duplicate even though the source `char` literals
+        // differ. Authors who try to "split" a hotkey across cases get
+        // a hard fail instead of a runtime ambiguity.
+        let choices = [
+            PromptChoice::new('E', "Equip", LootAction::Equip),
+            PromptChoice::new('e', "Eat", LootAction::Pass),
+        ];
+        assert!(matches!(
+            validate_choices(&choices),
+            Err(PromptError::DuplicateHotkey {
+                key: PromptKey::Char('e'),
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn validate_choices_rejects_active_disabled_collision() {
+        // SPEC §4.1: "Disabled choices still reserve their hotkey by
+        // default." A disabled row paired with an enabled row sharing
+        // the same key is exactly the surprise the SPEC forbids — the
+        // disabled label would either swallow the press (and the player
+        // sees a misleading "can't do that") or be ignored (and the
+        // visible disabled marker lies). Reject at construction.
+        let choices = [
+            PromptChoice::new('m', "Mana potions", LootAction::Take).with_disabled_reason("full"),
+            PromptChoice::new('m', "Mead", LootAction::Equip),
+        ];
+        assert!(matches!(
+            validate_choices(&choices),
+            Err(PromptError::DuplicateHotkey {
+                key: PromptKey::Char('m'),
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn validate_choices_rejects_two_disabled_with_same_key() {
+        // Even two disabled rows sharing a key is malformed: the
+        // renderer would print two `(M)` markers, and the moment one is
+        // re-enabled the prompt becomes ambiguous. Same rule, same
+        // error.
+        let choices = [
+            PromptChoice::new('m', "Mana potions", LootAction::Take).with_disabled_reason("full"),
+            PromptChoice::new('M', "Mead", LootAction::Equip).with_disabled_reason("none left"),
+        ];
+        assert!(matches!(
+            validate_choices(&choices),
+            Err(PromptError::DuplicateHotkey { .. })
+        ));
+    }
+
+    #[test]
+    fn validate_choices_reports_first_duplicate_in_declaration_order() {
+        // When several pairs collide, the validator returns the first
+        // pair encountered scanning forward. Determinism makes failing
+        // tests stable — otherwise refactors that reorder choices would
+        // flip which label landed in the error.
+        let choices = [
+            PromptChoice::new('a', "Alpha", LootAction::Equip),
+            PromptChoice::new('b', "Bravo", LootAction::Take),
+            PromptChoice::new('a', "Apple", LootAction::Pass),
+            PromptChoice::new('b', "Banana", LootAction::Pass),
+        ];
+        assert_eq!(
+            validate_choices(&choices),
+            Err(PromptError::DuplicateHotkey {
+                key: PromptKey::Char('a'),
+                first_label: "Alpha".to_string(),
+                second_label: "Apple".to_string(),
+            }),
+        );
+    }
+
+    #[test]
+    fn validate_choices_treats_enter_and_esc_as_keys_too() {
+        // Choices keyed on Enter/Esc are exotic but legal at the data
+        // level. Two `Enter`-keyed choices still collide — same rule,
+        // no special case. Ensures the validator does not silently skip
+        // non-`Char` variants.
+        let choices = [
+            PromptChoice::new(PromptKey::Enter, "Confirm", LootAction::Equip),
+            PromptChoice::new(PromptKey::Enter, "Also confirm", LootAction::Take),
+        ];
+        assert_eq!(
+            validate_choices(&choices),
+            Err(PromptError::DuplicateHotkey {
+                key: PromptKey::Enter,
+                first_label: "Confirm".to_string(),
+                second_label: "Also confirm".to_string(),
+            }),
+        );
     }
 
     #[test]
