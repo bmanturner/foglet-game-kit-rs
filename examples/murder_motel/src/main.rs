@@ -36,8 +36,8 @@ use std::rc::Rc;
 
 use foglet_game::{
     load_context, load_dialog, parse_map, process_env, read_save, render_inventory_list,
-    render_menu_list, resolve_save_path, write_atomic, Dialog, DialogState, FlagSet, Game,
-    GameConfig, GameContext, Input, InventoryList, Map, MenuList, SavePathInputs, Screen,
+    render_menu_list, resolve_save_path, write_atomic, ChoicePrompt, Dialog, DialogState, FlagSet,
+    Game, GameConfig, GameContext, Input, InventoryList, Map, MenuList, SavePathInputs, Screen,
     ScreenCommand, TileLegend,
 };
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
@@ -1119,6 +1119,67 @@ fn lobby_legend() -> TileLegend {
         ("L", "locked_door"),
     ])
     .expect("static lobby legend parses")
+}
+
+/// Player-facing narration shown above the Lost-and-Found Drawer loot
+/// prompt (SPEC_v1_1.md §9 step 1).
+///
+/// Stored as two body lines because `ChoicePrompt::body` appends one
+/// logical line per call and treats them as separate paragraphs the
+/// renderer wraps independently. Authoring the text as a constant keeps
+/// it close to the prompt builder and lets the test assert the exact
+/// string the player sees without re-typing it.
+pub const LOST_AND_FOUND_BODY: [&str; 2] = [
+    "Behind the desk, the lost-and-found drawer sticks halfway open.",
+    "Inside: a tarnished room key tagged \"7\", a cracked matchbook, and a receipt from last night.",
+];
+
+/// Stable id returned by [`lost_and_found_drawer_prompt`] when the
+/// player picks one of its four options (SPEC_v1_1.md §9 step 2).
+///
+/// Carries semantics, not display strings: copy edits to the prompt
+/// labels MUST NOT cascade into the action handler. Task 10c wires
+/// each variant into the corresponding state mutation; Task 10d adds
+/// the disabled-`(K)` branch on top.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LostAndFoundChoice {
+    /// `(K)` — move the Room 7 key into the player's inventory.
+    TakeRoom7Key,
+    /// `(M)` — pocket the cracked matchbook (shares the catalog id with
+    /// the lobby map's matchbook so the two pickup paths can't duplicate
+    /// the same keepsake).
+    PocketMatchbook,
+    /// `(R)` — set the `receipt_read` narrative flag and surface the
+    /// receipt body as feedback.
+    ReadReceipt,
+    /// `(L)` — leave the drawer untouched and exit the prompt.
+    Leave,
+}
+
+/// Build the Lost-and-Found Drawer loot prompt
+/// (SPEC_v1_1.md §9 step 2).
+///
+/// Returns a fresh `ChoicePrompt` every call so the caller is free to
+/// extend the chain with state-aware modifiers (`.disabled_if(...)`,
+/// `.footer(...)`) without coupling prompt construction to the player's
+/// current inventory. Task 10b introduces the prompt as pure data;
+/// Task 10c adds the action handler that consumes the variants and
+/// Task 10d will wrap this builder with the disabled-`(K)` branch when
+/// the Room 7 key is already in inventory.
+pub fn lost_and_found_drawer_prompt() -> ChoicePrompt<LostAndFoundChoice> {
+    let mut prompt = ChoicePrompt::new();
+    for line in LOST_AND_FOUND_BODY {
+        prompt = prompt.body(line);
+    }
+    prompt
+        .choice('K', LostAndFoundChoice::TakeRoom7Key, "Take the Room 7 key")
+        .choice(
+            'M',
+            LostAndFoundChoice::PocketMatchbook,
+            "Pocket the matchbook",
+        )
+        .choice('R', LostAndFoundChoice::ReadReceipt, "Read the receipt")
+        .choice('L', LostAndFoundChoice::Leave, "Leave it alone")
 }
 
 impl Screen for MapScreen {
@@ -3592,5 +3653,107 @@ mod tests {
             screen.handle_input(&mut ctx, Input::Up);
         }
         assert_eq!(screen.selected, 0, "cursor must clamp at top row");
+    }
+
+    // ---- Lost-and-Found Drawer prompt (SPEC §9 Task 10b) -------------
+
+    #[test]
+    fn lost_and_found_prompt_exposes_spec_choices_and_body() {
+        // SPEC §9 step 2 nails down the prompt's four hotkeys, their
+        // labels, and the narration above them. Asserting against the
+        // typed prompt (rather than the rendered buffer) catches drift
+        // in the data the action handler will read in Task 10c, even
+        // before the renderer hooks the prompt into a Screen.
+        use foglet_game::PromptKey;
+
+        let prompt = lost_and_found_drawer_prompt();
+
+        assert_eq!(
+            prompt.body.as_slice(),
+            &LOST_AND_FOUND_BODY[..],
+            "narration must match SPEC §9 step 1 verbatim"
+        );
+
+        let expected: &[(char, &str, LostAndFoundChoice)] = &[
+            ('k', "Take the Room 7 key", LostAndFoundChoice::TakeRoom7Key),
+            (
+                'm',
+                "Pocket the matchbook",
+                LostAndFoundChoice::PocketMatchbook,
+            ),
+            ('r', "Read the receipt", LostAndFoundChoice::ReadReceipt),
+            ('l', "Leave it alone", LostAndFoundChoice::Leave),
+        ];
+        assert_eq!(
+            prompt.choices.len(),
+            expected.len(),
+            "Lost-and-Found Drawer must expose the four SPEC §9 choices"
+        );
+        for (choice, (key, label, value)) in prompt.choices.iter().zip(expected) {
+            assert_eq!(
+                choice.key,
+                PromptKey::char(*key),
+                "hotkey for {label:?} drifted from SPEC §9"
+            );
+            assert_eq!(choice.label, *label, "label for {key} drifted from SPEC §9");
+            assert_eq!(choice.value, *value, "value for {label:?} drifted");
+            assert!(
+                choice.enabled,
+                "Task 10b ships every choice enabled; Task 10d adds the disabled-(K) branch"
+            );
+        }
+    }
+
+    #[test]
+    fn lost_and_found_prompt_renders_body_and_hotkeys() {
+        // Drive the prompt through Ratatui's `TestBackend` so the test
+        // asserts against the same buffer semantics the live runtime
+        // uses (SPEC §6 deterministic-render contract). A 70x10 area
+        // gives the body two rows and leaves room for the four choice
+        // rows + label without forcing the renderer into modal mode.
+        let prompt = lost_and_found_drawer_prompt();
+        let backend = TestBackend::new(70, 10);
+        let mut term = Terminal::new(backend).expect("test backend");
+        term.draw(|frame| {
+            let area = frame.area();
+            prompt.render(area, frame.buffer_mut());
+        })
+        .expect("draw");
+
+        let buf = term.backend().buffer().clone();
+        let mut rendered = String::new();
+        for y in 0..10 {
+            for x in 0..70 {
+                rendered.push_str(buf[(x, y)].symbol());
+            }
+            rendered.push('\n');
+        }
+
+        // SPEC §9 step 1 narration — the wrapped fragment "lost-and-found
+        // drawer" survives the renderer's word-wrap regardless of where
+        // the second body line breaks at 70 columns.
+        assert!(
+            rendered.contains("lost-and-found drawer"),
+            "rendered prompt missing SPEC §9 narration; got:\n{rendered}"
+        );
+        // Each choice row must surface its `(X)` hotkey marker plus the
+        // SPEC §9 label so monochrome terminals stay legible.
+        for marker in ["(K)", "(M)", "(R)", "(L)"] {
+            assert!(
+                rendered.contains(marker),
+                "missing hotkey marker {marker} in rendered prompt:\n{rendered}"
+            );
+        }
+        for label in [
+            "Take the Room 7 key",
+            "Pocket the matchbook",
+            "Read the receipt",
+            "Leave it alone",
+        ] {
+            assert!(
+                rendered.contains(label),
+                "missing label {label:?} in rendered prompt:\n{rendered}"
+            );
+        }
     }
 }
