@@ -1,96 +1,92 @@
-//! Modal NPC dialog screen and its tests.
+//! Modal NPC dialog scene — a thin wrapper around
+//! [`foglet_game::DialogScreen`].
 //!
-//! Owns a parsed [`Dialog`] graph and a [`DialogState`] cursor walking
-//! it. The shared [`FlagSet`] is borrowed from the [`MapScreen`]
-//! beneath us via an `Rc<RefCell<_>>`, so flags set during this
-//! conversation (the Night Clerk's `heard_rumor`, `has_key`, etc.)
-//! survive after the screen pops.
+//! v2 hand-rolled the entire `Screen` impl here: a centred 60×10 modal
+//! frame, line-pumping vs choice-mode body switching, an `Up`/`Down`
+//! cursor over `available_choices`, and a one-key Esc/Q quit affordance.
+//! v2.1 ships those mechanics in [`foglet_game::DialogScreen`] (Tasks
+//! 2a–2g), so the example only needs to add what is genuinely
+//! game-specific:
+//!
+//! 1. The **speaker name** painted into the modal's top border row —
+//!    the kit's [`Dialog`] schema does not carry one, so the wrapper
+//!    overlays it after the kit has drawn the (untitled) bordered
+//!    block.
+//! 2. **Quit affordances** — `Q`/`Ctrl-C` hard-quit and `Backspace`
+//!    pops, neither of which the kit adapter routes itself. The kit
+//!    deliberately stays out of the global hotkey conversation so each
+//!    example can pick its own (a help screen, a save scene, …); the
+//!    wrapper restores the v2 muscle memory.
+//! 3. **`j`/`k` aliases** for `Down`/`Up`, kept because the v2 example
+//!    advertised them in its hint band.
+//! 4. **`current_choice_labels()`** — a tiny read-only helper used by
+//!    the gating tests in this module. It re-derives the visible label
+//!    list from the kit's `state()` / `dialog()` plus a private clone
+//!    of the shared `FlagSet` handle.
 
 use std::cell::RefCell;
 use std::rc::Rc;
 
 use foglet_game::{
-    load_dialog, render_menu_list, Dialog, DialogState, FlagSet, GameContext, Input, MenuList,
-    Screen, ScreenCommand,
+    self as kit, load_dialog, DialogAction, DialogState, FlagSet, GameContext, Input, Screen,
+    ScreenCommand,
 };
-use ratatui::layout::{Alignment, Rect};
-use ratatui::style::{Color, Style};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::layout::Rect;
+use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
 use crate::map::Npc;
 
 /// Modal dialog screen pushed when the player talks to an NPC.
 ///
-/// Owns a parsed [`Dialog`] graph and a [`DialogState`] cursor walking
-/// it. The shared [`FlagSet`] is borrowed from the [`crate::map::MapScreen`]
-/// beneath us via an `Rc<RefCell<_>>`, so flags set during this
-/// conversation (the Night Clerk's `heard_rumor`, `has_key`, etc.)
-/// survive after the screen pops and are visible to later conversations
-/// and to future game logic (locked doors in 13f, win conditions in 13g).
-///
-/// ## Render contract
-///
-/// While the cursor sits on a line, the body shows the speaker's name
-/// and the line text plus a "[Enter] continue" hint. Once the lines on
-/// the current node are exhausted, the body shows the available
-/// choices through the shared [`MenuList`] widget. When the dialog has
-/// finished (no more lines, no more choices, no goto) the body shows
-/// a "[Esc] leave" hint.
-///
-/// ## Input contract
-///
-/// - `Up` / `Down` (and `j`/`k`) move the choice cursor when choices
-///   are visible.
-/// - `Enter` advances the next line, picks the highlighted choice, or
-///   pops the screen when the dialog is finished.
-/// - `Esc` / `Backspace` pops at any time — the player can always walk
-///   away mid-conversation.
-/// - `Q` / `Ctrl-C` still hard-quit, matching the rest of the kit.
+/// All dialog mechanics — line pumping, choice navigation, branch-flag
+/// application, `>9` choice scrolling — live in
+/// [`kit::DialogScreen`]. This wrapper exists for the three things the
+/// kit deliberately does not do (speaker title overlay, Q/Ctrl-C
+/// quitting, `j`/`k` aliases) plus a tiny read accessor used by the
+/// existing tests.
 pub struct DialogScreen {
-    /// Speaker label rendered in the dialog block's title. Owned as
-    /// `&'static str` because [`Npc`] is `Copy` and lives in
+    /// Speaker label rendered into the top border of the modal frame.
+    /// Stored as `&'static str` because [`Npc`] is `Copy` and lives in
     /// [`crate::map::MapScreen::NPCS`].
     speaker: &'static str,
-    /// Parsed dialog graph. Held by value so `DialogState` can borrow
-    /// it across multiple input dispatches without lifetime gymnastics.
-    dialog: Dialog,
-    /// Cursor walking [`Self::dialog`].
-    state: DialogState,
-    /// Shared narrative-flag store. Cloned from
-    /// [`crate::map::MapScreen::flags`] at construction time.
+    /// Shared narrative-flag store, cloned from the kit screen so the
+    /// `current_choice_labels()` helper can re-derive the visible label
+    /// list without poking at kit-internal state.
     flags: Rc<RefCell<FlagSet>>,
-    /// Highlighted choice when choices are visible. Clamped against
-    /// `available_choices().len()` at render time, so it's safe to
-    /// keep around even when choices change between frames.
-    selected_choice: usize,
+    /// The kit-side dialog adapter doing the actual work.
+    inner: kit::DialogScreen,
 }
 
 impl DialogScreen {
     /// Build a dialog screen for the given NPC, sharing the supplied
-    /// flag store. The dialog YAML is parsed eagerly here so any
-    /// schema error surfaces at the moment the player presses Enter
-    /// rather than on the first render.
-    ///
-    /// `expect` is acceptable because the YAML ships in the binary
-    /// (`include_str!`); a parse failure is a build-time bug, not a
-    /// runtime input.
+    /// flag store. The dialog YAML is parsed eagerly here so any schema
+    /// error surfaces at the moment the player presses Enter rather
+    /// than on the first render. `expect` is acceptable because the
+    /// YAML ships in the binary (`include_str!`); a parse failure is a
+    /// build-time bug, not a runtime input.
     pub fn new(npc: &Npc, flags: Rc<RefCell<FlagSet>>) -> Self {
         let dialog = load_dialog(npc.dialog_yaml).expect("embedded NPC dialog parses");
-        let state = {
+        let start = {
             let mut fs = flags.borrow_mut();
             DialogState::start(&dialog, &mut fs)
         };
+        // Map every kit-emitted action onto the v2 observable
+        // behaviour: a picked choice keeps the dialog open (None);
+        // Finished and Cancelled both walk the player back to the map.
+        let inner =
+            kit::DialogScreen::new(dialog, start, Rc::clone(&flags), |action| match action {
+                DialogAction::ChoicePicked { .. } => ScreenCommand::None,
+                DialogAction::Finished | DialogAction::Cancelled => ScreenCommand::Pop,
+            });
         Self {
             speaker: npc.name,
-            dialog,
-            state,
             flags,
-            selected_choice: 0,
+            inner,
         }
     }
 
-    /// Speaker name. Exposed for tests asserting which NPC is on
+    /// Speaker name — exposed for tests asserting which NPC is on
     /// screen without poking at private fields.
     pub fn speaker(&self) -> &str {
         self.speaker
@@ -99,22 +95,26 @@ impl DialogScreen {
     /// Whether the dialog cursor reports finished. Read-only: tests
     /// assert end-state without driving the screen through input.
     pub fn is_finished(&self) -> bool {
-        self.state.is_finished()
+        self.inner.state().is_finished()
     }
 
     /// Borrow the underlying dialog state. Mostly for tests; gameplay
     /// code routes through `handle_input`.
     pub fn state(&self) -> &DialogState {
-        &self.state
+        self.inner.state()
     }
 
     /// Snapshot of the choice labels currently presented. Useful for
     /// tests that want to assert "the unlocked branch appears after
-    /// the rumor flag is set" without owning a `Frame`.
+    /// the rumor flag is set" without owning a `Frame`. Re-derives
+    /// from the kit screen's `state()` / `dialog()` accessors plus the
+    /// wrapper's flag clone, so the result always matches what
+    /// `kit::DialogScreen::render` would draw on the next frame.
     pub fn current_choice_labels(&self) -> Vec<String> {
         let flags = self.flags.borrow();
-        self.state
-            .available_choices(&self.dialog, &flags)
+        self.inner
+            .state()
+            .available_choices(self.inner.dialog(), &flags)
             .into_iter()
             .map(|c| c.text.clone())
             .collect()
@@ -122,174 +122,42 @@ impl DialogScreen {
 }
 
 impl Screen for DialogScreen {
-    fn render(&mut self, _ctx: &mut GameContext<'_>, frame: &mut Frame<'_>) {
-        // Dialog modal sits across the bottom of the screen — high
-        // enough to fit the longest two-line node in the night clerk's
-        // script plus a hint row, and wide enough to fit the longest
-        // choice label without truncation. We centre it horizontally
-        // so the player's eye returns to roughly where the map sat.
-        let outer = frame.area();
-        let modal_w = outer.width.min(60);
-        let modal_h = outer.height.min(10);
-        let area = Rect {
-            x: outer.x + outer.width.saturating_sub(modal_w) / 2,
-            y: outer.y + outer.height.saturating_sub(modal_h) / 2,
-            width: modal_w,
-            height: modal_h,
-        };
-
-        let block = Block::default().borders(Borders::ALL).title(self.speaker);
-        let inner = block.inner(area);
-        frame.render_widget(block, area);
-
-        // Body decision: line-pumping mode, choice mode, or finished
-        // mode. Each mode renders its own widget into `inner`.
-        if let Some(line) = self.state.current_line(&self.dialog) {
-            // Reserve a one-row hint band at the bottom of `inner` for
-            // the "[Enter] continue" prompt; the rest is the line text
-            // wrapped to fit. `Wrap { trim: false }` keeps the
-            // author's literal punctuation but still wraps long lines.
-            let hint_h = 1.min(inner.height);
-            let body_h = inner.height.saturating_sub(hint_h);
-            let body = Rect {
-                x: inner.x,
-                y: inner.y,
-                width: inner.width,
-                height: body_h,
-            };
-            let hint = Rect {
-                x: inner.x,
-                y: inner.y + body_h,
-                width: inner.width,
-                height: hint_h,
-            };
-            let body_widget = Paragraph::new(line.to_string())
-                .alignment(Alignment::Left)
-                .wrap(Wrap { trim: false });
-            frame.render_widget(body_widget, body);
-            if hint_h > 0 {
-                frame.render_widget(
-                    Paragraph::new("[Enter] continue   [Esc] leave")
-                        .alignment(Alignment::Center)
-                        .style(Style::default().fg(Color::DarkGray)),
-                    hint,
-                );
-            }
+    fn render(&mut self, ctx: &mut GameContext<'_>, frame: &mut Frame<'_>) {
+        // Let the kit paint its bordered modal + body first, then
+        // overlay the speaker name into the top border row. ratatui
+        // renders into a flat buffer so the later write wins; the
+        // border `─` glyphs the kit drew get replaced by the title
+        // text in the overlap range only.
+        self.inner.render(ctx, frame);
+        let area = frame.area();
+        if area.height == 0 || area.width <= 4 {
             return;
         }
-
-        if self.is_finished() {
-            // Terminal node — the dialog ran off the end. Nothing to
-            // render except a leave hint; pressing Esc (or Enter)
-            // returns to the map.
-            let hint = Paragraph::new("(They turn away.)\n\n[Enter / Esc] leave")
-                .alignment(Alignment::Center)
-                .style(Style::default().fg(Color::DarkGray));
-            frame.render_widget(hint, inner);
-            return;
-        }
-
-        // Choice mode. Build owned `String`s for the menu widget and
-        // clamp the selection cursor against the live choice count.
-        let choice_labels = self.current_choice_labels();
-        if choice_labels.is_empty() {
-            // Defensive: validator guarantees this shape can only
-            // happen if every choice is gated *and* the node has no
-            // goto; render a leave hint so the player isn't stuck.
-            let hint = Paragraph::new("(There's nothing more to say.)\n\n[Esc] leave")
-                .alignment(Alignment::Center)
-                .style(Style::default().fg(Color::DarkGray));
-            frame.render_widget(hint, inner);
-            return;
-        }
-        let selected = self.selected_choice.min(choice_labels.len() - 1);
-        let menu = MenuList {
-            title: None,
-            items: &choice_labels,
-            selected,
+        let label = format!(" {} ", self.speaker);
+        let label_w = (label.chars().count() as u16).min(area.width.saturating_sub(2));
+        let title_area = Rect {
+            x: area.x + 2,
+            y: area.y,
+            width: label_w,
+            height: 1,
         };
-        // Reserve a hint band at the bottom of the modal.
-        let hint_h = 1.min(inner.height);
-        let body_h = inner.height.saturating_sub(hint_h);
-        let body = Rect {
-            x: inner.x,
-            y: inner.y,
-            width: inner.width,
-            height: body_h,
-        };
-        let hint = Rect {
-            x: inner.x,
-            y: inner.y + body_h,
-            width: inner.width,
-            height: hint_h,
-        };
-        render_menu_list(frame, body, &menu);
-        if hint_h > 0 {
-            frame.render_widget(
-                Paragraph::new("[Up/Down] choose    [Enter] pick    [Esc] leave")
-                    .alignment(Alignment::Center)
-                    .style(Style::default().fg(Color::DarkGray)),
-                hint,
-            );
-        }
+        frame.render_widget(Paragraph::new(label), title_area);
     }
 
-    fn handle_input(&mut self, _ctx: &mut GameContext<'_>, input: Input) -> ScreenCommand {
+    fn handle_input(&mut self, ctx: &mut GameContext<'_>, input: Input) -> ScreenCommand {
         match input {
-            // Always-on quit affordances.
+            // Always-on quit affordances. The kit adapter intentionally
+            // leaves these to the host so each game can pick its own
+            // global keys; v2 used Q / Ctrl-C and we keep that here.
             Input::Char('q') | Input::Char('Q') | Input::Ctrl('c') => ScreenCommand::Quit,
-            // Walk away from the conversation.
-            Input::Esc | Input::Backspace => ScreenCommand::Pop,
-
-            // Cursor movement applies only while choices are showing;
-            // outside that mode we treat it as inert (silent reject)
-            // so a stray arrow keystroke doesn't accidentally advance
-            // the line cursor.
-            Input::Up | Input::Char('k') | Input::Char('K') => {
-                if self.selected_choice > 0 {
-                    self.selected_choice -= 1;
-                }
-                ScreenCommand::None
-            }
-            Input::Down | Input::Char('j') | Input::Char('J') => {
-                let labels = self.current_choice_labels();
-                if !labels.is_empty() && self.selected_choice + 1 < labels.len() {
-                    self.selected_choice += 1;
-                }
-                ScreenCommand::None
-            }
-
-            Input::Enter => {
-                if self.is_finished() {
-                    return ScreenCommand::Pop;
-                }
-                let mut flags = self.flags.borrow_mut();
-                if self.state.current_line(&self.dialog).is_some() {
-                    // Pump the next line. `advance` only errors if
-                    // already finished, which we just checked.
-                    let _ = self.state.advance(&self.dialog, &mut flags);
-                    return ScreenCommand::None;
-                }
-                // Choice mode. Use the live count to clamp the index;
-                // an out-of-range pick returns NoChoices/OutOfRange
-                // and we fall through to a no-op rather than crashing.
-                let labels_len = self.state.available_choices(&self.dialog, &flags).len();
-                if labels_len == 0 {
-                    // Hub with all choices gated + no goto: try
-                    // advancing to honour any fallback the validator
-                    // permitted. If `advance` finishes the dialog,
-                    // the next Enter will Pop.
-                    let _ = self.state.advance(&self.dialog, &mut flags);
-                    return ScreenCommand::None;
-                }
-                let idx = self.selected_choice.min(labels_len - 1);
-                let _ = self.state.choose(&self.dialog, &mut flags, idx);
-                // Reset cursor for the next node so a long previous
-                // selection doesn't carry over to a short choice list.
-                self.selected_choice = 0;
-                ScreenCommand::None
-            }
-            _ => ScreenCommand::None,
+            // Backspace as an alias for Esc — same v2 behaviour.
+            Input::Backspace => self.inner.handle_input(ctx, Input::Esc),
+            // Vi-style aliases. The kit only knows Up/Down; translate
+            // before delegating so author-side hint text ("[Up/Down]
+            // choose") and player muscle memory (`j`/`k`) both work.
+            Input::Char('k') | Input::Char('K') => self.inner.handle_input(ctx, Input::Up),
+            Input::Char('j') | Input::Char('J') => self.inner.handle_input(ctx, Input::Down),
+            other => self.inner.handle_input(ctx, other),
         }
     }
 }
@@ -512,7 +380,8 @@ mod tests {
     #[test]
     fn dialog_renders_into_test_backend() {
         // Headless render check: the speaker name appears in the
-        // border and the first greeting line shows up in the body.
+        // border (overlay) and the first greeting line shows up in
+        // the body (kit render).
         let cfg = fixture_config();
         let fc = fixture_context();
         let mut ctx = GameContext::new(&cfg, &fc, (80, 24));
