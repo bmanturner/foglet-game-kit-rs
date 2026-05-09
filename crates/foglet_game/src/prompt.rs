@@ -590,18 +590,33 @@ impl<T: Clone> ChoicePrompt<T> {
             // to lowercase on both sides (`PromptKey::char` on storage,
             // `PromptKey::from_input` on input), so equality is the
             // entire comparison — no per-call `to_ascii_lowercase`.
+            //
+            // Task 3c: a disabled choice still owns its hotkey
+            // (SPEC §4.1: "disabled rows still reserve their hotkey")
+            // so we surface the press as `PromptAction::Disabled`
+            // rather than letting it fall through to `None`. That gives
+            // the game a chance to render the disabled_reason as
+            // feedback ("can't equip — bag full") instead of swallowing
+            // the press silently, which would leave the player guessing
+            // whether the prompt is broken or simply ignoring them.
             for choice in &self.choices {
-                if choice.key == key && choice.enabled {
-                    return PromptAction::Selected(choice.value.clone());
+                if choice.key == key {
+                    if choice.enabled {
+                        return PromptAction::Selected(choice.value.clone());
+                    }
+                    return PromptAction::Disabled {
+                        id: choice.value.clone(),
+                        reason: choice.disabled_reason.clone(),
+                    };
                 }
             }
         }
 
-        // Tasks 3c (disabled-key Disabled), 3d (Esc → Cancelled when
-        // configured), and 4c (Enter on highlighted choice) layer in
-        // on top of this scan. Until they land, anything that does not
-        // match an enabled hotkey is a no-op so the prompt never
-        // invents a selection from a press the player did not make.
+        // Tasks 3d (Esc → Cancelled when configured) and 4c (Enter on
+        // highlighted choice) layer in on top of this scan. Until they
+        // land, anything that does not match a registered hotkey is a
+        // no-op so the prompt never invents a selection from a press
+        // the player did not make.
         PromptAction::None
     }
 }
@@ -1274,25 +1289,67 @@ mod tests {
     }
 
     #[test]
-    fn handle_does_not_select_disabled_choice_via_direct_key() {
-        // Task 3b is "direct hotkey selection of an enabled choice".
-        // Disabled-key routing is Task 3c — until that lands, pressing
-        // a disabled hotkey must NOT return `Selected` (that would be
-        // the worst possible silent bug: a disabled label that quietly
-        // fires the action). `None` is the safe interim outcome; 3c
-        // will upgrade it to `Disabled { id, reason }`.
+    fn handle_disabled_choice_returns_disabled_with_id_and_reason() {
+        // Task 3c: pressing a disabled choice's hotkey MUST NOT silently
+        // succeed (would fire the action) and MUST NOT silently drop to
+        // `None` (would leave the player wondering if the keypress
+        // registered). Instead the reducer surfaces a `Disabled` action
+        // carrying the choice's id and its `disabled_reason`, so the
+        // game can render feedback like "bag full" without re-deriving
+        // why the row was disabled in the first place.
         let prompt: ChoicePrompt<LootAction> = ChoicePrompt::new()
             .choice('m', LootAction::Take, "Mana potions")
             .disabled_if(true, "full")
             .choice('n', LootAction::Pass, "No thanks");
 
-        assert_eq!(prompt.handle(Input::Char('m')), PromptAction::None);
-        assert_eq!(prompt.handle(Input::Char('M')), PromptAction::None);
+        // Lowercase and uppercase both route through the same disabled
+        // path — case-insensitivity is a `PromptKey` invariant, not a
+        // per-arm concern, but locking it in here guards against a
+        // future refactor that accidentally adds a case branch.
+        assert_eq!(
+            prompt.handle(Input::Char('m')),
+            PromptAction::Disabled {
+                id: LootAction::Take,
+                reason: Some("full".to_string()),
+            },
+        );
+        assert_eq!(
+            prompt.handle(Input::Char('M')),
+            PromptAction::Disabled {
+                id: LootAction::Take,
+                reason: Some("full".to_string()),
+            },
+        );
         // Enabled neighbour still selects normally — the disabled row
         // does not poison the rest of the prompt.
         assert_eq!(
             prompt.handle(Input::Char('n')),
             PromptAction::Selected(LootAction::Pass),
+        );
+    }
+
+    #[test]
+    fn handle_disabled_choice_without_reason_returns_disabled_with_none() {
+        // SPEC §4.2 makes `disabled_reason` optional. A choice flagged
+        // disabled without a reason (e.g. via direct field assignment
+        // or a future `with_disabled` helper) must still produce
+        // `Disabled` — `reason: None` — rather than falling through to
+        // `None`. The id is what the game keys feedback off; the reason
+        // is a humane bonus, not a prerequisite for the variant.
+        let mut choice = PromptChoice::new('k', "Take key", LootAction::Take);
+        choice.enabled = false;
+        let prompt: ChoicePrompt<LootAction> = ChoicePrompt {
+            body: Vec::new(),
+            choices: vec![choice],
+            footer: None,
+        };
+
+        assert_eq!(
+            prompt.handle(Input::Char('k')),
+            PromptAction::Disabled {
+                id: LootAction::Take,
+                reason: None,
+            },
         );
     }
 
