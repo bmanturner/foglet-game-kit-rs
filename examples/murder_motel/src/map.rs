@@ -1,0 +1,2079 @@
+//! Lobby map screen, NPC + item catalogs, and the embedded map/dialog
+//! assets they reference.
+//!
+//! [`MapScreen`] is the gameplay hub: it owns the parsed lobby tile
+//! grid and routes input into the dialog, inventory, and SPEC §9 proof
+//! scenes. The static [`Self::NPCS`] and [`Self::ITEMS`] catalogs along
+//! with the locked-door / win-tile / drawer constants live here so a
+//! single file describes the whole lobby.
+
+use std::cell::RefCell;
+use std::collections::BTreeSet;
+use std::rc::Rc;
+
+use foglet_game::{parse_map, FlagSet, GameContext, Input, Map, Screen, ScreenCommand, TileLegend};
+use ratatui::layout::{Alignment, Rect};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::Frame;
+
+use crate::layout::centred_rect;
+use crate::modals::{InventoryScreen, WinScreen};
+use crate::scenes::dialog::DialogScreen;
+use crate::scenes::lost_and_found::lost_and_found_drawer_screen;
+use crate::scenes::night_clerk::night_clerk_vendor_screen;
+use crate::state::SharedSlots;
+
+/// Lobby map source, embedded at compile time.
+///
+/// `include_str!` keeps the example self-contained — the binary needs
+/// no runtime asset lookup to render its first map, which sidesteps
+/// the "where am I being run from?" issue that bit the title screen's
+/// `assets/game.toml` lookup before [`crate::GAME_TOML_PATH`] was
+/// introduced. `fgk new`-generated projects load their starter map
+/// from disk via `assets/maps/<name>.txt`; switch to
+/// `std::fs::read_to_string` if you copy this scaffold and want
+/// hot-editable maps in dev.
+const LOBBY_MAP_TEXT: &str = include_str!("../assets/maps/lobby.txt");
+
+/// Dialog scripts for each NPC, embedded at compile time.
+///
+/// Same rationale as [`LOBBY_MAP_TEXT`] — keeping the YAML inside the
+/// binary means `cargo run --example` works no matter the CWD, and
+/// `fgk new`-generated scaffolds can swap to `std::fs::read_to_string`
+/// when authors want hot-edit iteration in dev. The Night Clerk's
+/// script carries the SPEC §13 branching requirement; the other two
+/// are short linear flavour beats so the map feels populated rather
+/// than decorated with one talkable NPC and two scenery glyphs.
+const NIGHT_CLERK_DIALOG: &str = include_str!("../assets/dialog/night_clerk.yaml");
+const BELLHOP_DIALOG: &str = include_str!("../assets/dialog/bellhop.yaml");
+const MAID_DIALOG: &str = include_str!("../assets/dialog/maid.yaml");
+
+/// A non-player character pinned to a fixed cell on the lobby map.
+///
+/// `Npc` is intentionally `Copy` and built from `&'static str` slices
+/// so the whole NPC roster lives as a `const` array on
+/// [`MapScreen::NPCS`]. The conversation YAML is also `&'static str`
+/// (via `include_str!`); the dialog graph is parsed lazily when the
+/// player actually engages, which keeps the example's startup cost
+/// at zero NPC-related allocations.
+#[derive(Debug, Clone, Copy)]
+pub struct Npc {
+    /// Display name shown in the dialog header. Stable across runs.
+    pub name: &'static str,
+    /// Map glyph painted at `(x, y)`. Single-cell ASCII — the render
+    /// path treats it the same way it treats the player glyph.
+    pub glyph: char,
+    /// Map column. Must reference a walkable floor cell in the lobby
+    /// legend; the constructor does not validate this because the
+    /// roster is hand-authored and any drift will surface as a
+    /// failing test rather than a runtime panic.
+    pub x: u16,
+    /// Map row. Same constraint as [`Self::x`].
+    pub y: u16,
+    /// Embedded dialog YAML this NPC opens with. Loaded by
+    /// [`DialogScreen::new`] on first interaction; parse failures are
+    /// build-time bugs (the YAML ships in the binary) so the dialog
+    /// constructor uses `expect`.
+    pub dialog_yaml: &'static str,
+}
+
+/// A collectable item pinned to a fixed cell on the lobby map.
+///
+/// Like [`Npc`], `Item` is `Copy` and built from `&'static str` slices
+/// so the entire item catalog lives as a `const` array on
+/// [`MapScreen::ITEMS`]. The collected set is tracked separately on the
+/// map screen as a [`BTreeSet`] of item IDs; the catalog is the
+/// authoritative source for an item's display name and glyph regardless
+/// of whether the player has picked it up.
+#[derive(Debug, Clone, Copy)]
+pub struct Item {
+    /// Stable identifier used as the inventory key. Chosen from a
+    /// constrained ASCII namespace so it round-trips through the save
+    /// file (Task 13h) without serialisation surprises.
+    pub id: &'static str,
+    /// Display name shown on the inventory screen. Stored separately
+    /// from `id` so we can rename the player-facing label without
+    /// invalidating saves.
+    pub name: &'static str,
+    /// Map glyph painted at `(x, y)` while the item is uncollected.
+    /// Single-cell ASCII to match the player and NPC overlays.
+    pub glyph: char,
+    /// Map column. Must reference a walkable floor cell that is *not*
+    /// occupied by an NPC; the test
+    /// `map_items_sit_on_walkable_non_npc_cells` enforces this.
+    pub x: u16,
+    /// Map row. Same constraint as [`Self::x`].
+    pub y: u16,
+}
+
+/// Lobby map screen — the SPEC §13 "5 rooms with player movement"
+/// fixture (Task 13c).
+///
+/// Owns a parsed [`Map`] plus the player's `(x, y)` coordinates. The
+/// map itself is immutable for this iteration: 13d/13e/13f layer NPCs,
+/// items, and locked-door state on top, but those concerns live on
+/// the screen (or future sibling screens) rather than mutating the
+/// underlying tile grid.
+///
+/// ## Why a fixed-size map and label overlay
+///
+/// The map is 46 cells wide and 7 cells tall, well inside the
+/// 80×24 minimum from SPEC §7.1. Five rooms are laid out in a
+/// horizontal strip — Room 1, Room 2, Lobby, Room 3, Room 4 — with
+/// `+` doors at `y == 3` connecting each room to its neighbour. The
+/// rooms are anonymous in the ASCII source (just `#`/`+`/space) and
+/// labels are overlaid at render time, which keeps the legend
+/// minimal and avoids the trap of maps becoming illegible if the
+/// labelling convention ever changes.
+///
+/// ## Walkability and bounds
+///
+/// Movement consults [`Map::is_walkable`]. Walls block, floors and
+/// doors pass. Out-of-bounds is treated as a wall so the input
+/// handler does not need a separate bounds check before stepping.
+pub struct MapScreen {
+    /// Parsed lobby map (immutable for this screen's lifetime). Held
+    /// directly rather than re-parsing each frame so render is
+    /// allocation-light.
+    map: Map,
+    /// Save-bearing runtime state — player position, narrative flags,
+    /// inventory, win latch. Shared with `main` (which writes the save
+    /// on exit), with [`DialogScreen`] (`flags`), and with
+    /// [`InventoryScreen`] (`inventory`). The single Rc bundle replaces
+    /// what used to be three separate fields so Task 13h's save/load
+    /// path manipulates the same handles the screens read.
+    slots: SharedSlots,
+}
+
+impl MapScreen {
+    /// Title rendered on the bordered block surrounding the map.
+    pub const TITLE: &'static str = "Murder Motel — Lobby";
+
+    /// Glyph used to draw the player on top of the underlying floor.
+    /// Pulled from [`foglet_game::PLAYER_GLYPH`] so the convention
+    /// stays in lockstep with the kit-wide constant.
+    pub const PLAYER_GLYPH: char = foglet_game::PLAYER_GLYPH;
+
+    /// Room labels rendered as overlays at fixed columns. The order
+    /// matches the left-to-right room order in the map; `Lobby` sits
+    /// in the middle. Stored as `(label, column)` pairs so the test
+    /// suite can assert each label paints into the expected room
+    /// without re-deriving the layout.
+    ///
+    /// Columns are computed from the map's room geometry: the first
+    /// room starts at column 1, each room is 8 cells wide, and the
+    /// dividing wall is one cell. So room `i` (0-based) starts at
+    /// column `1 + 9 * i`. We pick the third interior column of each
+    /// room (`start + 1`) so a six-character label fits without
+    /// trampling the room's own walls.
+    pub const ROOM_LABELS: &'static [(&'static str, u16)] = &[
+        ("Room 1", 2),
+        ("Room 2", 11),
+        ("Lobby", 21),
+        ("Room 3", 29),
+        ("Room 4", 38),
+    ];
+
+    /// Non-player characters placed on the lobby map (Task 13d).
+    ///
+    /// Three NPCs satisfies the SPEC §13 acceptance criterion. Two of
+    /// them — Bellhop and Maid — exist as flavour with short linear
+    /// scripts; the Night Clerk carries the branching dialog the
+    /// acceptance fixture requires (a `requires`-gated choice that
+    /// only unlocks after the player asks about the murder).
+    ///
+    /// Coordinates are expressed in map cells. Each NPC sits on a
+    /// floor cell inside its room — see the lobby ASCII source for
+    /// the room geometry. Glyphs are single uppercase ASCII letters
+    /// so even monochrome BBS clients can tell them apart from the
+    /// player's `@`.
+    pub const NPCS: [Npc; 3] = [
+        Npc {
+            name: "Night Clerk",
+            glyph: 'C',
+            x: 24,
+            y: 2,
+            dialog_yaml: NIGHT_CLERK_DIALOG,
+        },
+        Npc {
+            name: "Bellhop",
+            glyph: 'B',
+            x: 4,
+            y: 2,
+            dialog_yaml: BELLHOP_DIALOG,
+        },
+        Npc {
+            name: "Maid",
+            glyph: 'M',
+            x: 41,
+            y: 2,
+            dialog_yaml: MAID_DIALOG,
+        },
+    ];
+
+    /// Catalog of collectable items distributed across the lobby's
+    /// five rooms (Task 13e).
+    ///
+    /// Exactly five items, exactly one per room, satisfies the
+    /// SPEC §13 acceptance criterion. Coordinates land on floor cells
+    /// that are not occupied by an NPC; the
+    /// `map_items_sit_on_walkable_non_npc_cells` test enforces both
+    /// invariants so accidental drift surfaces as a failed test rather
+    /// than a confusing render. Glyphs are single lowercase ASCII
+    /// letters so they're visually distinguishable from the player's
+    /// `@` and the uppercase NPC glyphs even on monochrome BBS clients.
+    pub const ITEMS: [Item; 5] = [
+        // The brass key sits in Room 1 (left of every door) so the
+        // player can collect it without first traversing the locked
+        // door at x=36 introduced in Task 13f. The matchbook moved to
+        // Room 4 so the locked door actually gates progress: there is
+        // exactly one collectable behind it, and it is reachable only
+        // after the brass key is in the inventory.
+        Item {
+            id: "brass_key",
+            name: "Brass key",
+            glyph: 'k',
+            x: 6,
+            y: 5,
+        },
+        Item {
+            id: "cigarette_case",
+            name: "Cigarette case",
+            glyph: 'c',
+            x: 13,
+            y: 2,
+        },
+        Item {
+            id: "newspaper",
+            name: "Newspaper clipping",
+            glyph: 'n',
+            x: 20,
+            y: 5,
+        },
+        Item {
+            id: "lipstick",
+            name: "Lipstick tube",
+            glyph: 'l',
+            x: 32,
+            y: 2,
+        },
+        Item {
+            id: "matchbook",
+            name: "Matchbook",
+            glyph: 'm',
+            x: 39,
+            y: 5,
+        },
+    ];
+
+    /// Inventory ID required to pass the locked door at
+    /// [`Self::LOCKED_DOOR_POS`]. Must match the `id` of the brass-key
+    /// catalog entry above; the test
+    /// `locked_door_key_id_matches_catalog` asserts this invariant so
+    /// a future rename of either field surfaces immediately rather than
+    /// silently un-locking the door.
+    pub const LOCKED_DOOR_KEY_ID: &'static str = "brass_key";
+
+    /// Position of the lobby's one locked door. The cell is rendered
+    /// from the lobby ASCII map's `L` glyph (parsed as a `Custom`
+    /// tile kind via the lobby legend) so render code stays a thin
+    /// styling pass and the geometry lives in the asset file.
+    pub const LOCKED_DOOR_POS: (u16, u16) = (36, 3);
+
+    /// Glyph painted on the locked door cell while it is still locked.
+    /// Pulled out so render and tests share one source of truth.
+    pub const LOCKED_DOOR_GLYPH: char = 'L';
+
+    /// Glyph painted on the locked door cell once unlocked. Matches the
+    /// open-door glyph elsewhere on the map so a player who unlocks the
+    /// door visually understands the cell is now equivalent to its
+    /// unlocked siblings.
+    pub const UNLOCKED_DOOR_GLYPH: char = '+';
+
+    /// Position of the win tile — the spot the player must stand on,
+    /// after asking the Night Clerk about the murder, to solve the
+    /// case (Task 13g). Inside Room 4, which is itself only reachable
+    /// once the brass key has unlocked the door, so the natural play
+    /// chain is: talk to clerk → ask about the murder → grab the key →
+    /// walk into Room 4 → stand here.
+    pub const WIN_TILE_POS: (u16, u16) = (43, 4);
+
+    /// Glyph painted on [`Self::WIN_TILE_POS`] while the case is still
+    /// open. Stays put after winning: the player has already triggered
+    /// the modal, so re-painting an `*` would be misleading. Render
+    /// uses [`MapScreen::has_won`] to suppress the glyph post-win.
+    pub const WIN_TILE_GLYPH: char = '*';
+
+    /// Narrative flag that must be set for a step onto
+    /// [`Self::WIN_TILE_POS`] to win the game. Set by the Night Clerk's
+    /// `heard_rumor` branch (see `assets/dialog/night_clerk.yaml`).
+    /// Centralised as a constant so the tests can reference the exact
+    /// string the runtime checks without re-typing it.
+    pub const WIN_FLAG: &'static str = "heard_rumor";
+
+    /// Inventory id for the SPEC §9 Lost-and-Found Drawer key. Distinct
+    /// from [`Self::LOCKED_DOOR_KEY_ID`] (the lobby brass key) so the
+    /// two collectables can co-exist in `SharedSlots::inventory` and
+    /// be queried independently. Lives outside [`Self::ITEMS`] because
+    /// the v1.1 proof scene grants it through a prompt rather than a
+    /// map cell — there is no glyph or coordinate to record.
+    pub const ROOM_7_KEY_ID: &'static str = "room_7_key";
+
+    /// Inventory id for the cracked matchbook offered by the
+    /// Lost-and-Found Drawer prompt. Re-uses the existing catalog id
+    /// so the prompt and the lobby map item never duplicate the same
+    /// keepsake in the player's pockets — picking it up either way
+    /// flips the same `BTreeSet` entry.
+    pub const MATCHBOOK_ID: &'static str = "matchbook";
+
+    /// Narrative flag set when the player reads the receipt at the
+    /// Lost-and-Found Drawer (SPEC §9 step 3). Flag rather than item
+    /// because the receipt isn't carried; reading it unlocks branches
+    /// downstream of the drawer scene without occupying an inventory
+    /// slot.
+    pub const RECEIPT_READ_FLAG: &'static str = "receipt_read";
+
+    /// Map cell that hosts the Lost-and-Found Drawer (Task 10f). Sits
+    /// next to the Night Clerk at column 24 so the prompt's "behind the
+    /// desk" framing is geographically honest: the player walks up to
+    /// the front desk and finds the drawer beside the clerk. The cell
+    /// itself is treated as furniture — non-walkable, blocking via the
+    /// same gate that protects NPC tiles — so a press of the search key
+    /// from any orthogonally adjacent floor cell opens the prompt.
+    pub const LOST_AND_FOUND_POS: (u16, u16) = (25, 2);
+
+    /// Glyph painted at [`Self::LOST_AND_FOUND_POS`]. A single uppercase
+    /// `D` (for Drawer) keeps the affordance legible on monochrome BBS
+    /// clients without colliding with the existing NPC glyphs (`B`/`C`/
+    /// `M`) or item glyphs (lowercase). Pulled out as a constant so the
+    /// renderer and the headless `rendered_rows` test consult one
+    /// source of truth.
+    pub const LOST_AND_FOUND_GLYPH: char = 'D';
+
+    /// One-line movement hint shown directly below the map block.
+    /// Pulled out as a constant so tests can assert it appears in the
+    /// rendered buffer without binding to the precise wording.
+    pub const HINT_LINE: &'static str =
+        "Move: arrows/hjkl  Talk: Enter  Buy: B  Search: X  Inv: I  Back: Esc  Quit: Q";
+
+    /// Build a lobby map screen with fresh, unshared slots. Used by
+    /// tests that want an isolated screen instance and by callers that
+    /// don't need to participate in the Task 13h save/load handshake.
+    pub fn new_lobby(start_x: u16, start_y: u16) -> Self {
+        let slots = SharedSlots::default();
+        slots.reset(start_x, start_y);
+        Self::with_shared(start_x, start_y, slots)
+    }
+
+    /// Build a lobby map screen against caller-supplied [`SharedSlots`].
+    ///
+    /// The slots' `player.x/y` are used as the spawn unless the menu
+    /// has already populated them from a loaded save — in which case
+    /// the saved coordinates take precedence over `(start_x, start_y)`.
+    /// Walkability is still checked: if the saved cell has been re-
+    /// authored into a wall the spiral fallback steers the player onto
+    /// the nearest floor, mirroring the misconfigured-config path.
+    pub fn with_shared(start_x: u16, start_y: u16, slots: SharedSlots) -> Self {
+        let legend = lobby_legend();
+        let map =
+            parse_map(LOBBY_MAP_TEXT, &legend).expect("embedded lobby map parses against legend");
+        let screen = Self { map, slots };
+        // Decide the spawn cell. If the slots arrived empty (e.g. a
+        // brand-new game) we honour the caller's `(start_x, start_y)`;
+        // otherwise the slots already carry the loaded player position
+        // and we trust that. Either way we then pass the chosen cell
+        // through the walkability gate so a re-authored map can never
+        // strand the player inside a wall.
+        let initial = {
+            let p = screen.slots.player.borrow();
+            if p.x == 0 && p.y == 0 {
+                (start_x, start_y)
+            } else {
+                (p.x, p.y)
+            }
+        };
+        let (chosen_x, chosen_y) = if screen.map.is_walkable(initial.0, initial.1) {
+            initial
+        } else {
+            screen
+                .find_nearest_walkable(initial.0, initial.1)
+                .unwrap_or((1, 1))
+        };
+        let mut p = screen.slots.player.borrow_mut();
+        p.x = chosen_x;
+        p.y = chosen_y;
+        drop(p);
+        screen
+    }
+
+    /// Player coordinates, exposed so tests and future siblings (the
+    /// inventory screen, the save manager) can read the position
+    /// without reaching into private state.
+    pub fn player(&self) -> (u16, u16) {
+        let p = self.slots.player.borrow();
+        (p.x, p.y)
+    }
+
+    /// Reference to the parsed map. Useful for tests asserting that
+    /// the lobby has the expected room shape.
+    pub fn map(&self) -> &Map {
+        &self.map
+    }
+
+    /// Attempt to move the player by `(dx, dy)` (each ±1).
+    ///
+    /// Returns `true` if the step succeeded. The walkability check
+    /// short-circuits when the target would underflow the unsigned
+    /// coordinate space, so stepping left from column 0 silently
+    /// no-ops instead of wrapping to `u16::MAX`.
+    pub fn try_move(&mut self, dx: i32, dy: i32) -> bool {
+        let (cur_x, cur_y) = {
+            let p = self.slots.player.borrow();
+            (p.x, p.y)
+        };
+        let target_x = match (cur_x as i32).checked_add(dx) {
+            Some(v) if v >= 0 => v as u16,
+            _ => return false,
+        };
+        let target_y = match (cur_y as i32).checked_add(dy) {
+            Some(v) if v >= 0 => v as u16,
+            _ => return false,
+        };
+        if !self.map.is_walkable(target_x, target_y) {
+            return false;
+        }
+        // Locked-door gate (Task 13f). The lobby ASCII tags one cell
+        // with the `L` legend kind; passage is rejected unless the
+        // matching key item sits in the player's inventory. The map
+        // model itself treats `Custom` tiles as walkable — the lock
+        // is a screen-level concern, parallel to NPC blocking below.
+        if self.is_locked_door_blocking(target_x, target_y) {
+            return false;
+        }
+        // NPCs are solid: walking into one is converted to "stand
+        // adjacent". The talk affordance (Enter while next to an
+        // NPC) handles interaction; without this guard the player
+        // would have to step *off* an NPC's cell to address them,
+        // which is the wrong feel for a top-down game.
+        if Self::npc_at(target_x, target_y).is_some() {
+            return false;
+        }
+        // Lost-and-Found Drawer (Task 10f) is furniture. Blocking the
+        // step keeps the desk's framing consistent — the player stands
+        // beside the drawer and presses the search key, instead of
+        // standing *on* the drawer to interact with it.
+        if Self::is_lost_and_found_at(target_x, target_y) {
+            return false;
+        }
+        {
+            let mut p = self.slots.player.borrow_mut();
+            p.x = target_x;
+            p.y = target_y;
+        }
+        // Items pick up on step. The render path filters collected
+        // items out of the overlay, so the cell visually clears the
+        // same frame the inventory grows. Items aren't blocking — a
+        // stranded item under foot would otherwise trap the player
+        // until they pressed Enter, which is the wrong feel here.
+        if let Some(item) = Self::item_at(target_x, target_y) {
+            self.slots
+                .inventory
+                .borrow_mut()
+                .insert(item.id.to_string());
+        }
+        true
+    }
+
+    /// Find the NPC standing on the given cell, if any. Pulled out
+    /// so both [`Self::try_move`] (blocking) and the talk handler
+    /// (adjacency probe) consult the same roster.
+    pub fn npc_at(x: u16, y: u16) -> Option<&'static Npc> {
+        Self::NPCS.iter().find(|n| n.x == x && n.y == y)
+    }
+
+    /// NPC the player can talk to right now, or `None`. Returns the
+    /// first NPC whose cell is the player's own cell or one of the
+    /// four cardinal neighbours — diagonal "talk through the wall"
+    /// would be ambiguous when an NPC is in a different room and
+    /// also feels wrong on a square grid.
+    pub fn nearby_npc(&self) -> Option<&'static Npc> {
+        const OFFSETS: &[(i32, i32)] = &[(0, 0), (1, 0), (-1, 0), (0, 1), (0, -1)];
+        let (px, py) = self.player();
+        for (dx, dy) in OFFSETS {
+            let cx = px as i32 + dx;
+            let cy = py as i32 + dy;
+            if cx < 0 || cy < 0 {
+                continue;
+            }
+            if let Some(npc) = Self::npc_at(cx as u16, cy as u16) {
+                return Some(npc);
+            }
+        }
+        None
+    }
+
+    /// Whether the cell at `(x, y)` is the Lost-and-Found Drawer
+    /// (Task 10f). Centralised so the renderer, movement gate, and
+    /// adjacency probe consult the same answer instead of re-deriving
+    /// the comparison.
+    pub fn is_lost_and_found_at(x: u16, y: u16) -> bool {
+        (x, y) == Self::LOST_AND_FOUND_POS
+    }
+
+    /// Whether the player can act on the Lost-and-Found Drawer right
+    /// now. Mirrors [`Self::nearby_npc`]: the player must stand on the
+    /// drawer cell or one of the four cardinal neighbours. Diagonals
+    /// are excluded so a player two rooms away never accidentally
+    /// reaches across the wall to a drawer they cannot see.
+    pub fn nearby_lost_and_found(&self) -> bool {
+        const OFFSETS: &[(i32, i32)] = &[(0, 0), (1, 0), (-1, 0), (0, 1), (0, -1)];
+        let (px, py) = self.player();
+        OFFSETS.iter().any(|(dx, dy)| {
+            let cx = px as i32 + dx;
+            let cy = py as i32 + dy;
+            if cx < 0 || cy < 0 {
+                return false;
+            }
+            Self::is_lost_and_found_at(cx as u16, cy as u16)
+        })
+    }
+
+    /// Whether the player is positioned to interact with the Night
+    /// Clerk's vendor menu (Task 11g). Mirrors [`Self::nearby_npc`]
+    /// but filters by name so a future second NPC at an adjacent
+    /// cell — say, a passing maid — can never accidentally route the
+    /// `b`/`B` "buy" affordance into the wrong dialog. Diagonals are
+    /// excluded for the same reason `nearby_npc` rejects them: a
+    /// cardinal-only adjacency check matches the player's mental model
+    /// of "I'm standing next to the counter".
+    pub fn nearby_clerk(&self) -> bool {
+        self.nearby_npc()
+            .is_some_and(|npc| npc.name == "Night Clerk")
+    }
+
+    /// Shared handle to the narrative-flag store. Cloned so the
+    /// dialog screen and the map screen mutate the same `RefCell`.
+    pub fn flags(&self) -> Rc<RefCell<FlagSet>> {
+        Rc::clone(&self.slots.flags)
+    }
+
+    /// Borrow the screen's [`SharedSlots`]. Used by the menu screen so
+    /// "New Game" can reset all slots without reaching into private
+    /// fields, and by tests asserting save-related invariants.
+    pub fn slots(&self) -> &SharedSlots {
+        &self.slots
+    }
+
+    /// Shared handle to the inventory store. Cloned so the
+    /// [`InventoryScreen`] reads the same set the [`MapScreen`] writes
+    /// when the player walks over an item. Task 13h will lift this
+    /// onto the save manager so contents survive process exit; until
+    /// then it lives on the map screen for the play session.
+    pub fn inventory(&self) -> Rc<RefCell<BTreeSet<String>>> {
+        Rc::clone(&self.slots.inventory)
+    }
+
+    /// The catalog item sitting on `(x, y)`, or `None`. Walks the
+    /// static [`Self::ITEMS`] array; the catalog is small enough that
+    /// a linear scan matches how [`Self::npc_at`] queries the NPC
+    /// roster and avoids per-frame map allocations.
+    pub fn item_at(x: u16, y: u16) -> Option<&'static Item> {
+        Self::ITEMS.iter().find(|i| i.x == x && i.y == y)
+    }
+
+    /// Whether the given item ID has already been collected. Render
+    /// and `try_move` both consult this so an item disappears from
+    /// the map atomically with its appearance in the inventory.
+    pub fn is_collected(&self, id: &str) -> bool {
+        self.slots.inventory.borrow().contains(id)
+    }
+
+    /// Whether the cell at `(x, y)` is the lobby's locked door. The
+    /// position lives in [`Self::LOCKED_DOOR_POS`]; centralising the
+    /// check means the renderer and movement gate consult the same
+    /// answer instead of re-deriving the comparison.
+    pub fn is_locked_door_at(x: u16, y: u16) -> bool {
+        (x, y) == Self::LOCKED_DOOR_POS
+    }
+
+    /// Whether the player currently holds the locked-door key item.
+    /// Used by both [`Self::is_locked_door_blocking`] and the renderer
+    /// (so an unlocked door is painted in the open-door glyph).
+    pub fn has_locked_door_key(&self) -> bool {
+        self.is_collected(Self::LOCKED_DOOR_KEY_ID)
+    }
+
+    /// Whether a step into `(x, y)` should be blocked by the locked
+    /// door. True only for the locked-door cell while the player is
+    /// missing the matching key item — every other case (a non-locked
+    /// cell, or the locked cell with the key in hand) returns false.
+    pub fn is_locked_door_blocking(&self, x: u16, y: u16) -> bool {
+        Self::is_locked_door_at(x, y) && !self.has_locked_door_key()
+    }
+
+    /// Whether the win condition has already fired. Exposed so tests
+    /// can assert the latch without poking at private state and so the
+    /// renderer can drop the win-tile glyph after the modal triggers.
+    pub fn has_won(&self) -> bool {
+        self.slots.player.borrow().won
+    }
+
+    /// Whether stepping onto the win tile right now would solve the
+    /// case. True only when the player stands on [`Self::WIN_TILE_POS`]
+    /// with [`Self::WIN_FLAG`] set and has not already triggered the
+    /// modal. Centralising the predicate keeps render and
+    /// [`Self::handle_input`] reading the same answer.
+    fn should_trigger_win(&self) -> bool {
+        let p = self.slots.player.borrow();
+        if p.won {
+            return false;
+        }
+        if (p.x, p.y) != Self::WIN_TILE_POS {
+            return false;
+        }
+        drop(p);
+        self.slots.flags.borrow().contains(Self::WIN_FLAG)
+    }
+
+    /// Latch the win flag and return the screen command that should be
+    /// emitted in response to the player's last move. Called after
+    /// every successful or attempted movement so a step onto the win
+    /// tile fires the modal in the same frame the move resolves.
+    fn maybe_win_command(&mut self) -> ScreenCommand {
+        if self.should_trigger_win() {
+            self.slots.player.borrow_mut().won = true;
+            ScreenCommand::Push(Box::new(WinScreen))
+        } else {
+            ScreenCommand::None
+        }
+    }
+
+    /// Locate a walkable cell near `(x, y)` by widening rings.
+    ///
+    /// Used as a self-correcting safety net for misconfigured spawn
+    /// coordinates. Capped at a small radius — searching forever on a
+    /// pathologically hostile map is worse than the (1, 1) fallback.
+    fn find_nearest_walkable(&self, x: u16, y: u16) -> Option<(u16, u16)> {
+        for radius in 1i32..=8 {
+            for dy in -radius..=radius {
+                for dx in -radius..=radius {
+                    if dx.abs() != radius && dy.abs() != radius {
+                        continue;
+                    }
+                    let cx = x as i32 + dx;
+                    let cy = y as i32 + dy;
+                    if cx < 0 || cy < 0 {
+                        continue;
+                    }
+                    let cx = cx as u16;
+                    let cy = cy as u16;
+                    if self.map.is_walkable(cx, cy) {
+                        return Some((cx, cy));
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Build the rendered lines for the current map state.
+    ///
+    /// Pulled out of the `render` body so `cargo test` can assert the
+    /// painted glyphs without going through `ratatui::Terminal`. The
+    /// returned `Vec<String>` is one entry per map row; the player is
+    /// stamped on top of the floor cell using [`Self::PLAYER_GLYPH`].
+    pub fn rendered_rows(&self) -> Vec<String> {
+        let mut rows: Vec<String> = self
+            .map
+            .cells
+            .iter()
+            .map(|row| row.iter().map(|tile| tile.glyph).collect::<String>())
+            .collect();
+        // Locked-door glyph swap mirrors the styled render path: once
+        // unlocked, paint the cell as a regular `+` so headless tests
+        // see the same character the player does.
+        if self.has_locked_door_key() {
+            let (lx, ly) = Self::LOCKED_DOOR_POS;
+            if (ly as usize) < rows.len() {
+                let row = &mut rows[ly as usize];
+                let col = lx as usize;
+                if col < row.len() {
+                    let mut chars: Vec<char> = row.chars().collect();
+                    chars[col] = Self::UNLOCKED_DOOR_GLYPH;
+                    *row = chars.into_iter().collect();
+                }
+            }
+        }
+        // Win-tile glyph stamp (Task 13g). Mirrors the styled render
+        // path's behaviour: paint `*` until the player has won, then
+        // fall back to the underlying floor glyph. Stamped *before* the
+        // player overlay below so standing on the tile still shows the
+        // player's `@` rather than the marker.
+        let (px, py, won) = {
+            let p = self.slots.player.borrow();
+            (p.x, p.y, p.won)
+        };
+        if !won {
+            let (wx, wy) = Self::WIN_TILE_POS;
+            if (wy as usize) < rows.len() {
+                let row = &mut rows[wy as usize];
+                let col = wx as usize;
+                if col < row.len() {
+                    let mut chars: Vec<char> = row.chars().collect();
+                    chars[col] = Self::WIN_TILE_GLYPH;
+                    *row = chars.into_iter().collect();
+                }
+            }
+        }
+        // Lost-and-Found Drawer glyph (Task 10f). Painted unconditionally
+        // — there is no "drawer consumed" state because the prompt's own
+        // disabled-(K) branch (Task 10d) handles the only "already
+        // taken" case. Stamped before the player overlay below so
+        // standing adjacent to the drawer never hides its glyph.
+        let (lx, ly) = Self::LOST_AND_FOUND_POS;
+        if (ly as usize) < rows.len() {
+            let row = &mut rows[ly as usize];
+            let col = lx as usize;
+            if col < row.len() {
+                let mut chars: Vec<char> = row.chars().collect();
+                chars[col] = Self::LOST_AND_FOUND_GLYPH;
+                *row = chars.into_iter().collect();
+            }
+        }
+        // Stamp the player glyph by replacing the byte at the player's
+        // column with `@`. The lobby legend uses ASCII space/`#`/`+`
+        // (all 1-byte UTF-8) and the player glyph is also ASCII, so
+        // byte-level replacement is safe here. If the legend ever
+        // grows multi-byte glyphs this needs to switch to a
+        // char-aware splice.
+        if (py as usize) < rows.len() {
+            let row = &mut rows[py as usize];
+            let col = px as usize;
+            if col < row.len() {
+                let mut chars: Vec<char> = row.chars().collect();
+                chars[col] = Self::PLAYER_GLYPH;
+                *row = chars.into_iter().collect();
+            }
+        }
+        rows
+    }
+}
+
+impl Screen for MapScreen {
+    fn render(&mut self, _ctx: &mut GameContext<'_>, frame: &mut Frame<'_>) {
+        // Centre the map inside the frame. The +2 accounts for the
+        // bordered block; without it the right wall would be clipped
+        // by the border on terminals exactly at the 80-column floor.
+        let area = centred_rect(self.map.width + 2, self.map.height + 2, frame.area());
+
+        let player_glyph_style = Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD);
+        let label_style = Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD);
+        let npc_style = Style::default()
+            .fg(Color::Magenta)
+            .add_modifier(Modifier::BOLD);
+        let item_style = Style::default()
+            .fg(Color::Green)
+            .add_modifier(Modifier::BOLD);
+        // Locked door is painted red+bold while still locked so the
+        // player has an unmissable visual cue that the cell is gating
+        // them. Once the brass key is in inventory the cell falls back
+        // to the open-door glyph in default style — no separate
+        // "unlocked but special" state to maintain.
+        let locked_door_style = Style::default().fg(Color::Red).add_modifier(Modifier::BOLD);
+        // Win tile is painted in the same red+bold register as the
+        // locked door so the player reads "important" from the colour
+        // alone. Drops once the case has already been solved (see
+        // `has_won`) so a returning player does not see a stale marker.
+        let win_tile_style = Style::default().fg(Color::Red).add_modifier(Modifier::BOLD);
+
+        let (px, py, won) = {
+            let p = self.slots.player.borrow();
+            (p.x, p.y, p.won)
+        };
+        let mut lines: Vec<Line<'_>> = Vec::with_capacity(self.map.cells.len());
+        for (y, row) in self.map.cells.iter().enumerate() {
+            // Build each row as a sequence of spans: most cells are a
+            // single styleless character, but the player's cell gets
+            // the bold-yellow `@` overlay, and row 1 has the room
+            // labels stamped over the floor cells.
+            let mut spans: Vec<Span<'_>> = Vec::with_capacity(row.len());
+            let row_string: String = row.iter().map(|t| t.glyph).collect();
+            // Compute a per-column override lookup for this row so the
+            // span loop stays a flat O(width) walk.
+            let labels_for_row = if y == 1 {
+                Self::ROOM_LABELS.to_vec()
+            } else {
+                Vec::new()
+            };
+
+            let mut x = 0usize;
+            while x < row_string.len() {
+                // Player glyph wins over labels and base cells.
+                if (y as u16) == py && (x as u16) == px {
+                    spans.push(Span::styled(
+                        Self::PLAYER_GLYPH.to_string(),
+                        player_glyph_style,
+                    ));
+                    x += 1;
+                    continue;
+                }
+                // NPCs win over labels but lose to the player. The
+                // player and NPCs never share a cell because
+                // `try_move` blocks the player from stepping onto
+                // an NPC, so the priority here is purely a tiebreak
+                // against the room-label overlay.
+                if let Some(npc) = Self::npc_at(x as u16, y as u16) {
+                    spans.push(Span::styled(npc.glyph.to_string(), npc_style));
+                    x += 1;
+                    continue;
+                }
+                // Items appear under the player and NPCs but over
+                // labels and plain floor — once collected they vanish
+                // from the map until a future replay/save reset.
+                if let Some(item) = Self::item_at(x as u16, y as u16) {
+                    if !self.is_collected(item.id) {
+                        spans.push(Span::styled(item.glyph.to_string(), item_style));
+                        x += 1;
+                        continue;
+                    }
+                }
+                // Locked door (Task 13f). The lobby map's `L` cell
+                // paints red+bold while the player is missing the
+                // brass key, then collapses to the regular `+` glyph
+                // once the key is in inventory. No items or labels
+                // overlap this cell, so this branch is unconditional.
+                if Self::is_locked_door_at(x as u16, y as u16) {
+                    if self.has_locked_door_key() {
+                        spans.push(Span::raw(Self::UNLOCKED_DOOR_GLYPH.to_string()));
+                    } else {
+                        spans.push(Span::styled(
+                            Self::LOCKED_DOOR_GLYPH.to_string(),
+                            locked_door_style,
+                        ));
+                    }
+                    x += 1;
+                    continue;
+                }
+                // Win-tile marker (Task 13g). Painted only while the
+                // case is open; once the player has triggered the
+                // modal the cell falls back to its underlying floor
+                // glyph so a return visit reads as "ordinary room".
+                if !won && (x as u16, y as u16) == Self::WIN_TILE_POS {
+                    spans.push(Span::styled(
+                        Self::WIN_TILE_GLYPH.to_string(),
+                        win_tile_style,
+                    ));
+                    x += 1;
+                    continue;
+                }
+                // Lost-and-Found Drawer glyph (Task 10f). Painted in the
+                // same cyan+bold register as the room labels so the
+                // affordance reads as "important UI furniture" without
+                // getting confused with the locked door's red warning
+                // colour. The drawer cell is non-walkable so the player
+                // glyph never collides with it on this branch.
+                if Self::is_lost_and_found_at(x as u16, y as u16) {
+                    spans.push(Span::styled(
+                        Self::LOST_AND_FOUND_GLYPH.to_string(),
+                        label_style,
+                    ));
+                    x += 1;
+                    continue;
+                }
+                // Room label?
+                if let Some((label, _)) = labels_for_row.iter().find(|(_, lx)| (*lx as usize) == x)
+                {
+                    spans.push(Span::styled((*label).to_string(), label_style));
+                    x += label.len();
+                    continue;
+                }
+                // Plain cell.
+                let ch = row_string.as_bytes()[x] as char;
+                spans.push(Span::raw(ch.to_string()));
+                x += 1;
+            }
+            lines.push(Line::from(spans));
+        }
+
+        // Append a one-line hint under the map so a fresh player knows
+        // how to move and exit. Kept as a separate line so the map
+        // grid stays a clean rectangle aligned with its block borders.
+        let widget = Paragraph::new(lines)
+            .alignment(Alignment::Left)
+            .block(Block::default().borders(Borders::ALL).title(Self::TITLE));
+        frame.render_widget(widget, area);
+
+        // Hint line directly below the map block. We size it as one
+        // row tall and the same width as the map block so it looks
+        // anchored to the map rather than floating in the middle of
+        // the screen.
+        let hint_area = Rect {
+            x: area.x,
+            y: area.y.saturating_add(area.height),
+            width: area.width,
+            height: 1,
+        };
+        if hint_area.y < frame.area().height {
+            let hint = Paragraph::new(Self::HINT_LINE).alignment(Alignment::Center);
+            frame.render_widget(hint, hint_area);
+        }
+
+        // Feedback line (Task 10f). Sits one row below the hint so the
+        // post-action narration from prompts (e.g. "Moved Room 7 key
+        // to inventory.") lands in a consistent spot regardless of map
+        // size. We borrow read-only and clone the line because
+        // `FeedbackLine::render` takes `&self` and writes directly into
+        // the frame's buffer.
+        let feedback_y = hint_area.y.saturating_add(1);
+        if feedback_y < frame.area().height {
+            if let Some(line) = self.slots.feedback.borrow().clone() {
+                let feedback_area = Rect {
+                    x: area.x,
+                    y: feedback_y,
+                    width: area.width,
+                    height: 1,
+                };
+                line.render(feedback_area, frame.buffer_mut());
+            }
+        }
+    }
+
+    fn handle_input(&mut self, _ctx: &mut GameContext<'_>, input: Input) -> ScreenCommand {
+        match input {
+            // Cardinal movement, both arrow keys and vi-style aliases.
+            // The screen does not announce a "blocked" state when a
+            // move fails — the lack of motion is the feedback.
+            Input::Up | Input::Char('k') | Input::Char('K') => {
+                self.try_move(0, -1);
+                self.maybe_win_command()
+            }
+            Input::Down | Input::Char('j') | Input::Char('J') => {
+                self.try_move(0, 1);
+                self.maybe_win_command()
+            }
+            Input::Left | Input::Char('h') => {
+                self.try_move(-1, 0);
+                self.maybe_win_command()
+            }
+            Input::Right | Input::Char('l') | Input::Char('L') => {
+                self.try_move(1, 0);
+                self.maybe_win_command()
+            }
+            // Talk affordance: Enter (or `t`) when the player is
+            // adjacent to an NPC opens that NPC's dialog. With no
+            // one nearby the key is inert — silent rejection rather
+            // than an error message, the same feedback model as
+            // walking into a wall.
+            Input::Enter | Input::Char('t') | Input::Char('T') => match self.nearby_npc() {
+                Some(npc) => ScreenCommand::Push(Box::new(DialogScreen::new(npc, self.flags()))),
+                None => ScreenCommand::None,
+            },
+            // Open the inventory modal. `i` is the canonical RPG key
+            // for this affordance and the help screen documents it
+            // explicitly so a player can find their pockets without
+            // hunting for the right keystroke.
+            Input::Char('i') | Input::Char('I') => {
+                ScreenCommand::Push(Box::new(InventoryScreen::new(self.inventory())))
+            }
+            // Vendor affordance (Task 11g). When the player stands
+            // next to the Night Clerk, `b`/`B` ("buy") opens the SPEC
+            // §9 step 4 vendor prompt; everywhere else the key is
+            // inert. Mirrors the drawer's `x`/`X` route so both proof
+            // scenes share an interaction grammar — adjacency + verb
+            // key — and neither leaks into a debug menu.
+            Input::Char('b') | Input::Char('B') => {
+                if self.nearby_clerk() {
+                    *self.slots.feedback.borrow_mut() = None;
+                    ScreenCommand::Push(Box::new(night_clerk_vendor_screen(self.slots.clone())))
+                } else {
+                    ScreenCommand::None
+                }
+            }
+            // Search affordance (Task 10f). When the player stands next
+            // to the Lost-and-Found Drawer, `x`/`X` opens the SPEC §9
+            // loot prompt; everywhere else the key is inert (silent
+            // rejection, same model as bumping a wall). Keeps the prompt
+            // reachable from normal lobby play without bolting it onto
+            // a debug menu.
+            Input::Char('x') | Input::Char('X') => {
+                if self.nearby_lost_and_found() {
+                    // Clear any prior feedback so a fresh interaction
+                    // never pops in under stale narration from the last
+                    // action — the prompt will write its own line on
+                    // dismissal.
+                    *self.slots.feedback.borrow_mut() = None;
+                    ScreenCommand::Push(Box::new(lost_and_found_drawer_screen(self.slots.clone())))
+                } else {
+                    ScreenCommand::None
+                }
+            }
+            // Esc / Backspace pop back to the main menu so a curious
+            // player can return to the splash flow without quitting.
+            Input::Esc | Input::Backspace => ScreenCommand::Pop,
+            // Q and Ctrl-C remain hard-quit affordances everywhere.
+            Input::Char('q') | Input::Char('Q') | Input::Ctrl('c') => ScreenCommand::Quit,
+            _ => ScreenCommand::None,
+        }
+    }
+}
+
+/// Legend used to parse the lobby ASCII map.
+///
+/// Pulled out of [`MapScreen::with_shared`] so the integration tests
+/// can build the same legend the screen uses without coupling to the
+/// constructor's internals. Glyphs:
+///
+/// - `#` → wall (blocking)
+/// - ` ` → floor (walkable)
+/// - `+` → door (walkable)
+/// - `L` → locked door (parsed as a `Custom` kind so the kit's tile
+///   model stays minimal; [`MapScreen::try_move`] gates passage on the
+///   brass key being in inventory, while render styles the cell red
+///   until unlocked)
+fn lobby_legend() -> TileLegend {
+    TileLegend::from_pairs([
+        ("#", "wall"),
+        (" ", "floor"),
+        ("+", "door"),
+        ("L", "locked_door"),
+    ])
+    .expect("static lobby legend parses")
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    //! Tests for the lobby map: spawn, movement, NPC/item catalogs,
+    //! locked-door gating, win-tile latch, and the SPEC §9 hint /
+    //! adjacency contracts the proof scenes hang off of.
+    //!
+    //! `pub(crate)` so the cross-cutting fixtures (`fresh_map_screen`,
+    //! `walk_to`) are reachable from sibling test modules — the dialog
+    //! and lost-and-found scene tests need them to drive an integration
+    //! flow without re-deriving the helpers locally.
+
+    use super::*;
+    use crate::test_support::{fixture_config, fixture_context};
+    use foglet_game::GameContext;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    /// Build a [`MapScreen`] using the same spawn coordinates the
+    /// scaffold's `assets/game.toml` ships with. Centralised so a
+    /// future spawn retune updates one place instead of every test.
+    pub(crate) fn fresh_map_screen() -> MapScreen {
+        let cfg = fixture_config();
+        MapScreen::new_lobby(cfg.game.start_x, cfg.game.start_y)
+    }
+
+    /// Dispatch one input to a fresh map screen and return the screen
+    /// (so tests can assert position) plus the command emitted.
+    fn dispatch_map(input: Input) -> (MapScreen, ScreenCommand) {
+        let cfg = fixture_config();
+        let fc = fixture_context();
+        let mut ctx = GameContext::new(&cfg, &fc, (80, 24));
+        let mut map = fresh_map_screen();
+        let cmd = map.handle_input(&mut ctx, input);
+        (map, cmd)
+    }
+
+    /// Walk the player from spawn onto the cell at `(target_x,
+    /// target_y)` using a simple axis-aligned route. Used by the
+    /// pickup tests to land on an item without re-deriving the
+    /// movement sequence each time. Returns the live screen so the
+    /// caller can keep driving it.
+    pub(crate) fn walk_to(map: &mut MapScreen, ctx: &mut GameContext<'_>, tx: u16, ty: u16) {
+        // Doors live on y=3 — that's the only row connecting rooms.
+        // Route there first, traverse horizontally, then settle on
+        // the target row. A break-on-no-progress guard prevents the
+        // helper from looping forever if a wall ever blocks the
+        // route.
+        let step = |map: &mut MapScreen, ctx: &mut GameContext<'_>, key: Input| -> bool {
+            let before = map.player();
+            map.handle_input(ctx, key);
+            map.player() != before
+        };
+        while map.player().1 != 3 {
+            let key = if map.player().1 < 3 {
+                Input::Down
+            } else {
+                Input::Up
+            };
+            if !step(map, ctx, key) {
+                break;
+            }
+        }
+        while map.player().0 != tx {
+            let key = if map.player().0 < tx {
+                Input::Right
+            } else {
+                Input::Left
+            };
+            if !step(map, ctx, key) {
+                break;
+            }
+        }
+        while map.player().1 != ty {
+            let key = if map.player().1 < ty {
+                Input::Down
+            } else {
+                Input::Up
+            };
+            if !step(map, ctx, key) {
+                break;
+            }
+        }
+    }
+
+    // ---- Spawn / movement ---------------------------------------------
+
+    #[test]
+    fn map_spawn_uses_config_coordinates() {
+        let cfg = fixture_config();
+        let map = fresh_map_screen();
+        // `assets/game.toml` carries (22, 4) — the lobby's mid-room
+        // floor cell. If this assertion fails the spawn config and
+        // the test fixture have drifted; update both together.
+        assert_eq!(map.player(), (cfg.game.start_x, cfg.game.start_y));
+        assert!(
+            map.map().is_walkable(map.player().0, map.player().1),
+            "spawn cell must be walkable"
+        );
+    }
+
+    #[test]
+    fn map_lobby_has_five_rooms_in_a_row() {
+        // Sanity-check the geometry the rest of the screen relies on.
+        // Five rooms means six wall columns dividing them, including
+        // the outer walls. Walking row 1 from left to right we expect
+        // exactly six `#` cells.
+        let map = fresh_map_screen();
+        let row = &map.map().cells[1];
+        let wall_cells = row
+            .iter()
+            .filter(|t| matches!(t.kind, foglet_game::TileKind::Wall))
+            .count();
+        assert_eq!(
+            wall_cells,
+            6,
+            "expected six wall columns (5 rooms + 2 outer walls — minus 1 since outer walls double as room edges)"
+        );
+    }
+
+    #[test]
+    fn map_arrow_keys_move_player() {
+        // Right then left should land on the original cell. The lobby
+        // layout guarantees both steps are walkable from the spawn.
+        let (mut map, cmd) = dispatch_map(Input::Right);
+        assert!(matches!(cmd, ScreenCommand::None));
+        assert_eq!(map.player(), (23, 4));
+
+        let cfg = fixture_config();
+        let fc = fixture_context();
+        let mut ctx = GameContext::new(&cfg, &fc, (80, 24));
+        map.handle_input(&mut ctx, Input::Left);
+        assert_eq!(map.player(), (22, 4));
+        map.handle_input(&mut ctx, Input::Up);
+        assert_eq!(map.player(), (22, 3));
+        map.handle_input(&mut ctx, Input::Down);
+        assert_eq!(map.player(), (22, 4));
+    }
+
+    #[test]
+    fn map_vi_keys_move_player() {
+        let cfg = fixture_config();
+        let fc = fixture_context();
+        let mut ctx = GameContext::new(&cfg, &fc, (80, 24));
+        let mut map = fresh_map_screen();
+        for key in [
+            Input::Char('h'),
+            Input::Char('j'),
+            Input::Char('k'),
+            Input::Char('l'),
+        ] {
+            map.handle_input(&mut ctx, key);
+        }
+        // Net displacement: -1 +1 -1 +1 in (x,y,y,x) → back to spawn
+        // because every step succeeds (lobby's mid-room is fully open).
+        assert_eq!(map.player(), (cfg.game.start_x, cfg.game.start_y));
+    }
+
+    #[test]
+    fn map_walls_block_movement() {
+        // Walk left repeatedly until we hit Room 1's left wall, then
+        // try one more step. The position must clamp at the column
+        // immediately right of the wall instead of advancing into it.
+        let cfg = fixture_config();
+        let fc = fixture_context();
+        let mut ctx = GameContext::new(&cfg, &fc, (80, 24));
+        let mut map = fresh_map_screen();
+        for _ in 0..50 {
+            map.handle_input(&mut ctx, Input::Left);
+        }
+        let (x, y) = map.player();
+        // Spawn row (y=4) has no doors — only `#` at the column-9, 18,
+        // 27, 36 walls — so leftward motion clamps at the lobby's
+        // first interior column (x=19, immediately right of the wall
+        // at x=18). The test exercises both bounds-clamping and
+        // walkability invariants in one shot.
+        assert_eq!(
+            (x, y),
+            (19, 4),
+            "spawn-row left walks must clamp at the lobby's west wall"
+        );
+        assert!(map.map().is_walkable(x, y));
+    }
+
+    #[test]
+    fn map_player_can_traverse_doors_into_each_room() {
+        // Walk far enough left to enter Room 1 (cross doors at x=18
+        // and x=9), assert the player is past both door columns.
+        let cfg = fixture_config();
+        let fc = fixture_context();
+        let mut ctx = GameContext::new(&cfg, &fc, (80, 24));
+        let mut map = fresh_map_screen();
+        // Step up into the door row so doors are aligned with the
+        // player's y. Spawn is (22, 4); doors are on y=3.
+        map.handle_input(&mut ctx, Input::Up);
+        assert_eq!(map.player(), (22, 3));
+        for _ in 0..15 {
+            map.handle_input(&mut ctx, Input::Left);
+        }
+        let (x, y) = map.player();
+        assert_eq!(y, 3, "player must stay on the door row");
+        assert!(
+            x < 9,
+            "expected to have entered Room 1 (left of the x=9 door); ended at x={x}"
+        );
+    }
+
+    #[test]
+    fn map_esc_pops_back_to_menu() {
+        let (_, cmd) = dispatch_map(Input::Esc);
+        assert!(matches!(cmd, ScreenCommand::Pop));
+    }
+
+    #[test]
+    fn map_quit_keys_quit() {
+        for key in [Input::Char('q'), Input::Char('Q'), Input::Ctrl('c')] {
+            let (_, cmd) = dispatch_map(key);
+            assert!(
+                matches!(cmd, ScreenCommand::Quit),
+                "{key:?} should quit the map screen"
+            );
+        }
+    }
+
+    #[test]
+    fn map_unwalkable_spawn_falls_back_to_floor() {
+        // Spawning on a wall is a config bug, not a panic. The
+        // constructor finds the nearest walkable cell instead of
+        // entering an invariant-violating state.
+        let map = MapScreen::new_lobby(0, 0); // outer corner wall
+        let (x, y) = map.player();
+        assert!(
+            map.map().is_walkable(x, y),
+            "expected spawn to be relocated to a floor cell, got ({x}, {y}) which is not walkable"
+        );
+    }
+
+    #[test]
+    fn map_renders_into_test_backend() {
+        // Paint into a TestBackend and confirm the player glyph and
+        // every room label show up in the buffer. The map block title
+        // is also asserted so a future regression that strips the
+        // border is caught here.
+        let cfg = fixture_config();
+        let fc = fixture_context();
+        let mut ctx = GameContext::new(&cfg, &fc, (80, 24));
+        let mut map = fresh_map_screen();
+        let mut term = Terminal::new(TestBackend::new(80, 24)).expect("test backend");
+        term.draw(|frame| map.render(&mut ctx, frame))
+            .expect("draw");
+        let buf = term.backend().buffer().clone();
+        let mut found = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                found.push_str(buf.cell((x, y)).expect("cell").symbol());
+            }
+            found.push('\n');
+        }
+        assert!(
+            found.contains(MapScreen::TITLE),
+            "map block title missing; buffer was:\n{found}"
+        );
+        assert!(
+            found.contains("@"),
+            "expected player glyph in rendered map; buffer was:\n{found}"
+        );
+        for (label, _) in MapScreen::ROOM_LABELS {
+            assert!(
+                found.contains(label),
+                "missing room label {label:?}; buffer was:\n{found}"
+            );
+        }
+        assert!(
+            found.contains("Move:"),
+            "expected hint line below map; buffer was:\n{found}"
+        );
+    }
+
+    #[test]
+    fn map_rendered_rows_stamp_player() {
+        // `rendered_rows` is the headless-renderable surface tests use
+        // when they don't need a `TestBackend`. Confirm the player
+        // glyph lands at the expected column on the spawn row.
+        let map = fresh_map_screen();
+        let rows = map.rendered_rows();
+        let (px, py) = map.player();
+        let stamped: Vec<char> = rows[py as usize].chars().collect();
+        assert_eq!(
+            stamped[px as usize],
+            MapScreen::PLAYER_GLYPH,
+            "expected `@` at player column; row was {:?}",
+            rows[py as usize]
+        );
+    }
+
+    // ---- NPCs ---------------------------------------------------------
+
+    #[test]
+    fn map_has_three_npcs_on_walkable_floors() {
+        // SPEC §13 says exactly three NPCs. Each must stand on a
+        // walkable floor cell — placing one on a wall would silently
+        // erase that wall in the renderer and confuse navigation.
+        let map = fresh_map_screen();
+        assert_eq!(MapScreen::NPCS.len(), 3, "expected exactly three NPCs");
+        for npc in MapScreen::NPCS.iter() {
+            assert!(
+                map.map().is_walkable(npc.x, npc.y),
+                "NPC {:?} stands on an unwalkable cell ({}, {})",
+                npc.name,
+                npc.x,
+                npc.y
+            );
+        }
+    }
+
+    #[test]
+    fn map_npc_glyphs_render_into_buffer() {
+        // Paint the lobby and confirm every NPC's glyph appears. Locks
+        // in the contract that the NPC overlay actually fires from
+        // `render`.
+        let cfg = fixture_config();
+        let fc = fixture_context();
+        let mut ctx = GameContext::new(&cfg, &fc, (80, 24));
+        let mut map = fresh_map_screen();
+        let mut term = Terminal::new(TestBackend::new(80, 24)).expect("test backend");
+        term.draw(|frame| map.render(&mut ctx, frame))
+            .expect("draw");
+        let buf = term.backend().buffer().clone();
+        let mut found = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                found.push_str(buf.cell((x, y)).expect("cell").symbol());
+            }
+            found.push('\n');
+        }
+        for npc in MapScreen::NPCS.iter() {
+            assert!(
+                found.contains(npc.glyph),
+                "missing NPC glyph {:?} for {:?}; buffer was:\n{}",
+                npc.glyph,
+                npc.name,
+                found
+            );
+        }
+    }
+
+    #[test]
+    fn map_npcs_block_player_movement() {
+        // Stepping into an NPC must be a no-op. Drive the player up
+        // to a cell adjacent to the Night Clerk and confirm the next
+        // Up does not enter the clerk's cell.
+        let cfg = fixture_config();
+        let fc = fixture_context();
+        let mut ctx = GameContext::new(&cfg, &fc, (80, 24));
+        let mut map = fresh_map_screen();
+        // Spawn (22, 4) → Up to (22, 3) → Right twice to (24, 3).
+        // Night Clerk sits on (24, 2).
+        map.handle_input(&mut ctx, Input::Up);
+        map.handle_input(&mut ctx, Input::Right);
+        map.handle_input(&mut ctx, Input::Right);
+        assert_eq!(map.player(), (24, 3));
+        // Up would step onto the clerk; movement must be rejected.
+        map.handle_input(&mut ctx, Input::Up);
+        assert_eq!(
+            map.player(),
+            (24, 3),
+            "player must not be able to walk onto an NPC's cell"
+        );
+    }
+
+    #[test]
+    fn map_enter_with_no_npc_nearby_is_inert() {
+        // From spawn the nearest NPC (Night Clerk at (24, 2)) is two
+        // cells diagonal away. Enter should not push a dialog.
+        let (_, cmd) = dispatch_map(Input::Enter);
+        assert!(
+            matches!(cmd, ScreenCommand::None),
+            "Enter with no nearby NPC must be inert, got {cmd:?}"
+        );
+    }
+
+    #[test]
+    fn map_enter_adjacent_to_npc_pushes_dialog() {
+        // Walk to the cell directly south of the Night Clerk and
+        // press Enter; the screen must push a DialogScreen.
+        let cfg = fixture_config();
+        let fc = fixture_context();
+        let mut ctx = GameContext::new(&cfg, &fc, (80, 24));
+        let mut map = fresh_map_screen();
+        map.handle_input(&mut ctx, Input::Up); // (22, 3)
+        map.handle_input(&mut ctx, Input::Right); // (23, 3)
+        map.handle_input(&mut ctx, Input::Right); // (24, 3)
+        let cmd = map.handle_input(&mut ctx, Input::Enter);
+        assert!(
+            matches!(cmd, ScreenCommand::Push(_)),
+            "Enter adjacent to Night Clerk must push a dialog, got {cmd:?}"
+        );
+    }
+
+    // ---- Items + i-key wiring -----------------------------------------
+
+    #[test]
+    fn map_has_five_items_in_distinct_rooms() {
+        // SPEC §13 calls for exactly five collectables. We further
+        // enforce one per room — the rooms are 8 cells wide, so
+        // bucketing items by `x / 9` gives 0,1,2,3,4 with no
+        // duplicates if the catalog is correctly distributed.
+        assert_eq!(MapScreen::ITEMS.len(), 5, "expected exactly five items");
+        let mut buckets: Vec<u16> = MapScreen::ITEMS.iter().map(|i| i.x / 9).collect();
+        buckets.sort();
+        assert_eq!(
+            buckets,
+            vec![0, 1, 2, 3, 4],
+            "expected one item per room (x/9 bucket)"
+        );
+    }
+
+    #[test]
+    fn map_items_sit_on_walkable_non_npc_cells() {
+        // Catalog invariant: every item is on a floor cell with no
+        // NPC standing on it. Drift (an item placed on a wall, or on
+        // top of the Night Clerk) silently breaks render and pickup.
+        let map = fresh_map_screen();
+        for item in MapScreen::ITEMS.iter() {
+            assert!(
+                map.map().is_walkable(item.x, item.y),
+                "item {:?} at ({}, {}) sits on an unwalkable cell",
+                item.name,
+                item.x,
+                item.y
+            );
+            assert!(
+                MapScreen::npc_at(item.x, item.y).is_none(),
+                "item {:?} at ({}, {}) overlaps an NPC",
+                item.name,
+                item.x,
+                item.y
+            );
+        }
+    }
+
+    #[test]
+    fn map_item_glyphs_render_into_buffer_until_collected() {
+        // Each catalog glyph appears on a fresh map; once an item is
+        // marked collected, its glyph drops from the next render.
+        let cfg = fixture_config();
+        let fc = fixture_context();
+        let mut ctx = GameContext::new(&cfg, &fc, (80, 24));
+        let mut map = fresh_map_screen();
+        let mut term = Terminal::new(TestBackend::new(80, 24)).expect("test backend");
+        term.draw(|frame| map.render(&mut ctx, frame))
+            .expect("draw");
+        let buf = term.backend().buffer().clone();
+        let mut found = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                found.push_str(buf.cell((x, y)).expect("cell").symbol());
+            }
+            found.push('\n');
+        }
+        for item in MapScreen::ITEMS.iter() {
+            assert!(
+                found.contains(item.glyph),
+                "missing item glyph {:?} for {:?}; buffer was:\n{}",
+                item.glyph,
+                item.name,
+                found
+            );
+        }
+        // Mark the matchbook collected and re-render; the `m` glyph
+        // should disappear from the painted map.
+        map.inventory().borrow_mut().insert("matchbook".to_string());
+        term.draw(|frame| map.render(&mut ctx, frame))
+            .expect("redraw");
+        let buf = term.backend().buffer().clone();
+        // Inspect the matchbook's exact cell rather than the whole
+        // buffer; the lowercase `m` could plausibly recur elsewhere
+        // (it doesn't today, but a future label change shouldn't
+        // weaken the assertion).
+        let item = MapScreen::ITEMS
+            .iter()
+            .find(|i| i.id == "matchbook")
+            .expect("matchbook in catalog");
+        let cell = buf.cell((item.x, item.y)).expect("cell").symbol();
+        assert_ne!(
+            cell, "m",
+            "collected item must not paint its glyph; cell was {cell:?}"
+        );
+    }
+
+    #[test]
+    fn map_walking_onto_item_collects_it() {
+        // Drive the player onto the brass-key cell (6, 5) (Room 1,
+        // since Task 13f swapped the key into Room 1 so it is
+        // collectable without first traversing the locked door) and
+        // confirm the inventory grows by exactly that ID.
+        let cfg = fixture_config();
+        let fc = fixture_context();
+        let mut ctx = GameContext::new(&cfg, &fc, (80, 24));
+        let mut map = fresh_map_screen();
+        walk_to(&mut map, &mut ctx, 6, 5);
+        assert_eq!(map.player(), (6, 5), "should land on brass-key cell");
+        assert!(
+            map.is_collected("brass_key"),
+            "stepping onto an item must add it to the inventory"
+        );
+    }
+
+    #[test]
+    fn map_i_key_pushes_inventory_screen() {
+        let (_, cmd) = dispatch_map(Input::Char('i'));
+        assert!(
+            matches!(cmd, ScreenCommand::Push(_)),
+            "`i` must push the inventory screen, got {cmd:?}"
+        );
+    }
+
+    // ---- Locked door --------------------------------------------------
+
+    #[test]
+    fn locked_door_key_id_matches_catalog() {
+        // Renaming the brass-key item or the locked-door key constant
+        // would silently un-lock the door — assert they stay in sync.
+        assert!(MapScreen::ITEMS
+            .iter()
+            .any(|i| i.id == MapScreen::LOCKED_DOOR_KEY_ID));
+    }
+
+    #[test]
+    fn locked_door_blocks_player_without_key() {
+        // Walk to (36, 3) — the cell directly south of nothing but
+        // the locked door's own column — and try to step into it.
+        // Without the brass key in the inventory the step must be
+        // rejected and the player must remain on (35, 3).
+        let cfg = fixture_config();
+        let fc = fixture_context();
+        let mut ctx = GameContext::new(&cfg, &fc, (80, 24));
+        let mut map = fresh_map_screen();
+        // Spawn (22, 4) → Up to door row, then walk east toward Room
+        // 4. The door at x=36 should stop the player at x=35.
+        map.handle_input(&mut ctx, Input::Up);
+        for _ in 0..30 {
+            map.handle_input(&mut ctx, Input::Right);
+        }
+        let (x, y) = map.player();
+        assert_eq!(
+            (x, y),
+            (35, 3),
+            "locked door must clamp the eastward walk at x=35 (one cell west of the lock)"
+        );
+        assert!(
+            !map.has_locked_door_key(),
+            "test precondition: key must not yet be in inventory"
+        );
+    }
+
+    #[test]
+    fn locked_door_passes_player_with_key() {
+        // Pick up the brass key from Room 1 first, then walk back
+        // east across the locked door. The player must end up east
+        // of x=36 (Room 4).
+        let cfg = fixture_config();
+        let fc = fixture_context();
+        let mut ctx = GameContext::new(&cfg, &fc, (80, 24));
+        let mut map = fresh_map_screen();
+        walk_to(&mut map, &mut ctx, 6, 5);
+        assert!(
+            map.has_locked_door_key(),
+            "expected brass key to be collected at (6, 5)"
+        );
+        // Now route to Room 4 via the door row.
+        walk_to(&mut map, &mut ctx, 39, 5);
+        assert_eq!(
+            map.player(),
+            (39, 5),
+            "player should reach the matchbook cell once the door is unlocked"
+        );
+        assert!(
+            map.is_collected("matchbook"),
+            "matchbook in Room 4 should be picked up after passing the unlocked door"
+        );
+    }
+
+    #[test]
+    fn locked_door_renders_with_locked_glyph_until_unlocked() {
+        // Paint the lobby with no items collected and confirm the
+        // locked-door glyph (`L`) appears at its cell. Then mark the
+        // brass key as collected and re-render; the cell must paint
+        // the open-door glyph (`+`) instead.
+        let cfg = fixture_config();
+        let fc = fixture_context();
+        let mut ctx = GameContext::new(&cfg, &fc, (80, 24));
+        let mut map = fresh_map_screen();
+        let mut term = Terminal::new(TestBackend::new(80, 24)).expect("test backend");
+        term.draw(|frame| map.render(&mut ctx, frame))
+            .expect("draw");
+        let buf = term.backend().buffer().clone();
+        let (lx, ly) = MapScreen::LOCKED_DOOR_POS;
+        // The map block adds a one-cell border, and `centred_rect`
+        // offsets the map inside the frame — `rendered_rows` keeps the
+        // contract simpler, so use it for a direct cell check.
+        let rows = map.rendered_rows();
+        let locked_cell = rows[ly as usize].chars().nth(lx as usize).unwrap();
+        assert_eq!(
+            locked_cell,
+            MapScreen::LOCKED_DOOR_GLYPH,
+            "locked door must paint as `L` while still locked"
+        );
+        // The styled render path (TestBackend) must also include `L`
+        // somewhere visible.
+        let mut found = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                found.push_str(buf.cell((x, y)).expect("cell").symbol());
+            }
+            found.push('\n');
+        }
+        assert!(
+            found.contains('L'),
+            "expected locked-door glyph in render; buffer was:\n{found}"
+        );
+
+        // Unlock and re-check.
+        map.inventory().borrow_mut().insert("brass_key".into());
+        let rows = map.rendered_rows();
+        let cell = rows[ly as usize].chars().nth(lx as usize).unwrap();
+        assert_eq!(
+            cell,
+            MapScreen::UNLOCKED_DOOR_GLYPH,
+            "unlocked door must paint as `+`"
+        );
+    }
+
+    // ---- Win condition ------------------------------------------------
+
+    #[test]
+    fn win_tile_sits_on_walkable_floor_inside_room_four() {
+        // The win cell must be reachable. We assert: walkable, no NPC
+        // overlap, no item overlap, and column inside Room 4 (x/9 == 4).
+        let map = fresh_map_screen();
+        let (wx, wy) = MapScreen::WIN_TILE_POS;
+        assert!(
+            map.map().is_walkable(wx, wy),
+            "win tile must be a walkable cell"
+        );
+        assert!(
+            MapScreen::npc_at(wx, wy).is_none(),
+            "win tile must not overlap an NPC"
+        );
+        assert!(
+            MapScreen::item_at(wx, wy).is_none(),
+            "win tile must not overlap a collectable item"
+        );
+        assert_eq!(wx / 9, 4, "win tile must live in Room 4 (x/9 bucket)");
+    }
+
+    #[test]
+    fn win_step_with_flag_pushes_win_screen() {
+        // Walk to a cell adjacent to the win tile (with the brass key
+        // in inventory so the door is open), set the rumor flag, then
+        // step onto the win tile. The handle_input call must emit a
+        // Push and `has_won` must latch.
+        let cfg = fixture_config();
+        let fc = fixture_context();
+        let mut ctx = GameContext::new(&cfg, &fc, (80, 24));
+        let mut map = fresh_map_screen();
+        // Pick up the brass key first so the locked door opens.
+        walk_to(&mut map, &mut ctx, 6, 5);
+        assert!(map.has_locked_door_key());
+        // Set the flag the dialog would set.
+        map.flags()
+            .borrow_mut()
+            .insert(MapScreen::WIN_FLAG.to_string());
+        // Walk to (42, 4) — the cell directly west of the win tile.
+        // Approaching from the west avoids crossing the win tile mid-
+        // route: `walk_to` traverses doors on y=3, then descends to
+        // (42, 4), so the player never steps on (43, 4) until the
+        // explicit final move below.
+        walk_to(&mut map, &mut ctx, 42, 4);
+        assert_eq!(map.player(), (42, 4), "should land west of the win tile");
+        assert!(!map.has_won(), "win latch must still be open");
+        // Final step onto (43, 4).
+        let cmd = map.handle_input(&mut ctx, Input::Right);
+        assert!(
+            matches!(cmd, ScreenCommand::Push(_)),
+            "step onto win tile with flag set must push WinScreen, got {cmd:?}"
+        );
+        assert!(map.has_won(), "win latch must close after firing");
+        assert_eq!(map.player(), MapScreen::WIN_TILE_POS);
+    }
+
+    #[test]
+    fn win_step_without_flag_is_inert() {
+        // Same path as above but with no flag set. The step must
+        // succeed (the cell is walkable) but emit None.
+        let cfg = fixture_config();
+        let fc = fixture_context();
+        let mut ctx = GameContext::new(&cfg, &fc, (80, 24));
+        let mut map = fresh_map_screen();
+        walk_to(&mut map, &mut ctx, 6, 5);
+        walk_to(&mut map, &mut ctx, 42, 4);
+        assert!(
+            !map.flags().borrow().contains(MapScreen::WIN_FLAG),
+            "test precondition: rumor flag must not be set"
+        );
+        let cmd = map.handle_input(&mut ctx, Input::Right);
+        assert!(
+            matches!(cmd, ScreenCommand::None),
+            "step onto win tile without flag must be inert, got {cmd:?}"
+        );
+        assert!(!map.has_won());
+        assert_eq!(map.player(), MapScreen::WIN_TILE_POS);
+    }
+
+    #[test]
+    fn win_latch_is_one_shot() {
+        // Once the latch fires, walking off and back onto the tile
+        // must not push WinScreen a second time. Without the latch a
+        // post-modal exit path could produce a stack of WinScreens.
+        let cfg = fixture_config();
+        let fc = fixture_context();
+        let mut ctx = GameContext::new(&cfg, &fc, (80, 24));
+        let mut map = fresh_map_screen();
+        walk_to(&mut map, &mut ctx, 6, 5);
+        map.flags()
+            .borrow_mut()
+            .insert(MapScreen::WIN_FLAG.to_string());
+        walk_to(&mut map, &mut ctx, 42, 4);
+        // Trigger the modal once.
+        let _ = map.handle_input(&mut ctx, Input::Right);
+        assert!(map.has_won());
+        // Step off (west back to (42, 4)) then back on (east to
+        // (43, 4)). The second step must NOT push another WinScreen.
+        let cmd_off = map.handle_input(&mut ctx, Input::Left);
+        assert!(matches!(cmd_off, ScreenCommand::None));
+        let cmd_back = map.handle_input(&mut ctx, Input::Right);
+        assert!(
+            matches!(cmd_back, ScreenCommand::None),
+            "win modal must not re-fire after the latch closes; got {cmd_back:?}"
+        );
+    }
+
+    #[test]
+    fn win_tile_renders_until_won() {
+        // The `*` glyph must paint into both the headless rendered_rows
+        // surface and the styled TestBackend buffer while `has_won` is
+        // false. After winning the cell falls back to a plain floor.
+        let cfg = fixture_config();
+        let fc = fixture_context();
+        let mut ctx = GameContext::new(&cfg, &fc, (80, 24));
+        let mut map = fresh_map_screen();
+        let (wx, wy) = MapScreen::WIN_TILE_POS;
+        let rows = map.rendered_rows();
+        let cell = rows[wy as usize].chars().nth(wx as usize).unwrap();
+        assert_eq!(
+            cell,
+            MapScreen::WIN_TILE_GLYPH,
+            "win tile must paint as `*` while the case is open"
+        );
+        let mut term = Terminal::new(TestBackend::new(80, 24)).expect("test backend");
+        term.draw(|frame| map.render(&mut ctx, frame))
+            .expect("draw");
+        let buf = term.backend().buffer().clone();
+        let mut found = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                found.push_str(buf.cell((x, y)).expect("cell").symbol());
+            }
+            found.push('\n');
+        }
+        assert!(
+            found.contains('*'),
+            "expected win-tile glyph in styled render; buffer was:\n{found}"
+        );
+
+        // Latch the win and re-render — the `*` must be gone from the
+        // win tile (we check that exact cell to avoid false positives
+        // from any future glyph reuse).
+        map.slots().player.borrow_mut().won = true;
+        let rows = map.rendered_rows();
+        let cell = rows[wy as usize].chars().nth(wx as usize).unwrap();
+        assert_ne!(
+            cell,
+            MapScreen::WIN_TILE_GLYPH,
+            "post-win render must drop the `*` from the win tile"
+        );
+    }
+
+    // ---- Loaded-save / save-bridge surface ----------------------------
+
+    #[test]
+    fn map_screen_with_shared_honours_loaded_player_position() {
+        // `with_shared` must honour the player position the slots
+        // already carry (the loaded-save case) instead of resetting to
+        // the configured spawn. Without this, "Continue" would teleport
+        // the player back to the lobby door every launch.
+        let slots = SharedSlots::default();
+        {
+            let mut p = slots.player.borrow_mut();
+            p.x = 39;
+            p.y = 5;
+            p.won = false;
+        }
+        let map = MapScreen::with_shared(22, 4, slots);
+        assert_eq!(map.player(), (39, 5));
+    }
+
+    // ---- Drawer / clerk geometry the proof scenes hang off of ---------
+
+    #[test]
+    fn drawer_position_is_a_lobby_floor_cell_next_to_the_clerk() {
+        // The prompt's "behind the desk" framing is meaningful only if
+        // the drawer actually sits beside the Night Clerk. Pin both:
+        // the cell is walkable in the underlying map (so the renderer
+        // does not silently erase a wall) and the clerk is one step
+        // away, matching SPEC §9 step 1's narrative geometry.
+        let map = fresh_map_screen();
+        let (dx, dy) = MapScreen::LOST_AND_FOUND_POS;
+        assert!(
+            map.map().is_walkable(dx, dy),
+            "drawer cell ({dx}, {dy}) must be a walkable floor in the lobby ASCII"
+        );
+        let clerk = MapScreen::NPCS
+            .iter()
+            .find(|n| n.name == "Night Clerk")
+            .expect("Night Clerk must exist on the lobby roster");
+        let manhattan = (clerk.x as i32 - dx as i32).abs() + (clerk.y as i32 - dy as i32).abs();
+        assert_eq!(
+            manhattan, 1,
+            "drawer must be one orthogonal step from the clerk"
+        );
+    }
+
+    #[test]
+    fn drawer_glyph_appears_in_rendered_rows() {
+        // The headless render surface is what BBS clients ultimately see.
+        // Stamping `D` proves the affordance is visible in normal play
+        // — not just reachable through a hidden hotkey.
+        let map = fresh_map_screen();
+        let rows = map.rendered_rows();
+        let (dx, dy) = MapScreen::LOST_AND_FOUND_POS;
+        let stamped: Vec<char> = rows[dy as usize].chars().collect();
+        assert_eq!(
+            stamped[dx as usize],
+            MapScreen::LOST_AND_FOUND_GLYPH,
+            "expected `D` at drawer column; row was {:?}",
+            rows[dy as usize]
+        );
+    }
+
+    #[test]
+    fn drawer_cell_blocks_player_movement() {
+        // The drawer is furniture — the player must stand *beside* it,
+        // not on it. Otherwise the SPEC §9 prompt's framing breaks down
+        // and a wandering player could end up perched on the desk.
+        // Approach from below: spawn (22, 4) → step right three times
+        // to (25, 4) → step up to (25, 3), the floor cell directly
+        // below the drawer at (25, 2).
+        let mut map = fresh_map_screen();
+        let cfg = fixture_config();
+        let fc = fixture_context();
+        let mut ctx = GameContext::new(&cfg, &fc, (80, 24));
+        for _ in 0..3 {
+            map.handle_input(&mut ctx, Input::Right);
+        }
+        map.handle_input(&mut ctx, Input::Up);
+        assert_eq!(
+            map.player(),
+            (25, 3),
+            "expected approach-from-below path to land at (25, 3)"
+        );
+        assert!(
+            map.nearby_lost_and_found(),
+            "(25, 3) is the orthogonal neighbour directly below the drawer"
+        );
+
+        // Stepping up would land on the drawer cell — must be rejected.
+        let cmd = map.handle_input(&mut ctx, Input::Up);
+        assert!(matches!(cmd, ScreenCommand::None));
+        assert_eq!(
+            map.player(),
+            (25, 3),
+            "drawer cell must reject the player's step"
+        );
+    }
+
+    #[test]
+    fn search_key_is_inert_when_not_adjacent_to_drawer() {
+        // From the spawn (22, 4) the drawer is well out of reach.
+        // Pressing `x` must be a no-op — silent, like bumping a wall —
+        // so the affordance does not leak into rooms where the prompt
+        // would be narratively wrong.
+        let (mut map, cmd) = dispatch_map(Input::Char('x'));
+        assert!(
+            matches!(cmd, ScreenCommand::None),
+            "search key without nearby drawer must produce no command"
+        );
+        // And again with uppercase so a Caps-Lock player isn't punished
+        // by triggering the prompt from anywhere on the map.
+        let cfg = fixture_config();
+        let fc = fixture_context();
+        let mut ctx = GameContext::new(&cfg, &fc, (80, 24));
+        let cmd = map.handle_input(&mut ctx, Input::Char('X'));
+        assert!(matches!(cmd, ScreenCommand::None));
+    }
+
+    #[test]
+    fn search_key_pushes_prompt_when_adjacent_to_drawer() {
+        // Approach the drawer from the right (the only adjacency that
+        // does not cross the Night Clerk's blocking cell) and verify
+        // both `x` and `X` open the prompt.
+        for key in [Input::Char('x'), Input::Char('X')] {
+            let mut map = fresh_map_screen();
+            let cfg = fixture_config();
+            let fc = fixture_context();
+            let mut ctx = GameContext::new(&cfg, &fc, (80, 24));
+            // Spawn (22, 4) → right thrice → up once = (25, 3),
+            // the cell directly below the drawer at (25, 2).
+            for _ in 0..3 {
+                map.handle_input(&mut ctx, Input::Right);
+            }
+            map.handle_input(&mut ctx, Input::Up);
+            assert_eq!(map.player(), (25, 3));
+            assert!(map.nearby_lost_and_found());
+            let cmd = map.handle_input(&mut ctx, key);
+            assert!(
+                matches!(cmd, ScreenCommand::Push(_)),
+                "{key:?} adjacent to drawer must push the prompt screen"
+            );
+        }
+    }
+
+    #[test]
+    fn map_hint_advertises_search_affordance() {
+        // The hint line is the only place a player learns the search
+        // affordance exists. If a future copy edit drops "Search: X" the
+        // drawer becomes unreachable except by accident.
+        assert!(
+            MapScreen::HINT_LINE.contains("Search: X"),
+            "hint line must advertise the search key; got {:?}",
+            MapScreen::HINT_LINE
+        );
+    }
+
+    #[test]
+    fn map_hint_advertises_buy_affordance() {
+        // Same rationale as the Search hint test: `b`/`B` is the only
+        // route to the SPEC §9 step 4 vendor prompt from gameplay.
+        // Drop the cue and the proof scene becomes invisible.
+        assert!(
+            MapScreen::HINT_LINE.contains("Buy: B"),
+            "hint line must advertise the buy key; got {:?}",
+            MapScreen::HINT_LINE
+        );
+    }
+
+    #[test]
+    fn nearby_clerk_only_true_when_adjacent_to_clerk() {
+        // The vendor affordance is gated by `nearby_clerk` rather than
+        // `nearby_npc` so an adjacent Bellhop/Maid never accidentally
+        // routes a `b` press into a vendor flow they do not own. Pin
+        // the contract: spawn returns false (no NPC at the four
+        // cardinals), one step right of the clerk returns true.
+        let map = fresh_map_screen();
+        assert!(
+            !map.nearby_clerk(),
+            "spawn must not be adjacent to the Night Clerk"
+        );
+
+        // Walk to (24, 3) — the cell directly south of the Night Clerk
+        // at (24, 2). Spawn is (22, 4); right twice + up once lands on
+        // it without crossing the clerk's blocking cell or the drawer
+        // at (25, 2).
+        let mut map = fresh_map_screen();
+        let cfg = fixture_config();
+        let fc = fixture_context();
+        let mut ctx = GameContext::new(&cfg, &fc, (80, 24));
+        for _ in 0..2 {
+            map.handle_input(&mut ctx, Input::Right);
+        }
+        map.handle_input(&mut ctx, Input::Up);
+        assert_eq!(map.player(), (24, 3));
+        assert!(
+            map.nearby_clerk(),
+            "cell south of clerk at (24, 3) must satisfy nearby_clerk"
+        );
+    }
+
+    #[test]
+    fn buy_key_pushes_vendor_prompt_when_adjacent_to_clerk() {
+        // `b` and `B` must both push the vendor screen — SPEC §9 step 7
+        // requires case-folded hotkeys, and the integration must mirror
+        // it. `B` is also the Bellhop's glyph; that is *not* a hotkey
+        // collision because input mapping happens at the screen level
+        // before any glyph lookup.
+        for key in [Input::Char('b'), Input::Char('B')] {
+            let mut map = fresh_map_screen();
+            let cfg = fixture_config();
+            let fc = fixture_context();
+            let mut ctx = GameContext::new(&cfg, &fc, (80, 24));
+            for _ in 0..2 {
+                map.handle_input(&mut ctx, Input::Right);
+            }
+            map.handle_input(&mut ctx, Input::Up);
+            assert_eq!(map.player(), (24, 3));
+            assert!(map.nearby_clerk());
+            let cmd = map.handle_input(&mut ctx, key);
+            assert!(
+                matches!(cmd, ScreenCommand::Push(_)),
+                "{key:?} adjacent to Night Clerk must push the vendor screen"
+            );
+        }
+    }
+
+    #[test]
+    fn buy_key_inert_when_not_adjacent_to_clerk() {
+        // From spawn the player is two rows below the clerk (no
+        // cardinal neighbour). Pressing `b` here must be silent — the
+        // SPEC §4.1 inert-key contract — so a player who taps the
+        // wrong key cannot open a vendor prompt mid-corridor.
+        let mut map = fresh_map_screen();
+        let cfg = fixture_config();
+        let fc = fixture_context();
+        let mut ctx = GameContext::new(&cfg, &fc, (80, 24));
+        assert!(!map.nearby_clerk());
+        let cmd = map.handle_input(&mut ctx, Input::Char('b'));
+        assert!(
+            matches!(cmd, ScreenCommand::None),
+            "buy key must be inert away from the clerk"
+        );
+    }
+}
