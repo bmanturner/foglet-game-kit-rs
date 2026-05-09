@@ -105,7 +105,7 @@ One unchecked item per iteration. Dependencies in `[brackets]` must be checked o
 ### Task 14 — Documentation
 
 - [x] **14a** — Add `docs/shared-world.md` explaining SQLite file locations, migration policy, backups, and lock recovery. [Task 11]
-- [ ] **14b** — Add Murder Motel v2 walkthrough to README: two local users demonstrate shared world. [Task 13]
+- [x] **14b** — Add Murder Motel v2 walkthrough to README: two local users demonstrate shared world. [Task 13]
 - [ ] **14c** — Document why v2 intentionally avoids real-time multiplayer. [14a]
 
 - [ ] **Task 15 — Final v2 verification**
