@@ -406,6 +406,77 @@ impl DialogState {
     }
 }
 
+/// Maximum number of dialog choices [`dialog_choice_prompt`] can render
+/// with its built-in 1..=9 numeric hotkeys.
+///
+/// Exposed as a `const` so callers that hand-author very wide branching
+/// nodes can detect the truncation case and fall back to a custom prompt
+/// builder rather than silently dropping choices. SPEC §4.1 explicitly
+/// calls out numeric hotkeys as a supported style ("number keys when
+/// games choose numeric hotkeys"), and 1..=9 is the natural ceiling
+/// before two-digit keys would break direct-input semantics.
+pub const DIALOG_PROMPT_MAX_CHOICES: usize = 9;
+
+/// Render the currently-available dialog choices as a [`crate::prompt::ChoicePrompt`]
+/// (SPEC §8 dialog/prompt integration; Task 8a).
+///
+/// The returned prompt's `T = usize` parameter carries the index into
+/// the slice [`DialogState::available_choices`] returns *for the same
+/// `flags` snapshot*. A direct-key press resolves to
+/// [`crate::prompt::PromptAction::Selected`]`(index)`, and Task 8b's input helper feeds
+/// that index straight into [`DialogState::choose`].
+///
+/// # Hotkey assignment
+///
+/// Choices are bound to digits `'1'..='9'` in the order
+/// [`DialogState::available_choices`] returns them. The kit assigns
+/// hotkeys here (rather than reading them off [`Choice`]) because the
+/// dialog YAML schema deliberately keeps choices to the `text`/`goto`
+/// pair — adding a per-choice key would invite collisions across nodes
+/// and force every dialog author to think about input. Numeric digits
+/// give a stable, predictable mapping that matches the
+/// `1)` / `2)` listing the renderer uses for the body.
+///
+/// # Truncation
+///
+/// At most [`DIALOG_PROMPT_MAX_CHOICES`] (9) choices are emitted. A
+/// dialog node with more than nine flag-passing branches is unusual
+/// enough that callers should design a different UI (sub-menus, search)
+/// rather than rely on multi-character numeric hotkeys, which would
+/// break the direct-input contract. Use [`DialogState::available_choices`]
+/// directly when you need to detect the over-9 case.
+///
+/// # Body lines
+///
+/// The current line (if any) is **not** copied into the prompt body —
+/// dialog screens typically render the script lines themselves with
+/// their own pacing, then surface the prompt only once the cursor has
+/// walked past the last line. Callers who want the prompt to be
+/// self-contained can chain `.body(...)` calls onto the returned
+/// builder; the helper deliberately returns a builder, not a finished
+/// modal, so that composition stays open.
+pub fn dialog_choice_prompt(
+    state: &DialogState,
+    dialog: &Dialog,
+    flags: &FlagSet,
+) -> crate::prompt::ChoicePrompt<usize> {
+    let mut prompt = crate::prompt::ChoicePrompt::new();
+    for (idx, choice) in state
+        .available_choices(dialog, flags)
+        .into_iter()
+        .enumerate()
+        .take(DIALOG_PROMPT_MAX_CHOICES)
+    {
+        // `idx + 1` so the displayed hotkey matches the human-friendly
+        // 1-based numbering players expect ("press 1 for the first
+        // option"). `from_digit` cannot fail for `1..=9`.
+        let digit = char::from_digit((idx as u32) + 1, 10)
+            .expect("idx + 1 is in 1..=9 by the take(9) bound above");
+        prompt = prompt.choice(digit, idx, choice.text.clone());
+    }
+    prompt
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -630,5 +701,99 @@ nodes:
         state.advance(&dialog, &mut flags).unwrap();
         assert_eq!(state.current_node(), "fallback");
         assert!(state.is_finished());
+    }
+
+    // ----- Task 8a: dialog → ChoicePrompt helper -----
+
+    use crate::prompt::PromptKey;
+
+    fn walk_to_choices(dialog: &Dialog, flags: &mut FlagSet) -> DialogState {
+        let mut state = DialogState::start(dialog, flags);
+        // sample_yaml() puts two lines on `greeting` before its choices
+        // become visible; pump past them.
+        while state.current_line(dialog).is_some() {
+            state.advance(dialog, flags).unwrap();
+        }
+        state
+    }
+
+    #[test]
+    fn dialog_choice_prompt_assigns_numeric_hotkeys_in_order() {
+        let dialog = load_dialog(sample_yaml()).unwrap();
+        let mut flags = FlagSet::new();
+        let state = walk_to_choices(&dialog, &mut flags);
+
+        let prompt = dialog_choice_prompt(&state, &dialog, &flags);
+
+        // sample_yaml's `greeting` exposes two ungated choices when
+        // `heard_rumor` is absent: "I need a room" and "Just looking".
+        assert_eq!(prompt.choices.len(), 2);
+        assert_eq!(prompt.choices[0].key, PromptKey::char('1'));
+        assert_eq!(prompt.choices[0].label, "I need a room");
+        assert_eq!(prompt.choices[0].value, 0);
+        assert_eq!(prompt.choices[1].key, PromptKey::char('2'));
+        assert_eq!(prompt.choices[1].label, "Just looking");
+        assert_eq!(prompt.choices[1].value, 1);
+    }
+
+    #[test]
+    fn dialog_choice_prompt_includes_gated_choices_only_when_flag_present() {
+        let dialog = load_dialog(sample_yaml()).unwrap();
+        let mut flags = FlagSet::new();
+        flags.insert("heard_rumor".to_string());
+        let state = walk_to_choices(&dialog, &mut flags);
+
+        let prompt = dialog_choice_prompt(&state, &dialog, &flags);
+
+        // With the rumor flag set, all three branches are available and
+        // ordered by their position in the YAML node.
+        assert_eq!(prompt.choices.len(), 3);
+        assert_eq!(prompt.choices[1].label, "Tell me about the murder");
+        assert_eq!(prompt.choices[1].value, 1);
+        // Indices stay aligned with `available_choices` so 8b's input
+        // helper can route the selection straight into `choose`.
+        let available = state.available_choices(&dialog, &flags);
+        for (i, choice) in prompt.choices.iter().enumerate() {
+            assert_eq!(choice.label, available[i].text);
+            assert_eq!(choice.value, i);
+        }
+    }
+
+    #[test]
+    fn dialog_choice_prompt_is_empty_while_lines_remain() {
+        let dialog = load_dialog(sample_yaml()).unwrap();
+        let mut flags = FlagSet::new();
+        let state = DialogState::start(&dialog, &mut flags);
+        // Cursor still sits on the first line — choices must not leak.
+        assert!(state.current_line(&dialog).is_some());
+
+        let prompt = dialog_choice_prompt(&state, &dialog, &flags);
+        assert!(prompt.choices.is_empty());
+    }
+
+    #[test]
+    fn dialog_choice_prompt_truncates_at_nine_choices() {
+        // Build a node with twelve always-available branches.
+        let mut yaml = String::from("start: hub\nnodes:\n  hub:\n    choices:\n");
+        for i in 0..12 {
+            yaml.push_str(&format!("      - text: \"opt{i}\"\n        goto: end\n"));
+        }
+        yaml.push_str("  end: {}\n");
+        let dialog = load_dialog(&yaml).unwrap();
+        let mut flags = FlagSet::new();
+        let state = DialogState::start(&dialog, &mut flags);
+
+        let prompt = dialog_choice_prompt(&state, &dialog, &flags);
+
+        assert_eq!(prompt.choices.len(), DIALOG_PROMPT_MAX_CHOICES);
+        // Last emitted hotkey is '9'; nothing rolled into '0' or
+        // multi-character territory.
+        assert_eq!(prompt.choices.last().unwrap().key, PromptKey::char('9'));
+        // Hotkeys are unique — the prompt would refuse to validate
+        // otherwise, and downstream renderers rely on uniqueness.
+        let mut seen = std::collections::HashSet::new();
+        for c in &prompt.choices {
+            assert!(seen.insert(c.key), "duplicate key {:?}", c.key);
+        }
     }
 }
