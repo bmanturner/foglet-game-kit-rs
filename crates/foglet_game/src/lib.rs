@@ -103,8 +103,8 @@ pub use turns::{
     DateProvider, FixedDateProvider, LocalDate, TurnError, TurnLedgerRow, TURN_LEDGER_MIGRATION,
 };
 pub use widgets::{
-    render_inventory_list, render_menu_list, render_message_line, InventoryList, MenuList,
-    MessageKind, MessageLine,
+    centred_rect, render_hint_line, render_inventory_list, render_menu_list, render_message_line,
+    render_modal, InventoryList, MenuList, MessageKind, MessageLine,
 };
 pub use world_db::{WorldDb, WorldDbError, WorldDbOptions, WorldMigration};
 
