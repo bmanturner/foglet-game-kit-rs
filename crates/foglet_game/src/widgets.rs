@@ -40,11 +40,49 @@
 //! truncation works) without locking in incidental whitespace.
 
 use ratatui::buffer::Buffer;
-use ratatui::layout::Rect;
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Widget};
 use ratatui::Frame;
+
+/// Centre a `width × height` rectangle inside `outer`, clamping the
+/// inner size if `outer` is smaller than the requested dimensions.
+///
+/// Pulled into the kit from `examples/murder_motel/src/layout.rs` so
+/// every game's modal lays out the same way without each example
+/// re-implementing the constraint-split dance. SPEC §7.1 already
+/// guarantees an 80×24 floor, so the clamping path only matters for
+/// unit tests that hand in tiny `TestBackend` frames — but it MUST
+/// stay correct there because the v2.1 modal helpers and the
+/// `DialogScreen` snapshot tests depend on it.
+///
+/// The implementation is byte-equivalent to the original example
+/// helper: same `Constraint::Length` / `Min(0)` ordering, same
+/// `saturating_sub` math, so swapping example callers from
+/// `crate::layout::centred_rect` to `foglet_game::centred_rect`
+/// cannot shift any pixel.
+pub fn centred_rect(width: u16, height: u16, outer: Rect) -> Rect {
+    let w = width.min(outer.width);
+    let h = height.min(outer.height);
+    let h_layout = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Length((outer.width.saturating_sub(w)) / 2),
+            Constraint::Length(w),
+            Constraint::Min(0),
+        ])
+        .split(outer);
+    let v_layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length((outer.height.saturating_sub(h)) / 2),
+            Constraint::Length(h),
+            Constraint::Min(0),
+        ])
+        .split(h_layout[1]);
+    v_layout[1]
+}
 
 /// Marker drawn next to the selected row in a [`MenuList`] or
 /// [`InventoryList`]. Two characters wide so the "selected" row stays
@@ -500,6 +538,142 @@ mod tests {
         let row = row_text(&buf, 0);
         assert_eq!(row.len(), 8, "expected exactly 8 chars, got {row:?}");
         assert!(row.starts_with("this mes"));
+    }
+
+    // ---- centred_rect -----------------------------------------------
+
+    #[test]
+    fn centred_rect_centres_inside_larger_outer() {
+        let outer = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 24,
+        };
+        let inner = centred_rect(40, 10, outer);
+        assert_eq!(inner.width, 40);
+        assert_eq!(inner.height, 10);
+        // (80 - 40) / 2 = 20, (24 - 10) / 2 = 7.
+        assert_eq!(inner.x, 20);
+        assert_eq!(inner.y, 7);
+    }
+
+    #[test]
+    fn centred_rect_clamps_when_outer_is_smaller() {
+        let outer = Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 4,
+        };
+        // Requested width / height exceed `outer`; expect clamped to outer.
+        let inner = centred_rect(40, 10, outer);
+        assert_eq!(inner.width, 10);
+        assert_eq!(inner.height, 4);
+        assert_eq!(inner.x, 0);
+        assert_eq!(inner.y, 0);
+    }
+
+    #[test]
+    fn centred_rect_respects_outer_offset() {
+        // Outer rect not anchored at (0,0): the centred inner rect
+        // must be expressed in the same coordinate space.
+        let outer = Rect {
+            x: 5,
+            y: 3,
+            width: 20,
+            height: 10,
+        };
+        let inner = centred_rect(10, 4, outer);
+        assert_eq!(inner.width, 10);
+        assert_eq!(inner.height, 4);
+        // (20 - 10) / 2 = 5 → x = 5 + 5 = 10.
+        // (10 - 4) / 2 = 3 → y = 3 + 3 = 6.
+        assert_eq!(inner.x, 10);
+        assert_eq!(inner.y, 6);
+    }
+
+    #[test]
+    fn centred_rect_matches_legacy_example_helper() {
+        // Byte-equivalence guard: this mirrors the original
+        // `examples/murder_motel/src/layout.rs::centred_rect`. If the
+        // implementation here ever drifts, a v2.1 refactor commit
+        // could shift example pixels — which the tenets forbid.
+        fn legacy(width: u16, height: u16, outer: Rect) -> Rect {
+            let w = width.min(outer.width);
+            let h = height.min(outer.height);
+            let h_layout = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([
+                    Constraint::Length((outer.width.saturating_sub(w)) / 2),
+                    Constraint::Length(w),
+                    Constraint::Min(0),
+                ])
+                .split(outer);
+            let v_layout = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length((outer.height.saturating_sub(h)) / 2),
+                    Constraint::Length(h),
+                    Constraint::Min(0),
+                ])
+                .split(h_layout[1]);
+            v_layout[1]
+        }
+        for (w, h, outer) in [
+            (
+                40u16,
+                10u16,
+                Rect {
+                    x: 0,
+                    y: 0,
+                    width: 80,
+                    height: 24,
+                },
+            ),
+            (
+                40,
+                10,
+                Rect {
+                    x: 0,
+                    y: 0,
+                    width: 10,
+                    height: 4,
+                },
+            ),
+            (
+                10,
+                4,
+                Rect {
+                    x: 5,
+                    y: 3,
+                    width: 20,
+                    height: 10,
+                },
+            ),
+            (
+                1,
+                1,
+                Rect {
+                    x: 0,
+                    y: 0,
+                    width: 1,
+                    height: 1,
+                },
+            ),
+            (
+                5,
+                5,
+                Rect {
+                    x: 0,
+                    y: 0,
+                    width: 5,
+                    height: 5,
+                },
+            ),
+        ] {
+            assert_eq!(centred_rect(w, h, outer), legacy(w, h, outer));
+        }
     }
 
     #[test]
