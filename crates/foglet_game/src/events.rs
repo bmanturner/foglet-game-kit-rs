@@ -4,10 +4,12 @@
 //! layer behavior on top of the schema introduced here:
 //!
 //! - 7b added `WorldDb::append_event` for inserting one row.
-//! - 7c (this iteration) adds `WorldDb::recent_events(limit)` for the
-//!   lobby bulletin (SPEC §3.1 / §13).
-//! - 7d will add `WorldDb::player_events(player_id, limit)` for
-//!   per-player history.
+//! - 7c added `WorldDb::recent_events(limit)` for the lobby bulletin
+//!   (SPEC §3.1 / §13).
+//! - 7d (this iteration) adds `WorldDb::player_events(player_id, limit)`
+//!   for per-player history. Mirrors 7c's contract but constrains the
+//!   result to one player via the `idx_world_events_player_recent`
+//!   partial index.
 //! - 7e will add the message validation guard (empty / overlong
 //!   rejection).
 //!
@@ -303,6 +305,68 @@ LIMIT ?1";
             .map_err(|source| EventError::Sqlite { source })?;
         let rows = stmt
             .query_map(rusqlite::params![i64::from(limit)], row_to_event_record)
+            .map_err(|source| EventError::Sqlite { source })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|source| EventError::Sqlite { source })
+    }
+
+    /// Return the `limit` most recent events attributed to one player,
+    /// newest first (SPEC_v2 §4.7 / §Task 7d).
+    ///
+    /// Powers per-player history surfaces — Murder Motel will use this
+    /// to render "your last N actions" alongside the global lobby
+    /// bulletin (Task 13d). The ordering contract matches
+    /// [`Self::recent_events`]: `ORDER BY created_at DESC, id DESC` so
+    /// two events appended in the same SQLite-second sort
+    /// deterministically by their autoincrement id.
+    ///
+    /// "System" events with `NULL` `player_id` are deliberately
+    /// excluded: they aren't attributable to anyone, so a player's
+    /// per-player view should never surface them. The
+    /// `idx_world_events_player_recent` partial index covers exactly
+    /// this case (`WHERE player_id IS NOT NULL`), so even on a long-
+    /// running door this query stays seek-bound.
+    ///
+    /// # Parameters
+    ///
+    /// `player_id` is the canonical id from [`crate::players::PlayerRecord`]
+    /// — the same id `append_event` stores. Passing an unknown id is
+    /// not an error: it simply returns an empty vec, which is the
+    /// correct UI behavior for "this player has no events yet".
+    ///
+    /// `limit` mirrors [`Self::recent_events`]: `u32`, `0` is legal and
+    /// returns an empty vec.
+    ///
+    /// # Concurrency
+    ///
+    /// Takes `&self`: a single statement under the configured busy
+    /// timeout, same as [`Self::append_event`] and [`Self::recent_events`].
+    pub fn player_events(
+        &self,
+        player_id: i64,
+        limit: u32,
+    ) -> Result<Vec<EventRecord>, EventError> {
+        // Querying `WHERE player_id = ?` filters out the `NULL`
+        // system-event rows automatically (SQL `=` with `NULL` is
+        // `UNKNOWN`, which the `WHERE` treats as false). That matches
+        // the partial-index predicate exactly so the planner can use
+        // `idx_world_events_player_recent` without a residual filter.
+        const SQL: &str = "\
+SELECT id, created_at, kind, player_id, message, metadata \
+FROM world_events \
+WHERE player_id = ?1 \
+ORDER BY created_at DESC, id DESC \
+LIMIT ?2";
+
+        let mut stmt = self
+            .connection()
+            .prepare(SQL)
+            .map_err(|source| EventError::Sqlite { source })?;
+        let rows = stmt
+            .query_map(
+                rusqlite::params![player_id, i64::from(limit)],
+                row_to_event_record,
+            )
             .map_err(|source| EventError::Sqlite { source })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(|source| EventError::Sqlite { source })
@@ -698,5 +762,82 @@ mod tests {
             vec!["fourth", "third"],
             "limit takes the newest N"
         );
+    }
+
+    /// SPEC_v2 §Task 7d acceptance: `player_events` filters by
+    /// `player_id`, returns newest-first with the same id-tiebreak as
+    /// `recent_events`, excludes `NULL`-player system events, and
+    /// returns an empty vec for an unknown id.
+    ///
+    /// Seeds rows with explicit `created_at` so tie-ordering is
+    /// deterministic — the public `append_event` path uses
+    /// `CURRENT_TIMESTAMP` and the test would otherwise depend on
+    /// wall-clock granularity to produce a same-second tie.
+    #[test]
+    fn player_events_filters_to_player_with_id_tiebreak() {
+        let dir = tempdir().expect("tempdir creates");
+        let world = open_world_with_events(&dir);
+
+        let alice = world
+            .upsert_player(&ctx_with(Some("u-alice"), Some("alice")))
+            .expect("alice upsert");
+        let bob = world
+            .upsert_player(&ctx_with(Some("u-bob"), Some("bob")))
+            .expect("bob upsert");
+
+        // Mix of alice events, a bob event, and a system (NULL) event.
+        // Two of alice's rows share `created_at` so we can prove the
+        // id-tiebreak on the per-player path matches `recent_events`.
+        world
+            .connection()
+            .execute_batch(&format!(
+                "INSERT INTO world_events (created_at, kind, player_id, message) VALUES \
+                 ('2026-05-08 09:00:00', 'a1', {alice}, 'a1');\n\
+                 INSERT INTO world_events (created_at, kind, player_id, message) VALUES \
+                 ('2026-05-08 09:00:01', 'b1', {bob}, 'b1');\n\
+                 INSERT INTO world_events (created_at, kind, player_id, message) VALUES \
+                 ('2026-05-08 09:00:02', 'a2', {alice}, 'a2');\n\
+                 INSERT INTO world_events (created_at, kind, player_id, message) VALUES \
+                 ('2026-05-08 09:00:02', 'a3', {alice}, 'a3');\n\
+                 INSERT INTO world_events (created_at, kind, message) VALUES \
+                 ('2026-05-08 09:00:03', 'sys', 'midnight reset');",
+                alice = alice.id,
+                bob = bob.id,
+            ))
+            .expect("seed events");
+
+        let alice_events = world
+            .player_events(alice.id, 10)
+            .expect("player_events runs");
+        let kinds: Vec<&str> = alice_events.iter().map(|e| e.kind.as_str()).collect();
+        assert_eq!(
+            kinds,
+            vec!["a3", "a2", "a1"],
+            "alice's events newest-first; same-second pair sorts by id desc"
+        );
+        // Every returned row is attributed to alice — proves the WHERE
+        // clause is filtering and the system event was excluded.
+        assert!(
+            alice_events.iter().all(|e| e.player_id == Some(alice.id)),
+            "all rows must be alice's"
+        );
+
+        // Bob sees only his single row — not alice's, not the system
+        // event.
+        let bob_events = world.player_events(bob.id, 10).expect("bob query runs");
+        let bob_kinds: Vec<&str> = bob_events.iter().map(|e| e.kind.as_str()).collect();
+        assert_eq!(bob_kinds, vec!["b1"]);
+
+        // `limit` truncates from the newest end, same as recent_events.
+        let head = world.player_events(alice.id, 2).expect("limit query runs");
+        let head_kinds: Vec<&str> = head.iter().map(|e| e.kind.as_str()).collect();
+        assert_eq!(head_kinds, vec!["a3", "a2"]);
+
+        // Unknown player id is not an error — it simply has no rows.
+        // 9_999 is well above any id `upsert_player` assigned above.
+        let none = world
+            .player_events(9_999, 10)
+            .expect("unknown id query runs");
+        assert!(none.is_empty(), "unknown player id → empty vec");
     }
 }
