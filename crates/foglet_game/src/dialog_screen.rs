@@ -59,15 +59,18 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use crate::dialog::{Dialog, DialogState, FlagSet};
-use crate::screen::ScreenCommand;
+use ratatui::layout::{Alignment, Rect};
+use ratatui::style::{Color, Style};
+use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::Frame;
 
-// The `Screen` trait impl (render, handle_input) lands in Tasks 2c
-// and 2d. Task 2b just stands up the struct and its constructor so
-// downstream tasks have a concrete type to reach for; we intentionally
-// avoid pulling in `Screen` / `GameContext` here because doing so
-// before there is a `Screen for DialogScreen` impl would trip the
-// `-D warnings` gate on unused imports.
+use crate::dialog::{dialog_choice_prompt, Dialog, DialogState, FlagSet};
+use crate::screen::{GameContext, Screen, ScreenCommand};
+
+// Task 2d (handle_input) and 2e (accessors) still pull additional
+// items from `crate::dialog` (`dialog_handle_prompt_input`) and
+// `crate::input` (`Input`); those land alongside their own commits to
+// keep `-D warnings` clean.
 
 /// Boxed callback type translating a [`DialogAction`] outcome into a
 /// [`ScreenCommand`]. Aliased so the field type stays readable in
@@ -285,6 +288,188 @@ impl DialogScreen {
     }
 }
 
+impl Screen for DialogScreen {
+    /// Paint the dialog into `frame`, picking the body shape from the
+    /// current [`DialogState`] cursor (line-pumping, choice mode, or
+    /// finished) and the framing from [`Self::layout`] (Task 2c).
+    ///
+    /// # Layout
+    ///
+    /// `DialogLayout::Modal` draws a single bordered [`Block`] over
+    /// the entire frame area and renders the body into the inner rect;
+    /// `DialogLayout::Compact` skips the block and renders directly
+    /// into the frame area. The dialog's title (speaker name) is
+    /// **not** rendered here because the kit's [`Dialog`] schema does
+    /// not carry one — the modal frame is left untitled and games that
+    /// want a speaker label will compose `crate::widgets::render_modal`
+    /// (Task 3b — not yet landed) themselves before pushing the
+    /// screen, or wrap a
+    /// [`DialogScreen`] in a custom [`Screen`] that paints the title
+    /// row first. The Murder Motel refactor (Task 6) will spell that
+    /// pattern out concretely.
+    ///
+    /// # Body modes
+    ///
+    /// 1. **Line-pumping.** [`DialogState::current_line`] returns
+    ///    `Some(line)` while the cursor sits on a script line. Render
+    ///    the line text wrapped to the body area and a centred
+    ///    `[Enter] continue   [Esc] leave` hint along the bottom row.
+    /// 2. **Finished.** [`DialogState::is_finished`] is `true` after
+    ///    the cursor has walked off the end of the graph. Render a
+    ///    `(They turn away.)` leave hint — the dialog has nothing more
+    ///    to say. Task 2d will translate the next `Enter`/`Esc` into a
+    ///    [`DialogAction::Finished`] / [`DialogAction::Cancelled`]
+    ///    callback.
+    /// 3. **Choice mode.** Lines exhausted, dialog not yet finished.
+    ///    Build a [`crate::prompt::ChoicePrompt`] from the live flag
+    ///    snapshot via [`dialog_choice_prompt`] (the SPEC §8 helper
+    ///    that already filters `requires` / `requires_not` predicates
+    ///    and caps the choice list at [`crate::dialog::DIALOG_PROMPT_MAX_CHOICES`])
+    ///    and delegate rendering to [`crate::prompt::ChoicePrompt::render`].
+    ///    The screen's `choice_cursor` is fed in via the prompt's
+    ///    public `selected` field, clamped against the live choice
+    ///    count so a cursor stranded by a flag change cannot point off
+    ///    the end of the list.
+    ///
+    /// # Why delegate to `dialog_choice_prompt` rather than re-render
+    ///
+    /// SPEC_v2_1.md §4.2 explicitly forbids re-implementing dialog
+    /// mechanics here: "The adapter MUST use `dialog_choice_prompt`
+    /// and `dialog_handle_prompt_input` internally rather than
+    /// re-implementing dialog mechanics." Routing through the helper
+    /// also means the visible-choice cap and numeric-hotkey assignment
+    /// stay in one place — adapter and helper cannot drift.
+    ///
+    /// # Why borrow `flags` short-lived
+    ///
+    /// The shared [`FlagSet`] is `Rc<RefCell<_>>`, so the borrow has
+    /// to be released before any subsequent code path could grab a
+    /// `&mut FlagSet`. Render keeps the borrow inside the choice
+    /// branch and drops it at the end of the function, so a future
+    /// `Screen` method that wanted a `&mut` borrow during the same
+    /// frame (none today) would not deadlock.
+    fn render(&mut self, _ctx: &mut GameContext<'_>, frame: &mut Frame<'_>) {
+        let outer = frame.area();
+        let inner = match self.layout {
+            DialogLayout::Modal => {
+                let block = Block::default().borders(Borders::ALL);
+                let inside = block.inner(outer);
+                frame.render_widget(block, outer);
+                inside
+            }
+            DialogLayout::Compact => outer,
+        };
+        // A zero-sized inner rect happens on tiny terminals (or when
+        // a parent layout has clipped the frame to one cell). Bail
+        // rather than asking ratatui to render into nothing — the
+        // helpers below tolerate it, but the early return saves the
+        // borrow on `flags` and keeps the render trace shallow.
+        if inner.width == 0 || inner.height == 0 {
+            return;
+        }
+
+        // 1. Line-pumping mode: cursor sits on a script line.
+        if let Some(line) = self.state.current_line(&self.dialog) {
+            let line_text = line.to_string();
+            let (body_area, hint_area) = split_body_and_hint(inner);
+            frame.render_widget(
+                Paragraph::new(line_text)
+                    .alignment(Alignment::Left)
+                    .wrap(Wrap { trim: false }),
+                body_area,
+            );
+            if let Some(hint_area) = hint_area {
+                frame.render_widget(
+                    Paragraph::new("[Enter] continue   [Esc] leave")
+                        .alignment(Alignment::Center)
+                        .style(Style::default().fg(Color::DarkGray)),
+                    hint_area,
+                );
+            }
+            return;
+        }
+
+        // 2. Finished: nothing left to say.
+        if self.state.is_finished() {
+            frame.render_widget(
+                Paragraph::new("(They turn away.)\n\n[Enter / Esc] leave")
+                    .alignment(Alignment::Center)
+                    .style(Style::default().fg(Color::DarkGray)),
+                inner,
+            );
+            return;
+        }
+
+        // 3. Choice mode. Build the prompt under an immutable flag
+        // borrow; mutate nothing — render is read-only with respect
+        // to game state per SPEC §7.
+        let flags = self.flags.borrow();
+        let mut prompt = dialog_choice_prompt(&self.state, &self.dialog, &flags);
+        let visible = prompt.choices.len();
+        if visible == 0 {
+            // Defensive: every choice gated and no goto fallback.
+            // Render a leave hint so the player isn't stuck looking at
+            // a blank modal — the validator allows this shape and the
+            // example covered it before the refactor.
+            drop(flags);
+            frame.render_widget(
+                Paragraph::new("(There's nothing more to say.)\n\n[Esc] leave")
+                    .alignment(Alignment::Center)
+                    .style(Style::default().fg(Color::DarkGray)),
+                inner,
+            );
+            return;
+        }
+        // Clamp the cursor against the live choice count so a stale
+        // index (e.g. a flag flip between frames shrank the list)
+        // points at a real choice.
+        let cursor = self.choice_cursor.min(visible - 1);
+        prompt.selected = Some(cursor);
+        let (body_area, hint_area) = split_body_and_hint(inner);
+        let buf = frame.buffer_mut();
+        prompt.render(body_area, buf);
+        if let Some(hint_area) = hint_area {
+            frame.render_widget(
+                Paragraph::new("[Up/Down] choose    [Enter] pick    [Esc] leave")
+                    .alignment(Alignment::Center)
+                    .style(Style::default().fg(Color::DarkGray)),
+                hint_area,
+            );
+        }
+    }
+}
+
+/// Split `inner` into a body rect and an optional one-row hint rect
+/// along the bottom edge. Returns `None` for the hint when the inner
+/// rect is too short to spare a row.
+///
+/// Extracted as a free function (not a method) so both line-pumping
+/// and choice modes share the exact same split arithmetic — the hint
+/// row width must match between modes or a player flicking through a
+/// dialog will see the bottom row jump by a cell when the screen
+/// transitions from line to choice.
+fn split_body_and_hint(inner: Rect) -> (Rect, Option<Rect>) {
+    let hint_h = if inner.height > 1 { 1 } else { 0 };
+    let body_h = inner.height.saturating_sub(hint_h);
+    let body = Rect {
+        x: inner.x,
+        y: inner.y,
+        width: inner.width,
+        height: body_h,
+    };
+    let hint = if hint_h > 0 {
+        Some(Rect {
+            x: inner.x,
+            y: inner.y + body_h,
+            width: inner.width,
+            height: hint_h,
+        })
+    } else {
+        None
+    };
+    (body, hint)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -432,5 +617,290 @@ nodes:
         // same `RefCell`.
         flags.borrow_mut().insert("heard_rumor".to_string());
         assert!(screen.flags.borrow().contains("heard_rumor"));
+    }
+
+    // ---------- Task 2c render tests ----------
+    //
+    // The render impl picks one of three body modes (line-pumping,
+    // finished, choice) and one of two layouts (modal, compact). We
+    // pin each mode/layout combination through a `TestBackend` rather
+    // than via `insta` snapshots: the assertions below check shape
+    // (border glyphs in modal, no border in compact, choice text
+    // present, line text present) which is the contract real games
+    // rely on. Pixel-perfect snapshots would over-fit the tests to
+    // ratatui's internal layout choices and force churn on every
+    // upstream bump.
+
+    use crate::config::{GameConfig, GameSection, ManifestSection, SaveSection, SaveStrategy};
+    use crate::foglet::{ContextSource, FogletContext};
+    use crate::screen::{GameContext, Screen};
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    /// Minimal config fixture — every field is required by the
+    /// constructor, but render does not read any of them. Mirrors the
+    /// shape used in `prompt_screen.rs` tests so future readers can
+    /// hop between the two parallel suites without re-learning.
+    fn fixture_config() -> GameConfig {
+        GameConfig {
+            game: GameSection {
+                title: "Test".into(),
+                slug: "test".into(),
+                description: "fixture".into(),
+                min_width: 80,
+                min_height: 24,
+                start_map: "lobby".into(),
+                start_x: 1,
+                start_y: 1,
+            },
+            save: SaveSection {
+                strategy: SaveStrategy::PerFogletUser,
+            },
+            manifest: ManifestSection {
+                timeout_ms: 1_800_000,
+                idle_timeout_ms: 300_000,
+                visibility: "members".into(),
+                auth_scope: "site".into(),
+            },
+            world: Default::default(),
+            turns: None,
+            leaderboards: Vec::new(),
+        }
+    }
+
+    fn fixture_context() -> FogletContext {
+        FogletContext {
+            door_id: "test-door".into(),
+            user_id: Some("test-user".into()),
+            username: Some("tester".into()),
+            role: None,
+            session_id: Some("sess-1".into()),
+            terminal_width: 80,
+            terminal_height: 24,
+            source: ContextSource::LocalDev,
+        }
+    }
+
+    /// Slightly richer dialog than [`fixture_dialog_yaml`]: greeting
+    /// node has a script line and three branches, one of which is
+    /// gated by `heard_rumor`. Lets the choice-mode render and gating
+    /// tests share a single fixture.
+    fn fixture_branching_yaml() -> &'static str {
+        r#"
+start: greeting
+nodes:
+  greeting:
+    lines: ["The clerk eyes you."]
+    choices:
+      - text: "Just checking in."
+        goto: end
+      - text: "I heard about the murder."
+        set: [heard_rumor]
+        goto: end
+      - text: "Got a master key?"
+        requires: heard_rumor
+        goto: end
+  end: {}
+"#
+    }
+
+    /// Render the buffer to a single string for substring assertions.
+    /// A direct port of the technique used in `scenes/dialog.rs`
+    /// tests; keeping the pattern local avoids a test-only crate
+    /// dep just for pretty-printing.
+    fn buffer_to_string(buf: &ratatui::buffer::Buffer) -> String {
+        let mut out = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                out.push_str(buf.cell((x, y)).expect("cell").symbol());
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    #[test]
+    fn render_modal_paints_border_and_first_line() {
+        // Default layout is `Modal`. Render the fixture at the start
+        // (cursor on `greeting`, line 0) and pin two things: the
+        // top-left border glyph proves the bordered block was drawn,
+        // and the rendered buffer contains the line text.
+        let dialog = load_dialog(fixture_dialog_yaml()).expect("fixture parses");
+        let flags = Rc::new(RefCell::new(FlagSet::new()));
+        let start = {
+            let mut borrowed = flags.borrow_mut();
+            DialogState::start(&dialog, &mut borrowed)
+        };
+        let mut screen = DialogScreen::new(dialog, start, flags, |_| ScreenCommand::None);
+
+        let cfg = fixture_config();
+        let fc = fixture_context();
+        let mut ctx = GameContext::new(&cfg, &fc, (40, 12));
+        let mut term = Terminal::new(TestBackend::new(40, 12)).expect("test backend");
+        term.draw(|frame| screen.render(&mut ctx, frame))
+            .expect("draw");
+        let buf = term.backend().buffer().clone();
+
+        assert_eq!(
+            buf[(0, 0)].symbol(),
+            "┌",
+            "modal layout must draw a top-left border corner"
+        );
+        let dump = buffer_to_string(&buf);
+        assert!(
+            dump.contains("Hello, traveller."),
+            "expected greeting line in modal body; got:\n{dump}"
+        );
+    }
+
+    #[test]
+    fn render_compact_skips_border() {
+        // `compact()` builder doesn't exist yet (Task 2e), so we
+        // toggle the layout via the field that the test module can
+        // see. The post-Task-2e tests will switch to the builder.
+        let dialog = load_dialog(fixture_dialog_yaml()).expect("fixture parses");
+        let flags = Rc::new(RefCell::new(FlagSet::new()));
+        let start = {
+            let mut borrowed = flags.borrow_mut();
+            DialogState::start(&dialog, &mut borrowed)
+        };
+        let mut screen = DialogScreen::new(dialog, start, flags, |_| ScreenCommand::None);
+        screen.layout = DialogLayout::Compact;
+
+        let cfg = fixture_config();
+        let fc = fixture_context();
+        let mut ctx = GameContext::new(&cfg, &fc, (40, 12));
+        let mut term = Terminal::new(TestBackend::new(40, 12)).expect("test backend");
+        term.draw(|frame| screen.render(&mut ctx, frame))
+            .expect("draw");
+        let buf = term.backend().buffer().clone();
+        // Compact layout MUST NOT draw a border glyph at (0, 0). The
+        // body text starts in the top-left, so the cell is either a
+        // letter from the line or a blank — never a corner glyph.
+        assert_ne!(
+            buf[(0, 0)].symbol(),
+            "┌",
+            "compact layout must not draw a bordered block"
+        );
+        let dump = buffer_to_string(&buf);
+        assert!(
+            dump.contains("Hello, traveller."),
+            "expected greeting line in compact body; got:\n{dump}"
+        );
+    }
+
+    #[test]
+    fn render_choices_show_filtered_visible_text() {
+        // Walk past the single greeting line so the choice list is
+        // visible, then render. The gated branch (`requires: heard_rumor`)
+        // must not appear; the two ungated branches must.
+        let dialog = load_dialog(fixture_branching_yaml()).expect("fixture parses");
+        let flags = Rc::new(RefCell::new(FlagSet::new()));
+        let mut start = {
+            let mut borrowed = flags.borrow_mut();
+            DialogState::start(&dialog, &mut borrowed)
+        };
+        // Manual advance past the script line so `available_choices`
+        // returns the branches — Task 2d will own the input-driven
+        // version of this walk.
+        {
+            let mut borrowed = flags.borrow_mut();
+            start.advance(&dialog, &mut borrowed).expect("advance");
+        }
+
+        let mut screen = DialogScreen::new(dialog, start, flags.clone(), |_| ScreenCommand::None);
+        let cfg = fixture_config();
+        let fc = fixture_context();
+        let mut ctx = GameContext::new(&cfg, &fc, (60, 12));
+        let mut term = Terminal::new(TestBackend::new(60, 12)).expect("test backend");
+        term.draw(|frame| screen.render(&mut ctx, frame))
+            .expect("draw");
+        let dump = buffer_to_string(term.backend().buffer());
+
+        assert!(
+            dump.contains("Just checking in."),
+            "ungated choice should render; got:\n{dump}"
+        );
+        assert!(
+            dump.contains("I heard about the murder."),
+            "ungated choice should render; got:\n{dump}"
+        );
+        assert!(
+            !dump.contains("master key"),
+            "gated choice must hide while `heard_rumor` is unset; got:\n{dump}"
+        );
+    }
+
+    #[test]
+    fn render_finished_state_shows_leave_hint() {
+        // Drive the fixture to its terminal node — `greeting` has a
+        // line and a goto to `end` (an empty terminal). Two advances
+        // walk us off the line and into `end`; render then shows the
+        // "(They turn away.)" hint rather than panicking on an empty
+        // body.
+        let dialog = load_dialog(fixture_dialog_yaml()).expect("fixture parses");
+        let flags = Rc::new(RefCell::new(FlagSet::new()));
+        let mut start = {
+            let mut borrowed = flags.borrow_mut();
+            DialogState::start(&dialog, &mut borrowed)
+        };
+        {
+            // `advance` chases the linear `goto` in the same step
+            // when the next line lands on a node with no available
+            // choices, so a single advance is enough to reach `end`
+            // and finish the dialog.
+            let mut borrowed = flags.borrow_mut();
+            start.advance(&dialog, &mut borrowed).expect("advance line");
+        }
+        assert!(start.is_finished(), "fixture should be finished");
+
+        let mut screen = DialogScreen::new(dialog, start, flags, |_| ScreenCommand::None);
+        let cfg = fixture_config();
+        let fc = fixture_context();
+        let mut ctx = GameContext::new(&cfg, &fc, (40, 12));
+        let mut term = Terminal::new(TestBackend::new(40, 12)).expect("test backend");
+        term.draw(|frame| screen.render(&mut ctx, frame))
+            .expect("draw");
+        let dump = buffer_to_string(term.backend().buffer());
+        assert!(
+            dump.contains("turn away"),
+            "finished dialog must render the leave hint; got:\n{dump}"
+        );
+    }
+
+    #[test]
+    fn render_clamps_choice_cursor_against_live_count() {
+        // A stale `choice_cursor` (e.g. set by a prior render against
+        // a longer choice list) must not point past the end of the
+        // current list. We seed the cursor to 99, render, and rely on
+        // the absence of a panic plus the presence of the first
+        // choice's hotkey marker in the buffer to prove the clamp
+        // happened. (`render` would panic via `Some(99)` on a 2-choice
+        // prompt without the clamp; `ChoicePrompt::render` indexes
+        // into `choices` for the highlighted-row marker.)
+        let dialog = load_dialog(fixture_branching_yaml()).expect("fixture parses");
+        let flags = Rc::new(RefCell::new(FlagSet::new()));
+        let mut start = {
+            let mut borrowed = flags.borrow_mut();
+            DialogState::start(&dialog, &mut borrowed)
+        };
+        {
+            let mut borrowed = flags.borrow_mut();
+            start.advance(&dialog, &mut borrowed).expect("advance");
+        }
+        let mut screen = DialogScreen::new(dialog, start, flags, |_| ScreenCommand::None);
+        screen.choice_cursor = 99;
+
+        let cfg = fixture_config();
+        let fc = fixture_context();
+        let mut ctx = GameContext::new(&cfg, &fc, (60, 12));
+        let mut term = Terminal::new(TestBackend::new(60, 12)).expect("test backend");
+        term.draw(|frame| screen.render(&mut ctx, frame))
+            .expect("draw should not panic on out-of-range cursor");
+        let dump = buffer_to_string(term.backend().buffer());
+        assert!(
+            dump.contains("Just checking in."),
+            "first choice should still render after clamp; got:\n{dump}"
+        );
     }
 }
