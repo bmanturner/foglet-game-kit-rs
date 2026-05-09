@@ -375,6 +375,164 @@ pub fn validate_choices<T>(choices: &[PromptChoice<T>]) -> Result<(), PromptErro
     Ok(())
 }
 
+/// A prompt body + choice list + footer, built up via the SPEC §5
+/// builder API.
+///
+/// `ChoicePrompt<T>` is **just data** at this layer (Task 2d). The
+/// reducer (`PromptAction<T>`, input-handling, selection) lands in
+/// Task 3a on top of the same struct, and rendering (Task 5) reads
+/// the same fields. Splitting "shape of the prompt" from "what
+/// pressing a key does" keeps the builder testable without a
+/// runtime — `ChoicePrompt::new().body(...).choice(...)` is a pure
+/// expression that produces an inspectable value.
+///
+/// # Builder shape
+///
+/// SPEC §5 fixes the call sites the kit MUST support:
+///
+/// ```
+/// use foglet_game::prompt::ChoicePrompt;
+/// # #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// # enum LootAction { Equip, Take, Pass }
+/// let prompt = ChoicePrompt::new()
+///     .body("You found this on the Giant Spider's corpse.")
+///     .choice('e', LootAction::Equip, "Equip immediately")
+///     .choice('t', LootAction::Take, "Take to inventory")
+///     .choice('p', LootAction::Pass, "Pass");
+/// assert_eq!(prompt.choices.len(), 3);
+/// ```
+///
+/// `.disabled_if(cond, reason)` operates on the **most recently added
+/// choice**. That is the form SPEC §5's wandering-monk example uses,
+/// and it lets a prompt express "this row is disabled because …" in
+/// the same chain as the row's `.choice(...)` call without naming the
+/// row separately. Calling `.disabled_if(...)` before any `.choice(...)`
+/// is a no-op (rather than a panic) so partial chains stay safe to
+/// inspect during construction.
+///
+/// # Validation policy
+///
+/// The builder methods themselves never return `Result` — that would
+/// break the fluent chain. Duplicate-hotkey detection (SPEC §4.1) runs
+/// via [`ChoicePrompt::validate`], and the reducer constructors that
+/// arrive in Task 3a will call it during their `try_*` builders. For
+/// now, callers can call `prompt.validate()?` at the boundary if they
+/// want the same guarantee.
+///
+/// # What this type intentionally does NOT do (yet)
+///
+/// - No selected-index state. That belongs to the reducer (Task 4).
+/// - No `confirm` per-choice flag. That lands with `ConfirmPrompt`
+///   (Task 6a).
+/// - No theme/style storage. Per-choice `style: Option<StyleRole>`
+///   already lives on `PromptChoice`; whole-prompt theming is a
+///   render-layer concern (Task 5f).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChoicePrompt<T> {
+    /// Body lines, one per `.body(...)` call. Multi-line bodies are
+    /// expressed as multiple `.body(...)` calls so the renderer (Task
+    /// 5a) can preserve blank-line spacing without parsing embedded
+    /// `\n` sequences.
+    pub body: Vec<String>,
+    /// Active choices in declaration order. The reducer (Task 3a)
+    /// scans this list directly; the renderer iterates it for layout.
+    pub choices: Vec<PromptChoice<T>>,
+    /// Optional footer line — typically dynamic context like
+    /// `"Your gold: 173g"`. `None` means the renderer omits the
+    /// footer row entirely (no blank gap).
+    pub footer: Option<String>,
+}
+
+impl<T> Default for ChoicePrompt<T> {
+    /// Equivalent to [`ChoicePrompt::new`]. `Default` is provided so
+    /// the type composes with derive macros and generic helpers that
+    /// expect it.
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<T> ChoicePrompt<T> {
+    /// Start an empty prompt. Chain `.body(...)`, `.choice(...)`,
+    /// `.disabled_if(...)`, `.footer(...)` to fill it in.
+    pub fn new() -> Self {
+        Self {
+            body: Vec::new(),
+            choices: Vec::new(),
+            footer: None,
+        }
+    }
+
+    /// Append one body line. Call repeatedly for multi-line bodies —
+    /// each call is a logical paragraph the renderer (Task 5a) will
+    /// wrap independently and separate from neighbours.
+    pub fn body(mut self, line: impl Into<String>) -> Self {
+        self.body.push(line.into());
+        self
+    }
+
+    /// Append an enabled choice with `key`, stable id `value`, and
+    /// display `label`.
+    ///
+    /// Argument order matches SPEC §5's example
+    /// (`.choice('e', LootAction::Equip, "Equip immediately")`) — key,
+    /// then game-id, then label. That ordering keeps the visually
+    /// noisiest argument (the label string) at the end where it does
+    /// not push the key/id off-screen in long chains.
+    pub fn choice(mut self, key: impl Into<PromptKey>, value: T, label: impl Into<String>) -> Self {
+        self.choices.push(PromptChoice::new(key, label, value));
+        self
+    }
+
+    /// Disable the most recently added choice when `cond` is true,
+    /// attaching `reason` for the renderer and the reducer's
+    /// `Disabled` action.
+    ///
+    /// No-op in three cases (each chosen so partial builder chains
+    /// stay safe to inspect mid-construction):
+    ///
+    /// 1. `cond` is false — the choice stays enabled, reason discarded.
+    /// 2. No choice has been added yet — the call silently returns
+    ///    `self` instead of panicking. SPEC §5 puts `.disabled_if`
+    ///    immediately after `.choice(...)`; chains that violate that
+    ///    are arguably author bugs but a panic at builder time would
+    ///    crash the whole game on hot-reload.
+    /// 3. `cond` is true but the prior choice was already disabled by
+    ///    an earlier `.disabled_if(...)` or `.with_disabled_reason(...)`
+    ///    — the new reason replaces the old one. Last writer wins, so
+    ///    the most specific reason in the chain is the one the player
+    ///    sees.
+    pub fn disabled_if(mut self, cond: bool, reason: impl Into<String>) -> Self {
+        if cond {
+            if let Some(last) = self.choices.last_mut() {
+                last.enabled = false;
+                last.disabled_reason = Some(reason.into());
+            }
+        }
+        self
+    }
+
+    /// Replace the footer line. Pass an empty string to set an empty
+    /// footer (rendered as a blank row); to remove the footer entirely,
+    /// drop the `.footer(...)` call from the chain.
+    pub fn footer(mut self, footer: impl Into<String>) -> Self {
+        self.footer = Some(footer.into());
+        self
+    }
+
+    /// Run SPEC §4.1 hotkey validation against the current choice
+    /// list. Returns `Err(PromptError::DuplicateHotkey)` on the first
+    /// collision in declaration order; `Ok(())` for a valid prompt
+    /// (including the empty-choice case).
+    ///
+    /// Builder methods do not call this automatically — see the type
+    /// docs for why. Call it explicitly at the seam where the prompt
+    /// becomes player-visible (typically inside a Task 3a `try_new`).
+    pub fn validate(&self) -> Result<(), PromptError> {
+        validate_choices(&self.choices)
+    }
+}
+
 impl From<char> for PromptKey {
     /// Lift a `char` straight into a [`PromptKey`] via
     /// [`PromptKey::char`] so call sites like
@@ -660,6 +818,173 @@ mod tests {
                 second_label: "Also confirm".to_string(),
             }),
         );
+    }
+
+    #[test]
+    fn prompt_builder_collects_body_choices_and_footer() {
+        // Mirrors the SPEC §5 Giant Spider example. Asserts the
+        // builder records each call into the corresponding field
+        // without re-ordering or de-duplicating.
+        let prompt = ChoicePrompt::new()
+            .body("You found this on the Giant Spider's corpse.")
+            .choice('e', LootAction::Equip, "Equip immediately")
+            .choice('t', LootAction::Take, "Take to inventory")
+            .choice('p', LootAction::Pass, "Pass")
+            .footer("Press a key to choose.");
+
+        assert_eq!(
+            prompt.body,
+            vec!["You found this on the Giant Spider's corpse."]
+        );
+        assert_eq!(prompt.footer.as_deref(), Some("Press a key to choose."));
+
+        let labels: Vec<&str> = prompt.choices.iter().map(|c| c.label.as_str()).collect();
+        assert_eq!(
+            labels,
+            vec!["Equip immediately", "Take to inventory", "Pass"],
+        );
+
+        let keys: Vec<PromptKey> = prompt.choices.iter().map(|c| c.key).collect();
+        assert_eq!(
+            keys,
+            vec![
+                PromptKey::Char('e'),
+                PromptKey::Char('t'),
+                PromptKey::Char('p'),
+            ],
+        );
+
+        // All defaults: enabled, no hint, no disabled reason.
+        for choice in &prompt.choices {
+            assert!(choice.enabled, "{:?} should default enabled", choice.label);
+            assert_eq!(choice.disabled_reason, None);
+            assert_eq!(choice.hint, None);
+        }
+    }
+
+    #[test]
+    fn prompt_builder_body_calls_accumulate_in_order() {
+        // SPEC §5 wandering-monk example uses two `.body(...)` calls to
+        // express a two-paragraph body. Each call appends one entry; the
+        // renderer (Task 5a) is responsible for blank-line spacing.
+        let prompt: ChoicePrompt<LootAction> = ChoicePrompt::new()
+            .body("A wandering monk approaches after the battle...")
+            .body("\"I carry mana potions for those who wield magic.\"");
+        assert_eq!(prompt.body.len(), 2);
+        assert_eq!(
+            prompt.body[0],
+            "A wandering monk approaches after the battle..."
+        );
+        assert!(prompt.body[1].starts_with("\"I carry mana potions"));
+    }
+
+    #[test]
+    fn disabled_if_true_marks_last_choice_with_reason() {
+        // Wandering-monk vendor: the mana-potion row is added, then
+        // `.disabled_if(!can_buy, ...)` flips it to disabled when the
+        // condition is true. The reason text reaches the choice for
+        // both renderer and reducer to surface.
+        let prompt = ChoicePrompt::new()
+            .choice('m', LootAction::Take, "Mana potions")
+            .disabled_if(true, "not enough gold or potion bag is full")
+            .choice('n', LootAction::Pass, "No thanks");
+
+        assert!(!prompt.choices[0].enabled);
+        assert_eq!(
+            prompt.choices[0].disabled_reason.as_deref(),
+            Some("not enough gold or potion bag is full"),
+        );
+        // Subsequent choices are unaffected — `.disabled_if(...)` only
+        // touches the most recently added row, never neighbours.
+        assert!(prompt.choices[1].enabled);
+    }
+
+    #[test]
+    fn disabled_if_false_leaves_last_choice_enabled() {
+        // Same builder shape, condition flipped: the prompt stays fully
+        // enabled. The reason string is silently discarded — that is
+        // the SPEC §5 expectation, since the chain reads "disable IF
+        // can't buy", and not-can't-buy means no disable to apply.
+        let prompt: ChoicePrompt<LootAction> = ChoicePrompt::new()
+            .choice('m', LootAction::Take, "Mana potions")
+            .disabled_if(false, "would-be reason")
+            .choice('n', LootAction::Pass, "No thanks");
+
+        assert!(prompt.choices[0].enabled);
+        assert_eq!(prompt.choices[0].disabled_reason, None);
+    }
+
+    #[test]
+    fn disabled_if_with_no_prior_choice_is_a_no_op() {
+        // Out-of-order chain: `.disabled_if(...)` before any
+        // `.choice(...)`. Documented behaviour is "silently no-op" so
+        // partial builder values stay safe to inspect — never panic
+        // mid-construction (a hot-reloaded game would crash).
+        let prompt: ChoicePrompt<LootAction> = ChoicePrompt::new()
+            .disabled_if(true, "nothing to disable")
+            .choice('e', LootAction::Equip, "Equip");
+        assert!(prompt.choices[0].enabled);
+        assert_eq!(prompt.choices[0].disabled_reason, None);
+    }
+
+    #[test]
+    fn disabled_if_replaces_prior_disabled_reason() {
+        // "Last writer wins" — a later `.disabled_if(true, ...)` on the
+        // same row overrides the earlier reason. Lets a chain start
+        // from a `with_disabled_reason` default and refine it later.
+        let prompt = ChoicePrompt::new()
+            .choice('t', LootAction::Take, "Tip for rumor")
+            .disabled_if(true, "stale reason")
+            .disabled_if(true, "need 50g");
+        assert!(!prompt.choices[0].enabled);
+        assert_eq!(
+            prompt.choices[0].disabled_reason.as_deref(),
+            Some("need 50g"),
+        );
+    }
+
+    #[test]
+    fn footer_replaces_previous_footer() {
+        // `.footer(...)` is a setter, not an appender — only the last
+        // call survives. Mirrors the wandering-monk example which sets
+        // the footer once at the end of the chain.
+        let prompt: ChoicePrompt<LootAction> = ChoicePrompt::new()
+            .footer("Your gold: 100g")
+            .footer("Your gold: 173g");
+        assert_eq!(prompt.footer.as_deref(), Some("Your gold: 173g"));
+    }
+
+    #[test]
+    fn builder_validate_passes_for_unique_keys_and_rejects_duplicates() {
+        // The opt-in `validate()` shim runs SPEC §4.1 hotkey validation
+        // against the assembled prompt. Builder methods themselves do
+        // not return Result; validation is the explicit seam between
+        // "shape building" and "ready for the player".
+        let good: ChoicePrompt<LootAction> = ChoicePrompt::new()
+            .choice('e', LootAction::Equip, "Equip")
+            .choice('t', LootAction::Take, "Take");
+        assert_eq!(good.validate(), Ok(()));
+
+        let bad: ChoicePrompt<LootAction> = ChoicePrompt::new()
+            .choice('e', LootAction::Equip, "Equip")
+            .choice('E', LootAction::Take, "Eat");
+        assert!(matches!(
+            bad.validate(),
+            Err(PromptError::DuplicateHotkey {
+                key: PromptKey::Char('e'),
+                ..
+            }),
+        ));
+    }
+
+    #[test]
+    fn default_matches_new() {
+        // `Default` is a convenience for derive macros / generic code.
+        // It MUST behave identically to `new()` so callers can pick
+        // either without surprises.
+        let a: ChoicePrompt<LootAction> = ChoicePrompt::new();
+        let b: ChoicePrompt<LootAction> = ChoicePrompt::default();
+        assert_eq!(a, b);
     }
 
     #[test]
