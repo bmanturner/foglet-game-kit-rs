@@ -2,14 +2,18 @@
 //!
 //! Task 5a shipped the `players` table migration. Task 5b layered the
 //! typed [`PlayerRecord`] read model and the [`WorldDb::upsert_player`]
-//! write path on top, scoped to the Foglet-user-id case. Task 5c (this
-//! iteration) extends the upsert path to the local-dev fallback so a
+//! write path on top, scoped to the Foglet-user-id case. Task 5c
+//! extended the upsert path to the local-dev fallback so a
 //! [`FogletContext`] with no `user_id` lands on a stable
-//! `local_dev_key`-keyed row instead of erroring. Subsequent sub-tasks
-//! fill in the rest:
-//!
-//! - 5e — `FogletRole` parsing and `security_level` mapping.
-//! - 5f — Persist normalized role/security metadata at upsert time.
+//! `local_dev_key`-keyed row instead of erroring. Task 5d kept
+//! `first_seen_at` stable while refreshing `last_seen_at`. Task 5e
+//! introduced [`FogletRole`](crate::FogletRole) parsing and the
+//! `security_level` mapping. Task 5f (this iteration) plumbs that
+//! mapping into the upsert path so every relaunch persists the
+//! normalized role/security pair from the live context — strictly
+//! advisory metadata for in-game flavour, *not* a launch authorization
+//! gate (Foglet itself decides who may exec the door; the kit only
+//! records what it was told).
 //!
 //! Splitting the migration into its own iteration keeps every commit
 //! small enough to bisect cleanly: a regression that drops the
@@ -178,8 +182,15 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_players_local_dev_key\n\
 /// - `handle` — display string. Refreshed on every upsert so a
 ///   user who changes their Foglet handle sees the new value the
 ///   next time they launch.
-/// - `role`, `security_level` — set by SQL defaults today (`'user'`
-///   / `50`). Task 5e/5f overwrite these from the live context.
+/// - `role`, `security_level` — written from the live context's
+///   [`FogletContext::foglet_role`] /
+///   [`FogletContext::security_level`] on every upsert (Task 5f). The
+///   stored values are advisory metadata for in-game flavour only —
+///   never consulted as a launch authorization gate. An absent /
+///   unknown role normalises to `'user'` / `50`, which lines up with
+///   the SQL defaults so the column shape stays consistent whether the
+///   row was written by the upsert path or a hand-rolled INSERT in
+///   tests.
 /// - `first_seen_at` — UTC timestamp of the first upsert. Preserved
 ///   across repeat upserts (Task 5d's invariant).
 /// - `last_seen_at` — UTC timestamp refreshed to `CURRENT_TIMESTAMP`
@@ -248,9 +259,13 @@ impl WorldDb {
     /// Repeat upsert refreshes `last_seen_at` to `CURRENT_TIMESTAMP`
     /// (SPEC §4.4 / Task 5d) while leaving `first_seen_at` alone — the
     /// "first time we saw this identity" column is an audit anchor and
-    /// must survive every relaunch. Task 5e/5f will write normalized
-    /// `role` and `security_level`; until then the `players` row picks
-    /// up the SQL defaults for those columns.
+    /// must survive every relaunch. The normalized `role` /
+    /// `security_level` pair is also rewritten on every upsert (Task
+    /// 5f) so a player whose role changed upstream in Foglet sees the
+    /// new value the next time they launch. The stored values are
+    /// strictly advisory metadata: nothing in this kit gates door
+    /// launch on them. Foglet remains the only authority for
+    /// "who may exec this door".
     ///
     /// # Concurrency
     ///
@@ -263,9 +278,20 @@ impl WorldDb {
         // to `DEFAULT_HANDLE` keeps the `NOT NULL` `handle` constraint
         // satisfied without burying the choice in the SQL string.
         let handle = ctx.username.as_deref().unwrap_or(DEFAULT_HANDLE);
+        // Resolve the normalized role / security_level pair once per
+        // upsert (Task 5f). Computing here — rather than in each
+        // identity-branch helper — keeps the "one source of truth for
+        // role normalization" rule from SPEC §4.5 visible at the
+        // top-level entry point: both branches receive the exact same
+        // tokens, regardless of which partial unique index they target.
+        let role = ctx.foglet_role();
+        let role_token = role.as_token();
+        let security_level = role.security_level();
 
         match ctx.user_id.as_deref() {
-            Some(user_id) => self.upsert_by_foglet_user_id(user_id, handle),
+            Some(user_id) => {
+                self.upsert_by_foglet_user_id(user_id, handle, role_token, security_level)
+            }
             None => {
                 // SPEC §4.4 mandates a synthesised local key that does
                 // not collide with real Foglet users. The dedicated
@@ -273,7 +299,7 @@ impl WorldDb {
                 // us that namespace separation at the schema layer;
                 // [`synthesize_local_dev_key`] picks the value.
                 let key = synthesize_local_dev_key(handle);
-                self.upsert_by_local_dev_key(&key, handle)
+                self.upsert_by_local_dev_key(&key, handle, role_token, security_level)
             }
         }
     }
@@ -288,6 +314,8 @@ impl WorldDb {
         &self,
         user_id: &str,
         handle: &str,
+        role: &str,
+        security_level: i64,
     ) -> Result<PlayerRecord, PlayerError> {
         // Partial unique indexes require the `WHERE` clause to be
         // restated in the `ON CONFLICT` target; SQLite refuses to
@@ -307,17 +335,28 @@ impl WorldDb {
         // *deliberately* not in the SET list — that's the column the
         // audit story depends on, and excluding it from the update
         // preserves the original insert timestamp across every relaunch.
+        // `role` / `security_level` are now part of the SET list
+        // (Task 5f). Rewriting them on every conflict means a player
+        // who is promoted/demoted upstream in Foglet between launches
+        // sees the change reflected the next time they appear — and
+        // the column never ages out of sync with the live context.
         const SQL: &str = "\
-INSERT INTO players (foglet_user_id, handle) \
-VALUES (?1, ?2) \
+INSERT INTO players (foglet_user_id, handle, role, security_level) \
+VALUES (?1, ?2, ?3, ?4) \
 ON CONFLICT(foglet_user_id) WHERE foglet_user_id IS NOT NULL \
 DO UPDATE SET handle = excluded.handle, \
+              role = excluded.role, \
+              security_level = excluded.security_level, \
               last_seen_at = CURRENT_TIMESTAMP \
 RETURNING id, foglet_user_id, handle, role, security_level, \
           first_seen_at, last_seen_at, local_dev_key";
 
         self.connection()
-            .query_row(SQL, rusqlite::params![user_id, handle], row_to_record)
+            .query_row(
+                SQL,
+                rusqlite::params![user_id, handle, role, security_level],
+                row_to_record,
+            )
             .map_err(|source| PlayerError::Sqlite { source })
     }
 
@@ -332,6 +371,8 @@ RETURNING id, foglet_user_id, handle, role, security_level, \
         &self,
         local_dev_key: &str,
         handle: &str,
+        role: &str,
+        security_level: i64,
     ) -> Result<PlayerRecord, PlayerError> {
         // See [`Self::upsert_by_foglet_user_id`] for the rationale on
         // `last_seen_at = CURRENT_TIMESTAMP` (Task 5d). The local-dev
@@ -339,17 +380,28 @@ RETURNING id, foglet_user_id, handle, role, security_level, \
         // dev who relaunches `cargo run --example murder_motel` keeps
         // their original `first_seen_at` even as `last_seen_at` walks
         // forward.
+        // See [`Self::upsert_by_foglet_user_id`] for the rationale on
+        // including `role` / `security_level` in the SET list (Task
+        // 5f). The local-dev path mirrors the Foglet path so a single
+        // ground-truth contract — "every upsert refreshes role" —
+        // applies regardless of identity namespace.
         const SQL: &str = "\
-INSERT INTO players (local_dev_key, handle) \
-VALUES (?1, ?2) \
+INSERT INTO players (local_dev_key, handle, role, security_level) \
+VALUES (?1, ?2, ?3, ?4) \
 ON CONFLICT(local_dev_key) WHERE local_dev_key IS NOT NULL \
 DO UPDATE SET handle = excluded.handle, \
+              role = excluded.role, \
+              security_level = excluded.security_level, \
               last_seen_at = CURRENT_TIMESTAMP \
 RETURNING id, foglet_user_id, handle, role, security_level, \
           first_seen_at, last_seen_at, local_dev_key";
 
         self.connection()
-            .query_row(SQL, rusqlite::params![local_dev_key, handle], row_to_record)
+            .query_row(
+                SQL,
+                rusqlite::params![local_dev_key, handle, role, security_level],
+                row_to_record,
+            )
             .map_err(|source| PlayerError::Sqlite { source })
     }
 }
@@ -387,11 +439,24 @@ mod tests {
     /// `session_id`, but the struct fields are required, so this
     /// keeps test bodies focused on the behavior under test.
     fn ctx_with(user_id: Option<&str>, username: Option<&str>) -> FogletContext {
+        ctx_with_role(user_id, username, None)
+    }
+
+    /// Variant of [`ctx_with`] that lets a test pin the `role` string.
+    /// Task 5f's persistence test exercises sysop / mod / user / unknown
+    /// roles — passing the role through this helper keeps each test
+    /// body focused on the assertion under test instead of restating
+    /// the full struct literal.
+    fn ctx_with_role(
+        user_id: Option<&str>,
+        username: Option<&str>,
+        role: Option<&str>,
+    ) -> FogletContext {
         FogletContext {
             door_id: "test-door".to_string(),
             user_id: user_id.map(str::to_string),
             username: username.map(str::to_string),
-            role: None,
+            role: role.map(str::to_string),
             session_id: None,
             terminal_width: 80,
             terminal_height: 24,
@@ -481,13 +546,14 @@ mod tests {
         assert_eq!(record.handle, DEFAULT_HANDLE);
     }
 
-    /// SQL defaults from the §4.4 schema cover `role` and
-    /// `security_level` until Task 5e/5f land. Pinning the values
-    /// here means a follow-up that flips a default (without touching
-    /// the upsert) lands in this test, not a downstream Murder Motel
-    /// assertion.
+    /// A context with no `role` field upserts as `'user'` / `50`.
+    /// After Task 5f the upsert path writes the role explicitly rather
+    /// than relying on the SQL default, but the resulting values must
+    /// still match the documented "absent role" mapping from SPEC §4.5
+    /// — that's what keeps the column shape consistent with the
+    /// hand-rolled INSERTs in the migration tests below.
     #[test]
-    fn upsert_player_uses_schema_defaults_for_role_and_security() {
+    fn upsert_player_with_absent_role_maps_to_user_defaults() {
         let dir = tempdir().expect("tempdir creates");
         let db_path = dir.path().join("world.sqlite");
         let mut world = WorldDb::open(&db_path).expect("open succeeds");
@@ -501,6 +567,102 @@ mod tests {
         assert_eq!(record.role, "user");
         assert_eq!(record.security_level, 50);
         assert!(record.local_dev_key.is_none());
+    }
+
+    /// SPEC_v2 §Task 5f acceptance: distinct sysop / mod / user
+    /// contexts persist distinct normalized role/security pairs in the
+    /// `players` row. The mapping is the SPEC §4.5 contract — sysop →
+    /// 100, mod → 90, user → 50, unknown → 50 — and the test pins
+    /// each branch explicitly so a regression in
+    /// [`FogletRole::security_level`] surfaces here instead of in
+    /// downstream Murder Motel UI code that asks for the player's
+    /// label. Comments deliberately call out that the persisted values
+    /// are advisory only: nothing in the upsert path turns them into a
+    /// launch authorization decision (Foglet still owns that gate).
+    #[test]
+    fn upsert_player_persists_normalized_role_and_security_per_context() {
+        let dir = tempdir().expect("tempdir creates");
+        let db_path = dir.path().join("world.sqlite");
+        let mut world = WorldDb::open(&db_path).expect("open succeeds");
+        world
+            .apply_migration(&PLAYERS_MIGRATION)
+            .expect("players migration applies");
+
+        // Mixed-case input proves the role normalization runs through
+        // [`FogletRole::parse`] (which folds case) rather than writing
+        // the raw string verbatim — the on-disk token must be the
+        // canonical lowercase form so leaderboards and event log UIs
+        // can group by exact equality.
+        let sysop = world
+            .upsert_player(&ctx_with_role(
+                Some("u-sysop"),
+                Some("syndi"),
+                Some("Sysop"),
+            ))
+            .expect("sysop upsert succeeds");
+        let moderator = world
+            .upsert_player(&ctx_with_role(Some("u-mod"), Some("morgan"), Some("mod")))
+            .expect("mod upsert succeeds");
+        let user = world
+            .upsert_player(&ctx_with_role(Some("u-user"), Some("ursula"), Some("user")))
+            .expect("user upsert succeeds");
+
+        assert_eq!(sysop.role, "sysop");
+        assert_eq!(sysop.security_level, 100);
+        assert_eq!(moderator.role, "mod");
+        assert_eq!(moderator.security_level, 90);
+        assert_eq!(user.role, "user");
+        assert_eq!(user.security_level, 50);
+
+        // Three distinct rows — without that, the test would pass
+        // even if the upsert path collapsed every role onto a single
+        // row keyed off the wrong column.
+        assert_ne!(sysop.id, moderator.id);
+        assert_ne!(moderator.id, user.id);
+
+        // Unknown roles still persist a row, with the SPEC-mandated
+        // user-level fallback. The original token is preserved verbatim
+        // (no lowercase-folding for `Other`) so a curious operator
+        // dumping the table can still see what the upstream context
+        // actually said.
+        let other = world
+            .upsert_player(&ctx_with_role(Some("u-other"), Some("oz"), Some("oracle")))
+            .expect("unknown-role upsert succeeds");
+        assert_eq!(other.role, "oracle");
+        assert_eq!(other.security_level, 50);
+    }
+
+    /// A repeat upsert for the same player but with a different role
+    /// rewrites `role` / `security_level` in place — the upstream
+    /// Foglet user got promoted/demoted between launches and the
+    /// registry must reflect the new value rather than freezing the
+    /// first-seen role. Pinning this means a future "preserve role on
+    /// repeat upsert" patch (which would diverge from SPEC §4.5)
+    /// flunks here instead of silently freezing live data.
+    #[test]
+    fn repeat_upsert_refreshes_role_and_security_level() {
+        let dir = tempdir().expect("tempdir creates");
+        let db_path = dir.path().join("world.sqlite");
+        let mut world = WorldDb::open(&db_path).expect("open succeeds");
+        world
+            .apply_migration(&PLAYERS_MIGRATION)
+            .expect("players migration applies");
+
+        let promoted = world
+            .upsert_player(&ctx_with_role(Some("u-x"), Some("x"), Some("user")))
+            .expect("first upsert succeeds");
+        assert_eq!(promoted.role, "user");
+        assert_eq!(promoted.security_level, 50);
+
+        let after = world
+            .upsert_player(&ctx_with_role(Some("u-x"), Some("x"), Some("sysop")))
+            .expect("repeat upsert succeeds");
+        assert_eq!(
+            after.id, promoted.id,
+            "stable key still resolves to one row"
+        );
+        assert_eq!(after.role, "sysop");
+        assert_eq!(after.security_level, 100);
     }
 
     /// SPEC_v2 §Task 5c acceptance: two local-dev sessions with

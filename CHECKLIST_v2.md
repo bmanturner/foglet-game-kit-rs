@@ -35,7 +35,7 @@ One unchecked item per iteration. Dependencies in `[brackets]` must be checked o
 - [x] **5c** — Support local-dev player keys when `FogletContext.user_id` is missing. Test: two local-dev handles do not collide. [5b]
 - [x] **5d** — Update `last_seen_at` on repeat upsert without changing `first_seen_at`. [5b]
 - [x] **5e** — Add `FogletRole` parsing and `FogletContext::security_level()` mapping: `sysop` = 100, `mod` = 90, `user`/missing/unknown = 50. Tests cover mixed-case and unknown roles. [5b]
-- [ ] **5f** — Persist normalized role/security metadata during player upsert without using it for launch authorization. Test: sysop/mod/user contexts create distinct advisory metadata. [5e]
+- [x] **5f** — Persist normalized role/security metadata during player upsert without using it for launch authorization. Test: sysop/mod/user contexts create distinct advisory metadata. [5e]
 
 ### Task 6 — Turn ledger
 
