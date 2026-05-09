@@ -15,10 +15,10 @@ use foglet_game::{
     FogletContext, GameContext, Input, InventoryList, LeaderboardSort, ScoreRecord, Screen,
     ScreenCommand, WorldDb,
 };
-use ratatui::layout::{Alignment, Rect};
+use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
 use ratatui::text::Line;
-use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph};
+use ratatui::widgets::{Block, Borders, List, ListItem};
 use ratatui::Frame;
 
 use crate::map::MapScreen;
@@ -781,11 +781,15 @@ impl Screen for LeaderboardScreen {
         };
 
         if self.rows.is_empty() {
-            let widget = Paragraph::new(Self::EMPTY_HINT)
-                .alignment(Alignment::Center)
-                .style(Style::default().fg(Color::DarkGray))
-                .block(Block::default().borders(Borders::ALL).title(Self::TITLE));
-            frame.render_widget(widget, body);
+            // Empty leaderboard: shared helper paints the bordered
+            // titled modal with EMPTY_HINT inside, matching the
+            // bulletin's empty-state shape. Trades the prior centred
+            // DarkGray styling for `render_modal`'s left-aligned
+            // default tint — a deliberate re-pin to the kit's shared
+            // shape (SPEC_v2_1 §Task 11b-iii). The populated `List`
+            // arm stays hand-rolled because `render_modal` only
+            // accepts a `&str` body.
+            render_modal(frame, body, Some(Self::TITLE), Self::EMPTY_HINT);
         } else {
             let selected = self.selected.min(self.rows.len() - 1);
             let items: Vec<ListItem<'_>> = self
