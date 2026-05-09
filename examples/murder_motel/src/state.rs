@@ -14,6 +14,7 @@ use foglet_game::{DateProvider, FeedbackLine, FlagSet};
 use serde::{Deserialize, Serialize};
 
 use crate::clock::SystemDateProvider;
+use crate::world::PendingClueEvent;
 
 /// Persisted state for the player's save slot (Task 13h).
 ///
@@ -122,6 +123,20 @@ pub struct SharedSlots {
     /// the freshly-constructed provider, not via a stale value
     /// frozen into the JSON.
     pub date_provider: Rc<dyn DateProvider>,
+    /// Mailbox of `clue_found` world events queued by prompt callbacks
+    /// (SPEC_v2 §Task 13c-ii). Prompt-screen callbacks are `'static` and
+    /// never see [`foglet_game::GameContext`], so they cannot touch the
+    /// world DB themselves. Instead they push a [`PendingClueEvent`]
+    /// here when a *new* major clue lands in inventory; the lobby's
+    /// per-frame `tick` (which already holds `&WorldDb` via `ctx`)
+    /// drains the queue and writes the rows.
+    ///
+    /// Not part of [`SaveState`]: the mailbox is purely an in-memory
+    /// hand-off across one frame boundary. A pending entry that fails
+    /// to flush (e.g. `world_db` is `None`) is intentionally silent —
+    /// the bulletin missing one row is preferable to the prompt
+    /// callback panicking out of `handle_input`.
+    pub pending_clue_events: Rc<RefCell<Vec<PendingClueEvent>>>,
 }
 
 impl std::fmt::Debug for SharedSlots {
@@ -137,6 +152,7 @@ impl std::fmt::Debug for SharedSlots {
             .field("feedback", &self.feedback)
             .field("map_name", &self.map_name)
             .field("date_provider", &"<dyn DateProvider>")
+            .field("pending_clue_events", &self.pending_clue_events)
             .finish()
     }
 }
@@ -186,6 +202,7 @@ impl Default for SharedSlots {
             // tests overwrite this slot through `with_date_provider`
             // to drive the SPEC §Task 6f deterministic-reset story.
             date_provider: Rc::new(SystemDateProvider),
+            pending_clue_events: Rc::new(RefCell::new(Vec::new())),
         }
     }
 }
@@ -235,6 +252,12 @@ impl SharedSlots {
         // identifier from a previously-loaded save so the snapshot
         // taken on the New Game's first quit lands on the correct map.
         *self.map_name.borrow_mut() = default_map_name();
+        // Drop any clue-found events that never reached the lobby tick
+        // (e.g. the player picked up the matchbook then immediately hit
+        // New Game from the title menu). A fresh run must start with a
+        // clean mailbox or the next world-DB flush would write a stale
+        // row attributed to whoever happens to launch next.
+        self.pending_clue_events.borrow_mut().clear();
     }
 
     /// Build a [`SaveState`] from the current slot contents. Cloning the

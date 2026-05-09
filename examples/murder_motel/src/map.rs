@@ -1354,6 +1354,16 @@ impl Screen for MapScreen {
     /// an ensure-today-row write, both of which fall under that
     /// tolerance.
     fn tick(&mut self, ctx: &mut GameContext<'_>) -> ScreenCommand {
+        // SPEC_v2 §Task 13c-ii: drain any `clue_found` events the
+        // Lost-and-Found Drawer's prompt callback queued on the
+        // previous frame. Done first so a successful drawer interaction
+        // in frame N produces a bulletin row before the next render in
+        // frame N+1, even if the turns-status cache is already warm.
+        if let Some(world) = ctx.world_db {
+            if !self.slots.pending_clue_events.borrow().is_empty() {
+                let _ = crate::world::flush_pending_clue_events(world, ctx.foglet, &self.slots);
+            }
+        }
         if self.turns_status.borrow().is_some() {
             return ScreenCommand::None;
         }
@@ -3296,6 +3306,59 @@ pub(crate) mod tests {
         assert!(
             hint.contains("Turns: 0/3"),
             "rejected X-press must overwrite stale cache with the true zero balance: {hint}"
+        );
+    }
+
+    /// SPEC_v2 §Task 13c-ii: events queued by the Lost-and-Found
+    /// Drawer callback drain into `world_events` on the next lobby
+    /// tick. Drives the public `Screen::tick` surface so a regression
+    /// in the wiring (e.g. forgetting to call `flush_pending_clue_events`)
+    /// surfaces here, not in a downstream Murder Motel smoke test.
+    #[test]
+    fn tick_drains_pending_clue_events_into_world_events() {
+        use crate::world::{
+            PendingClueEvent, CLUE_FOUND_EVENT_KIND, CLUE_FOUND_ROOM_7_KEY_MESSAGE,
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        // world_with_full_stack covers players + turn_ledger +
+        // motel_world_state but not world_events; layer the events
+        // migration on top so the drain has a destination table.
+        let mut world = world_with_full_stack(&dir);
+        world
+            .apply_migration(&foglet_game::WORLD_EVENTS_MIGRATION)
+            .expect("apply world_events migration");
+        let cfg = fixture_config();
+        let fc = fixture_context();
+        let slots = fixed_date_slots();
+        let mut map = fresh_map_screen_with_slots(slots.clone());
+
+        // Pre-seed the mailbox the way the drawer callback would, so
+        // this test isolates the tick-drain wiring from the prompt.
+        slots
+            .pending_clue_events
+            .borrow_mut()
+            .push(PendingClueEvent {
+                item_id: MapScreen::ROOM_7_KEY_ID.to_string(),
+                message: CLUE_FOUND_ROOM_7_KEY_MESSAGE.to_string(),
+            });
+
+        {
+            let mut ctx = GameContext::new(&cfg, &fc, (80, 24)).with_world_db(&world);
+            let cmd = map.tick(&mut ctx);
+            assert!(matches!(cmd, ScreenCommand::None));
+        }
+
+        assert!(
+            slots.pending_clue_events.borrow().is_empty(),
+            "tick must drain the mailbox so a stale row never re-flushes"
+        );
+        let events = world.recent_events(10).expect("read events");
+        assert_eq!(events.len(), 1, "tick must write exactly one row");
+        assert_eq!(events[0].kind, CLUE_FOUND_EVENT_KIND);
+        assert_eq!(events[0].message, CLUE_FOUND_ROOM_7_KEY_MESSAGE);
+        assert!(
+            events[0].player_id.is_some(),
+            "tick must attribute the event to the current foglet user"
         );
     }
 }

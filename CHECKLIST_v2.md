@@ -93,9 +93,9 @@ One unchecked item per iteration. Dependencies in `[brackets]` must be checked o
 
 - [x] **13a** — Make clue inspection spend one daily turn. [6d]
 - [x] **13b** — Show remaining turns in the map/status UI. [13a]
-- [ ] **13c** — Append event when Room 7 opens and when a major clue is found. [7b, 12b]
+- [x] **13c** — Append event when Room 7 opens and when a major clue is found. [7b, 12b]
   - [x] **13c-i** — Append `room_7_opened` event for the first opener (idempotent across later openers). [12b, 7b]
-  - [ ] **13c-ii** — Append a `clue_found` (or per-item) event when the player takes a major clue from the Lost-and-Found Drawer. [13c-i, 7b]
+  - [x] **13c-ii** — Append a `clue_found` (or per-item) event when the player takes a major clue from the Lost-and-Found Drawer. [13c-i, 7b]
 - [ ] **13d** — Add lobby bulletin/ledger screen that lists recent events. [7c]
 - [ ] **13e** — Increment `investigators` leaderboard when clues are found. [8c]
 - [ ] **13f** — Add leaderboard screen reachable from the main menu. [8d]

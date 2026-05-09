@@ -349,6 +349,140 @@ pub fn append_room_7_opened_event(world: &WorldDb, opening: &Room7Opening) -> bo
         .is_ok()
 }
 
+/// Event-log `kind` label written when a player takes a major clue
+/// from the Lost-and-Found Drawer (SPEC_v2 §Task 13c-ii).
+///
+/// Mirrors [`ROOM_7_OPENED_EVENT_KIND`] in shape: a flat snake_case
+/// label the bulletin (Task 13d) can group on. The per-item identity
+/// rides in the row's `metadata` JSON column rather than fanning out
+/// into per-item kinds, so a future "list clue events for player X"
+/// query stays a single `WHERE kind = 'clue_found'` predicate.
+pub const CLUE_FOUND_EVENT_KIND: &str = "clue_found";
+
+/// One row queued for the `clue_found` event log (SPEC_v2 §Task
+/// 13c-ii).
+///
+/// Lives in [`crate::state::SharedSlots::pending_clue_events`] between
+/// the prompt-callback push and the lobby-tick drain. Carries the
+/// rendered player-facing message plus a small JSON metadata blob with
+/// the catalog id of the item taken — enough for a future bulletin to
+/// render "Investigator pocketed the cracked matchbook." with an icon
+/// keyed off `metadata.item_id` without re-deriving from the message.
+///
+/// Owns its strings (`String`, not `&'static str`) so the producing
+/// callback can drop its captured slots immediately after pushing —
+/// the mailbox is the single owner until the tick drains it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingClueEvent {
+    /// Catalog id of the item the player took (e.g. `"room_7_key"`,
+    /// `"matchbook"`). Embedded as the value of `metadata.item_id` so
+    /// the bulletin can render per-item icons later without parsing
+    /// the message string.
+    pub item_id: String,
+    /// Player-facing one-liner for the bulletin's `message` column.
+    /// Phrased without a handle for the same reason
+    /// [`ROOM_7_OPENED_EVENT_MESSAGE`] is: the kit has no id→handle
+    /// lookup yet (SPEC §4.5 keeps identities advisory).
+    pub message: String,
+}
+
+/// Player-facing message stored on a `clue_found` row when the player
+/// recovers the Room 7 key.
+pub const CLUE_FOUND_ROOM_7_KEY_MESSAGE: &str = "Investigator recovered the Room 7 key.";
+
+/// Player-facing message stored on a `clue_found` row when the player
+/// pockets the cracked matchbook.
+pub const CLUE_FOUND_MATCHBOOK_MESSAGE: &str = "Investigator pocketed the cracked matchbook.";
+
+/// Map a Lost-and-Found Drawer outcome to a [`PendingClueEvent`] when
+/// the press resulted in a *new* major clue landing in inventory.
+///
+/// `had_matchbook_before` is the matchbook-inventory predicate captured
+/// by the drawer callback *before* it called
+/// [`crate::scenes::lost_and_found::apply_lost_and_found_choice`]. The
+/// `(K)` branch needs no equivalent guard because the prompt's
+/// `disabled_if(has_room_7_key, …)` rule already keeps re-takes from
+/// reaching the action handler — so any
+/// [`LostAndFoundOutcome::TookRoom7Key`] is necessarily a new pickup.
+///
+/// Returns `None` when:
+/// - the outcome is `PocketedMatchbook` but the player already had it
+///   (re-press through the still-enabled `(M)` row, or pickup-after-
+///   lobby-grab),
+/// - the outcome is `ReadReceipt` (no inventory change — the receipt
+///   sets a narrative flag, not a clue item), or
+/// - the outcome is `Left` (no-op).
+pub fn pending_clue_event_for(
+    outcome: crate::scenes::lost_and_found::LostAndFoundOutcome,
+    had_matchbook_before: bool,
+) -> Option<PendingClueEvent> {
+    use crate::scenes::lost_and_found::LostAndFoundOutcome;
+    match outcome {
+        LostAndFoundOutcome::TookRoom7Key => Some(PendingClueEvent {
+            item_id: crate::map::MapScreen::ROOM_7_KEY_ID.to_string(),
+            message: CLUE_FOUND_ROOM_7_KEY_MESSAGE.to_string(),
+        }),
+        LostAndFoundOutcome::PocketedMatchbook if !had_matchbook_before => Some(PendingClueEvent {
+            item_id: crate::map::MapScreen::MATCHBOOK_ID.to_string(),
+            message: CLUE_FOUND_MATCHBOOK_MESSAGE.to_string(),
+        }),
+        LostAndFoundOutcome::PocketedMatchbook
+        | LostAndFoundOutcome::ReadReceipt
+        | LostAndFoundOutcome::Left => None,
+    }
+}
+
+/// Drain queued clue-found events into `world_events` (SPEC_v2 §Task
+/// 13c-ii).
+///
+/// Called from [`crate::map::MapScreen::tick`] once per frame. Resolves
+/// the current player via [`WorldDb::upsert_player`] and writes one
+/// row per queued event with [`CLUE_FOUND_EVENT_KIND`]. Failures are
+/// logged-and-swallowed — same terminal-safety contract as
+/// [`append_room_7_opened_event`]: a transient SQLite hiccup must not
+/// soft-lock the lobby. Successful writes always drain the queue
+/// regardless of partial-failure shape, so a flaky disk does not
+/// generate duplicate entries on the next tick.
+///
+/// Returns the count of events that landed in the DB. The status UI
+/// does not consume the count today; tests use it to assert "exactly N
+/// rows were written this tick".
+pub fn flush_pending_clue_events(
+    world: &WorldDb,
+    foglet: &FogletContext,
+    slots: &crate::state::SharedSlots,
+) -> usize {
+    let mut queue = slots.pending_clue_events.borrow_mut();
+    if queue.is_empty() {
+        return 0;
+    }
+    // Drain regardless of write success: leaving entries in the queue
+    // would re-attempt them on every tick and could double-write if a
+    // row landed but the helper returned an error mid-batch.
+    let drained: Vec<PendingClueEvent> = queue.drain(..).collect();
+    drop(queue);
+    let player = match world.upsert_player(foglet) {
+        Ok(p) => p,
+        Err(_) => return 0,
+    };
+    let mut written = 0usize;
+    for event in drained {
+        let metadata = format!("{{\"item_id\":\"{}\"}}", event.item_id);
+        if world
+            .append_event(
+                CLUE_FOUND_EVENT_KIND,
+                Some(player.id),
+                &event.message,
+                Some(metadata.as_str()),
+            )
+            .is_ok()
+        {
+            written += 1;
+        }
+    }
+    written
+}
+
 /// Number of daily turns one clue-inspection action consumes — SPEC_v2
 /// §7 ("Daily clue turns: examining clue hotspots spends turns") and
 /// §Task 13a. Centralised so the helper, the lobby's X-press handler,
@@ -1203,5 +1337,136 @@ mod tests {
             ClueInspectionOutcome::NotConfigured,
             "missing [turns] config must short-circuit to NotConfigured"
         );
+    }
+
+    // ---- SPEC_v2 §Task 13c-ii clue_found events ---------------------
+
+    use crate::scenes::lost_and_found::LostAndFoundOutcome;
+    use crate::state::SharedSlots;
+
+    #[test]
+    fn pending_clue_event_for_take_room_7_key_emits_event() {
+        // The disabled-(K) prompt rule means a `TookRoom7Key` outcome
+        // is always a brand-new pickup — no `had_*` predicate gates
+        // it. Pin the canonical message + item id so a copy edit on
+        // either side surfaces here.
+        let event = pending_clue_event_for(LostAndFoundOutcome::TookRoom7Key, false)
+            .expect("Room 7 key pickup must always queue a clue_found event");
+        assert_eq!(event.item_id, crate::map::MapScreen::ROOM_7_KEY_ID);
+        assert_eq!(event.message, CLUE_FOUND_ROOM_7_KEY_MESSAGE);
+
+        // The `had_matchbook_before` flag is irrelevant for the (K)
+        // path — it gates only the matchbook arm. Same outcome either
+        // way confirms the predicate is correctly scoped.
+        let event_with_flag =
+            pending_clue_event_for(LostAndFoundOutcome::TookRoom7Key, true).expect("still queued");
+        assert_eq!(event_with_flag, event);
+    }
+
+    #[test]
+    fn pending_clue_event_for_pocket_matchbook_emits_only_when_new() {
+        let new_pickup = pending_clue_event_for(LostAndFoundOutcome::PocketedMatchbook, false)
+            .expect("first pocket must queue an event");
+        assert_eq!(new_pickup.item_id, crate::map::MapScreen::MATCHBOOK_ID);
+        assert_eq!(new_pickup.message, CLUE_FOUND_MATCHBOOK_MESSAGE);
+
+        // Re-press after pickup (or pickup-after-lobby-grab): the
+        // BTreeSet insert is a no-op, so the event mailbox must stay
+        // empty or the bulletin would double-count one keepsake.
+        assert!(
+            pending_clue_event_for(LostAndFoundOutcome::PocketedMatchbook, true).is_none(),
+            "re-pressing (M) after the matchbook is held must not re-queue an event"
+        );
+    }
+
+    #[test]
+    fn pending_clue_event_for_read_receipt_and_left_are_none() {
+        // ReadReceipt only flips a narrative flag, not inventory; the
+        // bulletin tracks clue *items*, so the receipt is intentionally
+        // outside the `clue_found` namespace.
+        assert!(pending_clue_event_for(LostAndFoundOutcome::ReadReceipt, false).is_none());
+        assert!(pending_clue_event_for(LostAndFoundOutcome::ReadReceipt, true).is_none());
+        // Walking away never mutates state.
+        assert!(pending_clue_event_for(LostAndFoundOutcome::Left, false).is_none());
+        assert!(pending_clue_event_for(LostAndFoundOutcome::Left, true).is_none());
+    }
+
+    #[test]
+    fn flush_pending_clue_events_no_op_on_empty_queue() {
+        let dir = tempdir().expect("tempdir");
+        let world = world_with_event_stack(&dir);
+        let slots = SharedSlots::default();
+        let fc = fixture_context();
+
+        let written = flush_pending_clue_events(&world, &fc, &slots);
+        assert_eq!(written, 0, "empty queue must not write any rows");
+        assert_eq!(
+            world.recent_events(10).expect("read events").len(),
+            0,
+            "no rows should land in world_events"
+        );
+    }
+
+    #[test]
+    fn flush_pending_clue_events_writes_rows_drains_queue_and_attributes_player() {
+        // End-to-end: queue two events through the same Rc the
+        // production callback would push into, drain via the helper,
+        // and assert both rows landed with the right kind, message,
+        // metadata, and player attribution.
+        let dir = tempdir().expect("tempdir");
+        let world = world_with_event_stack(&dir);
+        let slots = SharedSlots::default();
+        let fc = fixture_context();
+
+        slots
+            .pending_clue_events
+            .borrow_mut()
+            .push(PendingClueEvent {
+                item_id: crate::map::MapScreen::ROOM_7_KEY_ID.to_string(),
+                message: CLUE_FOUND_ROOM_7_KEY_MESSAGE.to_string(),
+            });
+        slots
+            .pending_clue_events
+            .borrow_mut()
+            .push(PendingClueEvent {
+                item_id: crate::map::MapScreen::MATCHBOOK_ID.to_string(),
+                message: CLUE_FOUND_MATCHBOOK_MESSAGE.to_string(),
+            });
+
+        let written = flush_pending_clue_events(&world, &fc, &slots);
+        assert_eq!(written, 2, "both queued events must reach the DB");
+        assert!(
+            slots.pending_clue_events.borrow().is_empty(),
+            "successful flush must drain the mailbox so the next tick is a no-op"
+        );
+
+        // recent_events returns newest-first; pin both rows.
+        let events = world.recent_events(10).expect("read events");
+        assert_eq!(events.len(), 2);
+        for row in &events {
+            assert_eq!(row.kind, CLUE_FOUND_EVENT_KIND);
+            assert!(
+                row.player_id.is_some(),
+                "every clue_found row must attribute the taking player via FK"
+            );
+            let metadata = row
+                .metadata
+                .as_deref()
+                .expect("clue_found rows ride with item_id metadata");
+            assert!(
+                metadata.contains("\"item_id\""),
+                "metadata must embed the catalog id under item_id: {metadata}"
+            );
+        }
+        // Spot-check that *both* item ids are represented across the
+        // two rows so a future change that accidentally collapses both
+        // metadata blobs onto one item surfaces here.
+        let combined = events
+            .iter()
+            .filter_map(|e| e.metadata.as_deref())
+            .collect::<Vec<_>>()
+            .join("|");
+        assert!(combined.contains(crate::map::MapScreen::ROOM_7_KEY_ID));
+        assert!(combined.contains(crate::map::MapScreen::MATCHBOOK_ID));
     }
 }

@@ -250,7 +250,19 @@ pub fn lost_and_found_drawer_screen(slots: SharedSlots) -> PromptScreen<LostAndF
     let callback_slots = slots;
     PromptScreen::new(prompt, move |action| match action {
         PromptAction::Selected(choice) => {
+            // Snapshot the matchbook-inventory predicate *before*
+            // apply mutates the slot so SPEC_v2 §Task 13c-ii can
+            // detect a *new* pickup. The `(K)` branch needs no
+            // equivalent — the prompt's disabled-state rule already
+            // keeps re-takes out of the action handler.
+            let had_matchbook = callback_slots
+                .inventory
+                .borrow()
+                .contains(MapScreen::MATCHBOOK_ID);
             let outcome = apply_lost_and_found_choice(&callback_slots, choice);
+            if let Some(event) = crate::world::pending_clue_event_for(outcome, had_matchbook) {
+                callback_slots.pending_clue_events.borrow_mut().push(event);
+            }
             if let Some(line) = lost_and_found_feedback(outcome) {
                 *callback_slots.feedback.borrow_mut() = Some(line);
             }
@@ -777,6 +789,95 @@ mod tests {
             .clone()
             .expect("disabled press must surface a reason");
         assert_eq!(feedback.text(), ROOM_7_KEY_ALREADY_HELD_REASON);
+    }
+
+    #[test]
+    fn drawer_screen_callback_take_key_queues_clue_found_event() {
+        // SPEC_v2 §Task 13c-ii: when the drawer's `(K)` press lands the
+        // Room 7 key in inventory, the callback must enqueue a
+        // PendingClueEvent so the next lobby tick can write a
+        // `clue_found` row to world_events.
+        let slots = SharedSlots::default();
+        slots.reset(0, 0);
+        assert!(
+            slots.pending_clue_events.borrow().is_empty(),
+            "fresh slots start with an empty mailbox"
+        );
+        let mut screen = lost_and_found_drawer_screen(slots.clone());
+
+        let cfg = fixture_config();
+        let fc = fixture_context();
+        let mut ctx = GameContext::new(&cfg, &fc, (80, 24));
+        let cmd = screen.handle_input(&mut ctx, Input::Char('k'));
+        assert!(matches!(cmd, ScreenCommand::Pop));
+
+        let queue = slots.pending_clue_events.borrow();
+        assert_eq!(
+            queue.len(),
+            1,
+            "Room 7 key pickup must enqueue exactly one pending event"
+        );
+        assert_eq!(queue[0].item_id, MapScreen::ROOM_7_KEY_ID);
+        assert_eq!(
+            queue[0].message,
+            crate::world::CLUE_FOUND_ROOM_7_KEY_MESSAGE
+        );
+    }
+
+    #[test]
+    fn drawer_screen_callback_pocket_matchbook_only_queues_first_time() {
+        // First press queues an event; second press (with the
+        // matchbook now in inventory) must not — otherwise repeated
+        // (M) presses would multiply the same keepsake in the
+        // bulletin.
+        let slots = SharedSlots::default();
+        slots.reset(0, 0);
+        let cfg = fixture_config();
+        let fc = fixture_context();
+
+        // First press through a fresh prompt: the callback sees an
+        // empty inventory and enqueues a clue_found event.
+        let mut screen = lost_and_found_drawer_screen(slots.clone());
+        let mut ctx = GameContext::new(&cfg, &fc, (80, 24));
+        let _ = screen.handle_input(&mut ctx, Input::Char('m'));
+        assert_eq!(
+            slots.pending_clue_events.borrow().len(),
+            1,
+            "first matchbook pickup must enqueue an event"
+        );
+
+        // Drain the mailbox to mimic the lobby tick consuming the
+        // queued row before the player presses (M) again.
+        slots.pending_clue_events.borrow_mut().clear();
+
+        // Second press: inventory already contains the matchbook, so
+        // the callback must observe `had_matchbook = true` and skip
+        // the enqueue. Build a *new* drawer screen so the prompt
+        // state-aware predicate (currently only gates `(K)`) is rebuilt
+        // — even with `(M)` enabled, the callback's pre-snapshot must
+        // still detect the duplicate.
+        let mut screen = lost_and_found_drawer_screen(slots.clone());
+        let mut ctx = GameContext::new(&cfg, &fc, (80, 24));
+        let _ = screen.handle_input(&mut ctx, Input::Char('m'));
+        assert!(
+            slots.pending_clue_events.borrow().is_empty(),
+            "re-pressing (M) once the matchbook is held must not re-queue an event"
+        );
+    }
+
+    #[test]
+    fn drawer_screen_callback_read_receipt_does_not_queue_event() {
+        // The receipt sets a narrative flag, not a clue item — Task
+        // 13c-ii's bulletin tracks inventory clues, so reading the
+        // receipt must leave the mailbox empty.
+        let slots = SharedSlots::default();
+        slots.reset(0, 0);
+        let mut screen = lost_and_found_drawer_screen(slots.clone());
+        let cfg = fixture_config();
+        let fc = fixture_context();
+        let mut ctx = GameContext::new(&cfg, &fc, (80, 24));
+        let _ = screen.handle_input(&mut ctx, Input::Char('r'));
+        assert!(slots.pending_clue_events.borrow().is_empty());
     }
 
     #[test]
