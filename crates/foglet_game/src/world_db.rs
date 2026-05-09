@@ -9,12 +9,10 @@
 //!
 //! # What lands here, and when
 //!
-//! Task 3c (this commit) wires the `[world].busy_timeout_ms` config
-//! into the open path via [`WorldDbOptions`]. It still deliberately
-//! does not:
-//!
-//! - apply the `[world].journal_mode` config — Task 3d;
-//! - run any migrations — Task 4.
+//! Task 3d (this commit) extends the open path to apply the
+//! `[world].journal_mode` config alongside the busy timeout introduced
+//! in Task 3c. It still deliberately does not run any migrations —
+//! that's Task 4.
 //!
 //! Keeping each behavior in its own iteration means the test that
 //! ships with this commit covers exactly one promise ("the file opens
@@ -49,17 +47,16 @@ use thiserror::Error;
 
 /// Tunables applied to the SQLite connection at open time.
 ///
-/// Task 3c introduces `busy_timeout_ms`; Task 3d will add a journal
-/// mode field on this same struct so the open path keeps a single
-/// argument shape. Authors normally build this from the
+/// Authors normally build this from the
 /// [`crate::config::WorldSection`] via [`From`] (below) so a `[world]`
 /// TOML edit propagates without code changes.
 ///
 /// `Default` matches the SPEC v2 §5 documented defaults — 5 seconds of
-/// retry — so unit tests and ad-hoc callers (Task 4 migration tests,
-/// for example) can spell `WorldDbOptions::default()` without
-/// rediscovering the SPEC's numbers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// retry and WAL journaling — so unit tests and ad-hoc callers
+/// (Task 4 migration tests, for example) can spell
+/// `WorldDbOptions::default()` without rediscovering the SPEC's
+/// numbers.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorldDbOptions {
     /// Milliseconds SQLite spends retrying a locked database before
     /// returning `SQLITE_BUSY`. Translates to
@@ -71,15 +68,41 @@ pub struct WorldDbOptions {
     /// instances against the same SQLite file would otherwise see
     /// spurious lock errors on the second writer.
     pub busy_timeout_ms: u64,
+    /// SQLite journal mode applied via `PRAGMA journal_mode = X`.
+    ///
+    /// Stored as a `String` (rather than a closed enum) so a config
+    /// authored against a future SQLite that grows new journal modes
+    /// continues to round-trip. The set of values accepted at open
+    /// time is constrained — see `ALLOWED_JOURNAL_MODES` — so an
+    /// arbitrary string can never reach the SQL pragma.
+    ///
+    /// The default is `wal` because v2's shared-world workload (two
+    /// local-dev sessions + a Foglet host) benefits materially from
+    /// WAL's reader/writer concurrency. Networked filesystems that
+    /// reject WAL fall back automatically — see [`WorldDb::journal_mode`].
+    pub journal_mode: String,
 }
+
+/// Journal modes the world-DB open path will pass through to SQLite.
+///
+/// Limited to the documented `PRAGMA journal_mode` values. Restricting
+/// the set up front is also a defence-in-depth measure: the value gets
+/// interpolated into a `PRAGMA journal_mode = X` statement (SQLite
+/// pragmas don't accept bind parameters), so funnelling it through an
+/// allowlist keeps a malformed `[world].journal_mode` from turning into
+/// a SQL injection vector.
+pub(crate) const ALLOWED_JOURNAL_MODES: &[&str] =
+    &["delete", "truncate", "persist", "memory", "wal", "off"];
 
 impl Default for WorldDbOptions {
     fn default() -> Self {
-        // 5 seconds matches SPEC v2 §5 and `default_world_busy_timeout_ms`
-        // in `config.rs`; the duplication is deliberate so this struct
-        // works in tests that don't touch `GameConfig` parsing.
+        // Defaults intentionally mirror `default_world_*` in `config.rs`
+        // so this struct works in tests that don't touch `GameConfig`
+        // parsing. Keeping them in lockstep is checked by the
+        // `options_from_world_section_*` regression tests below.
         Self {
             busy_timeout_ms: 5_000,
+            journal_mode: "wal".to_string(),
         }
     }
 }
@@ -92,6 +115,7 @@ impl From<&crate::config::WorldSection> for WorldDbOptions {
     fn from(section: &crate::config::WorldSection) -> Self {
         Self {
             busy_timeout_ms: section.busy_timeout_ms,
+            journal_mode: section.journal_mode.clone(),
         }
     }
 }
@@ -110,10 +134,16 @@ impl From<&crate::config::WorldSection> for WorldDbOptions {
 #[derive(Debug)]
 pub struct WorldDb {
     /// Underlying `rusqlite` connection. Kept private so future tasks
-    /// (3c busy timeout, 3d journal mode, 9 transactions) can layer
-    /// behavior on top without breaking callers that grabbed `&mut
-    /// conn` directly.
+    /// (Task 9 transactions, Task 4 migrations) can layer behavior on
+    /// top without breaking callers that grabbed `&mut conn` directly.
     conn: Connection,
+    /// Journal mode SQLite reported as active after the open-time
+    /// `PRAGMA journal_mode = X` round-trip. Stored so callers (and
+    /// the Task 14 docs) can distinguish "WAL applied" from "WAL
+    /// requested but the host downgraded to delete" — SQLite signals a
+    /// downgrade by returning the old mode rather than raising an
+    /// error, so the only way to know is to read what came back.
+    journal_mode: String,
 }
 
 impl WorldDb {
@@ -140,28 +170,24 @@ impl WorldDb {
     /// "filesystem rejected `mkdir`" (permission/disk-full) from
     /// "SQLite rejected the open" (corrupt file, locked DB).
     ///
-    /// # Out of scope for Task 3c
-    ///
-    /// This constructor still does not apply journal mode (3d). That
-    /// follows in its own iteration.
-    ///
     /// Equivalent to [`Self::open_with_options`] using
     /// [`WorldDbOptions::default`]. Kept as a convenience because the
     /// majority of unit-test call sites (and the test fixtures that
-    /// land in Task 4+) don't care about the busy-timeout knob.
+    /// land in Task 4+) don't care about the open-time knobs.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, WorldDbError> {
         Self::open_with_options(path, WorldDbOptions::default())
     }
 
     /// Open the SQLite database and apply the supplied tunables.
     ///
-    /// Currently honours [`WorldDbOptions::busy_timeout_ms`]; Task 3d
-    /// will extend this to apply journal mode here as well so the
-    /// runtime layer (Task 10) only ever calls a single constructor.
+    /// Honours both [`WorldDbOptions::busy_timeout_ms`] and
+    /// [`WorldDbOptions::journal_mode`] so the runtime layer (Task 10)
+    /// only ever calls a single constructor.
     ///
-    /// The busy timeout is applied *after* [`Connection::open`] so a
-    /// failure to set the pragma surfaces as
-    /// [`WorldDbError::ApplyBusyTimeout`] rather than masquerading as a
+    /// Tunables are applied *after* [`Connection::open`] so a failure
+    /// to set a pragma surfaces with the responsible knob named
+    /// (e.g. [`WorldDbError::ApplyBusyTimeout`],
+    /// [`WorldDbError::ApplyJournalMode`]) rather than masquerading as a
     /// generic open error — operationally these are very different
     /// conditions (the file is fine, the connection just couldn't be
     /// configured).
@@ -202,7 +228,22 @@ impl WorldDb {
                 source,
             })?;
 
-        Ok(Self { conn })
+        let journal_mode = apply_journal_mode(&conn, &options.journal_mode)?;
+
+        Ok(Self { conn, journal_mode })
+    }
+
+    /// Journal mode that SQLite reported as active after open.
+    ///
+    /// Usually equals the requested value (`"wal"` for the default
+    /// config). May differ when SQLite refuses the requested mode —
+    /// the canonical case is asking for `wal` on a network filesystem
+    /// that doesn't support shared-memory mapping; SQLite silently
+    /// keeps the prior mode and returns it from the pragma. Callers
+    /// (operator docs, future Task 14 health checks) inspect this to
+    /// surface the downgrade rather than assume WAL took effect.
+    pub fn journal_mode(&self) -> &str {
+        &self.journal_mode
     }
 
     /// Borrow the underlying connection for crate-internal use.
@@ -214,6 +255,38 @@ impl WorldDb {
     pub(crate) fn connection(&self) -> &Connection {
         &self.conn
     }
+}
+
+/// Apply `PRAGMA journal_mode = X` and return SQLite's reported active
+/// mode.
+///
+/// Pulled out of [`WorldDb::open_with_options`] to keep the open path
+/// readable and to make the validation rule (allowlist + case folding)
+/// easy to find. The function trims and lower-cases the requested mode
+/// so `"WAL"`, `" wal"`, and `"wal"` all behave identically — config
+/// authors shouldn't be punished for a stray space or capital letter.
+fn apply_journal_mode(conn: &Connection, requested: &str) -> Result<String, WorldDbError> {
+    let normalized = requested.trim().to_ascii_lowercase();
+    if !ALLOWED_JOURNAL_MODES.contains(&normalized.as_str()) {
+        return Err(WorldDbError::InvalidJournalMode {
+            requested: requested.to_string(),
+        });
+    }
+
+    // SQLite pragmas don't accept bind parameters, so the value is
+    // interpolated. Safety comes from the allowlist above: `normalized`
+    // is provably one of a handful of literal ASCII keywords. The query
+    // returns one row whose single column is the active mode (string).
+    let active: String = conn
+        .query_row(&format!("PRAGMA journal_mode = {normalized}"), [], |row| {
+            row.get(0)
+        })
+        .map_err(|source| WorldDbError::ApplyJournalMode {
+            requested: normalized,
+            source,
+        })?;
+
+    Ok(active)
 }
 
 /// Errors raised while opening or operating on a [`WorldDb`].
@@ -247,6 +320,34 @@ pub enum WorldDbError {
         /// Value the caller asked us to apply, echoed back so the
         /// operator-facing error names the offending knob.
         busy_timeout_ms: u64,
+        /// Underlying `rusqlite` error.
+        #[source]
+        source: rusqlite::Error,
+    },
+
+    /// The configured `[world].journal_mode` value isn't one of the
+    /// modes the world DB layer is willing to pass through to SQLite
+    /// (see `ALLOWED_JOURNAL_MODES`). Surfaced as a distinct variant
+    /// so the operator-facing error tells them the config string is
+    /// the problem — not the file, not the host SQLite build.
+    #[error(
+        "unsupported world database journal_mode `{requested}` \
+         (expected one of: delete, truncate, persist, memory, wal, off)"
+    )]
+    InvalidJournalMode {
+        /// Raw value as it appeared in config, echoed verbatim so the
+        /// operator can spot the typo without consulting the source.
+        requested: String,
+    },
+
+    /// `PRAGMA journal_mode = X` returned an error. Distinct from
+    /// [`Self::InvalidJournalMode`] so a host-level rejection (e.g.
+    /// SQLite built without WAL support) is diagnosable separately
+    /// from a configuration typo.
+    #[error("failed to apply world database journal_mode={requested}: {source}")]
+    ApplyJournalMode {
+        /// Normalized mode we attempted to apply.
+        requested: String,
         /// Underlying `rusqlite` error.
         #[source]
         source: rusqlite::Error,
@@ -318,6 +419,7 @@ mod tests {
             &db_path,
             WorldDbOptions {
                 busy_timeout_ms: 7_500,
+                ..WorldDbOptions::default()
             },
         )
         .expect("open succeeds with explicit busy timeout");
@@ -367,6 +469,116 @@ mod tests {
         };
         let options: WorldDbOptions = (&section).into();
         assert_eq!(options.busy_timeout_ms, 12_345);
+    }
+
+    /// Companion guard for [`options_from_world_section_carries_busy_timeout`]:
+    /// the journal_mode field also has to thread through the bridge.
+    #[test]
+    fn options_from_world_section_carries_journal_mode() {
+        let section = crate::config::WorldSection {
+            journal_mode: "delete".to_string(),
+            ..crate::config::WorldSection::default()
+        };
+        let options: WorldDbOptions = (&section).into();
+        assert_eq!(options.journal_mode, "delete");
+    }
+
+    /// SPEC_v2 §Task 3d acceptance: the configured journal mode is
+    /// actually applied. Reading `PRAGMA journal_mode` after open
+    /// confirms either the requested mode (the WAL happy path) or the
+    /// documented fallback. Test files live on the local filesystem
+    /// where WAL is supported, so the assertion is the strict form.
+    #[test]
+    fn open_with_options_applies_wal_journal_mode() {
+        let dir = tempdir().expect("tempdir creates");
+        let db_path = dir.path().join("world.sqlite");
+
+        let world = WorldDb::open_with_options(&db_path, WorldDbOptions::default())
+            .expect("open succeeds with default options");
+
+        assert_eq!(
+            world.journal_mode(),
+            "wal",
+            "default options must put the connection in WAL mode on a local fs"
+        );
+
+        // Round-trip the pragma directly, not just our cached field, to
+        // catch a future regression where `journal_mode()` lies because
+        // the open path forgot to issue the pragma.
+        let active: String = world
+            .connection()
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .expect("journal_mode pragma is queryable");
+        assert_eq!(active, "wal");
+    }
+
+    /// A non-WAL mode round-trips end-to-end. Picking `delete`
+    /// specifically because it's SQLite's pre-WAL default — if the
+    /// open path silently ignored our value, the assertion would still
+    /// pass for `delete` and we'd ship a broken knob. The companion
+    /// `truncate` assertion guards against that by exercising a value
+    /// SQLite would never default to.
+    #[test]
+    fn open_with_options_applies_truncate_journal_mode() {
+        let dir = tempdir().expect("tempdir creates");
+        let db_path = dir.path().join("world.sqlite");
+
+        let world = WorldDb::open_with_options(
+            &db_path,
+            WorldDbOptions {
+                journal_mode: "truncate".to_string(),
+                ..WorldDbOptions::default()
+            },
+        )
+        .expect("open succeeds with truncate journal mode");
+
+        assert_eq!(world.journal_mode(), "truncate");
+    }
+
+    /// Case folding and whitespace tolerance: `WAL ` should behave as
+    /// `wal`. Authors who hand-edit `assets/game.toml` shouldn't get
+    /// punished for a stray capital or trailing space.
+    #[test]
+    fn journal_mode_is_normalized_before_apply() {
+        let dir = tempdir().expect("tempdir creates");
+        let db_path = dir.path().join("world.sqlite");
+
+        let world = WorldDb::open_with_options(
+            &db_path,
+            WorldDbOptions {
+                journal_mode: " WAL ".to_string(),
+                ..WorldDbOptions::default()
+            },
+        )
+        .expect("open succeeds with whitespace-padded uppercase WAL");
+
+        assert_eq!(world.journal_mode(), "wal");
+    }
+
+    /// Unknown journal modes are rejected before SQLite sees them. The
+    /// allowlist is the only thing that keeps the value from being
+    /// interpolated into a SQL pragma string, so a regression that
+    /// removed the check would also be a quiet SQL-injection risk.
+    #[test]
+    fn invalid_journal_mode_is_rejected() {
+        let dir = tempdir().expect("tempdir creates");
+        let db_path = dir.path().join("world.sqlite");
+
+        let err = WorldDb::open_with_options(
+            &db_path,
+            WorldDbOptions {
+                journal_mode: "definitely-not-a-mode".to_string(),
+                ..WorldDbOptions::default()
+            },
+        )
+        .expect_err("nonsense journal modes must not silently fall through");
+
+        match err {
+            WorldDbError::InvalidJournalMode { requested } => {
+                assert_eq!(requested, "definitely-not-a-mode");
+            }
+            other => panic!("expected InvalidJournalMode, got {other:?}"),
+        }
     }
 
     /// SPEC_v2 §Task 3b acceptance: a nested `world/world.sqlite`

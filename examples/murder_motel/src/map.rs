@@ -352,11 +352,11 @@ impl MapScreen {
     /// source of truth.
     pub const LOST_AND_FOUND_GLYPH: char = 'D';
 
-    /// One-line movement hint shown directly below the map block.
-    /// Pulled out as a constant so tests can assert it appears in the
-    /// rendered buffer without binding to the precise wording.
-    pub const HINT_LINE: &'static str =
-        "Move: arrows/hjkl  Talk: Enter  Buy: B  Search: X  Inv: I  Back: Esc  Quit: Q";
+    /// Always-visible movement and navigation cues. Concatenated with
+    /// any contextual verbs by [`Self::hint_line`] to form the full
+    /// hint shown beneath the map.
+    const HINT_BASE_PREFIX: &'static str = "Move: arrows/hjkl";
+    const HINT_BASE_SUFFIX: &'static str = "Inv: I  Back: Esc  Quit: Q";
 
     /// Build a lobby map screen with fresh, unshared slots. Used by
     /// tests that want an isolated screen instance and by callers that
@@ -551,6 +551,27 @@ impl MapScreen {
     pub fn nearby_clerk(&self) -> bool {
         self.nearby_npc()
             .is_some_and(|npc| npc.name == "Night Clerk")
+    }
+
+    /// Build the one-line hint shown beneath the map for the current
+    /// player position. Movement, inventory, and navigation cues are
+    /// always visible; verb hints (`Talk`, `Buy`, `Search`) only appear
+    /// when the player stands adjacent to a tile that accepts them, so
+    /// the hint never advertises an action the keypress would silently
+    /// reject.
+    pub fn hint_line(&self) -> String {
+        let mut segments: Vec<&str> = vec![Self::HINT_BASE_PREFIX];
+        if self.nearby_npc().is_some() {
+            segments.push("Talk: Enter");
+        }
+        if self.nearby_clerk() {
+            segments.push("Buy: B");
+        }
+        if self.nearby_lost_and_found() {
+            segments.push("Search: X");
+        }
+        segments.push(Self::HINT_BASE_SUFFIX);
+        segments.join("  ")
     }
 
     /// Shared handle to the narrative-flag store. Cloned so the
@@ -920,7 +941,7 @@ impl Screen for MapScreen {
             height: 1,
         };
         if hint_area.y < frame.area().height {
-            let hint = Paragraph::new(Self::HINT_LINE).alignment(Alignment::Center);
+            let hint = Paragraph::new(self.hint_line()).alignment(Alignment::Center);
             frame.render_widget(hint, hint_area);
         }
 
@@ -1978,26 +1999,74 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn map_hint_advertises_search_affordance() {
+    fn map_hint_advertises_search_affordance_only_when_adjacent() {
         // The hint line is the only place a player learns the search
-        // affordance exists. If a future copy edit drops "Search: X" the
-        // drawer becomes unreachable except by accident.
+        // affordance exists. The contextual rule: it must hide when the
+        // player is not next to the drawer (so a stray `X` press is
+        // never advertised) and reveal itself the moment the player
+        // steps adjacent.
+        let mut map = fresh_map_screen();
+        let cfg = fixture_config();
+        let fc = fixture_context();
+        let mut ctx = GameContext::new(&cfg, &fc, (80, 24));
+
+        // Spawn (22, 4): not adjacent to the drawer at (25, 2).
         assert!(
-            MapScreen::HINT_LINE.contains("Search: X"),
-            "hint line must advertise the search key; got {:?}",
-            MapScreen::HINT_LINE
+            !map.hint_line().contains("Search: X"),
+            "search hint must hide when not adjacent to the drawer; got {:?}",
+            map.hint_line()
+        );
+
+        // Walk to (26, 2) — adjacent to the drawer but not the clerk.
+        // From spawn: right four times, up twice. (24, 4) and (25, 4)
+        // are floor cells in the same room as spawn; (26, 3) crosses
+        // the door row at col 26 (floor between the two `+` doors).
+        for _ in 0..4 {
+            map.handle_input(&mut ctx, Input::Right);
+        }
+        for _ in 0..2 {
+            map.handle_input(&mut ctx, Input::Up);
+        }
+        assert_eq!(map.player(), (26, 2));
+        assert!(map.nearby_lost_and_found());
+        assert!(
+            map.hint_line().contains("Search: X"),
+            "search hint must advertise the key when adjacent to the drawer; got {:?}",
+            map.hint_line()
         );
     }
 
     #[test]
-    fn map_hint_advertises_buy_affordance() {
-        // Same rationale as the Search hint test: `b`/`B` is the only
-        // route to the SPEC §9 step 4 vendor prompt from gameplay.
-        // Drop the cue and the proof scene becomes invisible.
+    fn map_hint_advertises_buy_affordance_only_when_adjacent() {
+        // Same shape as the search-affordance test, scoped to the
+        // vendor prompt: `b`/`B` is the only route to the SPEC §9
+        // step 4 vendor screen, and the hint must surface that key
+        // exactly when the player stands next to the Night Clerk.
+        let mut map = fresh_map_screen();
+        let cfg = fixture_config();
+        let fc = fixture_context();
+        let mut ctx = GameContext::new(&cfg, &fc, (80, 24));
+
+        // Spawn (22, 4): not adjacent to the Night Clerk at (24, 2).
         assert!(
-            MapScreen::HINT_LINE.contains("Buy: B"),
-            "hint line must advertise the buy key; got {:?}",
-            MapScreen::HINT_LINE
+            !map.hint_line().contains("Buy: B"),
+            "buy hint must hide when not adjacent to the clerk; got {:?}",
+            map.hint_line()
+        );
+
+        // Walk to (24, 3) — adjacent only to the clerk; (24, 3) is on
+        // the door row but col 24 is floor between the room-3 / room-4
+        // doors at cols 18 and 27.
+        for _ in 0..2 {
+            map.handle_input(&mut ctx, Input::Right);
+        }
+        map.handle_input(&mut ctx, Input::Up);
+        assert_eq!(map.player(), (24, 3));
+        assert!(map.nearby_clerk());
+        assert!(
+            map.hint_line().contains("Buy: B"),
+            "buy hint must advertise the key when adjacent to the clerk; got {:?}",
+            map.hint_line()
         );
     }
 
