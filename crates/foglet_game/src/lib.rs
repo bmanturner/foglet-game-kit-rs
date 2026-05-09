@@ -40,6 +40,7 @@ pub mod input;
 pub mod leaderboards;
 pub mod manifest;
 pub mod map;
+pub mod notices;
 pub mod players;
 pub mod prompt;
 pub mod prompt_screen;
@@ -76,6 +77,7 @@ pub use manifest::{
 pub use map::{
     parse_map, EntityPlacement, Map, MapError, Tile, TileKind, TileLegend, PLAYER_GLYPH,
 };
+pub use notices::NOTICES_MIGRATION;
 pub use players::{PlayerError, PlayerRecord, PLAYERS_MIGRATION};
 pub use prompt::{
     AnyKeyOutcome, AnyKeyPrompt, ChoicePrompt, ConfirmAction, ConfirmOutcome, ConfirmPrompt,
