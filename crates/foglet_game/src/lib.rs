@@ -49,8 +49,8 @@ pub use config::{
     ConfigError, GameConfig, GameSection, ManifestSection, SaveSection, SaveStrategy,
 };
 pub use dialog::{
-    dialog_choice_prompt, load_dialog, Choice, ChoiceError, Dialog, DialogError, DialogState,
-    FlagSet, Node, DIALOG_PROMPT_MAX_CHOICES,
+    dialog_choice_prompt, dialog_handle_prompt_input, load_dialog, Choice, ChoiceError, Dialog,
+    DialogError, DialogState, FlagSet, Node, DIALOG_PROMPT_MAX_CHOICES,
 };
 pub use foglet::{
     load_context, load_context_from_env, load_context_from_file, load_context_with_options,

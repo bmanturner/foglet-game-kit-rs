@@ -477,6 +477,65 @@ pub fn dialog_choice_prompt(
     prompt
 }
 
+/// Route a single [`crate::input::Input`] through the current dialog node's choice
+/// prompt and apply a `Selected` outcome to the [`DialogState`]
+/// (SPEC §8 / Task 8b: bind prompt selection back to
+/// [`DialogState::choose`]).
+///
+/// Internally this just composes [`dialog_choice_prompt`] with
+/// [`crate::prompt::ChoicePrompt::handle`] and forwards the resolved
+/// index into [`DialogState::choose`]. It exists as a helper so the
+/// canonical "dialog screen handles input" path is one call rather
+/// than a four-line dance every game has to copy.
+///
+/// # Returned action
+///
+/// The returned [`crate::prompt::PromptAction<usize>`] carries the *raw* prompt
+/// outcome — `Selected(idx)` after the choice has already been
+/// applied to `state`/`flags`, `Disabled`/`Cancelled`/`None` exactly
+/// as [`crate::prompt::ChoicePrompt::handle`] produces them. Callers
+/// inspect it to drive feedback (e.g. surface a `Disabled` reason)
+/// without needing to re-derive what happened.
+///
+/// # Gating
+///
+/// Because the prompt is built fresh from
+/// [`DialogState::available_choices`] on every call, gated choices
+/// the player has not unlocked simply do not appear in the keymap —
+/// pressing their would-be digit returns
+/// [`crate::prompt::PromptAction::None`]. The caller does not have to filter
+/// anything itself.
+///
+/// # Error path
+///
+/// Returns [`ChoiceError::OutOfRange`] only if the prompt and
+/// `available_choices` ever disagree, which by construction they do
+/// not — the helper builds both from the same `(state, dialog,
+/// flags)` snapshot under a `&FlagSet` borrow that is upgraded to
+/// `&mut` only for the apply step. The `Result` exists so a future
+/// caller passing a *cached* prompt (built from an older flag
+/// snapshot) gets a typed failure instead of a panic; today's
+/// in-tree caller will never observe an error.
+pub fn dialog_handle_prompt_input(
+    state: &mut DialogState,
+    dialog: &Dialog,
+    flags: &mut FlagSet,
+    input: crate::input::Input,
+) -> Result<crate::prompt::PromptAction<usize>, ChoiceError> {
+    // Build the prompt under an immutable `&*flags` borrow so the
+    // `&mut FlagSet` argument is free for `state.choose` below. The
+    // prompt is stateless beyond `T = usize` indices, so dropping it
+    // before mutating flags has no observable cost.
+    let action = {
+        let prompt = dialog_choice_prompt(state, dialog, flags);
+        prompt.handle(input)
+    };
+    if let crate::prompt::PromptAction::Selected(idx) = &action {
+        state.choose(dialog, flags, *idx)?;
+    }
+    Ok(action)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -794,6 +853,74 @@ nodes:
         let mut seen = std::collections::HashSet::new();
         for c in &prompt.choices {
             assert!(seen.insert(c.key), "duplicate key {:?}", c.key);
+        }
+    }
+
+    // ----- Task 8b: prompt input → DialogState::choose helper -----
+
+    use crate::input::Input;
+    use crate::prompt::PromptAction;
+
+    #[test]
+    fn handle_prompt_input_advances_dialog_on_selection() {
+        let dialog = load_dialog(sample_yaml()).unwrap();
+        let mut flags = FlagSet::new();
+        let mut state = walk_to_choices(&dialog, &mut flags);
+
+        // Two ungated choices; '1' picks "I need a room" → room_request.
+        let action =
+            dialog_handle_prompt_input(&mut state, &dialog, &mut flags, Input::Char('1')).unwrap();
+        assert_eq!(action, PromptAction::Selected(0));
+        assert_eq!(state.current_node(), "room_request");
+        assert!(flags.contains("has_room_assigned"));
+    }
+
+    #[test]
+    fn handle_prompt_input_only_offers_gated_choices_when_flags_match() {
+        let dialog = load_dialog(sample_yaml()).unwrap();
+        let mut flags = FlagSet::new();
+        let mut state = walk_to_choices(&dialog, &mut flags);
+
+        // Without `heard_rumor`, "Tell me about the murder" is gated
+        // out and never gets a hotkey — the next ungated choice
+        // ("Just looking") takes the '2' slot, so '3' maps to
+        // nothing and the helper reports `None`.
+        let before = state.clone();
+        let action =
+            dialog_handle_prompt_input(&mut state, &dialog, &mut flags, Input::Char('3')).unwrap();
+        assert_eq!(action, PromptAction::None);
+        assert_eq!(state, before, "missing hotkey must not mutate state");
+        assert!(!flags.contains("asked_about_murder"));
+
+        // Now unlock the gated choice; '2' picks the (newly available)
+        // murder branch since it sits second in YAML order.
+        flags.insert("heard_rumor".to_string());
+        let action =
+            dialog_handle_prompt_input(&mut state, &dialog, &mut flags, Input::Char('2')).unwrap();
+        assert_eq!(action, PromptAction::Selected(1));
+        assert_eq!(state.current_node(), "murder_topic");
+        assert!(flags.contains("asked_about_murder"));
+    }
+
+    #[test]
+    fn handle_prompt_input_ignores_resize_and_unbound_keys() {
+        let dialog = load_dialog(sample_yaml()).unwrap();
+        let mut flags = FlagSet::new();
+        let mut state = walk_to_choices(&dialog, &mut flags);
+        let before = state.clone();
+
+        for input in [
+            Input::Resize {
+                width: 80,
+                height: 24,
+            },
+            Input::Char('q'), // not bound to any choice
+            Input::Up,
+        ] {
+            let action =
+                dialog_handle_prompt_input(&mut state, &dialog, &mut flags, input).unwrap();
+            assert_eq!(action, PromptAction::None, "input {input:?}");
+            assert_eq!(state, before, "input {input:?} mutated state");
         }
     }
 }
