@@ -297,6 +297,17 @@ pub enum NoticeError {
         #[source]
         source: rusqlite::Error,
     },
+    /// No `notices` row exists with the given id. Surfaced by helpers
+    /// that require an existing notice ([`WorldDb::mark_read`] and the
+    /// upcoming Task 3f `archive_notice`). The call site distinguishes
+    /// "this notice is gone" (a UI-recoverable state — refresh the
+    /// inbox) from a generic SQL failure.
+    #[error("notice {id} does not exist")]
+    NotFound {
+        /// The id the caller looked up. Echoed so log lines and
+        /// operator-facing errors can name the missing row.
+        id: i64,
+    },
 }
 
 impl WorldDb {
@@ -478,6 +489,76 @@ ORDER BY created_at DESC, id DESC";
             .map_err(|source| NoticeError::Sqlite { source })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(|source| NoticeError::Sqlite { source })
+    }
+
+    /// Mark a notice as read; idempotent (SPEC_v3 §4.1 / §Task 3e).
+    ///
+    /// SPEC §4.1 requires "Reading a notice MUST be idempotent". The
+    /// natural interpretation is "calling `mark_read` twice does not
+    /// change the timestamp the recipient first read it". We implement
+    /// that with `UPDATE … SET read_at = COALESCE(read_at,
+    /// CURRENT_TIMESTAMP)` — the first call flips `NULL` to the
+    /// current second; subsequent calls keep the original value
+    /// untouched. The returned [`Notice`] reflects the canonical row,
+    /// so the caller doesn't need a follow-up `SELECT` to discover the
+    /// timestamp.
+    ///
+    /// Idempotency matters because BBS-style screens often re-render
+    /// the inbox after every keypress; "viewing" a notice may fire
+    /// `mark_read` repeatedly during a single session. A naive
+    /// `SET read_at = CURRENT_TIMESTAMP` would silently advance the
+    /// timestamp on each render — defensible, but prevents UIs from
+    /// surfacing "first read at …" reliably and would mask a regression
+    /// where the helper is called more than expected.
+    ///
+    /// # Scope
+    ///
+    /// This helper authenticates by `id` only — it does not require a
+    /// `recipient_player_id`. v3 game UIs read the notice from the
+    /// recipient's own inbox before flipping the read flag, so the
+    /// caller has already established ownership; layering a second
+    /// recipient check here would force every call site through a
+    /// duplicate parameter. A future hardening pass can add a
+    /// `mark_read_for(recipient_id, notice_id)` overload if a screen
+    /// ever exposes raw ids that didn't come from `inbox()`.
+    ///
+    /// # Failure
+    ///
+    /// Returns [`NoticeError::NotFound`] if no row matches `notice_id`
+    /// — typically because the notice was archived from another
+    /// session and purged out of view, or because the id was stale.
+    /// `rusqlite` errors propagate as [`NoticeError::Sqlite`].
+    ///
+    /// # Concurrency
+    ///
+    /// Takes `&self`: a single `UPDATE … RETURNING` under the
+    /// configured busy timeout. Same shape as [`Self::send_notice`].
+    pub fn mark_read(&self, notice_id: i64) -> Result<Notice, NoticeError> {
+        // `COALESCE(read_at, CURRENT_TIMESTAMP)` is the idempotency
+        // hinge: first call replaces NULL; subsequent calls preserve
+        // the existing timestamp. Doing this in SQL (rather than a
+        // SELECT-then-UPDATE round-trip) collapses to a single
+        // statement and removes the read/write race window.
+        //
+        // The column list mirrors `RETURNING` in `send_notice` and the
+        // `inbox` SELECT — `row_to_notice` is the single decoder.
+        const SQL: &str = "\
+UPDATE notices \
+SET read_at = COALESCE(read_at, CURRENT_TIMESTAMP) \
+WHERE id = ?1 \
+RETURNING id, created_at, sender_player_id, recipient_player_id, \
+          kind, subject, body, read_at, archived_at, expires_at, metadata";
+
+        match self
+            .connection()
+            .query_row(SQL, rusqlite::params![notice_id], row_to_notice)
+        {
+            Ok(notice) => Ok(notice),
+            Err(rusqlite::Error::QueryReturnedNoRows) => {
+                Err(NoticeError::NotFound { id: notice_id })
+            }
+            Err(source) => Err(NoticeError::Sqlite { source }),
+        }
     }
 }
 
@@ -1226,6 +1307,93 @@ mod tests {
             inbox.iter().any(|n| n.id == read.id && n.read_at.is_some()),
             "read flag must round-trip"
         );
+    }
+
+    /// SPEC_v3 §Task 3e headline: a freshly sent notice has
+    /// `read_at IS NULL`; the first `mark_read` flips it to a
+    /// timestamp; the *second* call is a no-op — the timestamp does
+    /// not advance. SPEC §4.1 pins "Reading a notice MUST be
+    /// idempotent" and this is the test that locks it: a regression
+    /// from `COALESCE(read_at, CURRENT_TIMESTAMP)` to a plain
+    /// `SET read_at = CURRENT_TIMESTAMP` would silently advance the
+    /// timestamp on the second call and flunk here.
+    #[test]
+    fn mark_read_is_idempotent() {
+        let (_dir, world) = world_with_notices();
+        let alice = world.upsert_player(&ctx("u-a", "alice")).unwrap();
+        let bob = world.upsert_player(&ctx("u-b", "bob")).unwrap();
+        let sent = world
+            .send_notice(Some(alice.id), bob.id, "k", "hi", "body", None, None, 1_000)
+            .unwrap();
+        assert!(sent.read_at.is_none(), "fresh notice must be unread");
+
+        let first = world.mark_read(sent.id).expect("first mark_read succeeds");
+        let read_at = first
+            .read_at
+            .clone()
+            .expect("first mark_read must set read_at");
+
+        // Sleep at least one SQLite second so a non-idempotent
+        // implementation would observably advance the timestamp. If
+        // this test ever feels too slow, the contract is checkable
+        // without the sleep by asserting `second.read_at == first.read_at`
+        // — but the sleep makes the regression mode visible to a human
+        // running the test.
+        std::thread::sleep(std::time::Duration::from_millis(1_100));
+
+        let second = world.mark_read(sent.id).expect("second mark_read succeeds");
+        assert_eq!(
+            second.read_at.as_deref(),
+            Some(read_at.as_str()),
+            "second mark_read must be a no-op (timestamp must not advance)"
+        );
+
+        // Round-trip through a primary-key SELECT — a regression that
+        // returned the right `Notice` from RETURNING but actually
+        // advanced the row's `read_at` would flunk here.
+        let stored: Option<String> = world
+            .connection()
+            .query_row(
+                "SELECT read_at FROM notices WHERE id = ?1",
+                rusqlite::params![sent.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored.as_deref(), Some(read_at.as_str()));
+    }
+
+    /// SPEC_v3 §Task 3e: marking a missing notice returns
+    /// [`NoticeError::NotFound`], not a generic SQL error. The UI
+    /// layer needs to distinguish "this notice is gone" (refresh the
+    /// inbox) from "the database is broken" (escalate to the operator).
+    #[test]
+    fn mark_read_missing_id_returns_not_found() {
+        let (_dir, world) = world_with_notices();
+        let err = world.mark_read(999_999).expect_err("missing id must error");
+        match err {
+            NoticeError::NotFound { id } => assert_eq!(id, 999_999),
+            other => panic!("expected NotFound, got {other:?}"),
+        }
+    }
+
+    /// SPEC_v3 §Task 3d (revisited): a marked-read notice stays in
+    /// the default inbox. Pinned in `inbox_includes_read_notices` via
+    /// a hand-flipped `read_at`; pin it again here through the real
+    /// [`WorldDb::mark_read`] helper so the contract is locked
+    /// end-to-end.
+    #[test]
+    fn mark_read_keeps_notice_in_inbox() {
+        let (_dir, world) = world_with_notices();
+        let alice = world.upsert_player(&ctx("u-a", "alice")).unwrap();
+        let bob = world.upsert_player(&ctx("u-b", "bob")).unwrap();
+        let sent = world
+            .send_notice(Some(alice.id), bob.id, "k", "hi", "body", None, None, 1_000)
+            .unwrap();
+        world.mark_read(sent.id).unwrap();
+
+        let inbox = world.inbox(bob.id).unwrap();
+        assert_eq!(inbox.len(), 1, "read notices stay in the default inbox");
+        assert!(inbox[0].read_at.is_some());
     }
 
     /// SPEC_v3 §Task 3c: rejected notices MUST NOT produce a row.
