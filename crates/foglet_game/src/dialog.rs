@@ -526,19 +526,75 @@ pub fn dialog_choice_prompt(
     dialog: &Dialog,
     flags: &FlagSet,
 ) -> crate::prompt::ChoicePrompt<usize> {
+    dialog_choice_prompt_window(state, dialog, flags, 0)
+}
+
+/// Window-aware variant of [`dialog_choice_prompt`] (SPEC_v2_1.md §4.2
+/// Task 2f) used by [`crate::dialog_screen::DialogScreen`] to support
+/// nodes whose available-choice count exceeds
+/// [`DIALOG_PROMPT_MAX_CHOICES`].
+///
+/// Skips the first `offset` available choices and emits at most
+/// [`DIALOG_PROMPT_MAX_CHOICES`] entries from there. The hotkeys remain
+/// `'1'..='9'` (no two-digit hotkeys) so the direct-input contract from
+/// the un-windowed helper holds for every page; the prompt's
+/// `T = usize` value is the **full-list index** (`offset + i`), which is
+/// the same index a caller would pass to
+/// [`DialogState::choose`]. That keeps a single source of truth for the
+/// "which choice was picked" mapping — adapter and `DialogState` agree
+/// on indices regardless of which page the player is currently looking
+/// at.
+///
+/// # Why this is the only mechanism for >9 choices
+///
+/// SPEC_v2_1.md §4.2 forbids the adapter from re-implementing dialog
+/// mechanics, so the window is a *helper-level* feature: any caller
+/// that needs paged display routes through this function (or
+/// [`dialog_handle_prompt_input_window`]) and inherits the same
+/// gating, hotkey, and selection semantics the un-windowed helper
+/// already had. There is no second selection pipeline.
+///
+/// # Why the value carries the full-list index
+///
+/// `state.choose(idx, ..)` operates against
+/// [`DialogState::available_choices`] in its entirety — there is no
+/// "choose page-relative". Returning a window-relative index from
+/// `Selected(...)` would force every caller to reconstruct the page
+/// offset before applying, exactly the kind of duplicate book-keeping
+/// the helper exists to eliminate. The full-list index round-trips
+/// straight back into `choose` without any caller-side arithmetic.
+///
+/// # Out-of-range `offset`
+///
+/// An `offset` past the end of the available-choice list yields an
+/// empty prompt (`prompt.choices.is_empty()`), not a panic. Callers
+/// that want a friendly leave-hint render still need to detect the
+/// empty prompt themselves; the helper's contract is "skip-then-take",
+/// matching `Iterator::skip` + `Iterator::take`, not "clamp the
+/// offset."
+pub fn dialog_choice_prompt_window(
+    state: &DialogState,
+    dialog: &Dialog,
+    flags: &FlagSet,
+    offset: usize,
+) -> crate::prompt::ChoicePrompt<usize> {
     let mut prompt = crate::prompt::ChoicePrompt::new();
-    for (idx, choice) in state
+    for (display_pos, (full_idx, choice)) in state
         .available_choices(dialog, flags)
         .into_iter()
         .enumerate()
+        .skip(offset)
         .take(DIALOG_PROMPT_MAX_CHOICES)
+        .enumerate()
     {
-        // `idx + 1` so the displayed hotkey matches the human-friendly
-        // 1-based numbering players expect ("press 1 for the first
-        // option"). `from_digit` cannot fail for `1..=9`.
-        let digit = char::from_digit((idx as u32) + 1, 10)
-            .expect("idx + 1 is in 1..=9 by the take(9) bound above");
-        prompt = prompt.choice(digit, idx, choice.text.clone());
+        // `display_pos + 1` keeps hotkeys in `'1'..='9'` regardless of
+        // the page offset — players reading the on-screen list still
+        // press `1` for the first visible row, never `0` and never
+        // double digits. `full_idx` is what we hand to
+        // `state.choose` so the value is page-agnostic.
+        let digit = char::from_digit((display_pos as u32) + 1, 10)
+            .expect("display_pos + 1 is in 1..=9 by the take(9) bound above");
+        prompt = prompt.choice(digit, full_idx, choice.text.clone());
     }
     prompt
 }
@@ -588,12 +644,43 @@ pub fn dialog_handle_prompt_input(
     flags: &mut FlagSet,
     input: crate::input::Input,
 ) -> Result<crate::prompt::PromptAction<usize>, ChoiceError> {
+    dialog_handle_prompt_input_window(state, dialog, flags, input, 0)
+}
+
+/// Window-aware variant of [`dialog_handle_prompt_input`] (SPEC_v2_1.md
+/// §4.2 Task 2f) used by [`crate::dialog_screen::DialogScreen`] when
+/// the player is paging through a node with more than
+/// [`DIALOG_PROMPT_MAX_CHOICES`] available branches.
+///
+/// Builds the prompt via [`dialog_choice_prompt_window`] with the
+/// supplied `offset`, dispatches `input` through it, and applies the
+/// resolved `Selected(full_idx)` outcome to `state` exactly as the
+/// un-windowed helper does. The returned action carries the same
+/// full-list index the prompt builder embedded; callers that want to
+/// know which page-relative slot was picked subtract `offset`
+/// themselves.
+///
+/// # Why two pipelines, not a single offset-aware helper
+///
+/// We keep the un-windowed helper as a thin alias because every
+/// existing caller (and almost every future one) only ever shows one
+/// page of choices — passing `0` everywhere would be noise. The
+/// windowed helper is reserved for adapters that already track a
+/// scroll offset; mixing the two would force the runtime to thread an
+/// `Option<usize>` through every dialog dispatch.
+pub fn dialog_handle_prompt_input_window(
+    state: &mut DialogState,
+    dialog: &Dialog,
+    flags: &mut FlagSet,
+    input: crate::input::Input,
+    offset: usize,
+) -> Result<crate::prompt::PromptAction<usize>, ChoiceError> {
     // Build the prompt under an immutable `&*flags` borrow so the
     // `&mut FlagSet` argument is free for `state.choose` below. The
     // prompt is stateless beyond `T = usize` indices, so dropping it
     // before mutating flags has no observable cost.
     let action = {
-        let prompt = dialog_choice_prompt(state, dialog, flags);
+        let prompt = dialog_choice_prompt_window(state, dialog, flags, offset);
         prompt.handle(input)
     };
     if let crate::prompt::PromptAction::Selected(idx) = &action {

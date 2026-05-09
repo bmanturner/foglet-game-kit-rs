@@ -65,7 +65,7 @@ use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::Frame;
 
 use crate::dialog::{
-    dialog_choice_prompt, dialog_handle_prompt_input, Dialog, DialogState, FlagSet,
+    dialog_choice_prompt_window, dialog_handle_prompt_input_window, Dialog, DialogState, FlagSet,
     DIALOG_PROMPT_MAX_CHOICES,
 };
 use crate::input::Input;
@@ -222,6 +222,15 @@ pub struct DialogScreen {
     /// empty (line-pumping phase or finished dialog) the field is
     /// simply ignored by the render path.
     choice_cursor: usize,
+    /// Top of the visible-choices window when the current node has
+    /// more than [`DIALOG_PROMPT_MAX_CHOICES`] available branches
+    /// (SPEC_v2_1.md §4.2 Task 2f). `0` for any node within the cap,
+    /// which is the common case — only wide branching nodes (12+
+    /// suspects, long item lists threaded through dialog) ever set
+    /// this above zero. Maintained as the invariant
+    /// `choice_scroll <= choice_cursor < choice_scroll + DIALOG_PROMPT_MAX_CHOICES`
+    /// so the cursor always points into the visible window.
+    choice_scroll: usize,
     /// Render shape — modal frame (default) or compact unboxed.
     layout: DialogLayout,
     /// Game-supplied callback translating each [`DialogAction`] into
@@ -266,6 +275,7 @@ impl DialogScreen {
             state: start,
             flags,
             choice_cursor: 0,
+            choice_scroll: 0,
             layout: DialogLayout::Modal,
             on_action: Box::new(on_action),
         }
@@ -370,7 +380,7 @@ impl Screen for DialogScreen {
     ///    callback.
     /// 3. **Choice mode.** Lines exhausted, dialog not yet finished.
     ///    Build a [`crate::prompt::ChoicePrompt`] from the live flag
-    ///    snapshot via [`dialog_choice_prompt`] (the SPEC §8 helper
+    ///    snapshot via [`crate::dialog::dialog_choice_prompt`] (the SPEC §8 helper
     ///    that already filters `requires` / `requires_not` predicates
     ///    and caps the choice list at [`crate::dialog::DIALOG_PROMPT_MAX_CHOICES`])
     ///    and delegate rendering to [`crate::prompt::ChoicePrompt::render`].
@@ -450,11 +460,13 @@ impl Screen for DialogScreen {
 
         // 3. Choice mode. Build the prompt under an immutable flag
         // borrow; mutate nothing — render is read-only with respect
-        // to game state per SPEC §7.
+        // to game state per SPEC §7. We use the *windowed* helper
+        // here so a node with more than `DIALOG_PROMPT_MAX_CHOICES`
+        // available branches scrolls deterministically (Task 2f) —
+        // the un-windowed helper is the offset-0 case.
         let flags = self.flags.borrow();
-        let mut prompt = dialog_choice_prompt(&self.state, &self.dialog, &flags);
-        let visible = prompt.choices.len();
-        if visible == 0 {
+        let total = self.state.available_choices(&self.dialog, &flags).len();
+        if total == 0 {
             // Defensive: every choice gated and no goto fallback.
             // Render a leave hint so the player isn't stuck looking at
             // a blank modal — the validator allows this shape and the
@@ -468,11 +480,22 @@ impl Screen for DialogScreen {
             );
             return;
         }
-        // Clamp the cursor against the live choice count so a stale
-        // index (e.g. a flag flip between frames shrank the list)
-        // points at a real choice.
-        let cursor = self.choice_cursor.min(visible - 1);
-        prompt.selected = Some(cursor);
+        // Recompute the scroll window from the live `total` so a
+        // mid-frame flag flip (which can shrink the list and strand
+        // the saved offset past the end) cannot leave the prompt
+        // pointing at no rows. `cursor` is then clamped into the
+        // window, and `prompt.selected` is the *window-relative*
+        // position because the prompt only knows about its own rows.
+        let scroll = self.visible_window_offset(total);
+        let mut prompt = dialog_choice_prompt_window(&self.state, &self.dialog, &flags, scroll);
+        let visible = prompt.choices.len();
+        // Defensive: a stale `choice_cursor` past the live `total`
+        // (e.g. a flag flip between frames hid the cursor's choice)
+        // is clamped to the last visible row. Rendering would
+        // otherwise hand the prompt an out-of-range `selected` index.
+        let clamped_cursor = self.choice_cursor.min(total - 1);
+        let window_relative = clamped_cursor.saturating_sub(scroll).min(visible - 1);
+        prompt.selected = Some(window_relative);
         let (body_area, hint_area) = split_body_and_hint(inner);
         let buf = frame.buffer_mut();
         prompt.render(body_area, buf);
@@ -511,15 +534,20 @@ impl Screen for DialogScreen {
     ///    [`DialogAction::Finished`] without forcing the player to
     ///    press Enter twice — the v2 example's hand-rolled scene
     ///    behaved the same way and the refactor MUST preserve that.
-    /// 4. **Choice mode.** `Up`/`Down` move `choice_cursor`,
-    ///    clamped to `0..min(visible, DIALOG_PROMPT_MAX_CHOICES)`.
-    ///    `Enter` synthesises the matching numeric hotkey
+    /// 4. **Choice mode.** `Up`/`Down` move `choice_cursor` over
+    ///    the *full* available-choice list. When the node has more
+    ///    than [`DIALOG_PROMPT_MAX_CHOICES`] branches (Task 2f), the
+    ///    adapter maintains a `choice_scroll` window so the visible
+    ///    page follows the cursor: walking off the bottom edge
+    ///    advances the page; walking off the top retreats it. `Enter`
+    ///    synthesises the *window-relative* numeric hotkey
     ///    (`'1'..'9'`) and routes it through
-    ///    [`dialog_handle_prompt_input`], so this adapter never
-    ///    re-implements the SPEC §8 selection / flag-application
-    ///    pipeline. A literal `Char('1'..'9')` press goes straight
-    ///    through the same helper for parity with hand-rolled
-    ///    scenes.
+    ///    [`crate::dialog::dialog_handle_prompt_input_window`], so
+    ///    this adapter never re-implements the SPEC §8 selection /
+    ///    flag-application pipeline. A literal `Char('1'..'9')` press
+    ///    goes through the same windowed helper and is interpreted
+    ///    page-relative — `2` always picks the second visible row
+    ///    regardless of the current page.
     ///
     /// # Why synthesise a digit for Enter rather than call
     /// [`DialogState::choose`] directly
@@ -535,16 +563,16 @@ impl Screen for DialogScreen {
     /// helper rather than a parallel implementation that could drift
     /// from it.
     ///
-    /// # Cursor cap
+    /// # Cursor cap and scroll window
     ///
-    /// The cursor is bounded by both the live visible-choices count
-    /// and [`DIALOG_PROMPT_MAX_CHOICES`] (currently 9) because the
-    /// helper's prompt only assigns numeric hotkeys for `1..=9`.
-    /// Task 2f extends this to a deterministic scroll for >9-choice
-    /// nodes; today, a 10th branch is unreachable through the
-    /// adapter and authors must split the dialog. The render path
-    /// already clamps the cursor for display, so cursor drift here
-    /// is non-fatal.
+    /// The cursor is bounded by the live `available_choices` count
+    /// (no `DIALOG_PROMPT_MAX_CHOICES` cap on the cursor itself —
+    /// only on the visible window). When the node has more branches
+    /// than fit on a page, an internal `visible_window_offset`
+    /// helper keeps the `choice_scroll` field anchored so the
+    /// cursor row is always
+    /// visible. The render path uses the same offset so display and
+    /// input agree on which page the player is looking at.
     ///
     /// # Borrow discipline
     ///
@@ -594,22 +622,31 @@ impl Screen for DialogScreen {
             return ScreenCommand::None;
         }
 
-        // 4. Choice mode. Compute the live visible-choices count once
+        // 4. Choice mode. Compute the live total-choice count once
         // up-front so navigation, hotkey routing, and the synthesised
-        // Enter path all agree on the same boundary. Cap at
-        // DIALOG_PROMPT_MAX_CHOICES so the cursor never points past
-        // the helper's hotkey range.
-        let visible = {
+        // Enter path all agree on the same boundary. The cursor
+        // ranges over the *full* available-choices list — Task 2f's
+        // scroll window keeps it visible inside the
+        // `DIALOG_PROMPT_MAX_CHOICES` cap.
+        let total = {
             let flags = self.flags.borrow();
-            self.state
-                .available_choices(&self.dialog, &flags)
-                .len()
-                .min(DIALOG_PROMPT_MAX_CHOICES)
+            self.state.available_choices(&self.dialog, &flags).len()
         };
-        if visible == 0 {
+        if total == 0 {
             // Nothing to pick. The render path shows a leave hint, so
             // anything other than Esc (handled above) is absorbed.
             return ScreenCommand::None;
+        }
+        // Re-anchor the scroll window against the live `total` so a
+        // flag flip that shrank the list cannot leave the cursor
+        // outside the visible page.
+        self.choice_scroll = self.visible_window_offset(total);
+        // Cursor cannot point past the live list — clamp before any
+        // navigation arithmetic so subsequent `+ 1` / `- 1` operate
+        // on a valid index. This also covers the case where a stale
+        // cursor inherited from a longer list points off the end.
+        if self.choice_cursor >= total {
+            self.choice_cursor = total - 1;
         }
 
         match input {
@@ -618,47 +655,75 @@ impl Screen for DialogScreen {
                 // than wrapping — matches what
                 // `ChoicePrompt::step_from_input` does on the standard
                 // navigation path, and is the convention every Murder
-                // Motel scene already used.
+                // Motel scene already used. After moving, pull the
+                // window up if the cursor walked off the top edge so
+                // the player always sees the row they're highlighting.
                 if self.choice_cursor > 0 {
                     self.choice_cursor -= 1;
+                }
+                if self.choice_cursor < self.choice_scroll {
+                    self.choice_scroll = self.choice_cursor;
                 }
                 ScreenCommand::None
             }
             Input::Down => {
-                if self.choice_cursor + 1 < visible {
+                if self.choice_cursor + 1 < total {
                     self.choice_cursor += 1;
+                }
+                // Push the window down if the cursor walked past the
+                // bottom edge. The `+ 1` here is the "first row past
+                // the visible page"; subtracting `MAX_CHOICES - 1`
+                // lands the new top-of-window so the cursor sits on
+                // the last visible row.
+                if self.choice_cursor >= self.choice_scroll + DIALOG_PROMPT_MAX_CHOICES {
+                    self.choice_scroll = self.choice_cursor + 1 - DIALOG_PROMPT_MAX_CHOICES;
                 }
                 ScreenCommand::None
             }
             Input::Enter => {
-                let cursor = self.choice_cursor.min(visible - 1);
                 // Capture the picked choice's `goto` *before*
                 // applying — once the helper advances the state,
                 // `current_node` reflects the destination and the
-                // pre-advance metadata is gone.
+                // pre-advance metadata is gone. The cursor is the
+                // full-list index; the windowed helper consumes it
+                // directly.
                 let target_node = {
                     let flags = self.flags.borrow();
                     self.state
                         .available_choices(&self.dialog, &flags)
-                        .get(cursor)
+                        .get(self.choice_cursor)
                         .map(|c| c.goto.clone())
                         .unwrap_or_default()
                 };
-                // Synthesise the matching numeric hotkey (`'1'..='9'`).
-                // The cap above guarantees `cursor + 1 <= 9`, so the
-                // digit conversion is total.
-                let digit = char::from_digit((cursor as u32) + 1, 10)
-                    .expect("cursor < DIALOG_PROMPT_MAX_CHOICES (=9) by clamp");
+                // Synthesise the matching numeric hotkey (`'1'..='9'`)
+                // for the cursor's *window-relative* position. The
+                // window invariant guarantees
+                // `0 <= cursor - scroll < DIALOG_PROMPT_MAX_CHOICES`,
+                // so the digit conversion is total.
+                let window_relative = self.choice_cursor - self.choice_scroll;
+                let digit = char::from_digit((window_relative as u32) + 1, 10)
+                    .expect("window_relative < DIALOG_PROMPT_MAX_CHOICES (=9) by invariant");
                 let synth = Input::Char(digit);
+                let scroll = self.choice_scroll;
                 let action = {
                     let mut flags = self.flags.borrow_mut();
-                    dialog_handle_prompt_input(&mut self.state, &self.dialog, &mut flags, synth)
+                    dialog_handle_prompt_input_window(
+                        &mut self.state,
+                        &self.dialog,
+                        &mut flags,
+                        synth,
+                        scroll,
+                    )
                 };
-                // Reset cursor unconditionally — the next frame's
-                // filtered choice list may be smaller (a `set:` flag
-                // could have hidden a previously-visible branch), and
-                // landing back at index 0 is the conservative default.
+                // Reset cursor *and* scroll unconditionally — the next
+                // frame's filtered choice list may be smaller (a
+                // `set:` flag could have hidden a previously-visible
+                // branch) and landing back at index 0 / page 0 is the
+                // conservative default. Without this reset, paging
+                // through suspect dialogs would leave the next dialog
+                // mid-page on its first frame.
                 self.choice_cursor = 0;
+                self.choice_scroll = 0;
                 match action {
                     Ok(PromptAction::Selected(idx)) => {
                         (self.on_action)(DialogAction::ChoicePicked {
@@ -678,24 +743,33 @@ impl Screen for DialogScreen {
             Input::Char(c) if c.is_ascii_digit() && c != '0' => {
                 // Direct numeric hotkey — players who learned to type
                 // `2` instead of arrow-arrow-Enter keep that muscle
-                // memory. Capture target_node before applying so the
-                // callback can carry the pre-advance metadata.
+                // memory. The digit is *window-relative*: `2` always
+                // picks the second visible row, even when the player
+                // has scrolled to a later page. Map it back to a
+                // full-list index for the `target_node` capture and
+                // for the helper, which expects the windowed offset.
                 let digit = c.to_digit(10).expect("ascii_digit") as usize;
-                let target_node = if digit >= 1 {
+                let scroll = self.choice_scroll;
+                let target_node = {
                     let flags = self.flags.borrow();
                     self.state
                         .available_choices(&self.dialog, &flags)
-                        .get(digit - 1)
+                        .get(scroll + digit - 1)
                         .map(|c| c.goto.clone())
                         .unwrap_or_default()
-                } else {
-                    String::new()
                 };
                 let action = {
                     let mut flags = self.flags.borrow_mut();
-                    dialog_handle_prompt_input(&mut self.state, &self.dialog, &mut flags, input)
+                    dialog_handle_prompt_input_window(
+                        &mut self.state,
+                        &self.dialog,
+                        &mut flags,
+                        input,
+                        scroll,
+                    )
                 };
                 self.choice_cursor = 0;
+                self.choice_scroll = 0;
                 match action {
                     Ok(PromptAction::Selected(idx)) => {
                         (self.on_action)(DialogAction::ChoicePicked {
@@ -708,6 +782,40 @@ impl Screen for DialogScreen {
             }
             _ => ScreenCommand::None,
         }
+    }
+}
+
+impl DialogScreen {
+    /// Compute the top-of-window offset for the visible choice page,
+    /// given the live `total` available-choice count (Task 2f).
+    ///
+    /// Centralises the scroll-clamping arithmetic so the render path
+    /// and `handle_input` agree byte-for-byte: a flag flip that
+    /// shrank the list could otherwise leave one path scrolled past
+    /// the end while the other bailed early. The rule is "the cursor
+    /// must be visible, and the window cannot extend past `total`":
+    ///
+    /// 1. If `total <= MAX`, every choice fits on one page — the
+    ///    offset is always `0`.
+    /// 2. Otherwise the saved scroll cannot exceed `total - MAX` (or
+    ///    the last visible row would be past the end).
+    /// 3. Finally, if a stale cursor still falls below the saved
+    ///    scroll, pull the window up so the cursor row is on screen.
+    ///    This case fires when a flag flip removed choices *above*
+    ///    the cursor between frames.
+    fn visible_window_offset(&self, total: usize) -> usize {
+        if total <= DIALOG_PROMPT_MAX_CHOICES {
+            return 0;
+        }
+        let max_offset = total - DIALOG_PROMPT_MAX_CHOICES;
+        let mut offset = self.choice_scroll.min(max_offset);
+        let cursor = self.choice_cursor.min(total - 1);
+        if cursor < offset {
+            offset = cursor;
+        } else if cursor >= offset + DIALOG_PROMPT_MAX_CHOICES {
+            offset = cursor + 1 - DIALOG_PROMPT_MAX_CHOICES;
+        }
+        offset
     }
 }
 
@@ -1496,5 +1604,251 @@ nodes:
             dump.contains("Just checking in."),
             "first choice should still render after clamp; got:\n{dump}"
         );
+    }
+
+    // ---------- Task 2f scroll-on-overflow tests ----------
+    //
+    // SPEC_v2_1.md §4.2 requires deterministic scrolling when an
+    // available-choice list exceeds [`DIALOG_PROMPT_MAX_CHOICES`].
+    // The fixture below has 12 ungated choices on a single node; the
+    // tests pin both navigation (cursor + window invariants) and
+    // observable rendering (which choice texts are on screen as the
+    // window slides).
+
+    /// 12-choices fixture. All branches are ungated and lead to the
+    /// terminal node so the test focus stays on cursor/scroll
+    /// behaviour rather than flag mechanics.
+    fn fixture_twelve_choices_yaml() -> &'static str {
+        r#"
+start: pick
+nodes:
+  pick:
+    choices:
+      - text: "Choice 01"
+        goto: end
+      - text: "Choice 02"
+        goto: end
+      - text: "Choice 03"
+        goto: end
+      - text: "Choice 04"
+        goto: end
+      - text: "Choice 05"
+        goto: end
+      - text: "Choice 06"
+        goto: end
+      - text: "Choice 07"
+        goto: end
+      - text: "Choice 08"
+        goto: end
+      - text: "Choice 09"
+        goto: end
+      - text: "Choice 10"
+        goto: end
+      - text: "Choice 11"
+        goto: end
+      - text: "Choice 12"
+        goto: end
+  end: {}
+"#
+    }
+
+    fn fixture_twelve_choice_screen<F>(on_action: F) -> (DialogScreen, Rc<RefCell<FlagSet>>)
+    where
+        F: FnMut(DialogAction) -> ScreenCommand + 'static,
+    {
+        let dialog = load_dialog(fixture_twelve_choices_yaml()).expect("fixture parses");
+        let flags = Rc::new(RefCell::new(FlagSet::new()));
+        let state = {
+            let mut borrowed = flags.borrow_mut();
+            DialogState::start(&dialog, &mut borrowed)
+        };
+        let screen = DialogScreen::new(dialog, state, flags.clone(), on_action);
+        (screen, flags)
+    }
+
+    #[test]
+    fn handle_input_scrolls_window_when_cursor_walks_past_cap() {
+        // Twelve visible choices, page size nine. Walking Down past
+        // index 8 must advance `choice_scroll` so the cursor row
+        // stays inside the rendered window. After eleven Downs the
+        // cursor sits on the last choice (index 11) and the window
+        // is anchored at scroll=3 so rows 3..=11 are visible.
+        let (mut screen, _flags) = fixture_twelve_choice_screen(|_| ScreenCommand::None);
+        assert_eq!(screen.choice_cursor, 0);
+        assert_eq!(screen.choice_scroll, 0);
+
+        // First eight Downs stay inside the initial page.
+        for _ in 0..8 {
+            let _ = dispatch(&mut screen, Input::Down);
+        }
+        assert_eq!(screen.choice_cursor, 8);
+        assert_eq!(
+            screen.choice_scroll, 0,
+            "cursor still on the first page — no scroll yet"
+        );
+
+        // Ninth Down crosses the page boundary; the window slides
+        // by one so the cursor row remains the bottom-of-page entry.
+        let _ = dispatch(&mut screen, Input::Down);
+        assert_eq!(screen.choice_cursor, 9);
+        assert_eq!(
+            screen.choice_scroll, 1,
+            "scroll must advance once the cursor crosses MAX_CHOICES"
+        );
+
+        // Two more Downs walk to the last choice and scroll to the
+        // last possible window (scroll=3 → rows 3..=11 visible).
+        let _ = dispatch(&mut screen, Input::Down);
+        let _ = dispatch(&mut screen, Input::Down);
+        assert_eq!(screen.choice_cursor, 11);
+        assert_eq!(screen.choice_scroll, 3);
+
+        // Down at the bottom must clamp — neither cursor nor scroll
+        // can advance past the live list.
+        let _ = dispatch(&mut screen, Input::Down);
+        assert_eq!(screen.choice_cursor, 11);
+        assert_eq!(screen.choice_scroll, 3);
+    }
+
+    #[test]
+    fn handle_input_scrolls_window_back_on_up() {
+        // Mirror of the Down test: walk to the last choice, then Up
+        // until the cursor is on the first page again. The window
+        // must retreat with the cursor so the highlighted row is
+        // always visible.
+        let (mut screen, _flags) = fixture_twelve_choice_screen(|_| ScreenCommand::None);
+        for _ in 0..11 {
+            let _ = dispatch(&mut screen, Input::Down);
+        }
+        assert_eq!((screen.choice_cursor, screen.choice_scroll), (11, 3));
+
+        // Two Ups stay inside the bottom window (cursor 9 still
+        // visible at scroll=3 → rows 3..=11).
+        let _ = dispatch(&mut screen, Input::Up);
+        let _ = dispatch(&mut screen, Input::Up);
+        assert_eq!((screen.choice_cursor, screen.choice_scroll), (9, 3));
+
+        // Walking past the top of the window pulls scroll back so
+        // the cursor row stays on screen.
+        let _ = dispatch(&mut screen, Input::Up);
+        assert_eq!((screen.choice_cursor, screen.choice_scroll), (8, 3));
+        // Continue Up until the cursor lands at index 2 — by that
+        // point the window must have retreated to scroll=2.
+        for _ in 0..6 {
+            let _ = dispatch(&mut screen, Input::Up);
+        }
+        assert_eq!((screen.choice_cursor, screen.choice_scroll), (2, 2));
+    }
+
+    #[test]
+    fn render_paginated_choices_show_only_visible_window() {
+        // With twelve choices and the cursor on index 11, only the
+        // last nine rows ("Choice 04" through "Choice 12") must
+        // render — the first three are scrolled off the top.
+        let (mut screen, _flags) = fixture_twelve_choice_screen(|_| ScreenCommand::None);
+        for _ in 0..11 {
+            let _ = dispatch(&mut screen, Input::Down);
+        }
+        assert_eq!(screen.choice_scroll, 3);
+
+        let cfg = fixture_config();
+        let fc = fixture_context();
+        let mut ctx = GameContext::new(&cfg, &fc, (60, 18));
+        let mut term = Terminal::new(TestBackend::new(60, 18)).expect("test backend");
+        term.draw(|frame| screen.render(&mut ctx, frame))
+            .expect("draw");
+        let dump = buffer_to_string(term.backend().buffer());
+
+        // Off-page rows MUST NOT appear.
+        for label in ["Choice 01", "Choice 02", "Choice 03"] {
+            assert!(
+                !dump.contains(label),
+                "row {label} is above the visible window; got:\n{dump}"
+            );
+        }
+        // On-page rows MUST appear.
+        for label in [
+            "Choice 04",
+            "Choice 05",
+            "Choice 06",
+            "Choice 07",
+            "Choice 08",
+            "Choice 09",
+            "Choice 10",
+            "Choice 11",
+            "Choice 12",
+        ] {
+            assert!(
+                dump.contains(label),
+                "row {label} should be visible at scroll=3; got:\n{dump}"
+            );
+        }
+    }
+
+    #[test]
+    fn handle_input_enter_picks_offscreen_choice_via_window_relative_hotkey() {
+        // Walk the cursor to the 11th choice (full index 10, page
+        // index 7 once scroll lands at 3) and press Enter. The
+        // adapter must synthesise a *window-relative* digit (`'8'`)
+        // and route it through the windowed helper so the picked
+        // full-list index is 10, not 7.
+        let recorded: Rc<RefCell<Vec<DialogAction>>> = Rc::new(RefCell::new(Vec::new()));
+        let recorded_writer = recorded.clone();
+        let (mut screen, _flags) = fixture_twelve_choice_screen(move |a| {
+            recorded_writer.borrow_mut().push(a);
+            ScreenCommand::Pop
+        });
+        for _ in 0..10 {
+            let _ = dispatch(&mut screen, Input::Down);
+        }
+        assert_eq!((screen.choice_cursor, screen.choice_scroll), (10, 2));
+
+        let cmd = dispatch(&mut screen, Input::Enter);
+        assert!(matches!(cmd, ScreenCommand::Pop));
+        let actions = recorded.borrow();
+        assert_eq!(actions.len(), 1);
+        match &actions[0] {
+            DialogAction::ChoicePicked { choice_index, .. } => {
+                assert_eq!(
+                    *choice_index, 10,
+                    "Enter on cursor 10 must surface the full-list index, not the page-relative one"
+                );
+            }
+            other => panic!("expected ChoicePicked, got {other:?}"),
+        }
+        // Cursor and scroll must reset for the next dialog frame —
+        // the next conversation should start from the top.
+        assert_eq!(screen.choice_cursor, 0);
+        assert_eq!(screen.choice_scroll, 0);
+    }
+
+    #[test]
+    fn handle_input_numeric_hotkey_is_window_relative() {
+        // Scroll to the bottom page, then press `1` — the player
+        // should pick the *first visible* row (full index 3), not
+        // the absolute first choice in the list.
+        let recorded: Rc<RefCell<Vec<DialogAction>>> = Rc::new(RefCell::new(Vec::new()));
+        let recorded_writer = recorded.clone();
+        let (mut screen, _flags) = fixture_twelve_choice_screen(move |a| {
+            recorded_writer.borrow_mut().push(a);
+            ScreenCommand::Pop
+        });
+        for _ in 0..11 {
+            let _ = dispatch(&mut screen, Input::Down);
+        }
+        assert_eq!(screen.choice_scroll, 3);
+
+        let _ = dispatch(&mut screen, Input::Char('1'));
+        let actions = recorded.borrow();
+        assert_eq!(actions.len(), 1);
+        match &actions[0] {
+            DialogAction::ChoicePicked { choice_index, .. } => {
+                assert_eq!(
+                    *choice_index, 3,
+                    "digit `1` on the second page picks the first *visible* row (full index 3)"
+                );
+            }
+            other => panic!("expected ChoicePicked, got {other:?}"),
+        }
     }
 }
