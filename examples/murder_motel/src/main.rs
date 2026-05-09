@@ -1156,23 +1156,53 @@ pub enum LostAndFoundChoice {
     Leave,
 }
 
-/// Build the Lost-and-Found Drawer loot prompt
-/// (SPEC_v1_1.md §9 step 2).
+/// Disabled-reason string surfaced when the player presses `(K)` after
+/// the Room 7 key is already in their inventory (SPEC_v1_1.md §9 step
+/// 3). Centralised so the prompt builder, the runtime feedback line,
+/// and the test that pins the contract all reference one source — copy
+/// edits to the player-facing reason are a one-line change here.
+pub const ROOM_7_KEY_ALREADY_HELD_REASON: &str = "already in inventory";
+
+/// Build the Lost-and-Found Drawer loot prompt with every choice
+/// enabled (SPEC_v1_1.md §9 step 2).
 ///
-/// Returns a fresh `ChoicePrompt` every call so the caller is free to
-/// extend the chain with state-aware modifiers (`.disabled_if(...)`,
-/// `.footer(...)`) without coupling prompt construction to the player's
-/// current inventory. Task 10b introduces the prompt as pure data;
-/// Task 10c adds the action handler that consumes the variants and
-/// Task 10d will wrap this builder with the disabled-`(K)` branch when
-/// the Room 7 key is already in inventory.
+/// Convenience wrapper around [`lost_and_found_drawer_prompt_with_state`]
+/// for the common "fresh-state" case used by Task 10b's data tests and
+/// Task 10c's action-handler tests, where the player has not yet picked
+/// anything up. Production scene wiring (Task 10f) goes through the
+/// state-aware builder so `(K)` greys out automatically once the key is
+/// in inventory.
 pub fn lost_and_found_drawer_prompt() -> ChoicePrompt<LostAndFoundChoice> {
+    lost_and_found_drawer_prompt_with_state(false)
+}
+
+/// Build the Lost-and-Found Drawer loot prompt with the disabled-`(K)`
+/// branch wired in (SPEC_v1_1.md §9 step 3, Task 10d).
+///
+/// `has_room_7_key` is a plain bool rather than a `&SharedSlots` borrow
+/// so the function stays trivially pure: the caller computes the
+/// inventory predicate once at scene-entry and passes it in. That keeps
+/// the prompt builder testable without spinning up the runtime, and
+/// avoids tangling the renderer with `RefCell` borrow scheduling when
+/// the same scene later wants to redraw after a successful pickup
+/// flips the predicate.
+///
+/// `disabled_if` attaches to the **most recently added choice**
+/// (`crates/foglet_game/src/prompt.rs:651`), so the call sits
+/// immediately after `(K)`. The reducer in `foglet_game` then surfaces
+/// the press as [`foglet_game::PromptAction::Disabled`] with the
+/// SPEC-mandated reason, ensuring the disabled branch can never reach
+/// [`apply_lost_and_found_choice`] and double-insert the key.
+pub fn lost_and_found_drawer_prompt_with_state(
+    has_room_7_key: bool,
+) -> ChoicePrompt<LostAndFoundChoice> {
     let mut prompt = ChoicePrompt::new();
     for line in LOST_AND_FOUND_BODY {
         prompt = prompt.body(line);
     }
     prompt
         .choice('K', LostAndFoundChoice::TakeRoom7Key, "Take the Room 7 key")
+        .disabled_if(has_room_7_key, ROOM_7_KEY_ALREADY_HELD_REASON)
         .choice(
             'M',
             LostAndFoundChoice::PocketMatchbook,
@@ -3948,6 +3978,123 @@ mod tests {
         // stays empty so a future scene can't conflate "read" with
         // "took the receipt as an item".
         assert!(slots.inventory.borrow().is_empty());
+    }
+
+    // ---- Lost-and-Found Drawer disabled-(K) branch (SPEC §9 Task 10d) -
+
+    #[test]
+    fn lost_and_found_prompt_disables_take_key_when_already_held() {
+        // SPEC §9 step 3: "If the player already has the Room 7 key,
+        // `(K)` renders disabled with reason `already in inventory`."
+        // Inspect the typed prompt rather than the buffer so the test
+        // pins the data contract (the renderer test on line 3776
+        // already covers visual surfacing of disabled rows via the
+        // shared `ChoicePrompt::render` path in `foglet_game`).
+        let prompt = lost_and_found_drawer_prompt_with_state(true);
+
+        let take_key = prompt
+            .choices
+            .iter()
+            .find(|c| c.value == LostAndFoundChoice::TakeRoom7Key)
+            .expect("(K) choice must still be present so the player sees why it's locked");
+        assert!(
+            !take_key.enabled,
+            "(K) must be disabled when the Room 7 key is already in inventory"
+        );
+        assert_eq!(
+            take_key.disabled_reason.as_deref(),
+            Some(ROOM_7_KEY_ALREADY_HELD_REASON),
+            "disabled reason must match SPEC §9 step 3 verbatim"
+        );
+
+        // Sibling choices stay enabled — Task 10d only gates `(K)`, not
+        // the rest of the drawer's affordances.
+        for value in [
+            LostAndFoundChoice::PocketMatchbook,
+            LostAndFoundChoice::ReadReceipt,
+            LostAndFoundChoice::Leave,
+        ] {
+            let choice = prompt
+                .choices
+                .iter()
+                .find(|c| c.value == value)
+                .unwrap_or_else(|| panic!("{value:?} choice missing"));
+            assert!(
+                choice.enabled,
+                "{value:?} must remain enabled when only (K) is gated"
+            );
+            assert!(choice.disabled_reason.is_none());
+        }
+    }
+
+    #[test]
+    fn lost_and_found_prompt_take_key_stays_enabled_without_room_7_key() {
+        // Mirror of the disabled case so a future regression that
+        // accidentally inverts the condition lights up here, not in a
+        // downstream Murder Motel smoke test.
+        let prompt = lost_and_found_drawer_prompt_with_state(false);
+        let take_key = prompt
+            .choices
+            .iter()
+            .find(|c| c.value == LostAndFoundChoice::TakeRoom7Key)
+            .expect("(K) choice present");
+        assert!(take_key.enabled);
+        assert!(take_key.disabled_reason.is_none());
+    }
+
+    #[test]
+    fn lost_and_found_pressing_disabled_take_key_does_not_duplicate_item() {
+        // SPEC §9 step 3 + Task 10d test directive: "pressing `k` when
+        // disabled returns disabled message and does not duplicate the
+        // item." We stage a slot with the key already present, build
+        // the state-aware prompt, drive both lowercase and uppercase
+        // hotkeys through the reducer, assert the typed
+        // `PromptAction::Disabled` payload, and confirm the inventory
+        // count stays at one.
+        use foglet_game::PromptAction;
+
+        let slots = SharedSlots::default();
+        slots.reset(0, 0);
+        slots
+            .inventory
+            .borrow_mut()
+            .insert(MapScreen::ROOM_7_KEY_ID.to_string());
+        let before = slots.snapshot();
+
+        let prompt = lost_and_found_drawer_prompt_with_state(true);
+
+        for key in ['k', 'K'] {
+            let action = prompt.handle(Input::Char(key));
+            match action {
+                PromptAction::Disabled { reason, .. } => assert_eq!(
+                    reason.as_deref(),
+                    Some(ROOM_7_KEY_ALREADY_HELD_REASON),
+                    "disabled reason for {key} drifted from SPEC §9"
+                ),
+                other => panic!("expected PromptAction::Disabled, got {other:?} for {key}"),
+            }
+        }
+
+        // The reducer never reached `apply_lost_and_found_choice`, so
+        // state must be byte-identical to the pre-press snapshot — no
+        // ghost matchbook, no flag flips, and crucially no second
+        // ROOM_7_KEY_ID inserted (BTreeSet would dedupe anyway, but a
+        // future Vec-based inventory must not regress this).
+        assert_eq!(
+            slots.snapshot(),
+            before,
+            "disabled (K) press must not mutate any slot"
+        );
+        let count = slots
+            .inventory
+            .borrow()
+            .iter()
+            .filter(|id| id.as_str() == MapScreen::ROOM_7_KEY_ID)
+            .count();
+        assert_eq!(
+            count, 1,
+            "Room 7 key must not be duplicated by a disabled press"
+        );
     }
 
     #[test]
