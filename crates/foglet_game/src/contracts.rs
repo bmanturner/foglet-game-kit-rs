@@ -417,6 +417,9 @@ ORDER BY created_at ASC, id ASC";
     /// one contract row to `accepted`, records `acceptor_player_id`, and
     /// stamps `accepted_at = CURRENT_TIMESTAMP` atomically.
     ///
+    /// Contracts whose `expires_at` deadline is at-or-before "now" are not
+    /// accepted by this helper.
+    ///
     /// The optional `on_commit` callback runs after the SQL mutation while
     /// still inside the active transaction. If the callback returns `Err`,
     /// the transaction rolls back and no acceptance persists.
@@ -443,6 +446,7 @@ SET state = ?2,\n\
     accepted_at = CURRENT_TIMESTAMP\n\
 WHERE id = ?1\n\
   AND acceptor_player_id IS NULL\n\
+  AND (expires_at IS NULL OR datetime(expires_at) > CURRENT_TIMESTAMP)\n\
 RETURNING id, key, kind, issuer_owner_kind, issuer_owner_id, \
           acceptor_player_id, state, objective_json, reward_json, metadata_json, \
           created_at, accepted_at, completed_at, expires_at";
@@ -1118,6 +1122,67 @@ mod tests {
         assert_eq!(
             persisted.accepted_at, first_accept.accepted_at,
             "failed second accept must not rewrite accepted_at"
+        );
+    }
+
+    #[test]
+    fn accept_contract_rejects_when_expired_at_or_before_now() {
+        let dir = tempdir().expect("tempdir creates");
+        let db_path = dir.path().join("world.sqlite");
+        let mut world = WorldDb::open(&db_path).expect("open succeeds");
+        world
+            .apply_migration(&CONTRACTS_MIGRATION)
+            .expect("contracts migration applies");
+
+        let expires_now: String = world
+            .connection()
+            .query_row("SELECT CURRENT_TIMESTAMP", [], |row| row.get(0))
+            .expect("current timestamp query succeeds");
+
+        let created = world
+            .create_contract(CreateContractInput {
+                key: Some("dockside-bounty"),
+                kind: "bounty",
+                issuer_owner_kind: "harbor",
+                issuer_owner_id: 23,
+                objective_json: r#"{"target":"smuggler"}"#,
+                reward_json: r#"{"credits":700}"#,
+                metadata_json: Some(r#"{"difficulty":"high"}"#),
+                expires_at: Some(expires_now.as_str()),
+            })
+            .expect("create_contract succeeds");
+
+        let accept = world.accept_contract(
+            created.id,
+            31,
+            None::<fn(&rusqlite::Transaction<'_>, &super::Contract) -> Result<(), rusqlite::Error>>,
+        );
+        assert!(
+            matches!(
+                accept,
+                Err(super::ContractError::Sqlite {
+                    source: rusqlite::Error::QueryReturnedNoRows
+                })
+            ),
+            "accept should fail when expires_at is at-or-before current timestamp"
+        );
+
+        let persisted = world
+            .contract_by_id(created.id)
+            .expect("lookup succeeds")
+            .expect("contract row still exists");
+        assert_eq!(
+            persisted.state,
+            ContractState::Available.as_str(),
+            "failed accept on expired contract must keep state unchanged"
+        );
+        assert_eq!(
+            persisted.acceptor_player_id, None,
+            "failed accept on expired contract must not set an acceptor"
+        );
+        assert_eq!(
+            persisted.accepted_at, None,
+            "failed accept on expired contract must not set accepted_at"
         );
     }
 }

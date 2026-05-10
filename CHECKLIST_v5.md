@@ -27,7 +27,7 @@ One unchecked item per iteration. Dependencies in `[brackets]` must be checked o
 
 - [x] **4a** — Implement `accept_contract(id, player_id, on_commit?)` transactional API. Test: state moves to `accepted`; `acceptor_player_id` and `accepted_at` set. [3b]
 - [x] **4b** — Test `accept_contract` rejects when `acceptor_player_id` is already set. [4a]
-- [ ] **4c** — Test `accept_contract` rejects when `expires_at <= now`. [4a]
+- [x] **4c** — Test `accept_contract` rejects when `expires_at <= now`. [4a]
 - [ ] **4d** — Test rollback when `accept_contract` `on_commit` returns an error: state unchanged. [4a]
 - [ ] **4e** — Implement `complete_contract(id, on_commit?)`. Test: state moves to `completed` with `completed_at`; rejects when state is not `accepted`. [4a]
 - [ ] **4f** — Implement `fail_contract(id, on_commit?)` and `abandon_contract(id, on_commit?)`. Test: each rejects from invalid source states; `abandon_contract` clears `acceptor_player_id`. [4a]
