@@ -305,8 +305,8 @@ impl ChallengeState {
 /// justify the abstraction yet — SPEC tenet "no premature
 /// abstraction").
 ///
-/// Task 4b only needs three variants — `EmptyKind`, `Sqlite`, and
-/// `NotFound` (latter reserved for 4c–4f). Validation variants for
+/// Task 4b–4c need: `EmptyKind`, `Sqlite`, `NotFound`,
+/// `InvalidTransition`, and `Expired`. Validation variants for
 /// length caps or self-challenge are deferred to follow-up tasks if
 /// SPEC ever calls for them; SPEC §4.2 does not require either.
 #[derive(Debug, Error)]
@@ -318,7 +318,7 @@ pub enum ChallengeError {
     /// every "challenges of kind X" query.
     #[error("challenge kind must not be empty")]
     EmptyKind,
-    /// The `INSERT … RETURNING` round-trip (or future `UPDATE` on a
+    /// The `INSERT … RETURNING` round-trip (or `UPDATE` on a
     /// transition) failed. Wrapping `rusqlite::Error` keeps the call
     /// site readable while preserving the underlying cause for
     /// `tracing` and operator-facing messages.
@@ -328,13 +328,53 @@ pub enum ChallengeError {
         #[source]
         source: rusqlite::Error,
     },
-    /// No `challenges` row exists with the given id. Reserved for
-    /// the upcoming 4c–4f transition helpers; declared now so call
-    /// sites can match exhaustively from the start.
+    /// No `challenges` row exists with the given id. Surfaced by
+    /// transition helpers (`accept_challenge`, `decline_challenge`,
+    /// `resolve_challenge`) when the caller's id is stale or the
+    /// row has been removed by an operator.
     #[error("challenge {id} does not exist")]
     NotFound {
         /// The id the caller looked up. Echoed so log lines and
         /// operator-facing errors can name the missing row.
+        id: i64,
+    },
+    /// The transition is not legal from the challenge's current
+    /// state. SPEC §4.2 mandates exactly four transitions:
+    /// `open -> accepted`, `open -> declined`, `open -> expired`,
+    /// `accepted -> resolved`. Every other (from, to) pair fails
+    /// with this variant. Carrying both `from` (the actual state
+    /// the row was found in) and the desired `to` lets the UI
+    /// render a precise message — "this challenge has already been
+    /// declined" vs "this challenge is in an unexpected state". The
+    /// kit's helpers ([`Self::Expired`] is the one specialisation)
+    /// would otherwise have to fall back on stringly-typed errors.
+    #[error("cannot transition challenge {id} from {from:?} to {to:?}")]
+    InvalidTransition {
+        /// Challenge id the caller targeted. Echoed so log lines
+        /// can name the offending row.
+        id: i64,
+        /// The state the row was in when the helper read it. Kept
+        /// as a `String` (rather than [`ChallengeState`]) so a
+        /// future schema state added without a matching enum
+        /// variant still surfaces here verbatim instead of crashing
+        /// on decode.
+        from: String,
+        /// The state the helper attempted to set.
+        to: ChallengeState,
+    },
+    /// The challenge was still in `open` but its `expires_at`
+    /// deadline has already passed. SPEC §4.2 requires "Expired
+    /// challenges cannot be accepted"; a separate variant from
+    /// [`Self::InvalidTransition`] lets the UI distinguish "the
+    /// deadline lapsed before you got here" from "this challenge
+    /// is in some other terminal state". Note that the row may
+    /// still be `state = 'open'` in the database — the Task 4f
+    /// sweeper hasn't run yet — but the helper refuses to accept
+    /// regardless, so a slow sweeper can't widen the window in
+    /// which an already-stale challenge is acceptable.
+    #[error("challenge {id} expired before it could be accepted")]
+    Expired {
+        /// Challenge id the caller targeted.
         id: i64,
     },
 }
@@ -426,6 +466,159 @@ RETURNING id, created_at, challenger_player_id, target_player_id, \
                 row_to_challenge,
             )
             .map_err(|source| ChallengeError::Sqlite { source })
+    }
+
+    /// Transition a challenge from `open` to `accepted` and stamp
+    /// `accepted_at` (SPEC_v3 §4.2 / §Task 4c).
+    ///
+    /// The contract is "if and only if the row was still open and
+    /// not past its deadline, it is now `accepted` with an
+    /// `accepted_at` timestamp; otherwise the row is unchanged and
+    /// the helper returns a typed error explaining why". SPEC §4.2
+    /// requires "Challenge state transitions MUST be transactional";
+    /// the implementation is one conditional `UPDATE … RETURNING`
+    /// statement, which is natively atomic in SQLite — same shape
+    /// as [`WorldDb::mark_read`]. No explicit
+    /// `BEGIN`/`COMMIT` is needed for a single statement; the
+    /// transactional wrapper exists for multi-statement helpers
+    /// (e.g. the upcoming market-buy path).
+    ///
+    /// # Conditional UPDATE shape
+    ///
+    /// The `WHERE` clause folds three checks into the UPDATE so the
+    /// success path is a single round-trip:
+    ///
+    /// 1. `id = ?1` — addresses the row.
+    /// 2. `state = 'open'` — only the `open -> accepted` transition
+    ///    is legal (SPEC §4.2); any other current state must fall
+    ///    through to the diagnostic SELECT and become an
+    ///    [`ChallengeError::InvalidTransition`].
+    /// 3. `expires_at IS NULL OR datetime(expires_at) > datetime('now')`
+    ///    — open-ended challenges (`expires_at IS NULL`) are always
+    ///    acceptable; deadlined challenges are acceptable only
+    ///    while the deadline is still in the future. Wrapping both
+    ///    sides in `datetime(…)` normalises the two ISO forms the
+    ///    kit accepts (`'YYYY-MM-DDTHH:MM:SSZ'` from callers,
+    ///    `'YYYY-MM-DD HH:MM:SS'` from `CURRENT_TIMESTAMP`) so the
+    ///    comparison is chronological rather than lexicographic.
+    ///
+    /// The bookkeeping fields are written in the same statement:
+    /// `state = 'accepted'` and `accepted_at = CURRENT_TIMESTAMP`
+    /// (which `RETURNING` echoes back as the canonical row).
+    ///
+    /// # Diagnostic SELECT
+    ///
+    /// On `QueryReturnedNoRows` the helper performs one diagnostic
+    /// SELECT to differentiate the failure modes — `NotFound` if
+    /// no row exists, `Expired` if the row is still open but past
+    /// its deadline, otherwise `InvalidTransition` carrying the
+    /// row's actual state. The diagnostic is read-only and races
+    /// only on the *error category* surfaced to the caller (a
+    /// concurrent UPDATE could change the row between the failed
+    /// UPDATE and the diagnostic SELECT); the helper never returns
+    /// stale state because it only returns error categories on
+    /// this path.
+    ///
+    /// # Failure
+    ///
+    /// - [`ChallengeError::NotFound`] — no row matches `id`.
+    /// - [`ChallengeError::Expired`] — row is still `open` but its
+    ///   `expires_at` deadline has passed.
+    /// - [`ChallengeError::InvalidTransition`] — row is in any
+    ///   state other than `open` (already accepted, declined,
+    ///   resolved, or swept to `expired` by Task 4f).
+    /// - [`ChallengeError::Sqlite`] — any other `rusqlite` error.
+    ///
+    /// # Concurrency
+    ///
+    /// Takes `&self`: a single `UPDATE … RETURNING` plus an optional
+    /// diagnostic `SELECT` under the configured busy timeout. Same
+    /// borrow shape as [`Self::create_challenge`] and
+    /// [`WorldDb::mark_read`].
+    pub fn accept_challenge(&self, challenge_id: i64) -> Result<Challenge, ChallengeError> {
+        // Conditional UPDATE: only the `open + still-fresh` row
+        // gets transitioned. SPEC §4.2 transitions are exhaustive
+        // — any non-matching row falls through to the diagnostic
+        // SELECT below for typed-error mapping.
+        const UPDATE_SQL: &str = "\
+UPDATE challenges \
+SET state = 'accepted', accepted_at = CURRENT_TIMESTAMP \
+WHERE id = ?1 \
+  AND state = 'open' \
+  AND (expires_at IS NULL OR datetime(expires_at) > datetime('now')) \
+RETURNING id, created_at, challenger_player_id, target_player_id, \
+          kind, stake, state, accepted_at, resolved_at, expires_at, result";
+
+        match self.connection().query_row(
+            UPDATE_SQL,
+            rusqlite::params![challenge_id],
+            row_to_challenge,
+        ) {
+            Ok(challenge) => Ok(challenge),
+            Err(rusqlite::Error::QueryReturnedNoRows) => {
+                Err(self.diagnose_failed_transition(challenge_id, ChallengeState::Accepted))
+            }
+            Err(source) => Err(ChallengeError::Sqlite { source }),
+        }
+    }
+
+    /// Map a no-rows response from a transition `UPDATE` onto the
+    /// right typed [`ChallengeError`] by reading the row state.
+    ///
+    /// Pulled out of [`Self::accept_challenge`] so the upcoming
+    /// `decline_challenge` and `resolve_challenge` helpers (Tasks
+    /// 4d/4e) can share the same diagnostic. The function does
+    /// exactly one SELECT and returns the most specific error —
+    /// `NotFound` > `Expired` > `InvalidTransition` — without ever
+    /// returning `Ok`. Internal-only; not part of the public API.
+    fn diagnose_failed_transition(
+        &self,
+        challenge_id: i64,
+        attempted: ChallengeState,
+    ) -> ChallengeError {
+        // We need the current state plus a "is the deadline already
+        // past?" flag. Compute the deadline check in SQL so it uses
+        // the same `datetime()` normalisation as the UPDATE — a
+        // mismatch here would let the diagnostic disagree with the
+        // gate that produced the no-rows in the first place.
+        const DIAG_SQL: &str = "\
+SELECT state, \
+       CASE \
+           WHEN expires_at IS NOT NULL \
+               AND datetime(expires_at) <= datetime('now') \
+           THEN 1 ELSE 0 \
+       END AS deadline_lapsed \
+FROM challenges WHERE id = ?1";
+
+        let row = self
+            .connection()
+            .query_row(DIAG_SQL, rusqlite::params![challenge_id], |row| {
+                let state: String = row.get(0)?;
+                let deadline_lapsed: i64 = row.get(1)?;
+                Ok((state, deadline_lapsed != 0))
+            });
+
+        match row {
+            Err(rusqlite::Error::QueryReturnedNoRows) => {
+                ChallengeError::NotFound { id: challenge_id }
+            }
+            Err(source) => ChallengeError::Sqlite { source },
+            // Row still open but its deadline already lapsed — the
+            // sweeper hasn't run, but the helper refuses to accept.
+            // Only meaningful when `attempted == Accepted` (the only
+            // transition that gates on the deadline today).
+            Ok((state, true))
+                if state == ChallengeState::Open.as_str()
+                    && attempted == ChallengeState::Accepted =>
+            {
+                ChallengeError::Expired { id: challenge_id }
+            }
+            Ok((state, _)) => ChallengeError::InvalidTransition {
+                id: challenge_id,
+                from: state,
+                to: attempted,
+            },
+        }
     }
 }
 
@@ -867,6 +1060,181 @@ mod tests {
         assert!(
             created.expires_at.is_none(),
             "None expires_at must round-trip as NULL"
+        );
+    }
+
+    /// SPEC_v3 §Task 4c acceptance: the canonical happy path. A
+    /// freshly created `open` challenge with no deadline (or a
+    /// future deadline) flips to `accepted` and gets `accepted_at`
+    /// populated by SQL. The other transition timestamps stay
+    /// `NULL` — accept is a one-step transition, not a "stamp
+    /// everything" shortcut. Round-tripping through a primary-key
+    /// SELECT also proves the new row state is durable, not just
+    /// reflected in the `RETURNING` echo.
+    #[test]
+    fn accept_challenge_transitions_open_to_accepted() {
+        let (_dir, world) = world_with_challenges();
+        let alice = world.upsert_player(&ctx("u-a", "alice")).unwrap();
+        let bob = world.upsert_player(&ctx("u-b", "bob")).unwrap();
+        let created = world
+            .create_challenge(alice.id, bob.id, "clue_race", None, None)
+            .expect("create_challenge succeeds");
+
+        let accepted = world
+            .accept_challenge(created.id)
+            .expect("accept_challenge succeeds on a fresh open challenge");
+
+        assert_eq!(
+            accepted.state,
+            ChallengeState::Accepted.as_str(),
+            "open challenge must transition to 'accepted'"
+        );
+        assert!(
+            accepted.accepted_at.is_some(),
+            "accept_challenge must stamp accepted_at"
+        );
+        assert!(
+            accepted.resolved_at.is_none(),
+            "accept_challenge must not stamp resolved_at"
+        );
+        assert!(
+            accepted.result.is_none(),
+            "accept_challenge must not populate result"
+        );
+
+        // Durability: re-read by primary key and confirm the row
+        // matches the `RETURNING` echo. A regression that returned
+        // a phantom row from `RETURNING` without committing would
+        // flunk here.
+        let stored = world
+            .connection()
+            .query_row(
+                "SELECT id, created_at, challenger_player_id, target_player_id, \
+                        kind, stake, state, accepted_at, resolved_at, expires_at, result \
+                 FROM challenges WHERE id = ?1",
+                rusqlite::params![created.id],
+                row_to_challenge,
+            )
+            .expect("primary-key SELECT decodes the row");
+        assert_eq!(stored, accepted, "stored row must equal RETURNING row");
+    }
+
+    /// SPEC §4.2 says "Expired challenges cannot be accepted". An
+    /// `open` row whose `expires_at` is already in the past must
+    /// return [`ChallengeError::Expired`] *and* leave the row
+    /// untouched — neither `state` nor `accepted_at` advance. We
+    /// pin both halves: the typed error AND the row-unchanged
+    /// invariant. Without the second half, a future regression
+    /// that flipped the order of the `WHERE` checks could let a
+    /// stale challenge slip through with a "fail" return value
+    /// while still mutating the row.
+    #[test]
+    fn accept_challenge_rejects_expired() {
+        let (_dir, world) = world_with_challenges();
+        let alice = world.upsert_player(&ctx("u-a", "alice")).unwrap();
+        let bob = world.upsert_player(&ctx("u-b", "bob")).unwrap();
+        // A deadline well in the past so the `datetime()`
+        // comparison in `accept_challenge` rejects regardless of
+        // wall-clock skew.
+        let created = world
+            .create_challenge(
+                alice.id,
+                bob.id,
+                "clue_race",
+                None,
+                Some("2000-01-01T00:00:00Z"),
+            )
+            .expect("create_challenge succeeds");
+
+        let err = world
+            .accept_challenge(created.id)
+            .expect_err("accepting an expired challenge must fail");
+        assert!(
+            matches!(err, ChallengeError::Expired { id } if id == created.id),
+            "expected Expired {{ id: {} }}, got {err:?}",
+            created.id
+        );
+
+        // Row-unchanged invariant: state still 'open',
+        // accepted_at still NULL.
+        let (state, accepted_at): (String, Option<String>) = world
+            .connection()
+            .query_row(
+                "SELECT state, accepted_at FROM challenges WHERE id = ?1",
+                rusqlite::params![created.id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(state, "open", "expired-but-unswept row must stay 'open'");
+        assert!(
+            accepted_at.is_none(),
+            "rejected accept must leave accepted_at NULL"
+        );
+    }
+
+    /// Accept on a row that is no longer `open` must fail with
+    /// [`ChallengeError::InvalidTransition`] carrying the actual
+    /// `from` state. Pin the canonical case — a second accept on
+    /// an already-accepted row — because that's the regression
+    /// most likely to slip in (a UI re-fires accept after a
+    /// double-keypress). The other terminal states (`declined`,
+    /// `resolved`, `expired`) ride the same code path; Task 4g's
+    /// invalid-transition matrix will cover them exhaustively.
+    #[test]
+    fn accept_challenge_rejects_already_accepted() {
+        let (_dir, world) = world_with_challenges();
+        let alice = world.upsert_player(&ctx("u-a", "alice")).unwrap();
+        let bob = world.upsert_player(&ctx("u-b", "bob")).unwrap();
+        let created = world
+            .create_challenge(alice.id, bob.id, "clue_race", None, None)
+            .unwrap();
+
+        let first = world
+            .accept_challenge(created.id)
+            .expect("first accept succeeds");
+        let second = world
+            .accept_challenge(created.id)
+            .expect_err("second accept must fail");
+        assert!(
+            matches!(
+                &second,
+                ChallengeError::InvalidTransition { id, from, to }
+                    if *id == created.id && from == "accepted" && *to == ChallengeState::Accepted
+            ),
+            "expected InvalidTransition from 'accepted' to Accepted, got {second:?}"
+        );
+
+        // accepted_at must NOT have moved between the two calls —
+        // the second attempt is a no-op on the row, mirroring the
+        // idempotency contract on `mark_read` (only the *typed
+        // error* differs because the state machine is stricter
+        // here than the read-flag flip).
+        let post: Option<String> = world
+            .connection()
+            .query_row(
+                "SELECT accepted_at FROM challenges WHERE id = ?1",
+                rusqlite::params![created.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            post, first.accepted_at,
+            "second accept must not advance accepted_at"
+        );
+    }
+
+    /// A stale id (challenge was deleted, or the caller fabricated
+    /// one) must surface [`ChallengeError::NotFound`] rather than a
+    /// generic SQL error. Same shape as `mark_read_missing_id_returns_not_found`.
+    #[test]
+    fn accept_challenge_missing_id_returns_not_found() {
+        let (_dir, world) = world_with_challenges();
+        let err = world
+            .accept_challenge(424_242)
+            .expect_err("missing id must fail");
+        assert!(
+            matches!(err, ChallengeError::NotFound { id } if id == 424_242),
+            "expected NotFound, got {err:?}"
         );
     }
 
