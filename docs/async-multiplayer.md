@@ -44,7 +44,7 @@ that follow from this:
   player-typed field has a length cap enforced before the SQL
   round-trip, and rejected drafts never produce autoincrement gaps.
 
-What v3 explicitly does *not* do is covered separately in §6.
+What v3 explicitly does *not* do is covered separately in §10.
 
 ## 2. The five primitives at a glance
 
@@ -243,7 +243,140 @@ Public surface:
   eligible: a claimant who never completes their work should not pin
   the bounty open forever.
 
-## 8. Reading the world without polling
+## 8. Player-authored text: bounds and sanitization
+
+[`SPEC_v3 §7`](../SPEC_v3.md#7-operational-requirements) requires that
+"player-authored text MUST be bounded and SHOULD be sanitized for
+terminal display." Bounding is enforced by the kit at write time;
+sanitization is enforced by the game at render time. The split is
+deliberate: storage stays a faithful record of what the player typed
+(an operator running `sqlite3` against the world DB sees the truth),
+and rendering owns the responsibility of not corrupting another
+player's terminal.
+
+### 8.1 What is "player-authored"
+
+Three primitives carry text that came directly from a player keystroke
+and round-trips to another player's screen on next navigation. These
+are the fields the kit enforces caps on:
+
+| Primitive | Field        | Cap constant                          | Default | Configurable? |
+|-----------|--------------|---------------------------------------|---------|---------------|
+| Notices   | `subject`    | `NOTICE_SUBJECT_MAX_CHARS`            | 120     | Kit-internal  |
+| Notices   | `body`       | `[multiplayer].max_notice_body_chars` | 1000    | Per-game      |
+| Market    | `display_name` | `MARKET_DISPLAY_NAME_MAX_CHARS`     | 120     | Kit-internal  |
+| Bounties  | `title`      | `BOUNTY_TITLE_MAX_CHARS`              | 120     | Kit-internal  |
+| Bounties  | `description`| `BOUNTY_DESCRIPTION_MAX_CHARS`        | 1000    | Kit-internal  |
+
+Three things that look player-authored but are *not*:
+
+- **Faction slug, display name, and description.** Seeded from
+  `[[factions.seed]]` in `assets/game.toml`, not typed by a player at
+  runtime. Bounded by config-load validation, not by the v3 multiplayer
+  layer.
+- **Challenge `stake` and `result`, market `metadata`, bounty
+  `reward`.** Game-defined JSON payloads. The kit treats them as opaque
+  text and the game owns their shape. If a game lets players type into
+  one of those payloads, the game owns the cap.
+- **Notice `kind`, market `item_key`, bounty `reward` keys.** Short
+  machine-readable namespaces chosen by the game author, not entered at
+  runtime.
+
+### 8.2 Where the cap is enforced
+
+For every player-authored field above, validation runs **before** the
+SQL round-trip, in this order:
+
+1. Emptiness check (`subject.is_empty()` etc.) → typed `EmptySubject`
+   / `EmptyBody` / `EmptyDisplayName` / `EmptyTitle` /
+   `EmptyDescription` error.
+2. Character-count check (`s.chars().count()`) → typed `…TooLong { max,
+   actual }` error.
+
+The cap is counted in **Unicode scalar values**, not bytes. A 4-emoji
+body (16 UTF-8 bytes) passes a `chars().count() == 4` cap; the test
+suite pins this explicitly so a regression to `len()` would fail
+loudly. Counting in scalar values matches what authoring screens
+display in their "120 / 137" character counters and avoids penalising
+non-ASCII text.
+
+A rejected draft never reaches SQLite. Three concrete consequences:
+
+- No autoincrement gap (the `notices.id` sequence skips nothing because
+  no `INSERT` ran).
+- No partial index entry to clean up.
+- No `world_events` row for the failed write.
+
+The `actual` field on `…TooLong { max, actual }` is a UI affordance:
+it lets the authoring screen render "you typed 137 characters; the
+cap is 120" without re-counting in the caller.
+
+### 8.3 Why caps live in code, not in `CHECK` constraints
+
+A schema-level `CHECK (length(subject) <= 120)` would be hostile to
+two things v3 wants to preserve:
+
+- **Per-game tuning of the body cap.** `max_notice_body_chars` is
+  configurable per-game; embedding it in a `CHECK` would require a
+  migration whenever a game tightens or loosens its mail policy.
+- **Typed errors at the boundary.** A `CHECK` failure surfaces as a
+  generic `SQLITE_CONSTRAINT`; the kit-side validator returns
+  `BodyTooLong { max, actual }` which UIs can render directly.
+
+The schema does carry safety-net constraints for *non-text* invariants
+(`market_listings.price >= 0`, `quantity >= 0`, the challenge state
+vocabulary CHECK) where there is no per-game tuning story.
+
+### 8.4 Terminal-display sanitization is the renderer's job
+
+Storage is faithful: the kit does **not** strip control characters,
+ANSI escapes, or zero-width codepoints from incoming player text. An
+operator inspecting `notices.body` with `sqlite3` sees exactly what the
+player typed, which is the right contract for moderation, audit, and
+debugging.
+
+Rendering is defensive: any TUI screen that draws player-authored text
+to another player's terminal MUST pass the text through a sanitizer
+before handing it to `ratatui`. The recommended sanitizer for v3
+multiplayer screens:
+
+- **Strip ASCII control characters** (`c.is_control()` returning
+  `true`) except for tab and newline if the widget renders multi-line.
+  An unstripped `ESC` (U+001B) followed by `[2J` would clear another
+  player's screen on draw.
+- **Strip the C1 control range** (U+0080 – U+009F). `crossterm` and
+  `ratatui` route most output through their own escape pipeline, but a
+  C1 byte arriving through a `Paragraph` widget can still reach the
+  raw terminal on some emulators.
+- **Replace zero-width and bidirectional override codepoints** (U+200B,
+  U+200C, U+200D, U+200E, U+200F, U+202A–U+202E, U+2066–U+2069) with
+  the Unicode replacement character. These are the codepoints that
+  enable "reverse-character" homoglyph attacks on caller handles
+  rendered next to a notice subject.
+- **Truncate to the on-screen budget after sanitization**, not before.
+  A widget with a 60-cell budget should call its truncator on the
+  sanitized string so it never lands mid-escape.
+
+The kit ships this sanitizer with the v3 multiplayer screens it adds
+to Murder Motel (Tasks 10–13); a game that builds its own multiplayer
+screens calls the same helper. Game-defined JSON payloads
+(`stake`, `result`, `metadata`, `reward`) are sanitized by the same
+helper if they include player-typed strings, but the game decides
+which fields qualify because the kit treats those payloads as opaque.
+
+### 8.5 What the kit does *not* do
+
+- **No HTML/markdown stripping.** v3 is a terminal kit; player text is
+  rendered as plain text. There is no markdown layer to escape.
+- **No profanity filtering or content moderation.** That is a game
+  policy choice. A game that wants moderation can wrap
+  `WorldDb::send_notice` with its own pre-validation.
+- **No rate limiting in the kit.** A spammer-shaped flow (one player
+  flooding another's inbox) is rate-limited at the game layer, not the
+  storage layer. The hooks the kit gives you for that are
+  `WorldDb::inbox` (count recent senders) and the `created_at` column.
+
+## 9. Reading the world without polling
 
 The runtime contract ([SPEC_v3 §7](../SPEC_v3.md#7-operational-requirements))
 is "no polling loops; async multiplayer updates are visible on
@@ -267,7 +400,7 @@ In practice that means:
 If a feature seems to want a daemon, a socket, or a poller — stop.
 v3 is mailbox multiplayer; the contract is refresh-on-navigation.
 
-## 9. What v3 is not
+## 10. What v3 is not
 
 [`SPEC_v3 §2.2`](../SPEC_v3.md#22-non-goals) is the canonical list.
 The headline exclusions:
