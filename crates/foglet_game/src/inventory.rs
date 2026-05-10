@@ -79,6 +79,62 @@ pub enum InventoryError {
         #[source]
         source: rusqlite::Error,
     },
+    /// SQL failed while moving stock between two slots.
+    #[error("failed to transfer `{item_key}` for transition `{transition}`: {source}")]
+    TransferFailed {
+        /// Source→destination owner tuple summary.
+        transition: String,
+        /// Item key that was being moved.
+        item_key: String,
+        /// Underlying SQL failure.
+        #[source]
+        source: rusqlite::Error,
+    },
+    /// The source owner has no matching slot for this transfer key.
+    #[error("missing source inventory slot for `{owner_kind}:{owner_id}` and item `{item_key}`")]
+    MissingSourceSlot {
+        /// Owner bucket that was missing an item row.
+        owner_kind: String,
+        /// Owner id that was missing an item row.
+        owner_id: i64,
+        /// Item key that should be moved.
+        item_key: String,
+    },
+    /// The source stock is insufficient to cover the requested transfer.
+    #[error(
+        "insufficient stock for `{owner_kind}:{owner_id}` item `{item_key}`: requested {requested}, available {available}"
+    )]
+    InsufficientStock {
+        /// Owner bucket that did not have enough stock.
+        owner_kind: String,
+        /// Owner id that did not have enough stock.
+        owner_id: i64,
+        /// Item key being moved.
+        item_key: String,
+        /// Number of units requested.
+        requested: i64,
+        /// Number of units currently stored.
+        available: i64,
+    },
+    /// The transfer callback rejected the mutation.
+    #[error(
+        "transfer callback rejected movement of `{item_key}` for transition `{transition}`: {source}"
+    )]
+    TransferRejected {
+        /// Source→destination owner tuple summary.
+        transition: String,
+        /// Item key that was being moved.
+        item_key: String,
+        /// Underlying callback error.
+        #[source]
+        source: rusqlite::Error,
+    },
+    /// Transfer quantity must be strictly positive.
+    #[error("transfer quantity must be greater than zero; got {quantity}")]
+    InvalidTransferQuantity {
+        /// Requested transfer quantity.
+        quantity: i64,
+    },
     /// Slot write failed.
     #[error("failed to create inventory slot for owner `{owner_kind}:{owner_id}`, item `{item_key}`: {source}")]
     CreateFailed {
@@ -422,6 +478,197 @@ ORDER BY item_key ASC, id ASC";
 
         Ok(merged)
     }
+
+    /// Transfer one item key atomically between two owners.
+    ///
+    /// The helper performs all writes inside one SQLite transaction so
+    /// callers can rely on all-or-nothing semantics for:
+    ///
+    /// - debiting the source row,
+    /// - crediting the destination row (or creating one if missing),
+    /// - then invoking the optional `on_commit` callback.
+    ///
+    /// Why this shape exists:
+    ///
+    /// - In a **space exploration** game, credits can move between
+    ///   a `"ship"` and `"station"` owner without partial writes even
+    ///   if a docking callback rejects due to lockout.
+    /// - In a **dungeon crawler** game, chest loot transfers from
+    ///   `"player"` to `"chest"` stay atomic when a trap callback
+    ///   wants to veto the move after the SQL write phase.
+    ///
+    /// Callback contract:
+    ///
+    /// - `on_commit` (when provided) runs after SQL mutations and
+    ///   receives the post-mutation snapshots for both source and
+    ///   destination rows.
+    /// - If `on_commit` returns an error, the whole transfer rolls back,
+    ///   including both quantity mutations.
+    pub fn transfer<F>(
+        &mut self,
+        source: (&str, i64),
+        destination: (&str, i64),
+        item_key: &str,
+        quantity: i64,
+        on_commit: Option<F>,
+    ) -> Result<(InventorySlot, InventorySlot), InventoryError>
+    where
+        F: FnOnce(
+            &rusqlite::Transaction<'_>,
+            &InventorySlot,
+            &InventorySlot,
+        ) -> Result<(), rusqlite::Error>,
+    {
+        if quantity <= 0 {
+            return Err(InventoryError::InvalidTransferQuantity { quantity });
+        }
+
+        let (source_owner_kind, source_owner_id) = source;
+        let (destination_owner_kind, destination_owner_id) = destination;
+        let transition = transfer_transition(
+            source_owner_kind,
+            source_owner_id,
+            destination_owner_kind,
+            destination_owner_id,
+        );
+
+        let tx = self.connection_mut().transaction().map_err(|source| {
+            InventoryError::TransferFailed {
+                transition: transition.clone(),
+                item_key: item_key.to_string(),
+                source,
+            }
+        })?;
+
+        let source_slot =
+            match find_slot_for_owner_in_tx(&tx, source_owner_kind, source_owner_id, item_key)
+                .map_err(|source| InventoryError::TransferFailed {
+                    transition: transition.clone(),
+                    item_key: item_key.to_string(),
+                    source,
+                })? {
+                Some(slot) => slot,
+                None => {
+                    return Err(InventoryError::MissingSourceSlot {
+                        owner_kind: source_owner_kind.to_string(),
+                        owner_id: source_owner_id,
+                        item_key: item_key.to_string(),
+                    });
+                }
+            };
+
+        if source_slot.quantity < quantity {
+            return Err(InventoryError::InsufficientStock {
+                owner_kind: source_owner_kind.to_string(),
+                owner_id: source_owner_id,
+                item_key: item_key.to_string(),
+                requested: quantity,
+                available: source_slot.quantity,
+            });
+        }
+
+        let destination_slot = match find_slot_for_owner_in_tx(
+            &tx,
+            destination_owner_kind,
+            destination_owner_id,
+            item_key,
+        )
+        .map_err(|source| InventoryError::TransferFailed {
+            transition: transition.clone(),
+            item_key: item_key.to_string(),
+            source,
+        })? {
+            Some(slot) => slot,
+            None => tx
+                .query_row(
+                    "INSERT INTO inventory_slots (owner_kind, owner_id, item_key, quantity, equilibrium, metadata_json)\n\
+                     VALUES (?1, ?2, ?3, ?4, NULL, NULL)\n\
+                     RETURNING id, owner_kind, owner_id, item_key, quantity, equilibrium, metadata_json",
+                    rusqlite::params![
+                        destination_owner_kind,
+                        destination_owner_id,
+                        item_key,
+                        quantity,
+                    ],
+                    row_to_inventory_slot,
+                )
+                .map_err(|source| InventoryError::TransferFailed {
+                    transition: transition.clone(),
+                    item_key: item_key.to_string(),
+                    source,
+                })?,
+        };
+
+        tx.execute(
+            "UPDATE inventory_slots\nSET quantity = quantity - ?2,\nupdated_at = CURRENT_TIMESTAMP\nWHERE id = ?1",
+            rusqlite::params![source_slot.id, quantity],
+        )
+        .and_then(|updated| {
+            if updated == 0 {
+                Err(rusqlite::Error::QueryReturnedNoRows)
+            } else {
+                Ok(updated)
+            }
+        })
+        .map_err(|source| InventoryError::TransferFailed {
+            transition: transition.clone(),
+            item_key: item_key.to_string(),
+            source,
+        })?;
+
+        if source_slot.id != destination_slot.id {
+            tx.execute(
+                "UPDATE inventory_slots\nSET quantity = quantity + ?2,\nupdated_at = CURRENT_TIMESTAMP\nWHERE id = ?1",
+                rusqlite::params![destination_slot.id, quantity],
+            )
+            .and_then(|updated| {
+                if updated == 0 {
+                    Err(rusqlite::Error::QueryReturnedNoRows)
+                } else {
+                    Ok(updated)
+                }
+            })
+            .map_err(|source| InventoryError::TransferFailed {
+                transition: transition.clone(),
+                item_key: item_key.to_string(),
+                source,
+            })?;
+        }
+
+        let post_source = load_slot_by_id(&tx, source_slot.id).map_err(|source| {
+            InventoryError::TransferFailed {
+                transition: transition.clone(),
+                item_key: item_key.to_string(),
+                source,
+            }
+        })?;
+        let post_destination = load_slot_by_id(&tx, destination_slot.id).map_err(|source| {
+            InventoryError::TransferFailed {
+                transition: transition.clone(),
+                item_key: item_key.to_string(),
+                source,
+            }
+        })?;
+
+        if let Some(on_commit) = on_commit {
+            on_commit(&tx, &post_source, &post_destination).map_err(|source| {
+                InventoryError::TransferRejected {
+                    transition: transition.clone(),
+                    item_key: item_key.to_string(),
+                    source,
+                }
+            })?;
+        }
+
+        tx.commit()
+            .map_err(|source| InventoryError::TransferFailed {
+                transition: transition.clone(),
+                item_key: item_key.to_string(),
+                source,
+            })?;
+
+        Ok((post_source, post_destination))
+    }
 }
 
 fn row_to_inventory_slot(row: &rusqlite::Row<'_>) -> rusqlite::Result<InventorySlot> {
@@ -436,9 +683,57 @@ fn row_to_inventory_slot(row: &rusqlite::Row<'_>) -> rusqlite::Result<InventoryS
     })
 }
 
+fn transfer_transition(
+    source_owner_kind: &str,
+    source_owner_id: i64,
+    destination_owner_kind: &str,
+    destination_owner_id: i64,
+) -> String {
+    format!(
+        "{source_owner_kind}:{source_owner_id} -> {destination_owner_kind}:{destination_owner_id}"
+    )
+}
+
+fn find_slot_for_owner_in_tx(
+    connection: &rusqlite::Transaction<'_>,
+    owner_kind: &str,
+    owner_id: i64,
+    item_key: &str,
+) -> rusqlite::Result<Option<InventorySlot>> {
+    const SQL: &str = "\
+SELECT id, owner_kind, owner_id, item_key, quantity, equilibrium, metadata_json\n\
+FROM inventory_slots\n\
+WHERE owner_kind = ?1 AND owner_id = ?2 AND item_key = ?3\n\
+ORDER BY id ASC\n\
+LIMIT 1";
+
+    match connection.query_row(
+        SQL,
+        rusqlite::params![owner_kind, owner_id, item_key],
+        row_to_inventory_slot,
+    ) {
+        Ok(slot) => Ok(Some(slot)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(source) => Err(source),
+    }
+}
+
+fn load_slot_by_id(
+    connection: &rusqlite::Transaction<'_>,
+    slot_id: i64,
+) -> rusqlite::Result<InventorySlot> {
+    connection.query_row(
+        "SELECT id, owner_kind, owner_id, item_key, quantity, equilibrium, metadata_json\n\
+         FROM inventory_slots\n\
+         WHERE id = ?1",
+        rusqlite::params![slot_id],
+        row_to_inventory_slot,
+    )
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{InventoryError, INVENTORY_SLOTS_MIGRATION};
+    use super::{row_to_inventory_slot, InventoryError, InventorySlot, INVENTORY_SLOTS_MIGRATION};
     use crate::world_db::WorldDb;
     use rusqlite::params;
     use tempfile::tempdir;
@@ -806,5 +1101,78 @@ mod tests {
             owner_total, 2,
             "mismatched metadata must leave both rows untouched"
         );
+    }
+
+    #[test]
+    fn transfer_moves_quantities_with_single_commit() -> Result<(), InventoryError> {
+        let dir = tempdir().expect("tempdir creates");
+        let db_path = dir.path().join("world.sqlite");
+        let mut world = WorldDb::open(&db_path).expect("open succeeds");
+
+        world
+            .apply_migration(&INVENTORY_SLOTS_MIGRATION)
+            .expect("inventory_slots migration applies");
+
+        let captain_supply = world.create_slot(
+            "ship",
+            1,
+            "ration-pack",
+            12,
+            Some(25),
+            Some(r#"{"sealed":"yes"}"#),
+        )?;
+        let station_store = world.create_slot(
+            "station",
+            4,
+            "ration-pack",
+            3,
+            Some(50),
+            Some(r#"{"module":"coldchain"}"#),
+        )?;
+
+        let (after_source, after_destination) = world.transfer(
+            ("ship", 1),
+            ("station", 4),
+            "ration-pack",
+            5,
+            None::<
+                fn(
+                    &rusqlite::Transaction<'_>,
+                    &InventorySlot,
+                    &InventorySlot,
+                ) -> rusqlite::Result<()>,
+            >,
+        )?;
+
+        assert_eq!(after_source.id, captain_supply.id);
+        assert_eq!(after_source.quantity, 7);
+        assert_eq!(after_destination.id, station_store.id);
+        assert_eq!(after_destination.quantity, 8);
+
+        let persisted_source: InventorySlot = world
+            .connection()
+            .query_row(
+                "SELECT id, owner_kind, owner_id, item_key, quantity, equilibrium, metadata_json\n\
+                 FROM inventory_slots\n\
+                 WHERE id = ?1",
+                rusqlite::params![captain_supply.id],
+                row_to_inventory_slot,
+            )
+            .expect("source slot persists after transfer");
+        let persisted_destination: InventorySlot = world
+            .connection()
+            .query_row(
+                "SELECT id, owner_kind, owner_id, item_key, quantity, equilibrium, metadata_json\n\
+                 FROM inventory_slots\n\
+                 WHERE id = ?1",
+                rusqlite::params![station_store.id],
+                row_to_inventory_slot,
+            )
+            .expect("destination slot persists after transfer");
+
+        assert_eq!(persisted_source.quantity, 7);
+        assert_eq!(persisted_destination.quantity, 8);
+
+        Ok(())
     }
 }
