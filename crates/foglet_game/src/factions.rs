@@ -356,6 +356,70 @@ pub enum FactionError {
         /// The non-positive value the caller supplied.
         actual: i64,
     },
+    /// [`WorldDb::contribute_to_goal`] was called with a
+    /// non-positive `amount`. SPEC §4.4 frames a contribution as
+    /// "current_amount += amount"; an `amount` of zero is a no-op
+    /// that would still appear to "succeed" to UI callers, and a
+    /// negative amount would silently rewind progress for every
+    /// other contributor — both worth refusing at the typed-error
+    /// boundary so a stuck "0" or a sign-flip bug in a contribution
+    /// keypad surfaces here rather than as a confusing world-state
+    /// regression. Same defensive shape as
+    /// [`crate::market::MarketError::NonPositiveBuyQuantity`].
+    #[error("shared-goal contribution amount must be > 0 (got {actual})")]
+    NonPositiveContribution {
+        /// The non-positive value the caller supplied. Echoed so the
+        /// contribution UI can re-render the offending input.
+        actual: i64,
+    },
+    /// [`WorldDb::contribute_to_goal`] referenced a `goal_id` that
+    /// has no row in `shared_goals`. Distinct from
+    /// [`Self::GoalAlreadyCompleted`] so the agency UI can offer a
+    /// targeted "this goal has been removed, refresh your view"
+    /// recovery rather than a generic "couldn't contribute" toast.
+    /// Same shape as [`crate::market::MarketError::NotFound`] and
+    /// [`crate::challenges::ChallengeError::NotFound`].
+    #[error("shared goal id {id} was not found")]
+    GoalNotFound {
+        /// Goal id the caller passed.
+        id: i64,
+    },
+    /// [`WorldDb::contribute_to_goal`] was called against a goal
+    /// whose `state` is already `'completed'`. SPEC §4.4 pins the
+    /// state machine at `active -> completed`; once flipped, further
+    /// contributions are rejected so the bulletin can render a stable
+    /// "this goal is solved" terminal state without a late-arriving
+    /// contribution silently re-opening it. Distinct from
+    /// [`Self::GoalNotFound`] so the agency UI can render "this clue
+    /// board is already solved — well done!" rather than the generic
+    /// "not found" recovery flow.
+    #[error("shared goal {id} is already completed; contributions are closed")]
+    GoalAlreadyCompleted {
+        /// Goal id the caller passed.
+        id: i64,
+    },
+    /// The contributor callback inside [`WorldDb::contribute_to_goal`]
+    /// returned `Err`. The wrapping transaction has already rolled
+    /// back, so the goal's `current_amount` is unchanged and any side
+    /// effects the callback attempted (currency debit, inventory
+    /// burn, evidence row insert) are undone — that's the SPEC §4.4
+    /// "Contributions MUST be transactional" contract. Distinct from
+    /// [`Self::Sqlite`] so the agency UI can surface a contributor-
+    /// side reason ("you don't have enough clue points") separately
+    /// from a SQLite-layer failure. Same shape as
+    /// [`crate::market::MarketError::BuyerCallback`].
+    #[error(
+        "contributor callback inside contribute_to_goal failed; goal current_amount rolled back: {source}"
+    )]
+    ContributorCallback {
+        /// Underlying `rusqlite::Error` returned by the callback. The
+        /// callback is expected to map any non-SQLite failure into a
+        /// [`rusqlite::Error::SqliteFailure`] with an explanatory
+        /// message before returning, mirroring the convention on
+        /// [`crate::market::MarketError::BuyerCallback`].
+        #[source]
+        source: rusqlite::Error,
+    },
 }
 
 impl WorldDb {
@@ -835,6 +899,183 @@ WHERE faction_id IS ?1 AND key = ?2";
                 .map_err(|source| FactionError::Sqlite { source }),
             Err(source) => Err(FactionError::Sqlite { source }),
         }
+    }
+
+    /// Atomically increment a shared goal's `current_amount` and run
+    /// a contributor-side callback inside the same transaction —
+    /// SPEC_v3 §4.4 / §Task 6f.
+    ///
+    /// The contract is "either everything happens (the goal's
+    /// running total moves up by `amount` *and* every write the
+    /// callback performed lands) or nothing does". This is how the
+    /// kit honours SPEC §4.4's "Contributions MUST be transactional"
+    /// rule: a contributor who can't afford to spend the resource,
+    /// or a callback that fails partway through inventory mutation,
+    /// leaves the goal's `current_amount` exactly where it was.
+    /// Without that guarantee a flaky network drop mid-contribution
+    /// could double-debit a player or, worse, leave the agency goal
+    /// believing it received clue points the player never paid for.
+    ///
+    /// # Why a callback (not a separate write path)
+    ///
+    /// The kit owns the `shared_goals` row but knows nothing about
+    /// the resource the contribution costs the player — clue points,
+    /// inventory items, currency, time tokens, all game-defined.
+    /// SPEC §1 / §17 keep the kit out of the game's resource model;
+    /// the contributor closure is the seam where game code spends
+    /// whatever it needs to spend, inside the same `rusqlite::
+    /// Transaction` the kit opened, so a failure rolls *both* the
+    /// debit and the increment back together. Mirrors the buyer-
+    /// callback shape on [`WorldDb::buy_listing`].
+    ///
+    /// # State-machine guarantees
+    ///
+    /// - The increment only fires when `state = 'active'`. A goal
+    ///   that has already been flipped to `'completed'` (Task 6g
+    ///   handles that flip + the world event) rejects further
+    ///   contributions with [`FactionError::GoalAlreadyCompleted`]
+    ///   — the bulletin renders a stable terminal state, and a late
+    ///   contribute call from a stale UI cannot silently re-open it.
+    /// - This helper does *not* itself flip the state when the
+    ///   target is reached; that is Task 6g's job (state flip +
+    ///   `shared_goal.completed` world event). 6f's contract is
+    ///   strictly "`current_amount` increments transactionally".
+    ///   Splitting the responsibilities keeps each helper testable
+    ///   in isolation.
+    /// - There is no schema-side `CHECK` constraint capping
+    ///   `current_amount` at `target_amount`, so a final contribute
+    ///   that arrives "after" the target is met still succeeds and
+    ///   pushes `current_amount` past `target_amount`. Task 6g will
+    ///   read the post-update row and decide whether to flip — that
+    ///   model is simpler and race-safer than trying to clamp inside
+    ///   the UPDATE here.
+    ///
+    /// # Errors surfaced
+    ///
+    /// - [`FactionError::NonPositiveContribution`] — `amount <= 0`,
+    ///   raised before opening the transaction so a broken UI keypad
+    ///   doesn't pay for a `BEGIN` round-trip. A negative `amount`
+    ///   would silently rewind progress; a zero is a no-op that
+    ///   still appears to "succeed". Both worth refusing.
+    /// - [`FactionError::GoalNotFound`] — `goal_id` is not in
+    ///   `shared_goals` at all. Diagnosed by a follow-up SELECT
+    ///   inside the same transaction so the read sees the same
+    ///   snapshot the UPDATE saw.
+    /// - [`FactionError::GoalAlreadyCompleted`] — the row exists but
+    ///   its `state` is `'completed'` (the only other vocabulary
+    ///   point per the schema CHECK).
+    /// - [`FactionError::ContributorCallback`] — the closure
+    ///   returned `Err`. The transaction is dropped without commit
+    ///   so every write the callback attempted, plus the kit's own
+    ///   increment, rolls back as a unit.
+    /// - [`FactionError::Sqlite`] — any other `rusqlite` failure
+    ///   (DB lock timeout, schema corruption, FK enforcement
+    ///   surprise).
+    ///
+    /// # Concurrency
+    ///
+    /// Takes `&mut self` so we can open a `rusqlite::Transaction`
+    /// via the crate-internal `connection_mut` accessor. Same shape
+    /// as [`WorldDb::buy_listing`]; a `&self` variant would force
+    /// the helper to leak SQL across multiple statements without
+    /// transactional grouping, defeating the all-or-nothing
+    /// guarantee under a concurrent door open hitting the same
+    /// world DB file. The conditional UPDATE
+    /// (`WHERE id = ?1 AND state = 'active'`) plus SQLite's per-
+    /// statement atomicity guarantees no concurrent contribute can
+    /// interleave between the predicate check and the increment.
+    pub fn contribute_to_goal<F>(
+        &mut self,
+        goal_id: i64,
+        amount: i64,
+        contributor: F,
+    ) -> Result<SharedGoal, FactionError>
+    where
+        F: FnOnce(&rusqlite::Transaction<'_>, &SharedGoal) -> Result<(), rusqlite::Error>,
+    {
+        // Reject non-positive contributions before opening the
+        // transaction — same defensive ordering as `buy_listing`.
+        // A zero would be a no-op that still appears to "succeed";
+        // a negative would silently rewind progress for every other
+        // contributor.
+        if amount <= 0 {
+            return Err(FactionError::NonPositiveContribution { actual: amount });
+        }
+
+        // Conditional UPDATE: only increments when the row is still
+        // active. `RETURNING` echoes the post-increment row so the
+        // contributor callback can inspect the new running total
+        // (handy for "you tipped the goal over the target" UX) and
+        // the helper can return the canonical record to the caller.
+        // Column order matches `row_to_shared_goal` so the decoder
+        // and the SQL stay locked together.
+        const UPDATE_SQL: &str = "\
+UPDATE shared_goals \
+SET current_amount = current_amount + ?2 \
+WHERE id = ?1 AND state = 'active' \
+RETURNING id, faction_id, key, target_amount, current_amount, state, created_at, completed_at";
+
+        let tx = self
+            .connection_mut()
+            .transaction()
+            .map_err(|source| FactionError::Sqlite { source })?;
+
+        // SQLite's per-statement atomicity plus the wrapping
+        // transaction guarantees no concurrent contribute can
+        // interleave between the predicate check and the write.
+        let goal = match tx.query_row(
+            UPDATE_SQL,
+            rusqlite::params![goal_id, amount],
+            row_to_shared_goal,
+        ) {
+            Ok(goal) => goal,
+            Err(rusqlite::Error::QueryReturnedNoRows) => {
+                // Diagnose why the conditional update affected zero
+                // rows: either the goal doesn't exist (GoalNotFound)
+                // or its state is already 'completed'
+                // (GoalAlreadyCompleted). A second read inside the
+                // same transaction sees a consistent snapshot (the
+                // UPDATE didn't change anything) and lets us surface
+                // a typed error rather than a generic "no rows".
+                use rusqlite::OptionalExtension;
+                let state: Option<String> = tx
+                    .query_row(
+                        "SELECT state FROM shared_goals WHERE id = ?1",
+                        rusqlite::params![goal_id],
+                        |row| row.get(0),
+                    )
+                    .optional()
+                    .map_err(|source| FactionError::Sqlite { source })?;
+                // Drop the transaction without commit — rolls back
+                // automatically. The diagnostic SELECT didn't write
+                // anything, so the rollback is observably a no-op,
+                // but the explicit drop here documents the intent.
+                drop(tx);
+                return Err(match state {
+                    None => FactionError::GoalNotFound { id: goal_id },
+                    Some(_) => FactionError::GoalAlreadyCompleted { id: goal_id },
+                });
+            }
+            Err(source) => {
+                drop(tx);
+                return Err(FactionError::Sqlite { source });
+            }
+        };
+
+        // Run the contributor callback inside the same transaction.
+        // A callback `Err` propagates as `ContributorCallback` and
+        // the transaction drops without commit — every write the
+        // callback attempted, plus the kit's own increment, rolls
+        // back as a unit. SPEC §4.4 "Contributions MUST be
+        // transactional".
+        if let Err(source) = contributor(&tx, &goal) {
+            return Err(FactionError::ContributorCallback { source });
+        }
+
+        tx.commit()
+            .map_err(|source| FactionError::Sqlite { source })?;
+
+        Ok(goal)
     }
 }
 
@@ -2115,6 +2356,285 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM shared_goals", [], |row| row.get(0))
             .unwrap();
         assert_eq!(count, 0, "rejected calls must not leak rows");
+    }
+
+    /// SPEC_v3 §Task 6f acceptance criterion: "current amount
+    /// increments". Pins the happy path so a regression that
+    /// reordered the UPDATE / decoder columns or dropped the
+    /// `+= ?2` arithmetic flunks here rather than buried in a
+    /// downstream agency-screen test. Asserts both the canonical
+    /// returned record AND the durably-committed row (a follow-up
+    /// fresh SELECT after the helper returns), the way the v3
+    /// helper convention pins both the in-memory and on-disk
+    /// outcomes against a regression that returned the right struct
+    /// but failed to actually commit.
+    #[test]
+    fn contribute_to_goal_increments_current_amount_atomically() {
+        let (_dir, mut world) = world_with_factions();
+        let goal = world
+            .create_shared_goal(None, "city-cases-solved", 100)
+            .unwrap();
+
+        let after = world
+            .contribute_to_goal(goal.id, 25, |_, _| Ok(()))
+            .expect("contribution succeeds");
+
+        assert_eq!(after.id, goal.id, "id stable across the contribute call");
+        assert_eq!(
+            after.current_amount, 25,
+            "current_amount moved from 0 to 25"
+        );
+        assert_eq!(
+            after.target_amount, goal.target_amount,
+            "target_amount untouched by a contribution"
+        );
+        assert_eq!(after.state, "active", "state stays active below target");
+
+        // A second contribution accumulates rather than overwriting,
+        // pinning the `+=` arithmetic against a regression to `=`.
+        let after2 = world
+            .contribute_to_goal(goal.id, 10, |_, _| Ok(()))
+            .expect("second contribution succeeds");
+        assert_eq!(after2.current_amount, 35);
+
+        // Belt-and-braces: the row is durably visible to a fresh
+        // SELECT — catches a regression that returned the
+        // RETURNING row but failed to actually commit (e.g. a
+        // typo'd commit() that dropped the transaction).
+        let durable: i64 = world
+            .connection()
+            .query_row(
+                "SELECT current_amount FROM shared_goals WHERE id = ?1",
+                [goal.id],
+                |row| row.get(0),
+            )
+            .expect("durable read");
+        assert_eq!(durable, 35);
+    }
+
+    /// SPEC §4.4 "Contributions MUST be transactional" means the
+    /// contributor callback MUST observe the same `rusqlite::
+    /// Transaction` the kit's increment ran in — so a callback
+    /// write (e.g. a currency debit) commits atomically with the
+    /// increment, or rolls back atomically with it. Pin that the
+    /// callback receives a live transaction handle and that its
+    /// writes land on commit. Mirrors the buyer-callback shape on
+    /// `buy_listing`.
+    #[test]
+    fn contribute_to_goal_runs_contributor_callback_inside_transaction() {
+        let (_dir, mut world) = world_with_factions();
+        let goal = world.create_shared_goal(None, "k", 100).unwrap();
+
+        // Hand the callback a scratch table to write into. Using a
+        // schema-less side table (rather than `players` or
+        // `factions`) keeps the assertion narrowly scoped to "did
+        // the callback's writes commit?".
+        world
+            .connection()
+            .execute("CREATE TABLE contribute_audit (note TEXT NOT NULL)", [])
+            .unwrap();
+
+        let after = world
+            .contribute_to_goal(goal.id, 7, |tx, observed_goal| {
+                assert_eq!(observed_goal.id, goal.id);
+                // Post-update goal: the callback can see the new
+                // running total — useful for "you tipped it over"
+                // UX. Pinning this against a regression that handed
+                // the pre-update row to the callback.
+                assert_eq!(observed_goal.current_amount, 7);
+                tx.execute(
+                    "INSERT INTO contribute_audit (note) VALUES (?1)",
+                    rusqlite::params!["alice paid 7"],
+                )?;
+                Ok(())
+            })
+            .expect("callback succeeds");
+
+        assert_eq!(after.current_amount, 7);
+
+        let audit: String = world
+            .connection()
+            .query_row("SELECT note FROM contribute_audit", [], |row| row.get(0))
+            .expect("audit row was committed alongside the increment");
+        assert_eq!(audit, "alice paid 7");
+    }
+
+    /// SPEC §4.4 "Contributions MUST be transactional": a callback
+    /// that returns `Err` MUST roll back BOTH the kit's increment
+    /// AND every write the callback attempted before failing. Pin
+    /// the rollback by:
+    ///
+    /// 1. Asserting the helper raised `ContributorCallback` (not
+    ///    `Sqlite`, not `GoalNotFound`) so game UIs can branch on
+    ///    the failure source.
+    /// 2. Asserting `current_amount` is unchanged from before the
+    ///    call (the increment rolled back).
+    /// 3. Asserting any callback-side write (here, an audit row)
+    ///    is absent (the callback writes rolled back).
+    ///
+    /// Without this guarantee a "you don't have enough clue points"
+    /// rejection from the callback would still bump the goal's
+    /// running total — rewarding the agency for a contribution that
+    /// never actually happened.
+    #[test]
+    fn contribute_to_goal_rolls_back_on_callback_failure() {
+        let (_dir, mut world) = world_with_factions();
+        let goal = world.create_shared_goal(None, "k", 100).unwrap();
+        // Pre-charge the goal so the rollback assertion has a non-
+        // trivial baseline to compare against (a regression that
+        // accidentally reset to 0 on rollback would still pass a
+        // "current_amount == 0" check).
+        world.contribute_to_goal(goal.id, 5, |_, _| Ok(())).unwrap();
+
+        world
+            .connection()
+            .execute("CREATE TABLE contribute_audit (note TEXT NOT NULL)", [])
+            .unwrap();
+
+        let err = world
+            .contribute_to_goal(goal.id, 50, |tx, _| {
+                // Attempt a write that WOULD persist on commit, then
+                // fail — this is the realistic shape: the callback
+                // partially debits the contributor and *then*
+                // discovers it can't satisfy the rest, returning
+                // Err and trusting the kit to roll everything back.
+                tx.execute(
+                    "INSERT INTO contribute_audit (note) VALUES (?1)",
+                    rusqlite::params!["partial debit"],
+                )?;
+                Err(rusqlite::Error::SqliteFailure(
+                    rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT),
+                    Some("simulated callback failure".to_string()),
+                ))
+            })
+            .expect_err("callback failure must surface");
+
+        match err {
+            FactionError::ContributorCallback { source: _ } => {}
+            other => panic!("expected ContributorCallback, got {other:?}"),
+        }
+
+        let current: i64 = world
+            .connection()
+            .query_row(
+                "SELECT current_amount FROM shared_goals WHERE id = ?1",
+                [goal.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            current, 5,
+            "current_amount must roll back to its pre-call value"
+        );
+
+        let audit_count: i64 = world
+            .connection()
+            .query_row("SELECT COUNT(*) FROM contribute_audit", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            audit_count, 0,
+            "callback writes must roll back alongside the increment"
+        );
+    }
+
+    /// `amount <= 0` is rejected before the transaction opens. Pin
+    /// both `0` (no-op trap) and a negative value (would silently
+    /// rewind progress for every other contributor). Same defensive
+    /// shape as `create_shared_goal_rejects_non_positive_target_amount`
+    /// and `buy_listing`'s non-positive-quantity guard.
+    #[test]
+    fn contribute_to_goal_rejects_non_positive_amount() {
+        let (_dir, mut world) = world_with_factions();
+        let goal = world.create_shared_goal(None, "k", 100).unwrap();
+
+        for bad in [0_i64, -1, -100] {
+            let err = world
+                .contribute_to_goal(goal.id, bad, |_, _| Ok(()))
+                .expect_err("non-positive amount must be rejected");
+            match err {
+                FactionError::NonPositiveContribution { actual } => assert_eq!(actual, bad),
+                other => panic!("expected NonPositiveContribution for {bad}, got {other:?}"),
+            }
+        }
+
+        // Row-unchanged invariant: rejected calls leave the goal as
+        // it was — no half-opened transaction, no logged "attempt".
+        let current: i64 = world
+            .connection()
+            .query_row(
+                "SELECT current_amount FROM shared_goals WHERE id = ?1",
+                [goal.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(current, 0);
+    }
+
+    /// `goal_id` referencing a missing row surfaces
+    /// `GoalNotFound` — distinct from `GoalAlreadyCompleted` so the
+    /// agency UI can branch on the recovery hint. Pins the
+    /// diagnostic SELECT path against a regression that swallowed
+    /// the missing-row case as a generic `Sqlite`. Mirrors the shape
+    /// of `buy_listing`'s `NotFound` path.
+    #[test]
+    fn contribute_to_goal_returns_not_found_for_missing_goal() {
+        let (_dir, mut world) = world_with_factions();
+
+        let err = world
+            .contribute_to_goal(9_999, 5, |_, _| Ok(()))
+            .expect_err("missing goal must be rejected");
+        match err {
+            FactionError::GoalNotFound { id } => assert_eq!(id, 9_999),
+            other => panic!("expected GoalNotFound, got {other:?}"),
+        }
+    }
+
+    /// SPEC §4.4 pins the state machine at `active -> completed`.
+    /// A goal whose `state` is already `'completed'` rejects further
+    /// contributions with `GoalAlreadyCompleted` — distinct from
+    /// `GoalNotFound` so the agency UI can render a "this clue
+    /// board is already solved" terminal state rather than the
+    /// generic "not found" recovery flow. Manually flips the state
+    /// (Task 6g will land the helper that does this in production)
+    /// to exercise the rejection branch in isolation. Also pins the
+    /// row-unchanged invariant so a rejected contribute leaves
+    /// `current_amount` exactly where the completed-state flip put
+    /// it.
+    #[test]
+    fn contribute_to_goal_rejects_completed_goal() {
+        let (_dir, mut world) = world_with_factions();
+        let goal = world.create_shared_goal(None, "k", 100).unwrap();
+        world
+            .connection()
+            .execute(
+                "UPDATE shared_goals SET state = 'completed', current_amount = 100 \
+                 WHERE id = ?1",
+                [goal.id],
+            )
+            .unwrap();
+
+        let err = world
+            .contribute_to_goal(goal.id, 5, |_, _| Ok(()))
+            .expect_err("completed goal must be rejected");
+        match err {
+            FactionError::GoalAlreadyCompleted { id } => assert_eq!(id, goal.id),
+            other => panic!("expected GoalAlreadyCompleted, got {other:?}"),
+        }
+
+        let current: i64 = world
+            .connection()
+            .query_row(
+                "SELECT current_amount FROM shared_goals WHERE id = ?1",
+                [goal.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            current, 100,
+            "current_amount unchanged after a rejected contribute"
+        );
     }
 
     /// Helper to build a `FogletContext` — same shape as
