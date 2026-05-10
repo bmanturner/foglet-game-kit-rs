@@ -57,7 +57,10 @@ pub mod turns;
 pub mod widgets;
 pub mod world_db;
 
-pub use bounties::BOUNTIES_MIGRATION;
+pub use bounties::{
+    Bounty, BountyError, BountyState, BOUNTIES_MIGRATION, BOUNTY_DESCRIPTION_MAX_CHARS,
+    BOUNTY_TITLE_MAX_CHARS,
+};
 pub use challenges::{Challenge, ChallengeError, ChallengeState, CHALLENGES_MIGRATION};
 pub use config::{
     ConfigError, FactionSeed, FactionsSection, GameConfig, GameSection, LeaderboardSection,
