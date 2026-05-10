@@ -1260,6 +1260,64 @@ mod tests {
     }
 
     #[test]
+    fn transfer_rollback_happens_when_on_commit_rejects() -> Result<(), InventoryError> {
+        let dir = tempdir().expect("tempdir creates");
+        let db_path = dir.path().join("world.sqlite");
+        let mut world = WorldDb::open(&db_path).expect("open succeeds");
+
+        world
+            .apply_migration(&INVENTORY_SLOTS_MIGRATION)
+            .expect("inventory_slots migration applies");
+
+        let source = world.create_slot("ship", 1, "water-canister", 10, None, None)?;
+
+        fn reject_commit(
+            _: &rusqlite::Transaction<'_>,
+            _: &InventorySlot,
+            _: &InventorySlot,
+        ) -> rusqlite::Result<()> {
+            Err(rusqlite::Error::InvalidQuery)
+        }
+
+        let result = world.transfer(
+            ("ship", 1),
+            ("outpost", 9),
+            "water-canister",
+            4,
+            Some(reject_commit),
+        );
+
+        match result {
+            Err(InventoryError::TransferRejected {
+                transition,
+                item_key,
+                source: _,
+            }) => {
+                assert_eq!(transition, "ship:1 -> outpost:9");
+                assert_eq!(item_key, "water-canister");
+            }
+            other => panic!("expected TransferRejected from callback, got {other:?}"),
+        }
+
+        let after_source = world
+            .get_slot("ship", 1, "water-canister")?
+            .expect("source slot still exists");
+        assert_eq!(after_source.id, source.id);
+        assert_eq!(
+            after_source.quantity, 10,
+            "callback rejection should not debit source"
+        );
+
+        let destination = world.get_slot("outpost", 9, "water-canister")?;
+        assert!(
+            destination.is_none(),
+            "callback rejection should not create the destination slot"
+        );
+
+        Ok(())
+    }
+
+    #[test]
     fn transfer_rejects_non_positive_quantity() {
         let dir = tempdir().expect("tempdir creates");
         let db_path = dir.path().join("world.sqlite");
