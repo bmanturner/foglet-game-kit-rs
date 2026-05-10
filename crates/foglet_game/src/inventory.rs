@@ -1177,6 +1177,89 @@ mod tests {
     }
 
     #[test]
+    fn transfer_passes_post_mutation_snapshots_to_on_commit() -> Result<(), InventoryError> {
+        let dir = tempdir().expect("tempdir creates");
+        let db_path = dir.path().join("world.sqlite");
+        let mut world = WorldDb::open(&db_path).expect("open succeeds");
+
+        world
+            .apply_migration(&INVENTORY_SLOTS_MIGRATION)
+            .expect("inventory_slots migration applies");
+
+        let source = world.create_slot(
+            "ship",
+            12,
+            "water-canister",
+            10,
+            Some(25),
+            Some(r#"{"sealed":"no"}"#),
+        )?;
+        let destination = world.create_slot(
+            "outpost",
+            33,
+            "water-canister",
+            2,
+            None,
+            Some(r#"{"seal":"hatch"}"#),
+        )?;
+
+        fn callback(
+            _: &rusqlite::Transaction<'_>,
+            source_slot: &InventorySlot,
+            destination_slot: &InventorySlot,
+        ) -> rusqlite::Result<()> {
+            assert_eq!(source_slot.owner_kind, "ship");
+            assert_eq!(source_slot.owner_id, 12);
+            assert_eq!(source_slot.item_key, "water-canister");
+            assert_eq!(destination_slot.owner_kind, "outpost");
+            assert_eq!(destination_slot.owner_id, 33);
+            assert_eq!(destination_slot.item_key, "water-canister");
+            assert_eq!(source_slot.quantity, 6);
+            assert_eq!(destination_slot.quantity, 6);
+            Ok(())
+        }
+
+        let (after_source, after_destination) = world.transfer(
+            ("ship", 12),
+            ("outpost", 33),
+            "water-canister",
+            4,
+            Some(callback),
+        )?;
+
+        assert_eq!(after_source.quantity, 6);
+        assert_eq!(after_destination.quantity, 6);
+
+        let persisted_source: InventorySlot = world
+            .connection()
+            .query_row(
+                "SELECT id, owner_kind, owner_id, item_key, quantity, equilibrium, metadata_json\n\
+                 FROM inventory_slots\n\
+                 WHERE id = ?1",
+                rusqlite::params![source.id],
+                row_to_inventory_slot,
+            )
+            .expect("source slot persists after transfer");
+        let persisted_destination: InventorySlot = world
+            .connection()
+            .query_row(
+                "SELECT id, owner_kind, owner_id, item_key, quantity, equilibrium, metadata_json\n\
+                 FROM inventory_slots\n\
+                 WHERE id = ?1",
+                rusqlite::params![destination.id],
+                row_to_inventory_slot,
+            )
+            .expect("destination slot persists after transfer");
+
+        assert_eq!(persisted_source.quantity, 6);
+        assert_eq!(persisted_destination.quantity, 6);
+        assert_eq!(persisted_source.owner_kind, "ship");
+        assert_eq!(persisted_destination.owner_kind, "outpost");
+
+        Ok(())
+    }
+
+    #[test]
     fn transfer_rejects_non_positive_quantity() {
         let dir = tempdir().expect("tempdir creates");
         let db_path = dir.path().join("world.sqlite");
