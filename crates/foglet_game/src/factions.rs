@@ -438,6 +438,129 @@ FROM factions WHERE slug = ?1";
             .map_err(|source| FactionError::Sqlite { source })?;
         Ok(out)
     }
+
+    /// Add `player_id` to `faction_id` as an active member —
+    /// SPEC_v3 §4.4 / §Task 6c.
+    ///
+    /// The contract is "after this call returns, there is exactly
+    /// one row in `faction_memberships` with `(player_id,
+    /// faction_id, left_at IS NULL)`, and the returned struct
+    /// describes it". Calling again with the same arguments while
+    /// the membership is still active is a documented no-op: the
+    /// helper returns the *existing* row, not a duplicate. This
+    /// matches the kit's broader async-multiplayer convention —
+    /// idempotent helpers free the game UI from defensive "do they
+    /// already belong?" queries before offering a join button.
+    ///
+    /// # Idempotency primitive
+    ///
+    /// `INSERT … SELECT … WHERE NOT EXISTS (… active row …)
+    /// RETURNING …` is a single statement that either inserts a
+    /// fresh active row (and `RETURNING` echoes it) or inserts
+    /// nothing (and `RETURNING` produces zero rows). Folding the
+    /// existence check into the same statement as the insert is
+    /// what makes the path race-free under concurrent door opens
+    /// for the same player+faction: a "SELECT then INSERT"
+    /// handshake would let two near-simultaneous calls each see
+    /// "no active row", each insert, and leave the agency roster
+    /// rendering the player twice. The schema deliberately does
+    /// not carry a `UNIQUE (player_id, faction_id)` constraint
+    /// (Task 6d soft-deletes leave the historical row in place,
+    /// which would clash with such a unique key) — that's why the
+    /// idempotency MUST live in the helper SQL, not the schema.
+    ///
+    /// On `QueryReturnedNoRows` (an existing active row blocked
+    /// the insert) the helper performs one follow-up `SELECT` for
+    /// the same active membership and returns it. The SELECT
+    /// shares the column order of `RETURNING` so both arms decode
+    /// through the same crate-private `row_to_membership` helper.
+    ///
+    /// # `role`
+    ///
+    /// `role: Option<&str>` — `None` resolves to the schema-side
+    /// `DEFAULT 'member'` via `COALESCE(?3, 'member')` in the
+    /// VALUES clause. SPEC §4.4 leaves the role lexicon to the
+    /// game (rookies/sergeants vs. drivers/fences); games that
+    /// don't model roles pass `None` and never see the column.
+    ///
+    /// When the player is already an active member, the supplied
+    /// `role` is **ignored** — the existing row's role wins. Re-
+    /// joining an already-joined faction does not promote or demote
+    /// the player; that's a separate concern that would need a
+    /// dedicated helper, and conflating "join" with "set role"
+    /// would surprise game code that calls `join_faction` defensively
+    /// from a join-screen submit handler.
+    ///
+    /// # Multi-faction membership
+    ///
+    /// SPEC §4.4 states "One player MAY belong to multiple
+    /// factions unless the game config restricts it" — the schema
+    /// and this helper enforce no per-player limit. Cross-faction
+    /// exclusivity (the noir convention "you're either Blue Desk
+    /// or Red Room, not both") lives in the game's join-screen
+    /// logic, not the storage layer.
+    ///
+    /// # Concurrency
+    ///
+    /// Takes `&self`: a single `INSERT … RETURNING` plus an
+    /// optional follow-up `SELECT` under the configured busy
+    /// timeout. Same borrow shape as
+    /// [`WorldDb::create_challenge`] and [`WorldDb::accept_challenge`];
+    /// no explicit `BEGIN`/`COMMIT` is needed because the
+    /// idempotency check folds into the single INSERT statement.
+    pub fn join_faction(
+        &self,
+        player_id: i64,
+        faction_id: i64,
+        role: Option<&str>,
+    ) -> Result<FactionMembership, FactionError> {
+        // The INSERT only fires when no active membership row
+        // exists for this (player, faction) pair — `WHERE NOT
+        // EXISTS` runs in the same statement as the insert, so the
+        // existence check and the write happen under one lock and
+        // cannot race with a concurrent door open. `COALESCE` lets
+        // a `None` role bind as NULL and resolve to the schema-
+        // side default `'member'` without branching the SQL.
+        // `RETURNING` echoes the canonical row (autoincrement id +
+        // SQL-side `joined_at`) for the freshly-inserted case.
+        const INSERT_SQL: &str = "\
+INSERT INTO faction_memberships (player_id, faction_id, role) \
+SELECT ?1, ?2, COALESCE(?3, 'member') \
+WHERE NOT EXISTS (\
+    SELECT 1 FROM faction_memberships \
+    WHERE player_id = ?1 AND faction_id = ?2 AND left_at IS NULL\
+) \
+RETURNING id, player_id, faction_id, role, joined_at, left_at";
+
+        // When the INSERT inserts nothing (the player is already
+        // an active member), look up the existing active row and
+        // return it. Backed by `idx_faction_memberships_active`
+        // — a partial index on `(player_id, faction_id) WHERE
+        // left_at IS NULL` from FACTIONS_MIGRATION — so the lookup
+        // is seek-bound regardless of how many historical "left"
+        // rows the audit trail accumulates.
+        const SELECT_EXISTING_SQL: &str = "\
+SELECT id, player_id, faction_id, role, joined_at, left_at \
+FROM faction_memberships \
+WHERE player_id = ?1 AND faction_id = ?2 AND left_at IS NULL";
+
+        match self.connection().query_row(
+            INSERT_SQL,
+            rusqlite::params![player_id, faction_id, role],
+            row_to_membership,
+        ) {
+            Ok(membership) => Ok(membership),
+            Err(rusqlite::Error::QueryReturnedNoRows) => self
+                .connection()
+                .query_row(
+                    SELECT_EXISTING_SQL,
+                    rusqlite::params![player_id, faction_id],
+                    row_to_membership,
+                )
+                .map_err(|source| FactionError::Sqlite { source }),
+            Err(source) => Err(FactionError::Sqlite { source }),
+        }
+    }
 }
 
 /// Decode one `factions` row in the column order shared by
@@ -450,6 +573,65 @@ fn row_to_faction(row: &rusqlite::Row<'_>) -> rusqlite::Result<Faction> {
         display_name: row.get(2)?,
         description: row.get(3)?,
         created_at: row.get(4)?,
+    })
+}
+
+/// Read model for one row of the `faction_memberships` table —
+/// SPEC_v3 §4.4.
+///
+/// Returned by [`WorldDb::join_faction`] (and the upcoming Task 6d
+/// `leave_faction` helper) so callers receive the canonical row
+/// SQLite produced — autoincrement `id`, SQL-side `joined_at`,
+/// resolved `role` (the input default `'member'` when no override
+/// was supplied) — rather than echoing back the input arguments.
+///
+/// `left_at` is `Option<String>`: while the membership is active
+/// the column is `NULL` and decodes to `None`; Task 6d soft-deletes
+/// by stamping it with `CURRENT_TIMESTAMP`. Game UI surfaces filter
+/// to active membership by checking `left_at.is_none()` (or by
+/// using one of the partial indexes on the schema, which already
+/// scope to `WHERE left_at IS NULL`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FactionMembership {
+    /// Autoincrement primary key. Stable handle the kit references
+    /// memberships by; lets a player who leaves and rejoins the
+    /// same faction be addressed unambiguously by their *current*
+    /// active membership row even though the historical row is
+    /// retained as audit trail.
+    pub id: i64,
+    /// Foreign key into `players(id)`. The player who belongs to
+    /// the faction.
+    pub player_id: i64,
+    /// Foreign key into `factions(id)`. The faction the player is
+    /// currently (`left_at IS NULL`) a member of.
+    pub faction_id: i64,
+    /// Game-defined role label. Defaults to `'member'` when the
+    /// caller passes `None` to [`WorldDb::join_faction`]. The
+    /// schema does not constrain the vocabulary (no `CHECK`) — see
+    /// [`FACTIONS_MIGRATION`]'s doc on `faction_memberships.role`.
+    pub role: String,
+    /// SQLite-assigned UTC ISO timestamp (`CURRENT_TIMESTAMP`) of
+    /// the join — the moment this membership row was first
+    /// inserted. Stable for the life of the row.
+    pub joined_at: String,
+    /// `None` while the membership is active. Stamped with the
+    /// `CURRENT_TIMESTAMP` of the leave event by Task 6d's
+    /// `leave_faction` helper. Always `None` immediately after a
+    /// successful [`WorldDb::join_faction`] return.
+    pub left_at: Option<String>,
+}
+
+/// Decode one `faction_memberships` row in the column order shared
+/// by [`WorldDb::join_faction`] and (forthcoming) `leave_faction`.
+/// Centralised so a column rename touches one place.
+fn row_to_membership(row: &rusqlite::Row<'_>) -> rusqlite::Result<FactionMembership> {
+    Ok(FactionMembership {
+        id: row.get(0)?,
+        player_id: row.get(1)?,
+        faction_id: row.get(2)?,
+        role: row.get(3)?,
+        joined_at: row.get(4)?,
+        left_at: row.get(5)?,
     })
 }
 
@@ -948,6 +1130,241 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM factions", [], |row| row.get(0))
             .expect("count query runs");
         assert_eq!(count, 2, "one new row added, original retained");
+    }
+
+    /// SPEC_v3 §Task 6c acceptance: `join_faction` inserts a fresh
+    /// `faction_memberships` row for an unaffiliated player and
+    /// returns the canonical record. Pins the happy path so a
+    /// regression that swapped the `RETURNING` columns or dropped
+    /// the autoincrement-id assignment flunks here rather than in
+    /// a downstream agency-roster screen test.
+    #[test]
+    fn join_faction_creates_active_membership_row() {
+        let (_dir, mut world) = world_with_factions();
+        let alice = world.upsert_player(&ctx("u-a", "alice")).unwrap();
+        let seeds = vec![FactionSeed {
+            slug: "blue-desk".to_string(),
+            display_name: "Blue Desk Agency".to_string(),
+            description: "by-the-book".to_string(),
+        }];
+        let factions = world.seed_factions(&seeds).expect("seed succeeds");
+        let blue_desk = &factions[0];
+
+        let membership = world
+            .join_faction(alice.id, blue_desk.id, None)
+            .expect("join succeeds");
+
+        assert!(
+            membership.id > 0,
+            "id assigned by SQLite autoincrement, got {}",
+            membership.id
+        );
+        assert_eq!(membership.player_id, alice.id);
+        assert_eq!(membership.faction_id, blue_desk.id);
+        assert_eq!(
+            membership.role, "member",
+            "None role resolves to the schema default 'member'"
+        );
+        assert!(
+            !membership.joined_at.is_empty(),
+            "joined_at populated by CURRENT_TIMESTAMP"
+        );
+        assert!(
+            membership.left_at.is_none(),
+            "freshly joined membership is active (left_at IS NULL)"
+        );
+
+        // Belt-and-braces: the row is durably visible to a fresh
+        // SELECT — catches a regression that returned the
+        // RETURNING row but failed to actually insert (e.g. a
+        // typo'd WHERE clause in the WHERE NOT EXISTS guard that
+        // always evaluated true).
+        let count: i64 = world
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM faction_memberships \
+                 WHERE player_id = ?1 AND faction_id = ?2 AND left_at IS NULL",
+                rusqlite::params![alice.id, blue_desk.id],
+                |row| row.get(0),
+            )
+            .expect("count query runs");
+        assert_eq!(count, 1, "exactly one active membership row exists");
+    }
+
+    /// SPEC_v3 §Task 6c acceptance criterion: "membership row is
+    /// created" — and, by the kit's broader idempotency convention,
+    /// not duplicated on a second join. Doors restart on every
+    /// player session and game UIs may call `join_faction`
+    /// defensively from a "join" button without first checking
+    /// membership; without idempotency the agency roster would
+    /// render the same player N times.
+    ///
+    /// Verifies three independent regression vectors with one test:
+    ///
+    /// 1. The second call returns the *same* id as the first
+    ///    (catches a regression that re-keyed memberships per
+    ///    call).
+    /// 2. The total active-membership row count stays at 1
+    ///    (catches the most direct regression — the `WHERE NOT
+    ///    EXISTS` guard removed or inverted).
+    /// 3. The second call returns the *same* `joined_at` (catches
+    ///    a regression that wrote a fresh timestamp on each call,
+    ///    which would corrupt tenure-based UI surfaces).
+    #[test]
+    fn join_faction_is_idempotent_for_active_member() {
+        let (_dir, mut world) = world_with_factions();
+        let alice = world.upsert_player(&ctx("u-a", "alice")).unwrap();
+        let factions = world
+            .seed_factions(&[FactionSeed {
+                slug: "blue-desk".to_string(),
+                display_name: "Blue Desk".to_string(),
+                description: "x".to_string(),
+            }])
+            .unwrap();
+        let blue_desk = &factions[0];
+
+        let first = world.join_faction(alice.id, blue_desk.id, None).unwrap();
+        let second = world.join_faction(alice.id, blue_desk.id, None).unwrap();
+
+        assert_eq!(first.id, second.id, "id stable across join calls");
+        assert_eq!(
+            first.joined_at, second.joined_at,
+            "joined_at stable across join calls"
+        );
+
+        let count: i64 = world
+            .connection()
+            .query_row("SELECT COUNT(*) FROM faction_memberships", [], |row| {
+                row.get(0)
+            })
+            .expect("count query runs");
+        assert_eq!(
+            count, 1,
+            "second join MUST NOT duplicate rows (got {count})"
+        );
+    }
+
+    /// `role: Some("rookie")` MUST land on a fresh membership row.
+    /// Pins that the `COALESCE(?3, 'member')` actually consults the
+    /// bound parameter — a regression that always returned
+    /// `'member'` would flunk here. Game-defined role vocabularies
+    /// (rookies/sergeants, drivers/fences) are core to the
+    /// async-multiplayer agency surface; without role plumbing
+    /// every roster screen would read flat.
+    #[test]
+    fn join_faction_with_explicit_role_records_it() {
+        let (_dir, mut world) = world_with_factions();
+        let alice = world.upsert_player(&ctx("u-a", "alice")).unwrap();
+        let factions = world
+            .seed_factions(&[FactionSeed {
+                slug: "blue-desk".to_string(),
+                display_name: "Blue Desk".to_string(),
+                description: "x".to_string(),
+            }])
+            .unwrap();
+
+        let membership = world
+            .join_faction(alice.id, factions[0].id, Some("sergeant"))
+            .expect("join with role succeeds");
+
+        assert_eq!(membership.role, "sergeant");
+    }
+
+    /// When a player is already an active member, a subsequent
+    /// `join_faction` call with a different `role` MUST return the
+    /// *existing* row unchanged — re-joining is not a promotion
+    /// path. Pins that the helper ignores the supplied role on the
+    /// idempotent path, which guards game-UI code that calls
+    /// `join_faction` defensively (e.g. from a join-screen submit
+    /// handler) against silently overwriting the player's
+    /// established role.
+    #[test]
+    fn join_faction_does_not_change_role_for_existing_member() {
+        let (_dir, mut world) = world_with_factions();
+        let alice = world.upsert_player(&ctx("u-a", "alice")).unwrap();
+        let factions = world
+            .seed_factions(&[FactionSeed {
+                slug: "blue-desk".to_string(),
+                display_name: "Blue Desk".to_string(),
+                description: "x".to_string(),
+            }])
+            .unwrap();
+
+        let first = world
+            .join_faction(alice.id, factions[0].id, Some("rookie"))
+            .unwrap();
+        let second = world
+            .join_faction(alice.id, factions[0].id, Some("sergeant"))
+            .unwrap();
+
+        assert_eq!(first.id, second.id);
+        assert_eq!(
+            second.role, "rookie",
+            "existing role MUST NOT be overwritten by a re-join"
+        );
+    }
+
+    /// A player MAY belong to multiple factions (SPEC §4.4 — the
+    /// schema enforces no per-player cap; cross-faction exclusivity
+    /// is a game-config concern, not a storage one). Two separate
+    /// joins for the same player into different factions MUST each
+    /// succeed and produce a distinct active membership row.
+    #[test]
+    fn join_faction_supports_multiple_faction_membership() {
+        let (_dir, mut world) = world_with_factions();
+        let alice = world.upsert_player(&ctx("u-a", "alice")).unwrap();
+        let factions = world
+            .seed_factions(&[
+                FactionSeed {
+                    slug: "blue-desk".to_string(),
+                    display_name: "Blue Desk".to_string(),
+                    description: "x".to_string(),
+                },
+                FactionSeed {
+                    slug: "red-room".to_string(),
+                    display_name: "Red Room".to_string(),
+                    description: "y".to_string(),
+                },
+            ])
+            .unwrap();
+
+        let blue = world.join_faction(alice.id, factions[0].id, None).unwrap();
+        let red = world.join_faction(alice.id, factions[1].id, None).unwrap();
+
+        assert_ne!(blue.id, red.id);
+        assert_eq!(blue.faction_id, factions[0].id);
+        assert_eq!(red.faction_id, factions[1].id);
+
+        let count: i64 = world
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM faction_memberships \
+                 WHERE player_id = ?1 AND left_at IS NULL",
+                rusqlite::params![alice.id],
+                |row| row.get(0),
+            )
+            .expect("count query runs");
+        assert_eq!(
+            count, 2,
+            "alice has two active memberships (one per faction)"
+        );
+    }
+
+    /// Helper to build a `FogletContext` — same shape as
+    /// `notices::tests::ctx` and `challenges::tests::ctx`.
+    /// Deliberate duplication so the faction tests don't reach
+    /// across modules.
+    fn ctx(user_id: &str, username: &str) -> crate::foglet::FogletContext {
+        crate::foglet::FogletContext {
+            door_id: "test-door".to_string(),
+            user_id: Some(user_id.to_string()),
+            username: Some(username.to_string()),
+            role: None,
+            session_id: None,
+            terminal_width: 80,
+            terminal_height: 24,
+            source: crate::foglet::ContextSource::ContextFile,
+        }
     }
 
     /// Helper: open a fresh world DB with `players` and
