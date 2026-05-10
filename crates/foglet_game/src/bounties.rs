@@ -2336,6 +2336,347 @@ mod tests {
         );
     }
 
+    // -- SPEC_v3 §Task 7f — invalid-transition table tests --------------
+    //
+    // Standalone tests above already pin specific scenarios with extra
+    // invariants (claim attribution, reward-payload preservation,
+    // durability round-trips, deadline-equality sweep). The three
+    // `rstest` tables below complete the matrix: one row per (helper,
+    // starting-state) pair, asserting the *exact* outcome — `Ok` on
+    // each SPEC §4.5 legal edge, typed `InvalidTransition { from }`
+    // everywhere else (and silent non-inclusion for the sweeper).
+    // Without this exhaustive grid, a regression that (say) relaxed
+    // `complete_bounty`'s gate to also accept an `open` row could pass
+    // every existing test by coincidence; with the grid, that
+    // regression is one failing case.
+    //
+    // The starting state is encoded as the schema-side `state` string
+    // (not the `BountyState` enum) so a future state added in code
+    // without a matching test row surfaces as a missing case rather
+    // than as a silent compile-time mapping. The expected `from`
+    // value is the same string, which mirrors how
+    // `diagnose_failed_bounty_transition` actually populates the
+    // error.
+    //
+    // Same shape as `challenges::tests::accept_challenge_table` etc.
+    //
+    // Notes on edges this table deliberately does *not* cover:
+    //
+    // * `claim_bounty` on an `open` row whose deadline has lapsed
+    //   surfaces `Expired { id }`, not `InvalidTransition`. That edge
+    //   is pinned by `claim_bounty_rejects_expired_bounty` above; the
+    //   7f grid is concerned with state pairs, so every "open" row
+    //   here is built without a deadline.
+    // * `expire_bounties` is exercised in its own table below because
+    //   it operates on a set of rows (no addressed `id`) and its
+    //   "invalid transition" is a non-sweep, not a typed error.
+
+    /// Seed a single `bounties` row already in the requested state
+    /// using a raw `INSERT`. Building claimed/completed/expired rows
+    /// by walking the public helpers chains the success paths under
+    /// test (a claim → complete test would actually be testing *two*
+    /// helpers), so the table tests use a raw insert to isolate one
+    /// helper at a time. The schema-level `CHECK` constraint and FKs
+    /// still apply.
+    ///
+    /// `claimant` is the `claimed_by_player_id` to attribute on
+    /// `claimed`/`completed`/`expired` rows; ignored for `open`
+    /// (which the schema disallows from carrying a claimant before
+    /// the transition stamps it). Returns the new row id.
+    fn seed_bounty_in_state(world: &WorldDb, poster: i64, claimant: i64, state: &str) -> i64 {
+        // Each non-open state needs the audit fields the SPEC §4.5
+        // lifecycle would have stamped; we synthesise plausible
+        // values (real ISO timestamps, attributed claimant) so a
+        // future test that primary-key-SELECTs the row also sees a
+        // production-shaped record.
+        let (claimed_by, claimed_at, completed_at, expires_at) = match state {
+            "open" => (None, None, None, None),
+            "claimed" => (Some(claimant), Some("2026-01-01T00:00:00Z"), None, None),
+            "completed" => (
+                Some(claimant),
+                Some("2026-01-01T00:00:00Z"),
+                Some("2026-01-01T00:01:00Z"),
+                None,
+            ),
+            // An expired row was previously open or claimed with a
+            // past deadline. The deadline string lets a regression
+            // that re-checks `expires_at` on claim/complete still
+            // exercise the lapse branch on the swept row.
+            "expired" => (None, None, None, Some("2000-01-01T00:00:00Z")),
+            other => panic!("unknown seed state {other:?}"),
+        };
+        world
+            .connection()
+            .query_row(
+                "INSERT INTO bounties \
+                 (posted_by_player_id, title, description, reward, state, \
+                  claimed_by_player_id, claimed_at, completed_at, expires_at) \
+                 VALUES (?1, 'Seed', 'Seeded row.', '{\"credits\":1}', ?2, \
+                         ?3, ?4, ?5, ?6) \
+                 RETURNING id",
+                rusqlite::params![
+                    poster,
+                    state,
+                    claimed_by,
+                    claimed_at,
+                    completed_at,
+                    expires_at,
+                ],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap_or_else(|err| panic!("seed {state:?} row: {err}"))
+    }
+
+    /// SPEC_v3 §Task 7f acceptance — `claim_bounty` table.
+    ///
+    /// `open` is the only legal starting state; every other state
+    /// MUST surface as `InvalidTransition { from: <state> }` with
+    /// `to: BountyState::Claimed`. The `from` field's exact string
+    /// is asserted so a regression that mapped the schema state
+    /// through a lossy enum conversion would observably flunk.
+    #[rstest::rstest]
+    #[case::open_is_legal("open")]
+    #[case::claimed_is_invalid("claimed")]
+    #[case::completed_is_invalid("completed")]
+    #[case::expired_is_invalid("expired")]
+    fn claim_bounty_table(#[case] from: &str) {
+        let (_dir, world, poster_id, alice_id, bob_id) = world_with_poster_and_two_claimants();
+        let id = seed_bounty_in_state(&world, poster_id, alice_id, from);
+
+        let outcome = world.claim_bounty(id, bob_id);
+        if from == "open" {
+            let bounty = outcome.expect("open -> claimed is legal");
+            assert_eq!(
+                bounty.state,
+                BountyState::Claimed.as_str(),
+                "open -> claimed must land state='claimed'"
+            );
+            assert_eq!(
+                bounty.claimed_by_player_id,
+                Some(bob_id),
+                "claim must attribute the caller"
+            );
+            assert!(bounty.claimed_at.is_some(), "claim must stamp claimed_at");
+        } else {
+            match outcome.expect_err("non-open MUST NOT claim") {
+                BountyError::InvalidTransition {
+                    id: err_id,
+                    from: err_from,
+                    to,
+                } => {
+                    assert_eq!(err_id, id);
+                    assert_eq!(
+                        err_from, from,
+                        "InvalidTransition.from must echo schema state"
+                    );
+                    assert_eq!(to, BountyState::Claimed);
+                }
+                other => panic!("expected InvalidTransition for from={from:?}, got {other:?}"),
+            }
+            // Row state must be unchanged — a regression that wrote
+            // `claimed_by_player_id = ?2` before checking the gate
+            // would observably flunk this assertion.
+            let (stored_state, stored_claimant): (String, Option<i64>) = world
+                .connection()
+                .query_row(
+                    "SELECT state, claimed_by_player_id FROM bounties WHERE id = ?1",
+                    rusqlite::params![id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(stored_state, from, "rejected claim must not mutate state");
+            // For seeded `claimed`/`completed` rows the original
+            // claimant was `alice_id`; a regression that wrote
+            // `bob_id` over the top would flunk here.
+            if from == "claimed" || from == "completed" {
+                assert_eq!(
+                    stored_claimant,
+                    Some(alice_id),
+                    "rejected claim must not overwrite the existing claimant"
+                );
+            }
+        }
+    }
+
+    /// SPEC_v3 §Task 7f acceptance — `complete_bounty` table.
+    ///
+    /// `claimed` is the only legal starting state. The kit does not
+    /// gate completion on a deadline (a `claimed` row already passed
+    /// the deadline check at claim time, per `complete_bounty`'s
+    /// docs), so unlike `claim` there is no `Expired` outcome to
+    /// consider here.
+    #[rstest::rstest]
+    #[case::open_is_invalid("open")]
+    #[case::claimed_is_legal("claimed")]
+    #[case::completed_is_invalid("completed")]
+    #[case::expired_is_invalid("expired")]
+    fn complete_bounty_table(#[case] from: &str) {
+        let (_dir, world, poster_id, alice_id, _bob_id) = world_with_poster_and_two_claimants();
+        let id = seed_bounty_in_state(&world, poster_id, alice_id, from);
+
+        let outcome = world.complete_bounty(id);
+        if from == "claimed" {
+            let bounty = outcome.expect("claimed -> completed is legal");
+            assert_eq!(
+                bounty.state,
+                BountyState::Completed.as_str(),
+                "claimed -> completed must land state='completed'"
+            );
+            assert!(
+                bounty.completed_at.is_some(),
+                "complete must stamp completed_at"
+            );
+            // The reward payload and claim attribution MUST survive
+            // — pinned in detail by
+            // `complete_bounty_retains_reward_and_claim_attribution`,
+            // sanity-checked here so the table catches a regression
+            // that broadened the SET list.
+            assert_eq!(bounty.reward, r#"{"credits":1}"#);
+            assert_eq!(bounty.claimed_by_player_id, Some(alice_id));
+        } else {
+            match outcome.expect_err("non-claimed MUST NOT complete") {
+                BountyError::InvalidTransition {
+                    id: err_id,
+                    from: err_from,
+                    to,
+                } => {
+                    assert_eq!(err_id, id);
+                    assert_eq!(err_from, from);
+                    assert_eq!(to, BountyState::Completed);
+                }
+                other => panic!("expected InvalidTransition for from={from:?}, got {other:?}"),
+            }
+            let (stored_state, stored_completed_at): (String, Option<String>) = world
+                .connection()
+                .query_row(
+                    "SELECT state, completed_at FROM bounties WHERE id = ?1",
+                    rusqlite::params![id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(
+                stored_state, from,
+                "rejected complete must not mutate state"
+            );
+            // For a seeded `completed` row the original
+            // `completed_at` was `'2026-01-01T00:01:00Z'`; pinning
+            // that it didn't advance catches a regression that
+            // loosened the WHERE predicate to permit a re-stamp.
+            if from == "completed" {
+                assert_eq!(
+                    stored_completed_at.as_deref(),
+                    Some("2026-01-01T00:01:00Z"),
+                    "rejected complete must not advance completed_at"
+                );
+            } else {
+                assert_eq!(
+                    stored_completed_at, None,
+                    "rejected complete must not stamp completed_at on a non-completed row"
+                );
+            }
+        }
+    }
+
+    /// SPEC_v3 §Task 7f acceptance — `expire_bounties` table.
+    ///
+    /// The sweeper operates on a set, not a single id, and its
+    /// "invalid transition" is silent non-inclusion (no typed
+    /// error). The table covers every starting state plus deadline
+    /// variants (no deadline / future deadline / past deadline) to
+    /// pin the `expires_at IS NOT NULL` and `<= now` gates and the
+    /// `state IN ('open','claimed')` membership. SPEC §4.5 makes
+    /// both `open` and `claimed` rows eligible — a claimant who
+    /// never finishes their work shouldn't pin the bounty open
+    /// forever.
+    ///
+    /// Legal sweeps are `(open, past) -> expired` and
+    /// `(claimed, past) -> expired`. Every other case MUST stay in
+    /// its starting state after the sweep.
+    #[rstest::rstest]
+    #[case::open_past_deadline_is_swept("open", Some("2000-01-01T00:00:00Z"), true, "expired")]
+    #[case::open_no_deadline_is_not_swept("open", None, false, "open")]
+    #[case::open_future_deadline_is_not_swept("open", Some("2999-12-31T23:59:59Z"), false, "open")]
+    #[case::claimed_past_deadline_is_swept(
+        "claimed",
+        Some("2000-01-01T00:00:00Z"),
+        true,
+        "expired"
+    )]
+    #[case::claimed_no_deadline_is_not_swept("claimed", None, false, "claimed")]
+    #[case::claimed_future_deadline_is_not_swept(
+        "claimed",
+        Some("2999-12-31T23:59:59Z"),
+        false,
+        "claimed"
+    )]
+    #[case::completed_is_not_swept("completed", None, false, "completed")]
+    #[case::expired_is_not_swept("expired", None, false, "expired")]
+    fn expire_bounties_table(
+        #[case] start_state: &str,
+        #[case] expires_at: Option<&str>,
+        #[case] should_sweep: bool,
+        #[case] end_state: &str,
+    ) {
+        let (_dir, world, poster_id, alice_id, _bob_id) = world_with_poster_and_two_claimants();
+
+        // For "open" rows we drive `expires_at` from the case data
+        // via the public `post_bounty` helper so the deadline gate
+        // is exercised end-to-end. For non-open seed states, we
+        // reach for `seed_bounty_in_state` and override its default
+        // `expires_at` to match the case so a `claimed + future
+        // deadline` row really does carry that future deadline.
+        let id = if start_state == "open" {
+            world
+                .post_bounty(
+                    Some(poster_id),
+                    "Sweep target",
+                    "Sweep policy under test.",
+                    r#"{"credits":1}"#,
+                    expires_at,
+                )
+                .unwrap()
+                .id
+        } else {
+            let id = seed_bounty_in_state(&world, poster_id, alice_id, start_state);
+            // `seed_bounty_in_state`'s default `expires_at` only
+            // matches our case for `expired` (past deadline); for
+            // `claimed` we override it to whatever the case wants.
+            if start_state == "claimed" {
+                world
+                    .connection()
+                    .execute(
+                        "UPDATE bounties SET expires_at = ?2 WHERE id = ?1",
+                        rusqlite::params![id, expires_at],
+                    )
+                    .unwrap();
+            }
+            id
+        };
+
+        let swept = world
+            .expire_bounties("2026-01-01T00:00:00Z")
+            .expect("sweep succeeds");
+        let swept_ids: Vec<i64> = swept.iter().map(|b| b.id).collect();
+        assert_eq!(
+            swept_ids.contains(&id),
+            should_sweep,
+            "row id {id} sweep inclusion mismatch for ({start_state:?}, {expires_at:?})"
+        );
+
+        let stored: String = world
+            .connection()
+            .query_row(
+                "SELECT state FROM bounties WHERE id = ?1",
+                rusqlite::params![id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            stored, end_state,
+            "post-sweep state mismatch for ({start_state:?}, {expires_at:?})"
+        );
+    }
+
     /// Read column names from `pragma_table_info` in cid order —
     /// the storage-side column order, which is what the column-
     /// shape assertion pins.
