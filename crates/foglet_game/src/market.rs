@@ -448,6 +448,89 @@ RETURNING id, created_at, seller_player_id, item_key, display_name, \
             )
             .map_err(|source| MarketError::Sqlite { source })
     }
+
+    /// Return every currently-active market listing, sorted
+    /// deterministically (SPEC_v3 §4.3 / §Task 5c).
+    ///
+    /// "Active" means two things:
+    ///
+    /// 1. `quantity > 0` — exhausted listings stay in the table for
+    ///    audit (a future "listing history" view consumes them) but
+    ///    fall out of the marketplace UI the moment a buy commits. The
+    ///    partial `idx_market_listings_active` index landed in 5a
+    ///    encodes that predicate, so the planner can satisfy this
+    ///    query with an index walk and no residual scan.
+    /// 2. `expires_at` is either NULL (open-ended listing) or strictly
+    ///    in the future. The kit deliberately does **not** run a
+    ///    sweeper on listings — same policy as `notices.expires_at`,
+    ///    documented on [`MARKET_LISTINGS_MIGRATION`]. Filtering at
+    ///    read time keeps the schema simple (no background jobs, no
+    ///    "expired" state column to maintain) at the cost of a tiny
+    ///    `datetime()` comparison per row in the active set. The
+    ///    `datetime()` wrapping handles both ISO forms the kit accepts
+    ///    (`'YYYY-MM-DDTHH:MM:SSZ'` from callers,
+    ///    `'YYYY-MM-DD HH:MM:SS'` from `CURRENT_TIMESTAMP`) so the
+    ///    comparison is chronological rather than lexicographic — same
+    ///    rationale as [`Self::accept_challenge`] and
+    ///    [`Self::expire_open_challenges`].
+    ///
+    /// # Ordering
+    ///
+    /// `ORDER BY created_at DESC, id DESC` — newest first, with the
+    /// autoincrement `id` as the deterministic tiebreaker when two
+    /// listings post in the same SQLite second. Matches the partial
+    /// index column order so the planner satisfies the sort with a
+    /// reverse index walk. Same shape as [`Self::inbox`] and
+    /// [`Self::recent_events`] so the marketplace UI feels consistent
+    /// with the rest of the v3 mailbox surface.
+    ///
+    /// # Now-clock
+    ///
+    /// Uses SQL-side `datetime('now')` rather than a `now: &str`
+    /// parameter. This is a read query called from interactive UI
+    /// paths; the `expire_open_challenges` sweeper takes a `now`
+    /// parameter because it *writes* and tests need a deterministic
+    /// cutoff on the boundary, but `active_listings` is observation-
+    /// only and the SQL clock is what production callers want anyway.
+    /// Tests express expiry windows relative to "now" using
+    /// `datetime('now', '-1 hour')` / `'+1 hour'` modifiers.
+    ///
+    /// # No filters
+    ///
+    /// No `item_key` filter, no `seller_player_id` filter, no
+    /// pagination. SPEC §4.3 doesn't ask for any, and the v3
+    /// marketplace is expected to stay small enough (per-game world,
+    /// short-lived listings) that the UI can filter client-side. A
+    /// future paged or item-filtered variant can be added without
+    /// breaking this signature.
+    ///
+    /// # Concurrency
+    ///
+    /// Takes `&self`: a single read statement under the configured
+    /// busy timeout, same as [`Self::inbox`].
+    pub fn active_listings(&self) -> Result<Vec<MarketListing>, MarketError> {
+        // Column order matches `row_to_listing` and the `RETURNING`
+        // clause in `create_listing` — one decoder, one column list,
+        // surfaced as a type error if a future schema edit diverges
+        // them.
+        const SQL: &str = "\
+SELECT id, created_at, seller_player_id, item_key, display_name, \
+       price, quantity, expires_at, metadata \
+FROM market_listings \
+WHERE quantity > 0 \
+  AND (expires_at IS NULL OR datetime(expires_at) > datetime('now')) \
+ORDER BY created_at DESC, id DESC";
+
+        let mut stmt = self
+            .connection()
+            .prepare(SQL)
+            .map_err(|source| MarketError::Sqlite { source })?;
+        let rows = stmt
+            .query_map([], row_to_listing)
+            .map_err(|source| MarketError::Sqlite { source })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|source| MarketError::Sqlite { source })
+    }
 }
 
 /// Decode a `market_listings` row into [`MarketListing`].
@@ -953,5 +1036,167 @@ mod tests {
             }
             other => panic!("expected DisplayNameTooLong, got {other:?}"),
         }
+    }
+
+    /// SPEC_v3 §Task 5c: an empty marketplace returns an empty vec,
+    /// not an error. Mirrors `inbox_returns_empty_vec_for_player_with_no_notices`
+    /// — a fresh game world should render the marketplace screen
+    /// without surfacing a "query failed" toast.
+    #[test]
+    fn active_listings_returns_empty_vec_when_no_listings() {
+        let (_dir, world, _seller) = world_with_listings();
+        let listings = world
+            .active_listings()
+            .expect("active_listings runs on empty table");
+        assert!(
+            listings.is_empty(),
+            "fresh marketplace must yield zero listings, got {} rows",
+            listings.len()
+        );
+    }
+
+    /// Two listings posted in the same SQLite second MUST come back in
+    /// a deterministic order — newest `id` first when `created_at`
+    /// ties. Without an explicit tiebreaker, `ORDER BY created_at`
+    /// alone is non-deterministic on rows that share a value, which
+    /// would make the marketplace UI flicker between renders. Pinning
+    /// the secondary `id DESC` ordering here guards against a
+    /// regression that dropped the second sort key.
+    ///
+    /// Three rows are seeded in one rapid burst so they're nearly
+    /// guaranteed to share a `created_at` second; the assertion is on
+    /// `id` order alone, which is monotonic regardless of clock drift.
+    #[test]
+    fn active_listings_orders_newest_first_with_id_tiebreaker() {
+        let (_dir, world, seller_id) = world_with_listings();
+
+        // Three listings inserted back-to-back. We don't care about
+        // their exact `created_at` strings; we care that the helper
+        // returns them in `id DESC` order when their timestamps tie
+        // (which is overwhelmingly likely at sub-second cadence).
+        let first = world
+            .create_listing(Some(seller_id), "item.a", "Alpha", 10, 1, None, None)
+            .expect("first listing inserts");
+        let second = world
+            .create_listing(Some(seller_id), "item.b", "Bravo", 20, 1, None, None)
+            .expect("second listing inserts");
+        let third = world
+            .create_listing(Some(seller_id), "item.c", "Charlie", 30, 1, None, None)
+            .expect("third listing inserts");
+
+        let listings = world
+            .active_listings()
+            .expect("active_listings runs after three inserts");
+
+        assert_eq!(
+            listings.iter().map(|l| l.id).collect::<Vec<_>>(),
+            vec![third.id, second.id, first.id],
+            "active_listings must return newest id first when created_at ties"
+        );
+    }
+
+    /// A listing whose `quantity` has reached zero MUST fall out of
+    /// `active_listings`. The partial `idx_market_listings_active`
+    /// index encodes that predicate; this test pins the helper's
+    /// behavioural contract end-to-end so a regression that wrote
+    /// `WHERE quantity >= 0` (off-by-one) flunks here. Quantity goes
+    /// to zero via raw `UPDATE` rather than the upcoming `buy_listing`
+    /// helper because 5d hasn't landed yet — the contract under test
+    /// is the read filter, not the write path.
+    #[test]
+    fn active_listings_excludes_zero_quantity_rows() {
+        let (_dir, world, seller_id) = world_with_listings();
+
+        let stocked = world
+            .create_listing(Some(seller_id), "item.a", "Stocked", 10, 5, None, None)
+            .expect("stocked listing inserts");
+        let exhausted = world
+            .create_listing(Some(seller_id), "item.b", "Exhausted", 10, 1, None, None)
+            .expect("exhausted listing inserts");
+        world
+            .connection()
+            .execute(
+                "UPDATE market_listings SET quantity = 0 WHERE id = ?1",
+                rusqlite::params![exhausted.id],
+            )
+            .expect("manual quantity zero out");
+
+        let listings = world.active_listings().expect("active_listings runs");
+        let ids: Vec<i64> = listings.iter().map(|l| l.id).collect();
+        assert_eq!(
+            ids,
+            vec![stocked.id],
+            "exhausted listings must not appear in active_listings; got {ids:?}"
+        );
+    }
+
+    /// Listings with a lapsed `expires_at` MUST fall out of the
+    /// marketplace view. SPEC §4.3 lists `expires_at` in the field
+    /// set; the schema docs document the kit's policy of read-time
+    /// filtering (no sweeper). Open-ended listings (`NULL`) and
+    /// future-dated listings stay visible. Using `datetime('now',
+    /// modifier)` SQL fixtures keeps the test deterministic without
+    /// a stubbed clock.
+    #[test]
+    fn active_listings_filters_expired_and_keeps_open_ended() {
+        let (_dir, world, seller_id) = world_with_listings();
+
+        // Future deadline — must be visible.
+        let future_iso: String = world
+            .connection()
+            .query_row("SELECT datetime('now', '+1 hour')", [], |row| {
+                row.get::<_, String>(0)
+            })
+            .expect("future timestamp computes");
+        let future = world
+            .create_listing(
+                Some(seller_id),
+                "item.future",
+                "Future",
+                10,
+                1,
+                Some(&future_iso),
+                None,
+            )
+            .expect("future listing inserts");
+
+        // Past deadline — must be hidden.
+        let past_iso: String = world
+            .connection()
+            .query_row("SELECT datetime('now', '-1 hour')", [], |row| {
+                row.get::<_, String>(0)
+            })
+            .expect("past timestamp computes");
+        let past = world
+            .create_listing(
+                Some(seller_id),
+                "item.past",
+                "Past",
+                10,
+                1,
+                Some(&past_iso),
+                None,
+            )
+            .expect("past listing inserts");
+
+        // No deadline — must be visible.
+        let open = world
+            .create_listing(Some(seller_id), "item.open", "Open", 10, 1, None, None)
+            .expect("open-ended listing inserts");
+
+        let listings = world.active_listings().expect("active_listings runs");
+        let visible_ids: std::collections::HashSet<i64> = listings.iter().map(|l| l.id).collect();
+        assert!(
+            visible_ids.contains(&future.id),
+            "future-dated listing must be visible"
+        );
+        assert!(
+            visible_ids.contains(&open.id),
+            "open-ended listing must be visible"
+        );
+        assert!(
+            !visible_ids.contains(&past.id),
+            "lapsed listing must be filtered out"
+        );
     }
 }
