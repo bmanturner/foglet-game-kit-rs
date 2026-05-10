@@ -355,6 +355,7 @@ fn row_to_presence(row: &rusqlite::Row<'_>) -> rusqlite::Result<PresenceRecord> 
 mod tests {
     use super::{row_to_presence, PresenceError, PRESENCE_MIGRATION};
     use crate::foglet::{ContextSource, FogletContext};
+    use crate::place_recall::{PlaceRecallRecord, PLACE_RECALL_MIGRATION};
     use crate::players::PLAYERS_MIGRATION;
     use crate::spatial::PLACES_MIGRATION;
     use crate::world_db::WorldDb;
@@ -619,6 +620,98 @@ mod tests {
         assert_eq!(loaded.entered_at, initial.entered_at);
     }
 
+    /// Task 6f requires `move_player` to remain a pure presence
+    /// transition unless the caller explicitly invokes place recall.
+    ///
+    /// This test writes a recall row for the source place, executes a move
+    /// with a no-op callback, and then confirms recall metadata is
+    /// byte-identical and still has the same row cardinality.
+    ///
+    /// This keeps the kit genre-neutral:
+    ///
+    /// - A **space exploration** captain can move through waypoints
+    ///   without forcing a fog-map update unless the game explicitly
+    ///   touches recall on movement.
+    /// - A **dungeon crawler** hero can walk through chambers while
+    ///   leaving per-room fog entries unchanged unless the encounter layer
+    ///   decides to register a touch.
+    #[test]
+    fn move_player_does_not_auto_touch_recall() {
+        let dir = tempdir().expect("tempdir creates");
+        let db_path = dir.path().join("world.sqlite");
+        let mut world = WorldDb::open(&db_path).expect("open succeeds");
+
+        world
+            .apply_migration(&PLAYERS_MIGRATION)
+            .expect("players migration applies");
+        world
+            .apply_migration(&PLACES_MIGRATION)
+            .expect("places migration applies");
+        world
+            .apply_migration(&PRESENCE_MIGRATION)
+            .expect("presence migration applies");
+        world
+            .apply_migration(&PLACE_RECALL_MIGRATION)
+            .expect("place_recall migration applies");
+
+        let player_id: i64 = world
+            .connection()
+            .query_row(
+                "INSERT INTO players (handle) VALUES (?1) RETURNING id",
+                rusqlite::params!["Captain Quill"],
+                |row| row.get(0),
+            )
+            .expect("fixture player insert works");
+
+        let docking_gate = world
+            .insert_place("port-alpha", "Port Alpha", "harbor", None)
+            .expect("fixture place insert works");
+        let cargo_bay = world
+            .insert_place("cargo-bay", "Cargo Bay", "hub", None)
+            .expect("fixture place insert works");
+
+        world
+            .set_presence(player_id, docking_gate.id, Some(r#"{"zone":"entry"}"#))
+            .expect("initial presence exists before move");
+
+        let before_recall = world
+            .touch_recall(player_id, docking_gate.id, Some(r#"{"vision":"baseline"}"#))
+            .expect("explicit recall touch pre-populates memory");
+
+        let before_total: i64 = world
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM place_recall WHERE player_id = ?1",
+                rusqlite::params![player_id],
+                |row| row.get(0),
+            )
+            .expect("recall row count is queryable");
+        let before_destination: Option<PlaceRecallRecord> =
+            query_recall(world.connection(), player_id, cargo_bay.id);
+
+        world
+            .move_player(player_id, cargo_bay.id, |_, _| Ok(()))
+            .expect("move_player runs without touching recall");
+
+        let after_recall = query_recall(world.connection(), player_id, docking_gate.id)
+            .expect("existing source recall row still exists");
+        let after_total: i64 = world
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM place_recall WHERE player_id = ?1",
+                rusqlite::params![player_id],
+                |row| row.get(0),
+            )
+            .expect("recall row count is queryable");
+
+        assert_eq!(before_recall, after_recall);
+        assert_eq!(before_total, after_total);
+        assert!(
+            before_destination.is_none(),
+            "move should not create destination recall without explicit touch_recall"
+        );
+    }
+
     /// Task 5e proves the read path and the optional return:
     /// players that have never been placed report `None`.
     ///
@@ -807,5 +900,27 @@ mod tests {
         assert_eq!(vault_ids, vec![player_c]);
 
         Ok(())
+    }
+
+    fn query_recall(
+        connection: &rusqlite::Connection,
+        player_id: i64,
+        place_id: i64,
+    ) -> Option<PlaceRecallRecord> {
+        connection
+            .query_row(
+                "SELECT player_id, place_id, first_seen_at, last_seen_at, snapshot_json FROM place_recall WHERE player_id = ?1 AND place_id = ?2",
+                rusqlite::params![player_id, place_id],
+                |row| {
+                    Ok(PlaceRecallRecord {
+                        player_id: row.get(0)?,
+                        place_id: row.get(1)?,
+                        first_seen_at: row.get(2)?,
+                        last_seen_at: row.get(3)?,
+                        snapshot_json: row.get(4)?,
+                    })
+                },
+            )
+            .ok()
     }
 }

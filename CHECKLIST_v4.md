@@ -49,7 +49,7 @@ One unchecked item per iteration. Dependencies in `[brackets]` must be checked o
 - [x] **6c** — Test that `first_seen_at` is preserved across repeated `touch_recall` calls. [6b]
 - [x] **6d** — Test that `snapshot_json` updates on each touch. [6b]
 - [x] **6e** — Implement `recall_for_player(player_id)` newest-first. Test: deterministic ordering. [6b]
-- [ ] **6f** — Confirm `move_player` does not auto-touch recall. Test: a move without an explicit `touch_recall` leaves recall unchanged. [5c, 6b]
+- [x] **6f** — Confirm `move_player` does not auto-touch recall. Test: a move without an explicit `touch_recall` leaves recall unchanged. [5c, 6b]
 
 ### Task 7 — Inventory schema
 
