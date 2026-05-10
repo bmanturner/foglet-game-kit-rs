@@ -10,7 +10,7 @@ One unchecked item per iteration. Dependencies in `[brackets]` must be checked o
 ### Task 2 — v5 configuration
 
 - [x] **2a** — Add optional `[contracts]`, `[job_board]`, `[travel]`, `[inventory_capacity]`, and `[screens.event_log]` sections to `GameConfig`, each with an `enabled` flag. Test: absent sections leave each primitive disabled. [Task 1]
-- [ ] **2b** — Parse `[screens.event_log].default_page_size` as a positive integer with a documented default. Test: zero/negative values fail clearly; absent value applies default. [2a]
+- [x] **2b** — Parse `[screens.event_log].default_page_size` as a positive integer with a documented default. Test: zero/negative values fail clearly; absent value applies default. [2a]
 - [ ] **2c** — Reject configs that enable `job_board` without `contracts`. Test: clear error message. [2a]
 - [ ] **2d** — Reject configs that enable `travel` without `spatial` and `presence`. Test: clear error message. [2a]
 - [ ] **2e** — Reject configs that enable `inventory_capacity` without `inventory`. Test: clear error message. [2a]

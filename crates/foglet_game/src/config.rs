@@ -27,7 +27,7 @@
 
 use std::path::Path;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
 
 use crate::manifest::{
@@ -612,11 +612,32 @@ pub struct ScreensSection {
 }
 
 /// `[screens.event_log]` subsection: v5 Event Log / News screen toggle.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EventLogScreenSection {
     /// Enable the v5 event log screen helper.
     #[serde(default)]
     pub enabled: bool,
+    /// Default number of events shown per page in the v5 event-log
+    /// screen.
+    ///
+    /// We default to `20` to keep pagination deterministic across
+    /// game families (space station bulletins, dungeon death logs,
+    /// town council notices) without forcing every project to set an
+    /// explicit value in `game.toml`.
+    #[serde(
+        default = "default_event_log_page_size",
+        deserialize_with = "deserialize_positive_u32"
+    )]
+    pub default_page_size: u32,
+}
+
+impl Default for EventLogScreenSection {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            default_page_size: default_event_log_page_size(),
+        }
+    }
 }
 
 /// A single seeded faction definition (SPEC v3 §5.2).
@@ -654,6 +675,9 @@ fn default_world_journal_mode() -> String {
 }
 fn default_max_catchup_per_call() -> u32 {
     100
+}
+fn default_event_log_page_size() -> u32 {
+    20
 }
 
 fn default_timeout_ms() -> u64 {
@@ -874,6 +898,22 @@ fn is_valid_slug(s: &str) -> bool {
     }
     s.chars()
         .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+}
+
+/// Parse helper for config fields that must be strictly positive.
+///
+/// We parse through `i64` so `-1` and `0` both return the same clear
+/// author-facing message instead of leaking serde's unsigned-type
+/// internals.
+fn deserialize_positive_u32<'de, D>(deserializer: D) -> Result<u32, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = i64::deserialize(deserializer)?;
+    if value <= 0 {
+        return Err(serde::de::Error::custom("must be greater than zero"));
+    }
+    u32::try_from(value).map_err(|_| serde::de::Error::custom("value is too large"))
 }
 
 #[cfg(test)]
@@ -1157,6 +1197,7 @@ start_y = 0
         assert!(!config.travel.enabled);
         assert!(!config.inventory_capacity.enabled);
         assert!(!config.screens.event_log.enabled);
+        assert_eq!(config.screens.event_log.default_page_size, 20);
         assert_eq!(config.world_ticks.max_catchup_per_call, 100);
         assert!(!config.world_ticks.run_due_ticks_on_login);
     }
@@ -1230,6 +1271,7 @@ enabled = true
 
 [screens.event_log]
 enabled = true
+default_page_size = 42
 "#,
         )
         .unwrap();
@@ -1239,6 +1281,87 @@ enabled = true
         assert!(config.travel.enabled);
         assert!(config.inventory_capacity.enabled);
         assert!(config.screens.event_log.enabled);
+        assert_eq!(config.screens.event_log.default_page_size, 42);
+    }
+
+    #[test]
+    fn event_log_page_size_defaults_when_omitted() {
+        let config = GameConfig::from_toml_str(
+            r#"
+[game]
+title = "Event Defaults"
+slug = "event-defaults"
+description = ""
+min_width = 80
+min_height = 24
+start_map = "lobby"
+start_x = 0
+start_y = 0
+
+[screens.event_log]
+enabled = true
+"#,
+        )
+        .unwrap();
+
+        assert!(config.screens.event_log.enabled);
+        assert_eq!(config.screens.event_log.default_page_size, 20);
+    }
+
+    #[test]
+    fn event_log_page_size_rejects_zero() {
+        let err = GameConfig::from_toml_str(
+            r#"
+[game]
+title = "Event Zero"
+slug = "event-zero"
+description = ""
+min_width = 80
+min_height = 24
+start_map = "lobby"
+start_x = 0
+start_y = 0
+
+[screens.event_log]
+enabled = true
+default_page_size = 0
+"#,
+        )
+        .unwrap_err();
+
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("greater than zero"),
+            "error should mention positive page size: {msg}"
+        );
+    }
+
+    #[test]
+    fn event_log_page_size_rejects_negative_values() {
+        let err = GameConfig::from_toml_str(
+            r#"
+[game]
+title = "Event Negative"
+slug = "event-negative"
+description = ""
+min_width = 80
+min_height = 24
+start_map = "lobby"
+start_x = 0
+start_y = 0
+
+[screens.event_log]
+enabled = true
+default_page_size = -5
+"#,
+        )
+        .unwrap_err();
+
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("greater than zero"),
+            "error should mention positive page size: {msg}"
+        );
     }
 
     #[test]
