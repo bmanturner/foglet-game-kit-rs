@@ -662,35 +662,18 @@ mod tests {
 
     #[test]
     fn travel_success_updates_presence_touches_recall_and_appends_event() {
-        let dir = tempdir().expect("tempdir creates");
-        let db_path = dir.path().join("world.sqlite");
-        let mut world = WorldDb::open(&db_path).expect("open succeeds");
-        apply_travel_migrations(&mut world);
-
-        let player_id: i64 = world
-            .connection()
-            .query_row(
-                "INSERT INTO players (handle) VALUES (?1) RETURNING id",
-                rusqlite::params!["traveler"],
-                |row| row.get(0),
-            )
-            .expect("player insert works");
-        let origin = world
-            .insert_place("origin", "Origin", "room", None)
-            .expect("origin place inserts");
-        let destination = world
-            .insert_place("destination", "Destination", "room", None)
-            .expect("destination place inserts");
-        let route = world
-            .create_route(origin.id, destination.id, "hall", None, None)
-            .expect("route inserts");
-        world
-            .set_presence(player_id, origin.id, None)
-            .expect("initial presence inserts");
+        let TravelFixture {
+            mut world,
+            player_id,
+            origin_id,
+            destination_id,
+            route,
+            ..
+        } = setup_travel_fixture();
 
         let result = world
             .travel(
-                TravelRequest::new(player_id, destination.id).with_append_event(
+                TravelRequest::new(player_id, destination_id).with_append_event(
                     |presence, route| {
                         Some(TravelEventDraft {
                             kind: "arrived".to_string(),
@@ -716,20 +699,125 @@ mod tests {
             .player_events(player_id, 10)
             .expect("player events read after travel");
 
-        assert_eq!(result.from_place_id, origin.id);
-        assert_eq!(result.to_place_id, destination.id);
+        assert_eq!(result.from_place_id, origin_id);
+        assert_eq!(result.to_place_id, destination_id);
         assert_eq!(result.route_id, route.id);
         assert_eq!(result.event_id, events.first().map(|event| event.id));
-        assert_eq!(loaded_presence.place_id, destination.id);
+        assert_eq!(loaded_presence.place_id, destination_id);
         assert!(
             recall
                 .iter()
-                .any(|row| row.player_id == player_id && row.place_id == destination.id),
+                .any(|row| row.player_id == player_id && row.place_id == destination_id),
             "successful travel should touch recall for the destination"
         );
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].kind, "arrived");
         assert_eq!(events[0].metadata, Some(r#"{"via":"hall"}"#.to_string()));
+    }
+
+    #[test]
+    fn travel_validation_failure_rolls_back_presence_recall_and_events() {
+        let TravelFixture {
+            mut world,
+            player_id,
+            origin_id,
+            destination_id,
+            ..
+        } = setup_travel_fixture();
+
+        let rejected = world.travel(
+            TravelRequest::new(player_id, destination_id)
+                .with_validate(|_, route| {
+                    Err(TravelError::ValidationFailed {
+                        player_id,
+                        route_id: route.id,
+                        reason: "locked passage".to_string(),
+                    })
+                })
+                .with_append_event(|_, _| {
+                    Some(TravelEventDraft {
+                        kind: "arrived".to_string(),
+                        message: "should not persist".to_string(),
+                        metadata_json: None,
+                    })
+                }),
+        );
+
+        match rejected {
+            Err(TravelError::ValidationFailed { reason, .. }) => {
+                assert_eq!(reason, "locked passage");
+            }
+            other => panic!("expected validation failure, got {other:?}"),
+        }
+
+        let loaded_presence = world
+            .get_presence(player_id)
+            .expect("presence reads")
+            .expect("presence row exists");
+        let recall = world
+            .recall_for_player(player_id)
+            .expect("recall reads after rollback");
+        let events = world
+            .player_events(player_id, 10)
+            .expect("player events read after rollback");
+
+        assert_eq!(loaded_presence.place_id, origin_id);
+        assert!(
+            !recall
+                .iter()
+                .any(|row| row.player_id == player_id && row.place_id == destination_id),
+            "validation failure must not touch destination recall"
+        );
+        assert!(
+            events.is_empty(),
+            "validation failure must not append events"
+        );
+    }
+
+    struct TravelFixture {
+        world: WorldDb,
+        player_id: i64,
+        origin_id: i64,
+        destination_id: i64,
+        route: Route,
+        _tempdir: tempfile::TempDir,
+    }
+
+    fn setup_travel_fixture() -> TravelFixture {
+        let tempdir = tempdir().expect("tempdir creates");
+        let db_path = tempdir.path().join("world.sqlite");
+        let mut world = WorldDb::open(&db_path).expect("open succeeds");
+        apply_travel_migrations(&mut world);
+
+        let player_id: i64 = world
+            .connection()
+            .query_row(
+                "INSERT INTO players (handle) VALUES (?1) RETURNING id",
+                rusqlite::params!["traveler"],
+                |row| row.get(0),
+            )
+            .expect("player insert works");
+        let origin = world
+            .insert_place("origin", "Origin", "room", None)
+            .expect("origin place inserts");
+        let destination = world
+            .insert_place("destination", "Destination", "room", None)
+            .expect("destination place inserts");
+        let route = world
+            .create_route(origin.id, destination.id, "hall", None, None)
+            .expect("route inserts");
+        world
+            .set_presence(player_id, origin.id, None)
+            .expect("initial presence inserts");
+
+        TravelFixture {
+            world,
+            player_id,
+            origin_id: origin.id,
+            destination_id: destination.id,
+            route,
+            _tempdir: tempdir,
+        }
     }
 
     fn apply_travel_migrations(world: &mut WorldDb) {

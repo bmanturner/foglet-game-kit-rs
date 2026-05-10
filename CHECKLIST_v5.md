@@ -54,7 +54,7 @@ One unchecked item per iteration. Dependencies in `[brackets]` must be checked o
 
 - [x] **7a** — Define `TravelRequest`, `TravelResult`, and `TravelError` enums covering `NoPresence`, `NoRoute`, `AmbiguousRoute`, `ValidationFailed`, `CostFailed`, and `InventoryError`. [v4 Task 5, v4 Task 6]
 - [x] **7b** — Implement `travel(ctx, req)` executing the documented step order inside a single transaction. Test: success path updates presence, touches recall, and appends event. [7a]
-- [ ] **7c** — Test `validate` failure rolls back: presence, recall, and events unchanged. [7b]
+- [x] **7c** — Test `validate` failure rolls back: presence, recall, and events unchanged. [7b]
 - [ ] **7d** — Test `charge_cost` failure rolls back: presence, recall, and events unchanged. [7b]
 - [ ] **7e** — Test omitted `route_id` resolves a unique outbound route; ambiguous case returns `AmbiguousRoute`. [7b]
 - [ ] **7f** — Test `touch_recall = false` leaves recall unchanged even when `place_recall` is enabled. [7b]
