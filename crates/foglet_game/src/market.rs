@@ -38,6 +38,7 @@
 
 use thiserror::Error;
 
+use crate::events::EventError;
 use crate::world_db::{WorldDb, WorldMigration};
 
 /// Schema for the shared marketplace table — SPEC_v3 §4.3 / §Task 5a.
@@ -257,6 +258,18 @@ pub struct MarketListing {
 /// notice-subject and (eventually) bounty-title caps.
 pub const MARKET_DISPLAY_NAME_MAX_CHARS: usize = 120;
 
+/// World-event `kind` written by [`WorldDb::buy_listing`] when a
+/// purchase commits successfully (SPEC_v3 §4.3 / §Task 5f).
+///
+/// Pinned as a `pub const` rather than a string literal so consuming
+/// games can pattern-match the bulletin / per-player-event stream
+/// against the same canonical value the kit emits — and so a regression
+/// that changed the kind silently would flunk a string-equality test in
+/// this module rather than leaking past Murder Motel's bulletin filter.
+/// Namespaced (`market.buy`) following the kit's `primitive.verb`
+/// convention so future faction/bounty/challenge events don't collide.
+pub const MARKET_BUY_EVENT_KIND: &str = "market.buy";
+
 /// Failure modes for [`WorldDb::create_listing`] and the upcoming
 /// market-lifecycle helpers.
 ///
@@ -401,6 +414,24 @@ pub enum MarketError {
         /// Underlying `rusqlite` error from the statement.
         #[source]
         source: rusqlite::Error,
+    },
+    /// The world-event append that fires after a successful buy-and-
+    /// callback transaction (SPEC_v3 §4.3 / §Task 5f) failed. The
+    /// wrapping transaction rolls back as a unit, so the listing's
+    /// quantity decrement and any callback writes are also undone —
+    /// the SPEC §4.3 "Buying MUST be atomic … event append" guarantee.
+    /// Distinct from [`Self::Sqlite`] and [`Self::BuyerCallback`] so
+    /// the marketplace UI can surface the event-append phase
+    /// explicitly (in practice this is an operator-fix path: the
+    /// `world_events` migration was never applied, or the event
+    /// message we built blew through `MAX_EVENT_MESSAGE_LEN` because a
+    /// pathologically long `display_name` slipped past
+    /// [`MARKET_DISPLAY_NAME_MAX_CHARS`]).
+    #[error("failed to append market.buy world event; transaction rolled back: {source}")]
+    Event {
+        /// Underlying [`EventError`] returned by `append_event_on`.
+        #[source]
+        source: EventError,
     },
 }
 
@@ -759,11 +790,59 @@ RETURNING id, created_at, seller_player_id, item_key, display_name, \
             return Err(MarketError::BuyerCallback { source });
         }
 
+        // SPEC §4.3 / §Task 5f: append a `market.buy` world event last,
+        // inside the same transaction as the decrement and the callback
+        // writes. Appending *after* the callback (not before) means a
+        // callback rollback also rolls back the event row, so the
+        // bulletin invariant "every event corresponds to a real,
+        // persisted purchase" holds — the same ordering rule
+        // [`WorldDb::spend_turn_and_emit`] uses.
+        //
+        // The event is attributed to `seller_player_id` so a successful
+        // sale surfaces in the seller's per-player history (Task 13d's
+        // future "your sales" surface). For NPC/system listings
+        // (`seller_player_id IS NULL`) the event lands as a system row
+        // — visible in the global bulletin, absent from any single
+        // player's view, which is the right shape for "the kit-run
+        // shop sold a thing".
+        let event_message = format_market_buy_event_message(&listing, quantity_to_buy);
+        crate::events::append_event_on(
+            &tx,
+            MARKET_BUY_EVENT_KIND,
+            listing.seller_player_id,
+            &event_message,
+            None,
+        )
+        .map_err(|source| MarketError::Event { source })?;
+
         tx.commit()
             .map_err(|source| MarketError::Sqlite { source })?;
 
         Ok(listing)
     }
+}
+
+/// Render the human-readable `world_events.message` body the kit emits
+/// after a successful buy (SPEC_v3 §Task 5f). Pulled into a free
+/// function so the `buy_listing` callsite stays focused on
+/// transactional plumbing and tests can assert the exact rendered shape
+/// without re-running a full buy round-trip.
+///
+/// Format: `market listing #{id} ({display_name}) sold {qty} unit(s) at {price} each`.
+/// The post-decrement listing is the right argument because it carries
+/// the canonical `id`, `display_name`, and `price` SQLite assigned —
+/// and `quantity_sold` is passed separately because the post-decrement
+/// row's `quantity` is the *remaining* count, not the sold count. A
+/// regression that swapped them would render "sold 3" when 2 were
+/// actually bought; the dedicated parameter makes that swap impossible.
+fn format_market_buy_event_message(listing: &MarketListing, quantity_sold: i64) -> String {
+    format!(
+        "market listing #{id} ({name}) sold {qty} unit(s) at {price} each",
+        id = listing.id,
+        name = listing.display_name,
+        qty = quantity_sold,
+        price = listing.price,
+    )
 }
 
 /// Decode a `market_listings` row into [`MarketListing`].
@@ -792,6 +871,7 @@ fn row_to_listing(row: &rusqlite::Row<'_>) -> rusqlite::Result<MarketListing> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::events::WORLD_EVENTS_MIGRATION;
     use crate::players::PLAYERS_MIGRATION;
     use tempfile::tempdir;
 
@@ -1024,6 +1104,15 @@ mod tests {
         world
             .apply_migration(&PLAYERS_MIGRATION)
             .expect("players migration applies");
+        // `buy_listing` (Task 5d–5f) appends a `market.buy` event
+        // inside its wrapping transaction, so every buy-path test
+        // needs `world_events` present. Applying it unconditionally in
+        // the helper means the create/active-listing tests pay a tiny
+        // cost (one extra migration on a tempfile) in exchange for one
+        // canonical fixture instead of two.
+        world
+            .apply_migration(&WORLD_EVENTS_MIGRATION)
+            .expect("world_events migration applies");
         world
             .apply_migration(&MARKET_LISTINGS_MIGRATION)
             .expect("market_listings migration applies");
@@ -1817,6 +1906,191 @@ mod tests {
         assert_eq!(
             visible.quantity, 3,
             "active_listings must reflect the rolled-back pre-buy quantity"
+        );
+    }
+
+    /// SPEC_v3 §Task 5f acceptance: a successful `buy_listing` appends
+    /// exactly one [`MARKET_BUY_EVENT_KIND`] event to `world_events`,
+    /// attributed to the seller, with a deterministic message body
+    /// covering the listing id, display name, sold quantity, and price.
+    ///
+    /// Pinning the kind, the player attribution, and the rendered
+    /// message together catches three independent regressions in one
+    /// test: a renamed kind would hide bulletin entries from a game
+    /// that filters by kind; an attribution swap (buyer vs seller, or
+    /// `None`) would leak the event into the wrong per-player history;
+    /// a format change would silently break Murder Motel's bulletin
+    /// rendering. The message asserts substring matches rather than
+    /// exact-string equality so a future tweak to the connector words
+    /// ("sold" → "for") doesn't flunk this test for cosmetic reasons,
+    /// but every load-bearing fact (id, display_name, qty, price) is
+    /// individually pinned.
+    #[test]
+    fn buy_listing_appends_market_buy_world_event_attributed_to_seller() {
+        let (_dir, mut world, seller_id) = world_with_listings();
+
+        let listing = world
+            .create_listing(
+                Some(seller_id),
+                "item.lockpick",
+                "Lockpick",
+                25,
+                5,
+                None,
+                None,
+            )
+            .expect("create_listing succeeds");
+
+        // Sanity: starting from a clean event log so any event we see
+        // afterwards is one this buy emitted.
+        let pre = world.recent_events(10).expect("recent_events runs");
+        assert!(pre.is_empty(), "fresh world has no events before the buy");
+
+        world
+            .buy_listing(listing.id, 2, |_tx, _row| Ok(()))
+            .expect("buy succeeds");
+
+        // Exactly one event was appended — not zero (which would mean
+        // the append was skipped) and not two (which would mean the
+        // helper double-emitted).
+        let events = world.recent_events(10).expect("recent_events runs");
+        assert_eq!(
+            events.len(),
+            1,
+            "buy_listing must append exactly one world event"
+        );
+        let event = &events[0];
+
+        assert_eq!(
+            event.kind, MARKET_BUY_EVENT_KIND,
+            "event kind must match the kit's canonical market.buy namespace",
+        );
+        assert_eq!(
+            event.player_id,
+            Some(seller_id),
+            "event must be attributed to the listing's seller so it surfaces in their history",
+        );
+        assert!(
+            event.message.contains(&format!("#{}", listing.id)),
+            "event message must reference the listing id; got {:?}",
+            event.message,
+        );
+        assert!(
+            event.message.contains("Lockpick"),
+            "event message must include the display_name; got {:?}",
+            event.message,
+        );
+        assert!(
+            event.message.contains(" 2 "),
+            "event message must include the sold quantity (not the post-decrement remaining); got {:?}",
+            event.message,
+        );
+        assert!(
+            event.message.contains("25"),
+            "event message must include the unit price; got {:?}",
+            event.message,
+        );
+        assert!(
+            event.metadata.is_none(),
+            "kit-emitted market.buy events carry no metadata by default",
+        );
+
+        // Per-player view: the seller sees the sale in their history
+        // because we attribute by `seller_player_id`. A regression that
+        // attributed to `None` would flunk this assertion with an
+        // empty vec.
+        let seller_history = world
+            .player_events(seller_id, 10)
+            .expect("player_events runs");
+        assert_eq!(
+            seller_history.len(),
+            1,
+            "seller must see the sale in their per-player event history",
+        );
+    }
+
+    /// SPEC_v3 §Task 5f acceptance: NPC/system listings (no
+    /// `seller_player_id`) emit a *system* event — `player_id IS NULL`
+    /// — so the bulletin still shows the sale but no player's per-
+    /// player view is polluted with it. Pins the same SPEC §4.7
+    /// "system events have NULL player_id" convention the kit uses
+    /// elsewhere, applied to the buy path.
+    #[test]
+    fn buy_listing_emits_system_event_for_npc_listings() {
+        let (_dir, mut world, _seller_id) = world_with_listings();
+
+        // No seller — SPEC §4.3 explicitly allows this for NPC/system
+        // listings.
+        let listing = world
+            .create_listing(None, "item.npc", "NPC Crate", 10, 3, None, None)
+            .expect("create_listing succeeds");
+
+        world
+            .buy_listing(listing.id, 1, |_tx, _row| Ok(()))
+            .expect("buy succeeds");
+
+        let events = world.recent_events(10).expect("recent_events runs");
+        assert_eq!(events.len(), 1, "exactly one event after one buy");
+        assert_eq!(events[0].kind, MARKET_BUY_EVENT_KIND);
+        assert_eq!(
+            events[0].player_id, None,
+            "NPC listing buy must produce a NULL-player_id system event",
+        );
+    }
+
+    /// SPEC_v3 §Task 5f / §7 atomicity: when the buyer callback fails,
+    /// the world-event row that *would* have been appended must also
+    /// roll back. Layered on top of the §Task 5e listing-and-callback
+    /// rollback test: 5e proves listing quantity and callback writes
+    /// roll back; this proves the event row does too. A regression that
+    /// committed the event before checking the callback (or that
+    /// appended the event in a separate connection) would leave a
+    /// `market.buy` row with no actual purchase behind it — breaking
+    /// the "every event corresponds to a real, persisted action"
+    /// invariant.
+    #[test]
+    fn buy_listing_rolls_back_world_event_when_callback_fails() {
+        let (_dir, mut world, seller_id) = world_with_listings();
+
+        let listing = world
+            .create_listing(
+                Some(seller_id),
+                "item.lockpick",
+                "Lockpick",
+                25,
+                3,
+                None,
+                None,
+            )
+            .expect("create_listing succeeds");
+
+        let err = world
+            .buy_listing(listing.id, 1, |_tx, _row| {
+                // Fail *after* the kit's decrement, before the event
+                // append in source order — but because the event is
+                // appended after the callback in the wrapping
+                // transaction, a regression that emitted the event
+                // *before* the callback would still flunk this test.
+                Err(rusqlite::Error::SqliteFailure(
+                    rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT),
+                    Some("simulated buyer failure".to_string()),
+                ))
+            })
+            .expect_err("callback failure must surface as MarketError");
+        assert!(
+            matches!(err, MarketError::BuyerCallback { .. }),
+            "callback failure must surface as MarketError::BuyerCallback (got {:?})",
+            err,
+        );
+
+        // Zero events: the wrapping transaction rolled back, so the
+        // `market.buy` row never landed. A leaked event row would
+        // surface as `len() == 1` here.
+        let events = world.recent_events(10).expect("recent_events runs");
+        assert!(
+            events.is_empty(),
+            "no world event must persist when buy_listing rolls back; got {:?}",
+            events,
         );
     }
 }
