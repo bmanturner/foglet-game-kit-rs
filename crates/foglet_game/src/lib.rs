@@ -43,6 +43,7 @@ pub mod foglet;
 pub mod input;
 pub mod inventory;
 pub mod job_board;
+pub mod job_board_screen;
 pub mod leaderboards;
 pub mod manifest;
 pub mod map;
@@ -98,6 +99,7 @@ pub use job_board::{
     BountyProvider, BuiltInProviders, ChallengeProvider, ContractProvider, JobBoard, JobBoardEntry,
     JobBoardError, JobBoardFilter, JobBoardSort, JobBoardSource, OpportunityProvider,
 };
+pub use job_board_screen::JobBoardScreen;
 pub use leaderboards::{LeaderboardError, ScoreRecord, LEADERBOARD_SCORES_MIGRATION};
 pub use manifest::{
     FogletManifest, ManifestError, ManifestInputs, DEFAULT_AUTH_SCOPE, DEFAULT_IDLE_TIMEOUT_MS,

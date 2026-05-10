@@ -44,7 +44,7 @@ One unchecked item per iteration. Dependencies in `[brackets]` must be checked o
 
 ### Task 6 — Job Board screen
 
-- [ ] **6a** — Implement a `JobBoardScreen` widget rendering at 80×24 with `kind_label`, `state_label`, `title`, `expires_at`. Test: synthetic long titles do not overflow. [5b]
+- [x] **6a** — Implement a `JobBoardScreen` widget rendering at 80×24 with `kind_label`, `state_label`, `title`, `expires_at`. Test: synthetic long titles do not overflow. [5b]
 - [ ] **6b** — Support keyboard navigation, pagination, and a quit hotkey. Test: cursor wraps at page boundaries; quit returns control to caller. [6a]
 - [ ] **6c** — Support a detail modal whose body is a game-supplied callback. Test: modal opens and closes without redrawing the underlying list incorrectly. [6a]
 - [ ] **6d** — Render empty-state text when the aggregated query returns zero entries. Test: empty providers produce the configured copy. [6a]
