@@ -40,6 +40,7 @@ pub mod events;
 pub mod factions;
 pub mod foglet;
 pub mod input;
+pub mod inventory;
 pub mod leaderboards;
 pub mod manifest;
 pub mod map;
@@ -86,6 +87,7 @@ pub use foglet::{
     process_env, synthesize_local_dev, ContextError, ContextSource, FogletContext, LoadOptions,
 };
 pub use input::{from_event, from_key_event, Input};
+pub use inventory::INVENTORY_SLOTS_MIGRATION;
 pub use leaderboards::{LeaderboardError, ScoreRecord, LEADERBOARD_SCORES_MIGRATION};
 pub use manifest::{
     FogletManifest, ManifestError, ManifestInputs, DEFAULT_AUTH_SCOPE, DEFAULT_IDLE_TIMEOUT_MS,
