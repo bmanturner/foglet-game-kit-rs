@@ -664,6 +664,130 @@ RETURNING id, key, kind, issuer_owner_kind, issuer_owner_id, \
 
         Ok(abandoned)
     }
+
+    /// Expire one overdue available contract inside a single transaction.
+    ///
+    /// This transition is intentionally narrow:
+    ///
+    /// - Only rows still in `available` are eligible.
+    /// - Only rows with `expires_at <= CURRENT_TIMESTAMP` are eligible.
+    ///
+    /// That guard keeps expiry behavior predictable for games that may still
+    /// inspect accepted/completed rows after their nominal deadlines.
+    ///
+    /// Genre-neutral usage:
+    ///
+    /// - In a **space exploration** game, expire a stale station freight offer
+    ///   that timed out before any pilot accepted it.
+    /// - In a **dungeon crawler**, expire an unclaimed guild commission after
+    ///   the tavern notice board rollover.
+    pub fn expire_contract(&mut self, contract_id: i64) -> Result<Contract, ContractError> {
+        const SQL: &str = "\
+UPDATE contracts\n\
+SET state = ?2\n\
+WHERE id = ?1\n\
+  AND state = ?3\n\
+  AND expires_at IS NOT NULL\n\
+  AND datetime(expires_at) <= CURRENT_TIMESTAMP\n\
+RETURNING id, key, kind, issuer_owner_kind, issuer_owner_id, \
+          acceptor_player_id, state, objective_json, reward_json, metadata_json, \
+          created_at, accepted_at, completed_at, expires_at";
+
+        let tx = self
+            .connection_mut()
+            .transaction()
+            .map_err(|source| ContractError::Sqlite { source })?;
+
+        let expired = tx
+            .query_row(
+                SQL,
+                rusqlite::params![
+                    contract_id,
+                    ContractState::Expired.as_str(),
+                    ContractState::Available.as_str()
+                ],
+                row_to_contract,
+            )
+            .map_err(|source| ContractError::Sqlite { source })?;
+
+        tx.commit()
+            .map_err(|source| ContractError::Sqlite { source })?;
+
+        Ok(expired)
+    }
+
+    /// Expire all overdue available contracts whose deadline is at-or-before `now`.
+    ///
+    /// The sweep is one transaction to avoid partial state when a process exits
+    /// mid-pass. It first selects due ids in deterministic deadline order, then
+    /// updates each id under the same transaction so callers can report exactly
+    /// which rows transitioned.
+    ///
+    /// Genre-neutral usage:
+    ///
+    /// - In a **space exploration** game, sweep stale station freight postings
+    ///   before rendering a board refresh.
+    /// - In a **dungeon crawler**, sweep expired guild commissions when opening
+    ///   the mission hall screen.
+    pub fn sweep_expired_contracts(&mut self, now: &str) -> Result<Vec<Contract>, ContractError> {
+        const DUE_IDS_SQL: &str = "\
+SELECT id\n\
+FROM contracts\n\
+WHERE state = ?1\n\
+  AND expires_at IS NOT NULL\n\
+  AND datetime(expires_at) <= datetime(?2)\n\
+ORDER BY datetime(expires_at) ASC, id ASC";
+
+        const EXPIRE_ONE_SQL: &str = "\
+UPDATE contracts\n\
+SET state = ?2\n\
+WHERE id = ?1\n\
+  AND state = ?3\n\
+RETURNING id, key, kind, issuer_owner_kind, issuer_owner_id, \
+          acceptor_player_id, state, objective_json, reward_json, metadata_json, \
+          created_at, accepted_at, completed_at, expires_at";
+
+        let tx = self
+            .connection_mut()
+            .transaction()
+            .map_err(|source| ContractError::Sqlite { source })?;
+
+        let due_ids = {
+            let mut statement = tx
+                .prepare(DUE_IDS_SQL)
+                .map_err(|source| ContractError::Sqlite { source })?;
+            let due_ids = statement
+                .query_map(
+                    rusqlite::params![ContractState::Available.as_str(), now],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(|source| ContractError::Sqlite { source })?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(|source| ContractError::Sqlite { source })?;
+            due_ids
+        };
+
+        let mut expired = Vec::with_capacity(due_ids.len());
+        for contract_id in due_ids {
+            let contract = tx
+                .query_row(
+                    EXPIRE_ONE_SQL,
+                    rusqlite::params![
+                        contract_id,
+                        ContractState::Expired.as_str(),
+                        ContractState::Available.as_str()
+                    ],
+                    row_to_contract,
+                )
+                .map_err(|source| ContractError::Sqlite { source })?;
+            expired.push(contract);
+        }
+
+        tx.commit()
+            .map_err(|source| ContractError::Sqlite { source })?;
+
+        Ok(expired)
+    }
 }
 
 /// Decode one `contracts` row in the column order used by this module.
@@ -1734,6 +1858,199 @@ mod tests {
                 })
             ),
             "abandon_contract should reject terminal rows on repeated invocation"
+        );
+    }
+
+    #[test]
+    fn expire_contract_transitions_due_available_row_only() {
+        let dir = tempdir().expect("tempdir creates");
+        let db_path = dir.path().join("world.sqlite");
+        let mut world = WorldDb::open(&db_path).expect("open succeeds");
+        world
+            .apply_migration(&CONTRACTS_MIGRATION)
+            .expect("contracts migration applies");
+
+        let due_available = world
+            .create_contract(CreateContractInput {
+                key: Some("due-available"),
+                kind: "delivery",
+                issuer_owner_kind: "station",
+                issuer_owner_id: 44,
+                objective_json: r#"{"to":"dock-east"}"#,
+                reward_json: r#"{"credits":40}"#,
+                metadata_json: None,
+                expires_at: Some("2000-01-01 00:00:00"),
+            })
+            .expect("due available insert succeeds");
+        let future_available = world
+            .create_contract(CreateContractInput {
+                key: Some("future-available"),
+                kind: "delivery",
+                issuer_owner_kind: "station",
+                issuer_owner_id: 44,
+                objective_json: r#"{"to":"dock-west"}"#,
+                reward_json: r#"{"credits":50}"#,
+                metadata_json: None,
+                expires_at: Some("2999-01-01 00:00:00"),
+            })
+            .expect("future available insert succeeds");
+        let accepted_past_due = world
+            .create_contract(CreateContractInput {
+                key: Some("accepted-past-due"),
+                kind: "recovery",
+                issuer_owner_kind: "guild",
+                issuer_owner_id: 11,
+                objective_json: r#"{"room":"deep-crypt"}"#,
+                reward_json: r#"{"favor":{"guild":3}}"#,
+                metadata_json: None,
+                expires_at: Some("2000-01-01 00:00:00"),
+            })
+            .expect("accepted candidate insert succeeds");
+        world
+            .connection()
+            .execute(
+                "UPDATE contracts SET state = ?1, acceptor_player_id = ?2, accepted_at = CURRENT_TIMESTAMP WHERE id = ?3",
+                rusqlite::params![
+                    ContractState::Accepted.as_str(),
+                    909_i64,
+                    accepted_past_due.id
+                ],
+            )
+            .expect("marking accepted contract succeeds");
+
+        let expired = world
+            .expire_contract(due_available.id)
+            .expect("due available row should expire");
+        assert_eq!(expired.state, ContractState::Expired.as_str());
+
+        let reject_future = world.expire_contract(future_available.id);
+        assert!(
+            matches!(
+                reject_future,
+                Err(super::ContractError::Sqlite {
+                    source: rusqlite::Error::QueryReturnedNoRows
+                })
+            ),
+            "future deadline rows should not expire early"
+        );
+
+        let reject_accepted = world.expire_contract(accepted_past_due.id);
+        assert!(
+            matches!(
+                reject_accepted,
+                Err(super::ContractError::Sqlite {
+                    source: rusqlite::Error::QueryReturnedNoRows
+                })
+            ),
+            "accepted rows should not transition via expire_contract"
+        );
+    }
+
+    #[test]
+    fn sweep_expired_contracts_moves_only_past_due_available_rows() {
+        let dir = tempdir().expect("tempdir creates");
+        let db_path = dir.path().join("world.sqlite");
+        let mut world = WorldDb::open(&db_path).expect("open succeeds");
+        world
+            .apply_migration(&CONTRACTS_MIGRATION)
+            .expect("contracts migration applies");
+
+        let due_available = world
+            .create_contract(CreateContractInput {
+                key: Some("due-available"),
+                kind: "delivery",
+                issuer_owner_kind: "station",
+                issuer_owner_id: 12,
+                objective_json: r#"{"to":"ring-a"}"#,
+                reward_json: r#"{"credits":70}"#,
+                metadata_json: None,
+                expires_at: Some("2026-05-10 11:59:59"),
+            })
+            .expect("due available insert succeeds");
+        let future_available = world
+            .create_contract(CreateContractInput {
+                key: Some("future-available"),
+                kind: "delivery",
+                issuer_owner_kind: "station",
+                issuer_owner_id: 12,
+                objective_json: r#"{"to":"ring-b"}"#,
+                reward_json: r#"{"credits":90}"#,
+                metadata_json: None,
+                expires_at: Some("2026-05-10 12:00:01"),
+            })
+            .expect("future available insert succeeds");
+        let no_deadline_available = world
+            .create_contract(CreateContractInput {
+                key: Some("no-deadline"),
+                kind: "escort",
+                issuer_owner_kind: "guild",
+                issuer_owner_id: 9,
+                objective_json: r#"{"from":"market","to":"tower"}"#,
+                reward_json: r#"{"favor":{"guild":1}}"#,
+                metadata_json: None,
+                expires_at: None,
+            })
+            .expect("no deadline insert succeeds");
+        let past_due_accepted = world
+            .create_contract(CreateContractInput {
+                key: Some("past-due-accepted"),
+                kind: "recovery",
+                issuer_owner_kind: "guild",
+                issuer_owner_id: 9,
+                objective_json: r#"{"room":"catacomb"}"#,
+                reward_json: r#"{"favor":{"guild":4}}"#,
+                metadata_json: None,
+                expires_at: Some("2026-05-10 11:59:00"),
+            })
+            .expect("past due accepted insert succeeds");
+        world
+            .connection()
+            .execute(
+                "UPDATE contracts SET state = ?1, acceptor_player_id = ?2, accepted_at = CURRENT_TIMESTAMP WHERE id = ?3",
+                rusqlite::params![
+                    ContractState::Accepted.as_str(),
+                    301_i64,
+                    past_due_accepted.id
+                ],
+            )
+            .expect("accepted row update succeeds");
+
+        let swept = world
+            .sweep_expired_contracts("2026-05-10 12:00:00")
+            .expect("sweep succeeds");
+        assert_eq!(
+            swept.iter().map(|contract| contract.id).collect::<Vec<_>>(),
+            vec![due_available.id],
+            "sweep should only transition rows that are both due and available"
+        );
+
+        let due_after = world
+            .contract_by_id(due_available.id)
+            .expect("lookup due row succeeds")
+            .expect("due row still exists");
+        assert_eq!(due_after.state, ContractState::Expired.as_str());
+
+        let future_after = world
+            .contract_by_id(future_available.id)
+            .expect("lookup future row succeeds")
+            .expect("future row still exists");
+        assert_eq!(future_after.state, ContractState::Available.as_str());
+
+        let no_deadline_after = world
+            .contract_by_id(no_deadline_available.id)
+            .expect("lookup no-deadline row succeeds")
+            .expect("no-deadline row still exists");
+        assert_eq!(no_deadline_after.state, ContractState::Available.as_str());
+
+        let accepted_after = world
+            .contract_by_id(past_due_accepted.id)
+            .expect("lookup accepted row succeeds")
+            .expect("accepted row still exists");
+        assert_eq!(accepted_after.state, ContractState::Accepted.as_str());
+        assert_eq!(
+            accepted_after.acceptor_player_id,
+            Some(301),
+            "sweep should not alter accepted rows even if their deadline is past due"
         );
     }
 }
