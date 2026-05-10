@@ -106,7 +106,7 @@ One unchecked item per iteration. Dependencies in `[brackets]` must be checked o
 - [x] **12i** — Document the deliberate choice to skip sample-game integration of v4 features in this kit's fixture and the reason (genre-neutrality). [12e]
 - [x] **12j** — Add a backup/maintenance note covering the new tables: `places`, `routes`, `presence`, `place_recall`, `inventory_slots`, `world_tick_tasks`. [12e]
 
-- [ ] **Task 13 — Final v4 verification**
+- [x] **Task 13 — Final v4 verification**
 - [x] **13a** — Run `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`, `cargo doc --workspace --no-deps`, and `cargo run -p fgk -- tick --project <fixture>` against a synthetic v4 fixture. Capture pass/fail evidence for every completion condition. [all prior tasks]
 - [x] **13b** — Make `fgk new <tmp>` scaffolds pass `cargo test` in-repo without requiring a published `foglet_game` crate so Completion condition 11 is verifiable in CI/dev loops. [13a]
 - [x] **13c** — Re-run completion commands 1–17 after 13b, then check Task 13 and Acceptance criteria gates together if all pass. [13b]
