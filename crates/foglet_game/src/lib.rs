@@ -60,6 +60,7 @@ pub mod terminal;
 pub mod turns;
 pub mod widgets;
 pub mod world_db;
+pub mod world_ticks;
 
 pub use bounties::{
     Bounty, BountyError, BountyState, BOUNTIES_MIGRATION, BOUNTY_DESCRIPTION_MAX_CHARS,
@@ -136,6 +137,7 @@ pub use widgets::{
     render_modal, InventoryList, MenuList, MessageKind, MessageLine,
 };
 pub use world_db::{WorldDb, WorldDbError, WorldDbOptions, WorldMigration};
+pub use world_ticks::WORLD_TICK_TASKS_MIGRATION;
 
 /// Crate version string, sourced from `Cargo.toml` at build time.
 ///
