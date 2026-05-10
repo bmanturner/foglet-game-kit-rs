@@ -829,6 +829,11 @@ impl GameConfig {
                 "[place_recall].enabled requires [spatial].enabled = true".into(),
             ));
         }
+        if self.job_board.enabled && !self.contracts.enabled {
+            return Err(ConfigError::Validate(
+                "[job_board].enabled requires [contracts].enabled = true".into(),
+            ));
+        }
         // Leaderboard names must be non-empty and unique. Task 8 will
         // key SQL rows by `name`, so a duplicate would silently merge
         // two boards that the author intended to keep separate, and an
@@ -1478,6 +1483,39 @@ enabled = true
             ConfigError::Validate(msg) => {
                 assert!(
                     msg.contains("[presence]") && msg.contains("[spatial]"),
+                    "error should mention both toggles: {msg}"
+                );
+            }
+            other => panic!("expected Validate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn job_board_requires_contracts_be_enabled() {
+        // CHECKLIST_v5 Task 2c: the built-in v5 job board aggregates
+        // contract rows, so enabling `[job_board]` without
+        // `[contracts]` is a config authoring error.
+        let err = GameConfig::from_toml_str(
+            r#"
+[game]
+title = "Board Without Contracts"
+slug = "board-without-contracts"
+description = ""
+min_width = 80
+min_height = 24
+start_map = "lobby"
+start_x = 0
+start_y = 0
+
+[job_board]
+enabled = true
+"#,
+        )
+        .unwrap_err();
+        match err {
+            ConfigError::Validate(msg) => {
+                assert!(
+                    msg.contains("[job_board]") && msg.contains("[contracts]"),
                     "error should mention both toggles: {msg}"
                 );
             }
