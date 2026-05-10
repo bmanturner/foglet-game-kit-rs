@@ -264,6 +264,11 @@ mod tests {
             leaderboards: Vec::new(),
             multiplayer: None,
             factions: Default::default(),
+            spatial: Default::default(),
+            presence: Default::default(),
+            place_recall: Default::default(),
+            inventory: Default::default(),
+            world_ticks: Default::default(),
         }
     }
 

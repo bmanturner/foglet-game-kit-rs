@@ -86,6 +86,40 @@ pub struct GameConfig {
     /// signal the runtime checks before wiring any v3 primitive.
     #[serde(default)]
     pub multiplayer: Option<MultiplayerSection>,
+    /// `[spatial]` section — v4 location graph primitives (Task 3).
+    ///
+    /// `enabled` is default false so omitting this section keeps
+    /// existing games unchanged and off the default path.
+    #[serde(default)]
+    pub spatial: SpatialSection,
+    /// `[presence]` section — v4 player-location tracking primitives
+    /// (Task 5).
+    ///
+    /// Absent section and `enabled = false` are treated the same:
+    /// movement APIs are not wired until the game opts in.
+    #[serde(default)]
+    pub presence: PresenceSection,
+    /// `[place_recall]` section — v4 discovered-place memory
+    /// primitives for fog-of-war style UIs (Task 6).
+    ///
+    /// Keeping this separate from `presence` lets games choose whether
+    /// to persist discovered state independently from movement.
+    #[serde(default)]
+    pub place_recall: PlaceRecallSection,
+    /// `[inventory]` section — v4 owner-keyed stockpile primitives
+    /// (Task 7 and 8).
+    ///
+    /// Explicitly disabled by default so older games are unaffected
+    /// until they opt in to stockpile APIs.
+    #[serde(default)]
+    pub inventory: InventorySection,
+    /// `[world_ticks]` section — v4 durable scheduled callback
+    /// controls (Task 9).
+    ///
+    /// Defaults to disabled because v4 scheduling is additive and
+    /// never on by default.
+    #[serde(default)]
+    pub world_ticks: WorldTicksSection,
     /// `[[factions.seed]]` array — game-authored faction definitions
     /// (SPEC v3 §5.2 example).
     ///
@@ -403,6 +437,61 @@ pub struct FactionsSection {
     /// two intended-distinct agencies.
     #[serde(default)]
     pub seed: Vec<FactionSeed>,
+}
+
+/// `[spatial]` section: location graph primitives (v4 Task 3).
+///
+/// `enabled` is the contract-safe off-switch for place/route APIs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct SpatialSection {
+    /// Enable directed location graph support for this project.
+    #[serde(default)]
+    pub enabled: bool,
+}
+
+/// `[presence]` section: player location tracking (v4 Task 5).
+///
+/// This section stays focused on whether movement APIs are
+/// exposed; movement rules and gating remain game-defined and happen
+/// via callbacks.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct PresenceSection {
+    /// Enable current-location state and movement helpers.
+    #[serde(default)]
+    pub enabled: bool,
+}
+
+/// `[place_recall]` section: per-player visited-place history (v4 Task 6).
+///
+/// `enabled` gates storage and helper APIs for fog-of-war / map
+/// memory. The schema and payload shape remain game-defined.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct PlaceRecallSection {
+    /// Enable visit tracking and recall listing helpers.
+    #[serde(default)]
+    pub enabled: bool,
+}
+
+/// `[inventory]` section: owner-keyed stockpile primitives (v4 Task 7/8).
+///
+/// This toggle enables stockpile persistence and transfer helpers;
+/// it intentionally does not add economics, caps, or pricing policy.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct InventorySection {
+    /// Enable inventory CRUD and atomic transfer helpers.
+    #[serde(default)]
+    pub enabled: bool,
+}
+
+/// `[world_ticks]` section: durable scheduler controls (v4 Task 9).
+///
+/// `enabled` gates registration and execution entrypoints. The
+/// catch-up budget is validated in Task 2b.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct WorldTicksSection {
+    /// Enable scheduled world-tick callbacks.
+    #[serde(default)]
+    pub enabled: bool,
 }
 
 /// A single seeded faction definition (SPEC v3 §5.2).
@@ -889,6 +978,70 @@ start_y = 0
         assert_eq!(config.world.path, "world/world.sqlite");
         assert_eq!(config.world.busy_timeout_ms, 5_000);
         assert_eq!(config.world.journal_mode, "wal");
+    }
+
+    #[test]
+    fn absent_v4_sections_are_disabled_by_default() {
+        // SPEC_v4 Task 2a: all v4 sections are optional and safe to
+        // omit; every `enabled` flag must default to false.
+        let config = GameConfig::from_toml_str(
+            r#"
+[game]
+title = "Legacy"
+slug = "legacy"
+description = ""
+min_width = 80
+min_height = 24
+start_map = "lobby"
+start_x = 0
+start_y = 0
+"#,
+        )
+        .unwrap();
+        assert!(!config.spatial.enabled);
+        assert!(!config.presence.enabled);
+        assert!(!config.place_recall.enabled);
+        assert!(!config.inventory.enabled);
+        assert!(!config.world_ticks.enabled);
+    }
+
+    #[test]
+    fn parses_v4_sections_with_explicit_enabled_flags() {
+        // Explicitly declared sections must parse as their payloads.
+        let config = GameConfig::from_toml_str(
+            r#"
+[game]
+title = "V4"
+slug = "v4"
+description = ""
+min_width = 80
+min_height = 24
+start_map = "lobby"
+start_x = 0
+start_y = 0
+
+[spatial]
+enabled = true
+
+[presence]
+enabled = true
+
+[place_recall]
+enabled = true
+
+[inventory]
+enabled = true
+
+[world_ticks]
+enabled = true
+"#,
+        )
+        .unwrap();
+        assert!(config.spatial.enabled);
+        assert!(config.presence.enabled);
+        assert!(config.place_recall.enabled);
+        assert!(config.inventory.enabled);
+        assert!(config.world_ticks.enabled);
     }
 
     #[test]

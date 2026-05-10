@@ -63,9 +63,10 @@ pub use bounties::{
 };
 pub use challenges::{Challenge, ChallengeError, ChallengeState, CHALLENGES_MIGRATION};
 pub use config::{
-    ConfigError, FactionSeed, FactionsSection, GameConfig, GameSection, LeaderboardSection,
-    LeaderboardSort, ManifestSection, MultiplayerSection, SaveSection, SaveStrategy, TurnReset,
-    TurnsSection, WorldSection,
+    ConfigError, FactionSeed, FactionsSection, GameConfig, GameSection, InventorySection,
+    LeaderboardSection, LeaderboardSort, ManifestSection, MultiplayerSection, PlaceRecallSection,
+    PresenceSection, SaveSection, SaveStrategy, SpatialSection, TurnReset, TurnsSection,
+    WorldSection, WorldTicksSection,
 };
 pub use dialog::{
     dialog_choice_prompt, dialog_handle_prompt_input, load_dialog, Choice, ChoiceError, Dialog,
