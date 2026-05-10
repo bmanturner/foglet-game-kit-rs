@@ -127,6 +127,11 @@ pub struct GameContext<'a> {
     /// Optional v5 inventory-capacity handle.
     pub inventory_capacity: Option<&'a WorldDb>,
     /// Optional v5 event-log screen data handle.
+    ///
+    /// Do not query or construct [`crate::EventLogScreen`] from inside
+    /// `Screen::render`/paint loops. Loading event rows touches SQLite
+    /// and belongs in `handle_input`, `tick`, or screen construction;
+    /// render should consume a cached screen or event snapshot.
     pub event_log_screen: Option<&'a WorldDb>,
 }
 
