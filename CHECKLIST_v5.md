@@ -74,7 +74,7 @@ One unchecked item per iteration. Dependencies in `[brackets]` must be checked o
 
 ### Task 9 — Event Log / News screen
 
-- [ ] **9a** — Implement `EventLogScreen` widget reading v2 events with configured `scope`, `page_size`, `timestamp_style`, and `empty_state_text`. Test: renders within 80×24. [v2 events]
+- [x] **9a** — Implement `EventLogScreen` widget reading v2 events with configured `scope`, `page_size`, `timestamp_style`, and `empty_state_text`. Test: renders within 80×24. [v2 events]
 - [ ] **9b** — Test empty-result rendering uses `empty_state_text`. [9a]
 - [ ] **9c** — Test forward and backward pagination across a 100-event fixture. [9a]
 - [ ] **9d** — Test player-scoped filter excludes other players' events. [9a]
