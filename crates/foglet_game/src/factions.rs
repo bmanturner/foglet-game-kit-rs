@@ -343,6 +343,19 @@ pub enum FactionError {
         /// Faction id that was supplied to the leave call.
         faction_id: i64,
     },
+    /// [`WorldDb::create_shared_goal`] was called with a
+    /// `target_amount` of zero or negative. The schema enforces
+    /// `CHECK (target_amount > 0)`; pre-validating in Rust lets the
+    /// helper short-circuit before opening a transaction and surface
+    /// a typed variant the agency-config UI can render as "target
+    /// must be positive" without parsing a generic SQLite CHECK
+    /// failure. Same shape as
+    /// [`crate::market::MarketError::NonPositiveBuyQuantity`].
+    #[error("shared-goal target_amount must be > 0 (got {actual})")]
+    InvalidTargetAmount {
+        /// The non-positive value the caller supplied.
+        actual: i64,
+    },
 }
 
 impl WorldDb {
@@ -688,6 +701,141 @@ ORDER BY id DESC LIMIT 1";
             Err(source) => Err(FactionError::Sqlite { source }),
         }
     }
+
+    /// Idempotently create a shared goal for `(faction_id, key)` —
+    /// SPEC_v3 §4.4 / §Task 6e.
+    ///
+    /// The contract is "after this call returns successfully there
+    /// is exactly one `shared_goals` row matching the supplied
+    /// `(faction_id, key)`, and the returned struct describes it".
+    /// Calling again with the same `(faction_id, key)` is a no-op:
+    /// the helper returns the *existing* row — same id, same
+    /// `target_amount`, same `current_amount`, same `created_at` —
+    /// rather than creating a duplicate or overwriting progress.
+    /// This matches the v3 helper convention of leaning on the
+    /// underlying schema's uniqueness so a defensive double-call
+    /// from the agency-bootstrap path never accidentally resets a
+    /// goal that already has contributions on it.
+    ///
+    /// # Idempotency primitive
+    ///
+    /// `INSERT … SELECT … WHERE NOT EXISTS (…) RETURNING …` —
+    /// single statement that either inserts a fresh `active` row
+    /// (and `RETURNING` echoes it) or inserts nothing (and
+    /// `RETURNING` produces zero rows). The same shape used by
+    /// [`WorldDb::join_faction`]; chosen here because the schema's
+    /// `UNIQUE (faction_id, key)` index treats NULL as distinct
+    /// (SQLite default semantics). A bare
+    /// `INSERT … ON CONFLICT(faction_id, key) DO NOTHING` would
+    /// silently allow duplicate world-wide goals (`faction_id IS
+    /// NULL`) on every call, which is exactly the regression the
+    /// idempotency contract above forbids. The helper-level
+    /// `WHERE NOT EXISTS` clause uses SQLite's `IS` operator
+    /// (`faction_id IS ?1`) so NULL matches NULL — making
+    /// idempotency hold uniformly for faction-scoped *and* world-
+    /// wide goals.
+    ///
+    /// On `QueryReturnedNoRows` (an existing row blocked the
+    /// insert) the helper performs one follow-up `SELECT` for the
+    /// same `(faction_id, key)` and returns it. The SELECT shares
+    /// the column order of `RETURNING` so both arms decode through
+    /// the same crate-private `row_to_shared_goal` helper.
+    ///
+    /// # `target_amount` is validated up front
+    ///
+    /// The schema enforces `CHECK (target_amount > 0)` (a goal with
+    /// target 0 would be instantly complete on creation, surfacing
+    /// "solved!" to the UI before any work is done). Pre-checking
+    /// in Rust lets the helper return [`FactionError::InvalidTargetAmount`]
+    /// without paying a SQLite round-trip and without forcing the
+    /// caller to parse a generic CHECK-violation `SqliteFailure` to
+    /// distinguish it from "FK missing" or "DB locked". On the
+    /// idempotent re-create path the supplied `target_amount` is
+    /// **ignored** — the existing row's target wins, mirroring
+    /// `join_faction`'s "supplied role is ignored on re-join"
+    /// stance. A game author who needs to change a goal's target
+    /// mid-run picks a new `key` (or, in a future helper, calls a
+    /// dedicated "retarget" path that lands its own world event);
+    /// silently overwriting target_amount on every defensive UI
+    /// submit would let a stray 1-character config edit erase the
+    /// progress proportions every contributor has been seeing.
+    ///
+    /// # `faction_id` is `Option<i64>`
+    ///
+    /// SPEC §4.4 explicitly lists "faction id optional" — a goal
+    /// MAY be world-wide (e.g. "the city solves 100 cases") rather
+    /// than scoped to one faction. `None` lands as SQL `NULL` and
+    /// is treated as a distinct goal-scope from any specific
+    /// faction.
+    ///
+    /// # Concurrency
+    ///
+    /// Takes `&self`: a single `INSERT … RETURNING` plus an
+    /// optional follow-up `SELECT` under the configured busy
+    /// timeout. Same borrow shape as [`WorldDb::join_faction`] —
+    /// no explicit `BEGIN`/`COMMIT` is needed because the
+    /// idempotency check folds into the single INSERT statement.
+    pub fn create_shared_goal(
+        &self,
+        faction_id: Option<i64>,
+        key: &str,
+        target_amount: i64,
+    ) -> Result<SharedGoal, FactionError> {
+        // Pre-validate `target_amount` so the schema CHECK is the
+        // safety net for raw-SQL bypass paths, not the primary
+        // failure surface for game code. Surfacing a typed variant
+        // here lets the agency-config UI render "target must be
+        // positive" without `match`-ing on a `SqliteFailure`'s
+        // string body.
+        if target_amount <= 0 {
+            return Err(FactionError::InvalidTargetAmount {
+                actual: target_amount,
+            });
+        }
+
+        // Fold the existence check into the INSERT itself so a
+        // concurrent door open hitting the same (faction_id, key)
+        // pair cannot race past a "SELECT then INSERT" handshake
+        // and land a duplicate row. `IS` (rather than `=`) is
+        // critical for the `faction_id IS NULL` case — `=` returns
+        // NULL when either operand is NULL, which would let two
+        // world-wide goals with the same key both pass the
+        // existence check and both land in the table.
+        const INSERT_SQL: &str = "\
+INSERT INTO shared_goals (faction_id, key, target_amount) \
+SELECT ?1, ?2, ?3 \
+WHERE NOT EXISTS (\
+    SELECT 1 FROM shared_goals \
+    WHERE faction_id IS ?1 AND key = ?2\
+) \
+RETURNING id, faction_id, key, target_amount, current_amount, state, created_at, completed_at";
+
+        // Fallback for the idempotent re-create branch. Same
+        // `IS`-rather-than-`=` semantics so NULL faction_id matches
+        // its own row. Backed by `idx_shared_goals_faction_key`
+        // (UNIQUE on `(faction_id, key)`).
+        const SELECT_EXISTING_SQL: &str = "\
+SELECT id, faction_id, key, target_amount, current_amount, state, created_at, completed_at \
+FROM shared_goals \
+WHERE faction_id IS ?1 AND key = ?2";
+
+        match self.connection().query_row(
+            INSERT_SQL,
+            rusqlite::params![faction_id, key, target_amount],
+            row_to_shared_goal,
+        ) {
+            Ok(goal) => Ok(goal),
+            Err(rusqlite::Error::QueryReturnedNoRows) => self
+                .connection()
+                .query_row(
+                    SELECT_EXISTING_SQL,
+                    rusqlite::params![faction_id, key],
+                    row_to_shared_goal,
+                )
+                .map_err(|source| FactionError::Sqlite { source }),
+            Err(source) => Err(FactionError::Sqlite { source }),
+        }
+    }
 }
 
 /// Decode one `factions` row in the column order shared by
@@ -759,6 +907,72 @@ fn row_to_membership(row: &rusqlite::Row<'_>) -> rusqlite::Result<FactionMembers
         role: row.get(3)?,
         joined_at: row.get(4)?,
         left_at: row.get(5)?,
+    })
+}
+
+/// Read model for one row of the `shared_goals` table —
+/// SPEC_v3 §4.4.
+///
+/// Returned by [`WorldDb::create_shared_goal`] (and the upcoming
+/// Task 6f `contribute_to_goal` / Task 6g completion helpers) so
+/// callers receive the canonical row SQLite produced —
+/// autoincrement `id`, SQL-side `created_at`, schema-default
+/// `current_amount = 0` and `state = 'active'` — rather than
+/// echoing back the input arguments.
+///
+/// `faction_id` is `Option<i64>` because SPEC §4.4 explicitly
+/// allows world-wide goals (`NULL` faction). `completed_at` is
+/// `Option<String>` and stays `None` until Task 6g flips the
+/// state to `'completed'` and stamps `CURRENT_TIMESTAMP`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SharedGoal {
+    /// Autoincrement primary key. Stable handle the kit and game
+    /// code reference goals by; survives idempotent re-create
+    /// calls (same id every time for a given `(faction_id, key)`).
+    pub id: i64,
+    /// Foreign key into `factions(id)`, or `None` for a world-wide
+    /// goal (SPEC §4.4 "faction id optional").
+    pub faction_id: Option<i64>,
+    /// Game-authored stable identifier (e.g. `"blue-desk.clue-board"`).
+    /// Combined with `faction_id` it forms the logical lookup key.
+    pub key: String,
+    /// The amount contributions need to accumulate before the goal
+    /// flips to `completed`. Pinned at first creation; the
+    /// idempotent re-create path returns the *existing* target,
+    /// not the freshly-supplied one.
+    pub target_amount: i64,
+    /// Running total of contributions. Starts at `0`; Task 6f's
+    /// `contribute_to_goal` increments it; Task 6g flips state to
+    /// `completed` once the target is reached.
+    pub current_amount: i64,
+    /// Either `"active"` or `"completed"` — the schema CHECK on
+    /// `shared_goals.state` pins the vocabulary. Newly-created
+    /// goals start `"active"`.
+    pub state: String,
+    /// SQLite-assigned UTC ISO timestamp (`CURRENT_TIMESTAMP`) of
+    /// the create call that materialised this row. Stable across
+    /// idempotent re-create calls.
+    pub created_at: String,
+    /// `None` while the goal is active. Stamped with the
+    /// `CURRENT_TIMESTAMP` of the completion event by Task 6g.
+    pub completed_at: Option<String>,
+}
+
+/// Decode one `shared_goals` row in the column order shared by
+/// [`WorldDb::create_shared_goal`]'s `RETURNING` clause and its
+/// fallback SELECT. Centralised so a column rename touches one
+/// place — same convention as `row_to_faction` and
+/// `row_to_membership`.
+fn row_to_shared_goal(row: &rusqlite::Row<'_>) -> rusqlite::Result<SharedGoal> {
+    Ok(SharedGoal {
+        id: row.get(0)?,
+        faction_id: row.get(1)?,
+        key: row.get(2)?,
+        target_amount: row.get(3)?,
+        current_amount: row.get(4)?,
+        state: row.get(5)?,
+        created_at: row.get(6)?,
+        completed_at: row.get(7)?,
     })
 }
 
@@ -1692,6 +1906,215 @@ mod tests {
             "fallback SELECT must return the most recent historical row"
         );
         assert_eq!(idempotent.left_at, second_leave.left_at);
+    }
+
+    /// SPEC_v3 §Task 6e acceptance happy path: a fresh
+    /// `create_shared_goal` call lands a row with the supplied
+    /// target, schema defaults for `current_amount = 0` and
+    /// `state = 'active'`, the SQL-side `created_at` populated, and
+    /// `completed_at` still `None`. Doubles as proof that the
+    /// `RETURNING` column order matches `row_to_shared_goal`'s
+    /// decoder — a column-order swap would surface as a wrong
+    /// `target_amount`/`current_amount` pair here, not in a 6f/6g
+    /// behavioural test.
+    #[test]
+    fn create_shared_goal_inserts_active_row_with_schema_defaults() {
+        let (_dir, mut world) = world_with_factions();
+        let factions = world
+            .seed_factions(&[FactionSeed {
+                slug: "blue-desk".to_string(),
+                display_name: "Blue Desk".to_string(),
+                description: "x".to_string(),
+            }])
+            .unwrap();
+
+        let goal = world
+            .create_shared_goal(Some(factions[0].id), "clue-board", 100)
+            .expect("create_shared_goal succeeds");
+
+        assert!(goal.id > 0, "id is autoincrement-assigned");
+        assert_eq!(goal.faction_id, Some(factions[0].id));
+        assert_eq!(goal.key, "clue-board");
+        assert_eq!(goal.target_amount, 100);
+        assert_eq!(goal.current_amount, 0);
+        assert_eq!(goal.state, "active");
+        assert!(
+            !goal.created_at.is_empty(),
+            "SQL-side CURRENT_TIMESTAMP populated"
+        );
+        assert!(goal.completed_at.is_none());
+
+        // Row was actually committed (a regression that opened a
+        // transaction without committing would still succeed in the
+        // RETURNING arm but fail this fresh-connection-style read).
+        let count: i64 = world
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM shared_goals \
+                 WHERE faction_id = ?1 AND key = ?2",
+                rusqlite::params![factions[0].id, "clue-board"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    /// SPEC_v3 §Task 6e acceptance — idempotency: a second call for
+    /// the same `(faction_id, key)` returns the **existing** row
+    /// (same id, same `target_amount`, same `current_amount`, same
+    /// `created_at`) and does not insert a duplicate. Three
+    /// regression vectors layered into one test:
+    ///
+    /// - id stability — pins the SELECT-existing fallback branch.
+    /// - target/current/created_at stability — proves the supplied
+    ///   `target_amount` is *ignored* on re-create (write-once
+    ///   contract); proves a (theoretical) regression that overwrote
+    ///   `current_amount` would flunk; proves `created_at` does not
+    ///   refresh.
+    /// - row count stays at 1 — proves no duplicate was inserted.
+    #[test]
+    fn create_shared_goal_is_idempotent_for_same_faction_key() {
+        let (_dir, mut world) = world_with_factions();
+        let factions = world
+            .seed_factions(&[FactionSeed {
+                slug: "blue-desk".to_string(),
+                display_name: "Blue Desk".to_string(),
+                description: "x".to_string(),
+            }])
+            .unwrap();
+
+        let first = world
+            .create_shared_goal(Some(factions[0].id), "clue-board", 100)
+            .unwrap();
+
+        // Simulate prior progress so a regression that reset
+        // `current_amount` on the re-create path would surface here.
+        world
+            .connection()
+            .execute(
+                "UPDATE shared_goals SET current_amount = 25 WHERE id = ?1",
+                rusqlite::params![first.id],
+            )
+            .unwrap();
+
+        // Re-create with a *different* target_amount — the existing
+        // row's target must win (write-once).
+        let second = world
+            .create_shared_goal(Some(factions[0].id), "clue-board", 9999)
+            .unwrap();
+
+        assert_eq!(second.id, first.id, "same id on re-create");
+        assert_eq!(
+            second.target_amount, 100,
+            "supplied target_amount must be ignored on re-create"
+        );
+        assert_eq!(
+            second.current_amount, 25,
+            "current_amount progress must not be reset"
+        );
+        assert_eq!(
+            second.created_at, first.created_at,
+            "created_at must be stable across idempotent calls"
+        );
+
+        let count: i64 = world
+            .connection()
+            .query_row("SELECT COUNT(*) FROM shared_goals", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1, "idempotent call must not insert a duplicate");
+    }
+
+    /// World-wide goals (`faction_id IS NULL`) are also idempotent
+    /// per `(faction_id, key)`. SQLite treats NULLs as distinct in
+    /// `=` comparisons, so a regression that used `=` instead of
+    /// `IS` in the helper's `WHERE NOT EXISTS` clause would let the
+    /// second call insert a duplicate world-wide row. This test
+    /// pins the `IS` choice.
+    #[test]
+    fn create_shared_goal_is_idempotent_for_world_wide_goal() {
+        let (_dir, world) = world_with_factions();
+
+        let first = world
+            .create_shared_goal(None, "city-cases-solved", 100)
+            .unwrap();
+        let second = world
+            .create_shared_goal(None, "city-cases-solved", 100)
+            .unwrap();
+
+        assert_eq!(first.id, second.id);
+        assert!(first.faction_id.is_none());
+
+        let count: i64 = world
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM shared_goals WHERE faction_id IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    /// Two factions may each carry their own `"clue-board"` —
+    /// `(faction_id, key)` is the uniqueness scope, not `key`
+    /// alone. Pins the schema-side `UNIQUE (faction_id, key)`
+    /// against a regression that narrowed the index to `key` only.
+    #[test]
+    fn create_shared_goal_allows_same_key_under_different_factions() {
+        let (_dir, mut world) = world_with_factions();
+        let factions = world
+            .seed_factions(&[
+                FactionSeed {
+                    slug: "blue-desk".to_string(),
+                    display_name: "Blue Desk".to_string(),
+                    description: "x".to_string(),
+                },
+                FactionSeed {
+                    slug: "red-room".to_string(),
+                    display_name: "Red Room".to_string(),
+                    description: "y".to_string(),
+                },
+            ])
+            .unwrap();
+
+        let blue = world
+            .create_shared_goal(Some(factions[0].id), "clue-board", 100)
+            .unwrap();
+        let red = world
+            .create_shared_goal(Some(factions[1].id), "clue-board", 50)
+            .unwrap();
+
+        assert_ne!(blue.id, red.id);
+        assert_eq!(blue.target_amount, 100);
+        assert_eq!(red.target_amount, 50);
+    }
+
+    /// SPEC §4.4 + the schema CHECK forbid `target_amount <= 0`.
+    /// The helper short-circuits before opening a transaction so
+    /// the agency-config UI sees a typed
+    /// [`FactionError::InvalidTargetAmount`] with the offending
+    /// value, not a generic `SqliteFailure` it has to string-parse.
+    /// Covers zero and negative; also verifies the row-unchanged
+    /// invariant after a rejected call.
+    #[test]
+    fn create_shared_goal_rejects_non_positive_target_amount() {
+        let (_dir, world) = world_with_factions();
+
+        for actual in [0_i64, -1, -100] {
+            let err = world
+                .create_shared_goal(None, "k", actual)
+                .expect_err("non-positive target must be rejected");
+            match err {
+                FactionError::InvalidTargetAmount { actual: got } => assert_eq!(got, actual),
+                other => panic!("expected InvalidTargetAmount, got {other:?}"),
+            }
+        }
+
+        let count: i64 = world
+            .connection()
+            .query_row("SELECT COUNT(*) FROM shared_goals", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0, "rejected calls must not leak rows");
     }
 
     /// Helper to build a `FogletContext` — same shape as
