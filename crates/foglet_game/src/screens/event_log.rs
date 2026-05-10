@@ -306,7 +306,7 @@ fn write_row(buf: &mut ratatui::buffer::Buffer, area: Rect, row: u16, text: &str
 
 #[cfg(test)]
 mod tests {
-    use super::{EventLogScope, EventLogScreen, TimestampStyle};
+    use super::{EventLogLine, EventLogScope, EventLogScreen, TimestampStyle};
     use crate::config::{
         EventLogScreenSection, GameConfig, GameSection, ManifestSection, SaveSection, SaveStrategy,
     };
@@ -320,6 +320,8 @@ mod tests {
     use ratatui::backend::TestBackend;
     use ratatui::buffer::Buffer;
     use ratatui::Terminal;
+    use std::cell::Cell;
+    use std::rc::Rc;
     use tempfile::tempdir;
 
     #[test]
@@ -432,6 +434,28 @@ mod tests {
 
         assert!(contains_text(&buffer, "alice moved"));
         assert!(!contains_text(&buffer, "bob moved"));
+    }
+
+    #[test]
+    fn event_log_screen_formatter_runs_once_per_visible_event_and_drives_rendering() {
+        let calls = Rc::new(Cell::new(0));
+        let calls_for_formatter = Rc::clone(&calls);
+        let mut screen = EventLogScreen::new(event_fixture(3), 2)
+            .with_timestamp_style(TimestampStyle::Hidden)
+            .with_formatter(move |event| {
+                calls_for_formatter.set(calls_for_formatter.get() + 1);
+                EventLogLine {
+                    primary: format!("formatted {}", event.message),
+                    secondary: None,
+                }
+            });
+
+        let buffer = draw_screen(&mut screen);
+
+        assert_eq!(calls.get(), 2);
+        assert!(contains_text(&buffer, "kind formatted event-000"));
+        assert!(contains_text(&buffer, "kind formatted event-001"));
+        assert!(!contains_text(&buffer, "event-002"));
     }
 
     fn draw_screen(screen: &mut EventLogScreen) -> Buffer {
