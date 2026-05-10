@@ -84,6 +84,17 @@ pub enum InventoryError {
         #[source]
         source: rusqlite::Error,
     },
+    /// A query failed while listing slots for one owner.
+    #[error("failed to list slots for owner `{owner_kind}:{owner_id}`: {source}")]
+    ListFailed {
+        /// Owner bucket for diagnostics.
+        owner_kind: String,
+        /// Owner row id for diagnostics.
+        owner_id: i64,
+        /// Underlying SQL failure.
+        #[source]
+        source: rusqlite::Error,
+    },
 }
 
 /// Migration for the `inventory_slots` table (SPEC_v4 Task 7a).
@@ -215,6 +226,65 @@ LIMIT 1";
                 source,
             }),
         }
+    }
+
+    /// List all inventory slots for one owner in deterministic order.
+    ///
+    /// The ordering is stable and replay-safe:
+    ///
+    /// - primary sort: `item_key` ascending, so callers can render slots
+    ///   in stable lexical order across restarts;
+    /// - secondary sort: `id` ascending, which disambiguates duplicate keys
+    ///   (for example, distinct metadata rows for the same owner/item) without
+    ///   imposing any merge policy.
+    ///
+    /// Why this API exists:
+    ///
+    /// - In a **space exploration** game, a `"station"` owner can own a
+    ///   mixed manifest of cargo and components across many bays, and the
+    ///   rendering layer wants a deterministic list every refresh.
+    /// - In a **dungeon crawler** game, a `"chest"` owner can expose
+    ///   multiple stack rows for the same item in an intentionally
+    ///   metadata-rich layout, while still presenting them in a reproducible
+    ///   order.
+    pub fn slots_for_owner(
+        &self,
+        owner_kind: &str,
+        owner_id: i64,
+    ) -> Result<Vec<InventorySlot>, InventoryError> {
+        const SQL: &str = "\
+SELECT id, owner_kind, owner_id, item_key, quantity, equilibrium, metadata_json\n\
+FROM inventory_slots\n\
+WHERE owner_kind = ?1 AND owner_id = ?2\n\
+ORDER BY item_key ASC, id ASC";
+
+        let mut statement =
+            self.connection()
+                .prepare(SQL)
+                .map_err(|source| InventoryError::ListFailed {
+                    owner_kind: owner_kind.to_string(),
+                    owner_id,
+                    source,
+                })?;
+
+        let rows = statement
+            .query_map(
+                rusqlite::params![owner_kind, owner_id],
+                row_to_inventory_slot,
+            )
+            .map_err(|source| InventoryError::ListFailed {
+                owner_kind: owner_kind.to_string(),
+                owner_id,
+                source,
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|source| InventoryError::ListFailed {
+                owner_kind: owner_kind.to_string(),
+                owner_id,
+                source,
+            })?;
+
+        Ok(rows)
     }
 }
 
@@ -448,6 +518,49 @@ mod tests {
             loaded_after.quantity, 4,
             "kit must not auto-drift quantity toward equilibrium"
         );
+
+        Ok(())
+    }
+
+    /// Task 7e requires a deterministic listing for one owner.
+    ///
+    /// The test verifies:
+    ///
+    /// - filtering by exact owner tuple;
+    /// - stable lexical ordering by `item_key`;
+    /// - stable secondary ordering by `id` when keys tie.
+    #[test]
+    fn slots_for_owner_is_deterministic() -> Result<(), InventoryError> {
+        let dir = tempdir().expect("tempdir creates");
+        let db_path = dir.path().join("world.sqlite");
+        let mut world = WorldDb::open(&db_path).expect("open succeeds");
+
+        world
+            .apply_migration(&INVENTORY_SLOTS_MIGRATION)
+            .expect("inventory_slots migration applies");
+
+        let zeta = world.create_slot("ship", 7, "zeta-parts", 12, None, None)?;
+        let alpha_first =
+            world.create_slot("ship", 7, "alpha-gel", 3, None, Some(r#"{"grade":"A"}"#))?;
+        let alpha_second =
+            world.create_slot("ship", 7, "alpha-gel", 5, None, Some(r#"{"grade":"B"}"#))?;
+        let _other_owner = world.create_slot("station", 7, "alpha-gel", 99, None, None)?;
+
+        let listed = world.slots_for_owner("ship", 7)?;
+
+        assert_eq!(
+            listed.len(),
+            3,
+            "two alpha slots plus one zeta slot for this owner"
+        );
+        assert_eq!(listed[0].id, alpha_first.id);
+        assert_eq!(listed[1].id, alpha_second.id);
+        assert_eq!(listed[2].id, zeta.id);
+        assert_eq!(listed[0].owner_kind, "ship".to_string());
+        assert_eq!(listed[0].owner_id, 7);
+        assert_eq!(listed[0].item_key, "alpha-gel".to_string());
+        assert_eq!(listed[1].item_key, "alpha-gel".to_string());
+        assert_eq!(listed[2].item_key, "zeta-parts".to_string());
 
         Ok(())
     }

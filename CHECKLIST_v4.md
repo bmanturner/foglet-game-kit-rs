@@ -57,7 +57,7 @@ One unchecked item per iteration. Dependencies in `[brackets]` must be checked o
 - [x] **7b** — Implement `create_slot` and `get_slot(owner_kind, owner_id, item_key)`. Test: round-trips. [7a]
 - [x] **7c** — Add CHECK constraint or runtime guard preventing negative quantity. Test: direct write of negative quantity fails. [7b]
 - [x] **7d** — Confirm `equilibrium` is advisory. Test: setting `equilibrium` does not alter `quantity`; the kit performs no auto-drift. [7b]
-- [ ] **7e** — Implement `slots_for_owner(owner_kind, owner_id)`. Test: deterministic ordering. [7b]
+- [x] **7e** — Implement `slots_for_owner(owner_kind, owner_id)`. Test: deterministic ordering. [7b]
 - [ ] **7f** — Implement explicit `merge_slots(slot_a, slot_b)` helper that merges only when `(owner_kind, owner_id, item_key, metadata_json)` match exactly. Test: mismatched metadata refuses to merge. [7b]
 
 ### Task 8 — Inventory atomic transfer
