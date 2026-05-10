@@ -80,7 +80,9 @@ pub use manifest::{
 pub use map::{
     parse_map, EntityPlacement, Map, MapError, Tile, TileKind, TileLegend, PLAYER_GLYPH,
 };
-pub use market::MARKET_LISTINGS_MIGRATION;
+pub use market::{
+    MarketError, MarketListing, MARKET_DISPLAY_NAME_MAX_CHARS, MARKET_LISTINGS_MIGRATION,
+};
 pub use notices::{Notice, NoticeError, NOTICES_MIGRATION, NOTICE_SUBJECT_MAX_CHARS};
 pub use players::{PlayerError, PlayerRecord, PLAYERS_MIGRATION};
 pub use prompt::{
