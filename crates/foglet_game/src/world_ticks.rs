@@ -17,8 +17,7 @@
 
 use thiserror::Error;
 
-use crate::world_db::WorldDb;
-use crate::world_db::WorldMigration;
+use crate::world_db::{WorldDb, WorldMigration, WorldTickCallback};
 
 /// Durable timer task persisted in `world_tick_tasks`.
 ///
@@ -76,6 +75,38 @@ pub enum WorldTickError {
         #[source]
         source: rusqlite::Error,
     },
+    /// SQLite query failed while reading due tasks in `run_due_ticks`.
+    #[error("failed to query due world ticks: {source}")]
+    DueTasksQueryFailed {
+        /// Underlying SQLite failure.
+        #[source]
+        source: rusqlite::Error,
+    },
+    /// A tick key was registered without an in-memory callback this
+    /// runtime process can dispatch.
+    #[error("no callback registered in memory for tick `{key}`")]
+    MissingCallbackForTick {
+        /// Task key with missing callback.
+        key: String,
+    },
+    /// A tick callback rejected because its callback closure failed.
+    #[error("tick callback rejected for `{key}`: {source}")]
+    CallbackRejected {
+        /// Task key whose callback failed.
+        key: String,
+        /// Callback or SQL failure surfaced from callback context.
+        #[source]
+        source: rusqlite::Error,
+    },
+    /// A tick row could not be marked as run within its transaction.
+    #[error("failed to mark tick `{key}` as run: {source}")]
+    RunTickFailed {
+        /// Task key that failed to update.
+        key: String,
+        /// Underlying SQL failure.
+        #[source]
+        source: rusqlite::Error,
+    },
 }
 
 impl WorldDb {
@@ -89,18 +120,18 @@ impl WorldDb {
     /// - on repeated registration with the same key and a different interval,
     ///   the cadence is updated so one source of truth remains.
     ///
-    /// The callback argument is intentionally accepted now so task startup code
-    /// can register durable callbacks consistently across all v4 features.
-    /// This iteration only persists and normalizes metadata; callback storage and
-    /// invocation wiring lands in Task 9c.
+    /// The callback argument is stored on this `WorldDb` handle during
+    /// startup so later `run_due_ticks` calls can dispatch it in-process.
+    /// Registration keeps a single durable row in SQLite and one callback
+    /// binding per task key.
     pub fn register_tick<F>(
         &mut self,
         key: &str,
         interval_seconds: i64,
-        _on_commit: F,
+        on_commit: F,
     ) -> Result<WorldTickTask, WorldTickError>
     where
-        F: FnMut(&rusqlite::Transaction<'_>) -> rusqlite::Result<()>,
+        F: FnMut(&rusqlite::Transaction<'_>) -> rusqlite::Result<()> + 'static,
     {
         if interval_seconds <= 0 {
             return Err(WorldTickError::InvalidInterval {
@@ -147,7 +178,120 @@ impl WorldDb {
                 source,
             })?;
 
+        self.tick_callbacks
+            .borrow_mut()
+            .insert(key.to_string(), Box::new(on_commit) as WorldTickCallback);
+
         Ok(task)
+    }
+
+    /// Run all due tick callbacks at the supplied `now` timestamp.
+    ///
+    /// A task is due when `last_run_at` is `NULL` (never run) or the
+    /// cadence window has elapsed (`datetime(last_run_at, interval) <= now`).
+    ///
+    /// Why this method updates `last_run_at` inside the same transaction
+    /// as the callback:
+    ///
+    /// - callback failures roll back the row update, so callers retry the
+    ///   missed work later;
+    /// - successful callbacks are durable markers of work completed during
+    ///   this invocation.
+    ///
+    /// The return value is the count of callbacks that reached `COMMIT`.
+    ///
+    /// In a **space exploration** game, this powers periodic station
+    /// replenishment without busy looping after long absences.
+    /// In a **dungeon crawler**, trap resets can catch up one
+    /// tick-at-a-time when the player returns after disconnection.
+    pub fn run_due_ticks(&mut self, now: &str) -> Result<usize, WorldTickError> {
+        let due_tasks: Vec<WorldTickTask> = {
+            let mut statement = self
+                .connection()
+                .prepare(
+                    "SELECT key, last_run_at, interval_seconds, metadata_json\n\
+                     FROM world_tick_tasks\n\
+                     WHERE last_run_at IS NULL\n\
+                        OR datetime(last_run_at, '+' || interval_seconds || ' seconds') <= ?1\n\
+                     ORDER BY key",
+                )
+                .map_err(|source| WorldTickError::DueTasksQueryFailed { source })?;
+
+            let rows = statement
+                .query_map(rusqlite::params![now], row_to_world_tick_task)
+                .map_err(|source| WorldTickError::DueTasksQueryFailed { source })?;
+
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(|source| WorldTickError::DueTasksQueryFailed { source })?
+        };
+
+        let mut ran = 0_usize;
+        for task in due_tasks {
+            let mut callback = {
+                let mut callbacks = self.tick_callbacks.borrow_mut();
+                callbacks.remove(&task.key).ok_or_else(|| {
+                    WorldTickError::MissingCallbackForTick {
+                        key: task.key.clone(),
+                    }
+                })?
+            };
+
+            let tx = self.connection_mut().transaction().map_err(|source| {
+                WorldTickError::RunTickFailed {
+                    key: task.key.clone(),
+                    source,
+                }
+            })?;
+
+            let updated = tx
+                .execute(
+                    "UPDATE world_tick_tasks\n\
+                     SET last_run_at = ?2\n\
+                     WHERE key = ?1\n\
+                        AND (\n\
+                             last_run_at IS NULL\n\
+                             OR datetime(last_run_at, '+' || interval_seconds || ' seconds') <= ?2\n\
+                        )",
+                    rusqlite::params![task.key, now],
+                )
+                .map_err(|source| WorldTickError::RunTickFailed {
+                    key: task.key.clone(),
+                    source,
+                })?;
+
+            if updated == 0 {
+                drop(tx);
+                self.tick_callbacks
+                    .borrow_mut()
+                    .insert(task.key.clone(), callback);
+                continue;
+            }
+
+            if let Err(source) = callback(&tx) {
+                drop(tx);
+                self.tick_callbacks
+                    .borrow_mut()
+                    .insert(task.key.clone(), callback);
+                return Err(WorldTickError::CallbackRejected {
+                    key: task.key.clone(),
+                    source,
+                });
+            }
+
+            tx.commit()
+                .map_err(|source| WorldTickError::RunTickFailed {
+                    key: task.key.clone(),
+                    source,
+                })?;
+
+            self.tick_callbacks
+                .borrow_mut()
+                .insert(task.key.clone(), callback);
+
+            ran += 1;
+        }
+
+        Ok(ran)
     }
 }
 
@@ -185,6 +329,9 @@ CREATE TABLE IF NOT EXISTS world_tick_tasks (
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
     use super::{row_to_world_tick_task, WorldTickError, WORLD_TICK_TASKS_MIGRATION};
     use crate::world_db::WorldDb;
     use rusqlite::params;
@@ -300,6 +447,87 @@ mod tests {
             })
             .expect("row count query runs");
         assert_eq!(count, 0, "invalid interval should not write rows");
+    }
+
+    /// Task 9c runs only ticks whose cadence is due at `now` and skips
+    /// rows that are still waiting for their next window.
+    #[test]
+    fn run_due_ticks_executes_only_due_tasks() {
+        let dir = tempdir().expect("tempdir creates");
+        let db_path = dir.path().join("world.sqlite");
+        let mut world = WorldDb::open(&db_path).expect("open succeeds");
+
+        world
+            .apply_migration(&WORLD_TICK_TASKS_MIGRATION)
+            .expect("world_tick_tasks migration applies");
+
+        let calls = Rc::new(RefCell::new(Vec::new()));
+
+        world
+            .register_tick("null_key_is_due", 600, {
+                let calls = Rc::clone(&calls);
+                move |_tx| {
+                    calls.borrow_mut().push("null_key_is_due".to_string());
+                    Ok(())
+                }
+            })
+            .expect("register_tick persists row");
+
+        world
+            .register_tick("not_due", 3600, {
+                let calls = Rc::clone(&calls);
+                move |_tx| {
+                    calls.borrow_mut().push("not_due".to_string());
+                    Ok(())
+                }
+            })
+            .expect("register_tick persists row");
+
+        world
+            .connection()
+            .execute(
+                "UPDATE world_tick_tasks\n SET last_run_at = ?1\n WHERE key = ?2",
+                params!["2026-01-01 10:30:00", "not_due"],
+            )
+            .expect("seed not_due last_run_at");
+
+        let ran = world
+            .run_due_ticks("2026-01-01 10:45:00")
+            .expect("run due ticks executes");
+
+        assert_eq!(ran, 1, "only one task should have advanced at 10:45");
+        let observed = calls.borrow().clone();
+        assert_eq!(
+            observed,
+            vec!["null_key_is_due".to_string()],
+            "only due callback should run"
+        );
+
+        let null_last: String = world
+            .connection()
+            .query_row(
+                "SELECT last_run_at FROM world_tick_tasks WHERE key = ?1",
+                params!["null_key_is_due"],
+                |row| row.get(0),
+            )
+            .expect("query updated due row");
+        assert_eq!(
+            null_last, "2026-01-01 10:45:00",
+            "due row should receive new last_run_at"
+        );
+
+        let not_due_last: String = world
+            .connection()
+            .query_row(
+                "SELECT last_run_at FROM world_tick_tasks WHERE key = ?1",
+                params!["not_due"],
+                |row| row.get(0),
+            )
+            .expect("query unchanged skipped row");
+        assert_eq!(
+            not_due_last, "2026-01-01 10:30:00",
+            "skip target must leave last_run_at untouched"
+        );
     }
 
     /// Task 9a accepts that the migration creates the documented schema.

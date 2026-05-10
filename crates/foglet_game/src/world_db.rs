@@ -38,6 +38,8 @@
 //!    behind `WorldDb::open` means tests in those tasks build on the
 //!    same surface authors use in production.
 
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 use std::time::Duration;
@@ -82,6 +84,14 @@ pub struct WorldDbOptions {
     /// reject WAL fall back automatically — see [`WorldDb::journal_mode`].
     pub journal_mode: String,
 }
+
+/// Type-erased callback signature for a durable world-tick key.
+///
+/// The callback receives the active transaction that owns the due
+/// tick's row lock. This lets runtime-authored task logic mutate
+/// game tables in the same SQL transaction as `last_run_at`.
+pub(crate) type WorldTickCallback =
+    Box<dyn for<'tx> FnMut(&rusqlite::Transaction<'tx>) -> rusqlite::Result<()> + 'static>;
 
 /// Journal modes the world-DB open path will pass through to SQLite.
 ///
@@ -131,7 +141,6 @@ impl From<&crate::config::WorldSection> for WorldDbOptions {
 /// share across threads, and v2 explicitly defers real-time
 /// multiplayer (SPEC §3.2). A single owner per door process is the
 /// shape every later task assumes.
-#[derive(Debug)]
 pub struct WorldDb {
     /// Underlying `rusqlite` connection. Kept private so future tasks
     /// (Task 9 transactions, Task 4 migrations) can layer behavior on
@@ -144,6 +153,20 @@ pub struct WorldDb {
     /// downgrade by returning the old mode rather than raising an
     /// error, so the only way to know is to read what came back.
     journal_mode: String,
+    /// In-process callbacks keyed by registered world-tick key.
+    ///
+    /// This registry stays in-memory because `WorldDb` is the runtime
+    /// owner for both durability and task callback dispatch.
+    pub(crate) tick_callbacks: RefCell<HashMap<String, WorldTickCallback>>,
+}
+
+impl std::fmt::Debug for WorldDb {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WorldDb")
+            .field("journal_mode", &self.journal_mode)
+            .field("tick_callbacks", &self.tick_callbacks.borrow().len())
+            .finish()
+    }
 }
 
 impl WorldDb {
@@ -232,7 +255,11 @@ impl WorldDb {
 
         bootstrap_migrations_table(&conn)?;
 
-        Ok(Self { conn, journal_mode })
+        Ok(Self {
+            conn,
+            journal_mode,
+            tick_callbacks: RefCell::new(HashMap::new()),
+        })
     }
 
     /// Journal mode that SQLite reported as active after open.
