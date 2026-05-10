@@ -16,9 +16,11 @@ use serde::Deserialize;
 use thiserror::Error;
 
 use crate::bounties::BountyError;
+use crate::bounties::BOUNTY_DESCRIPTION_MAX_CHARS;
 use crate::challenges::ChallengeError;
 use crate::config::MultiplayerSection;
 use crate::contracts::{AvailableContractsFilter, ContractError};
+use crate::notices::NOTICE_SUBJECT_MAX_CHARS;
 use crate::world_db::WorldDb;
 
 /// Stable source bucket for an aggregated [`JobBoardEntry`].
@@ -139,6 +141,13 @@ impl JobBoardFilter {
 #[derive(Debug, Default, Clone, Copy)]
 pub struct JobBoard;
 
+/// v3-bounded cap for short player-facing strings projected into the
+/// board list row (title column).
+const JOB_BOARD_TITLE_MAX_CHARS: usize = NOTICE_SUBJECT_MAX_CHARS;
+/// v3-bounded cap for longer player-facing strings projected into the
+/// board detail body (summary column).
+const JOB_BOARD_SUMMARY_MAX_CHARS: usize = BOUNTY_DESCRIPTION_MAX_CHARS;
+
 impl JobBoard {
     /// Aggregate rows from all `providers`, apply `filter`, and return
     /// one stable-ordered list.
@@ -153,7 +162,13 @@ impl JobBoard {
         let mut decorated = Vec::new();
         for (provider_index, provider) in providers.iter().enumerate() {
             let provider_entries = provider.entries(world_db)?;
-            for (entry_index, entry) in provider_entries.into_iter().enumerate() {
+            for (entry_index, mut entry) in provider_entries.into_iter().enumerate() {
+                // SPEC_v5 §7 requires sanitization at the aggregation
+                // boundary regardless of provider. We sanitize here so
+                // both built-in and external rows obey the same
+                // terminal-safety + bounded-text contract before any
+                // screen renders them.
+                sanitize_entry_text(&mut entry);
                 if filter.includes_source(entry.source) {
                     decorated.push(DecoratedEntry {
                         provider_index,
@@ -201,6 +216,56 @@ fn compare_expiration(left: Option<&str>, right: Option<&str>) -> Ordering {
         (None, Some(_)) => Ordering::Greater,
         (None, None) => Ordering::Equal,
     }
+}
+
+fn sanitize_entry_text(entry: &mut JobBoardEntry) {
+    entry.title = sanitize_for_terminal(&entry.title, JOB_BOARD_TITLE_MAX_CHARS, false);
+    entry.summary = sanitize_for_terminal(&entry.summary, JOB_BOARD_SUMMARY_MAX_CHARS, true);
+}
+
+fn sanitize_for_terminal(raw: &str, max_chars: usize, preserve_multiline: bool) -> String {
+    let mut output = String::with_capacity(raw.len().min(max_chars));
+    let mut visible_chars = 0_usize;
+    for ch in raw.chars() {
+        let Some(normalized) = normalize_terminal_char(ch, preserve_multiline) else {
+            continue;
+        };
+        if visible_chars >= max_chars {
+            break;
+        }
+        output.push(normalized);
+        visible_chars += 1;
+    }
+    output
+}
+
+fn normalize_terminal_char(ch: char, preserve_multiline: bool) -> Option<char> {
+    // `char::is_control` strips both C0 and C1 ranges, including ESC.
+    // We optionally preserve LF/tab for multi-line detail surfaces.
+    if ch.is_control() {
+        if preserve_multiline && matches!(ch, '\n' | '\t') {
+            return Some(ch);
+        }
+        return None;
+    }
+    // Strip/neutralize the highest-risk invisible text-shaping chars.
+    if is_zero_width_or_bidi_override(ch) {
+        return Some('\u{FFFD}');
+    }
+    Some(ch)
+}
+
+fn is_zero_width_or_bidi_override(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{200B}'
+            | '\u{200C}'
+            | '\u{200D}'
+            | '\u{200E}'
+            | '\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2066}'..='\u{2069}'
+    )
 }
 
 /// Shared provider contract for Job Board opportunity sources.
@@ -913,6 +978,68 @@ mod tests {
         let entries = JobBoard::query(&world, &filter, &providers).expect("query succeeds");
         let titles: Vec<&str> = entries.iter().map(|entry| entry.title.as_str()).collect();
         assert_eq!(titles, vec!["first", "second"]);
+    }
+
+    #[test]
+    fn query_sanitizes_provider_title_and_summary_with_v3_bounded_text_rules() {
+        let dir = tempdir().expect("tempdir creates");
+        let db_path = dir.path().join("world.sqlite");
+        let world = WorldDb::open(&db_path).expect("open succeeds");
+
+        let overlong_title = format!(
+            "A\u{200E}{}\u{001B}[2J\u{0085}TAIL",
+            "T".repeat(super::JOB_BOARD_TITLE_MAX_CHARS)
+        );
+        let overlong_summary = format!(
+            "First line\nSecond\tline\u{200D}{}\u{001B}[31m\u{0085}TAIL",
+            "S".repeat(super::JOB_BOARD_SUMMARY_MAX_CHARS)
+        );
+        let provider = StaticProvider {
+            entries: vec![JobBoardEntry {
+                source: JobBoardSource::External,
+                source_id: 51,
+                kind_label: "Guild".to_string(),
+                state_label: "open".to_string(),
+                title: overlong_title,
+                summary: overlong_summary,
+                reward_preview: None,
+                location_preview: None,
+                expires_at: None,
+                accept_action: None,
+            }],
+        };
+
+        let providers: [&dyn OpportunityProvider; 1] = [&provider];
+        let entries = JobBoard::query(&world, &JobBoardFilter::default(), &providers)
+            .expect("query succeeds");
+        let entry = &entries[0];
+
+        assert_eq!(
+            entry.title.chars().count(),
+            super::JOB_BOARD_TITLE_MAX_CHARS,
+            "title should be truncated to the v3 short-text bound after sanitization"
+        );
+        assert_eq!(
+            entry.summary.chars().count(),
+            super::JOB_BOARD_SUMMARY_MAX_CHARS,
+            "summary should be truncated to the v3 long-text bound after sanitization"
+        );
+        assert!(
+            !entry.title.contains('\u{001B}') && !entry.summary.contains('\u{001B}'),
+            "ESC control characters should be stripped"
+        );
+        assert!(
+            !entry.title.contains('\u{0085}') && !entry.summary.contains('\u{0085}'),
+            "C1 controls should be stripped"
+        );
+        assert!(
+            entry.title.contains('\u{FFFD}') || entry.summary.contains('\u{FFFD}'),
+            "zero-width / bidi override chars should be neutralized"
+        );
+        assert!(
+            entry.summary.contains('\n') && entry.summary.contains('\t'),
+            "summary sanitizer should preserve multiline separators for detail views"
+        );
     }
 
     #[test]
