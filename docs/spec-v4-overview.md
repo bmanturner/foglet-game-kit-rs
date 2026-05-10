@@ -120,3 +120,25 @@ policy control:
 
 That separation lets one kit support space ports, dungeons, towns, and
 trading posts without prescribing one vocabulary.
+
+## 5. Why v4 skips sample-game integration
+
+v4 intentionally does not wire these primitives into
+`examples/murder_motel` in this release.
+
+Reasoning:
+
+- The fixture exists to preserve v1-v3 runtime and multiplayer
+  regression coverage.
+- v4 primitives are structural and genre-neutral, so forcing one fixture
+  to adopt one movement, recall, stocking, or tick policy would imply a
+  preferred genre vocabulary.
+- The kit instead proves v4 behavior with focused unit and integration
+  tests in `crates/foglet_game`, then leaves policy composition to each
+  game project.
+
+Examples of game-side policy choices that stay outside the kit:
+
+- A space-port game can recall only visited docks with verified access.
+- A dungeon crawler can recall only explored rooms after a scouting
+  action succeeds.
