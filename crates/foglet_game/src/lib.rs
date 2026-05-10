@@ -52,6 +52,7 @@ pub mod roles;
 pub mod runtime;
 pub mod save;
 pub mod screen;
+pub mod spatial;
 pub mod terminal;
 pub mod turns;
 pub mod widgets;
@@ -115,6 +116,7 @@ pub use save::{
 pub use screen::{
     apply_command, ExitReason, GameContext, Screen, ScreenCommand, ScreenStack, SideEffect,
 };
+pub use spatial::PLACES_MIGRATION;
 pub use terminal::{
     arm_panic_hook, disarm_panic_hook, flush_stdout, install_panic_hook, install_panic_hook_with,
     is_panic_hook_armed, CrosstermBackend, PanicRestoreFn, TerminalBackend, TerminalError,
