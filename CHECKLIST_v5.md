@@ -112,7 +112,7 @@ One unchecked item per iteration. Dependencies in `[brackets]` must be checked o
 - [x] **12i** — Document explicitly that v5 still has no real-time multiplayer, no long-lived daemon, no scripted-terminal driver, and no sample-game integration of v5 features in this kit's fixture. [12g]
 - [x] **12j** — Add a backup/maintenance note covering the new tables: `contracts`. [12g]
 
-- [ ] **Task 13 — Final v5 verification**
+- [x] **Task 13 — Final v5 verification**
       Run `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`, `cargo test --workspace`, `cargo test --workspace --features test-support`, and `cargo doc --workspace --no-deps`. Quote results in the final iteration. [all prior tasks]
 
 ## Acceptance criteria — gate for `<promise>V5_COMPLETE</promise>`
