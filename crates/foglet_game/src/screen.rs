@@ -109,6 +109,14 @@ pub struct GameContext<'a> {
     /// Optional v4 world-tick handle. Present when the runtime opens a
     /// shared-world DB; this is added in Task 11a so cron/login-driven
     /// tick runners and ad-hoc callbacks share one context field.
+    ///
+    /// **Scheduling contract (SPEC_v4 §2.2):** call
+    /// [`WorldDb::run_due_ticks`]
+    /// from login flow or screen transitions, never from
+    /// `Screen::render`/paint loops. Tick callbacks may perform SQL
+    /// work, so invoking them during paint risks frame stutter and
+    /// violates the "no automatic tick execution in paint loops"
+    /// tenet.
     pub world_ticks: Option<&'a WorldDb>,
 }
 

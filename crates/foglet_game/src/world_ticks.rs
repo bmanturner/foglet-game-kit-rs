@@ -218,6 +218,11 @@ impl WorldDb {
     /// `fgk tick`, and there can be more than one process invoking either
     /// path. Keep callback SQL idempotent (or protected by application-level
     /// version checks) so retries and concurrent invocations remain safe.
+    ///
+    /// **Call-site guidance (SPEC_v4 Task 11c):** do not invoke this from
+    /// paint/render loops. Run it from login boundaries or explicit
+    /// screen transitions so callback latency is paid at game-state
+    /// boundaries instead of frame time.
     pub fn run_due_ticks(
         &mut self,
         now: &str,

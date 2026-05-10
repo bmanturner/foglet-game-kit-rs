@@ -90,7 +90,7 @@ One unchecked item per iteration. Dependencies in `[brackets]` must be checked o
 
 - [x] **11a** — Add optional `spatial`, `presence`, `place_recall`, `inventory`, and `world_ticks` handles to `GameContext`. [v2 Task 10]
 - [x] **11b** — Construct each handle only when its config section enables the primitive. Test: disabled sections leave the corresponding handle as `None`. [11a, 2a]
-- [ ] **11c** — Document that `run_due_ticks` MUST NOT be called from inside paint loops; SHOULD run on login or screen transitions. [11a]
+- [x] **11c** — Document that `run_due_ticks` MUST NOT be called from inside paint loops; SHOULD run on login or screen transitions. [11a]
 - [ ] **11d** — Add an opt-in `run_due_ticks_on_login` runtime hook that callers may enable. Test: when enabled, login path invokes ticks; when disabled, it does not. [11c]
 
 ### Task 12 — Documentation
