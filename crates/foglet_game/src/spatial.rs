@@ -133,6 +133,15 @@ pub enum RouteError {
         #[source]
         source: rusqlite::Error,
     },
+    /// The underlying SQL query for inbound adjacency failed.
+    #[error("failed to list inbound routes for `{to_place_id}`: {source}")]
+    ListInbound {
+        /// Destination place id for diagnostics.
+        to_place_id: i64,
+        /// Underlying `rusqlite` error.
+        #[source]
+        source: rusqlite::Error,
+    },
 }
 
 /// Migration for the shared `places` table (SPEC_v4 Task 3a).
@@ -351,6 +360,48 @@ ORDER BY to_place_id ASC, id ASC";
             .collect::<Result<Vec<_>, _>>()
             .map_err(|source| RouteError::ListOutbound {
                 from_place_id,
+                source,
+            })?;
+
+        Ok(routes)
+    }
+
+    /// Query all routes whose destination is `to_place_id`.
+    ///
+    /// This returns the inbound half of the directed graph and allows
+    /// the same location to be queried for both outward exits and incoming
+    /// entrances. It intentionally does not infer reciprocal edges:
+    /// callers should only call this if they need inbound visibility.
+    ///
+    /// In a **space exploration** game, this supports displays like
+    /// "where can I come from right now?" for a docking pad.
+    ///
+    /// In a **dungeon crawler** game, this supports a fog map layer that
+    /// reveals how a chamber can be reached without assuming any of those
+    /// passages are bidirectional by default.
+    pub fn inbound_routes(&self, to_place_id: i64) -> Result<Vec<Route>, RouteError> {
+        const SQL: &str = "\
+SELECT from_place_id, to_place_id, id, kind, requirements_json, metadata_json, created_at\n\
+FROM routes\n\
+WHERE to_place_id = ?1\n\
+ORDER BY from_place_id ASC, id ASC";
+
+        let mut stmt =
+            self.connection()
+                .prepare(SQL)
+                .map_err(|source| RouteError::ListInbound {
+                    to_place_id,
+                    source,
+                })?;
+        let routes = stmt
+            .query_map(rusqlite::params![to_place_id], row_to_route)
+            .map_err(|source| RouteError::ListInbound {
+                to_place_id,
+                source,
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|source| RouteError::ListInbound {
+                to_place_id,
                 source,
             })?;
 
@@ -924,5 +975,74 @@ mod tests {
         assert_eq!(inbound_routes.len(), 1);
         assert_eq!(inbound_routes[0].from_place_id, refinery.id);
         assert_eq!(inbound_routes[0].to_place_id, star_hatch.id);
+    }
+
+    /// SPEC_v4 Task 4d — `inbound_routes` should return only routes whose
+    /// destination is the provided place.
+    ///
+    /// The test keeps two separate source nodes feeding a common destination
+    /// and confirms outbound rows from unrelated places are not returned.
+    #[test]
+    fn inbound_routes_filters_to_destination_only() {
+        let dir = tempdir().expect("tempdir creates");
+        let db_path = dir.path().join("world.sqlite");
+        let mut world = WorldDb::open(&db_path).expect("open succeeds");
+
+        world
+            .apply_migration(&PLACES_MIGRATION)
+            .expect("places migration applies");
+        world
+            .apply_migration(&ROUTES_MIGRATION)
+            .expect("routes migration applies");
+
+        let star_hatch = world
+            .insert_place("star-hatch", "Star Hatch", "hatch", None)
+            .expect("source place inserts");
+        let refinery = world
+            .insert_place("refinery", "Refinery", "facility", None)
+            .expect("destination place inserts");
+        let hangar = world
+            .insert_place("hangar", "Hangar", "hangar", None)
+            .expect("alternate source inserts");
+
+        let incoming_refinery = world
+            .create_route(
+                refinery.id,
+                star_hatch.id,
+                "cargo-bay",
+                None,
+                Some(r#"{"route":"refinery-to-hatch"}"#),
+            )
+            .expect("inbound route inserts");
+        let incoming_hangar = world
+            .create_route(
+                hangar.id,
+                star_hatch.id,
+                "maintenance-passage",
+                None,
+                Some(r#"{"route":"hangar-to-hatch"}"#),
+            )
+            .expect("inbound route inserts");
+        world
+            .create_route(
+                star_hatch.id,
+                refinery.id,
+                "airlock",
+                None,
+                Some(r#"{"route":"hatch-to-refinery"}"#),
+            )
+            .expect("outbound route inserts");
+
+        let inbound = world
+            .inbound_routes(star_hatch.id)
+            .expect("inbound query should succeed");
+
+        assert_eq!(inbound.len(), 2);
+        assert_eq!(inbound[0], incoming_refinery);
+        assert_eq!(inbound[1], incoming_hangar);
+        assert_eq!(inbound[0].to_place_id, star_hatch.id);
+        assert_eq!(inbound[1].to_place_id, star_hatch.id);
+        assert_eq!(inbound[0].from_place_id, refinery.id);
+        assert_eq!(inbound[1].from_place_id, hangar.id);
     }
 }

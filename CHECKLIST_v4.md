@@ -27,7 +27,7 @@ One unchecked item per iteration. Dependencies in `[brackets]` must be checked o
 - [x] **4a** — Add `routes` migration with `id`, `from_place_id`, `to_place_id`, `kind`, `requirements_json`, `metadata_json`, `created_at` and FK constraints to `places`. [3a]
 - [x] **4b** — Implement `create_route`. Test: stored row round-trips. [4a]
 - [x] **4c** — Implement `outbound_routes(place_id)` adjacency query. Test: returns only outbound routes. [4b]
-- [ ] **4d** — Implement `inbound_routes(place_id)` query. Test: returns only inbound routes. [4b]
+- [x] **4d** — Implement `inbound_routes(place_id)` query. Test: returns only inbound routes. [4b]
 - [ ] **4e** — Allow parallel routes between same two places when `kind` differs. Test: two rows coexist. [4b]
 - [ ] **4f** — Test asymmetric topology: route A→B without B→A; outbound from A includes it, outbound from B does not. [4c]
 - [ ] **4g** — Test bidirectional access requires two rows. [4c, 4d]
