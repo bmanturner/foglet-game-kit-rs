@@ -396,4 +396,59 @@ mod tests {
             "negative quantity must be rejected by the inventory constraint"
         );
     }
+
+    #[test]
+    fn equilibrium_is_advisory_only() -> Result<(), InventoryError> {
+        let dir = tempdir().expect("tempdir creates");
+        let db_path = dir.path().join("world.sqlite");
+        let mut world = WorldDb::open(&db_path).expect("open succeeds");
+
+        world
+            .apply_migration(&INVENTORY_SLOTS_MIGRATION)
+            .expect("inventory_slots migration applies");
+
+        let created = world.create_slot(
+            "market-stand",
+            7,
+            "plasma-core",
+            4,
+            Some(12),
+            Some(r#"{"condition":"sealed"}"#),
+        )?;
+        assert_eq!(created.quantity, 4);
+        assert_eq!(created.equilibrium, Some(12));
+        assert_eq!(
+            created.metadata_json,
+            Some(r#"{"condition":"sealed"}"#.to_string())
+        );
+
+        let loaded_before = world
+            .get_slot("market-stand", 7, "plasma-core")?
+            .expect("slot exists");
+        assert_eq!(loaded_before.quantity, 4);
+        assert_eq!(loaded_before.equilibrium, Some(12));
+
+        world
+            .connection()
+            .execute(
+                "UPDATE inventory_slots SET equilibrium = ?1 WHERE id = ?2",
+                rusqlite::params![88, created.id],
+            )
+            .expect("equilibrium can be updated independently");
+
+        let loaded_after = world
+            .get_slot("market-stand", 7, "plasma-core")?
+            .expect("slot exists after equilibrium update");
+        assert_eq!(
+            loaded_after.equilibrium,
+            Some(88),
+            "advisory target can be moved independently"
+        );
+        assert_eq!(
+            loaded_after.quantity, 4,
+            "kit must not auto-drift quantity toward equilibrium"
+        );
+
+        Ok(())
+    }
 }
