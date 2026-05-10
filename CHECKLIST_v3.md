@@ -113,10 +113,133 @@ One unchecked item per iteration. Dependencies in `[brackets]` must be checked o
       → Restructured `docs/async-multiplayer.md` §10 from a flat "headline exclusions" bullet list into three explicitly-titled subsections so the no-real-time contract gets its own load-bearing space rather than living as one bullet among five. §10.1 "v3 has no real-time multiplayer — by design" leads with an unambiguous **No.** in answer to the implicit "can I add a chat window?" question and walks five concrete forbidden patterns: live sockets between sessions, real-time combat/chat/co-op, background pollers/daemons/long-lived threads (calling out the 1-second inbox-badge poll as still-forbidden so a future contributor can't argue "but it's only a *small* poll"), cross-game identity, and payment mechanics — each tied to the SPEC_v3 §2.2 line it implements. The pollers/daemons bullet explicitly contrasts with the navigation-hook sweepers from §9 (`expire_open_challenges`, `expire_bounties`) so a reader doesn't mistake the deterministic-`now` sweeper pattern for a forbidden background thread. §10.2 "Why the line is drawn here" is the part 9a/9b deferred — three numbered reasons in priority order: (1) terminal safety is release-critical (SPEC §§13/17 v1: a background socket reader holding `&mut Terminal` is the second uncoordinated writer the guard exists to prevent — this is the architectural pin, not just a preference), (2) transactional state machines depend on the one-writer-per-row serialisation that SQLite's write lock provides (real-time re-introduces the optimistic-concurrency problem mailbox sidesteps), (3) BBS sweet spot (door audiences are asynchronous by nature; building real-time on `:external_pty` would compete with chat applications). §10.3 "If you find yourself reaching for real-time" gives a five-row alternatives table mapping common real-time pulls to their mailbox-shaped solutions (chat → faction-scoped notices, race → challenge with deadline, live counts → refresh-on-navigation reads, push notifications → inbox on login, leaderboard updates → events-table read on entry) so a reader hitting the guardrail has a concrete escape hatch rather than just "stop". The closing paragraph re-pins the guardrail: features that don't fit the alternatives are v4-shaped, document in `DECISIONS.md` § Open Questions, never silently add a poller/socket/thread because it breaks terminal safety. The §1 forward-reference to §10 still resolves correctly (§1 already says "covered separately in §10" — no renumbering needed since 10.1/10.2/10.3 are subsections, not new top-level headings). Workspace test count unchanged at 851 (doc-only commit).
 
 - [ ] **Task 10 — Final v3 verification**
-      Run formatting, clippy, tests, docs, and package smoke. Quote results in the final iteration. [all prior tasks]
+      Run formatting, clippy, tests, docs, and package smoke. Quote results in the final iteration. [all prior tasks, Tasks 11–16]
 
 - [x] **10a** — Mention v3's BBS-native async multiplayer primitives in `README.md` overview/feature list (completion condition #13). [9a]
       → Added a v3 paragraph to the existing `foglet_game` bullet under "What you get" (rather than inserting a new bullet, which would have desynced the bullet list's "library / CLI / example" cadence). The paragraph names the five primitive families with their public surface in parentheses (`Notice` + `send_notice`/`inbox`/`mark_read`/`archive_notice`; `Challenge` with the five-state lifecycle; `MarketListing` with `buy_listing` and the callback-rollback contract that's load-bearing for atomic buys; `Faction`/`SharedGoal` + `contribute_to_goal` with the auto-completion-at-target hinge; `Bounty` with the four-state lifecycle), opts in via `[multiplayer]` in `game.toml`, pins the "stored in the v2 SQLite world DB — no live sockets, no background pollers, refresh-on-navigation only" guardrail (mirrors `docs/async-multiplayer.md` §10), and links to that doc as the canonical primer. Doc-only change; workspace tests unchanged at 851.
+
+### Task 11 — Murder Motel guestbook screen (notices wiring)
+
+Wires `Notice` + `send_notice` / `inbox` / `mark_read` / `archive_notice`
+into the example so completion condition #8's "alice → bob notice"
+half is reachable. Per CLAUDE.md "Murder Motel content tasks are
+additive": existing v2/v2.1 screens and tests must keep passing
+unchanged.
+
+- [ ] **11a** — Add `notices` reads to `world.rs`: `WorldDb` accessor on the example's
+      world handle and a `recent_players_for_picker` wrapper that calls
+      `WorldDb::recent_players` so the recipient picker has its data source. Pure
+      plumbing; no UI yet. Test: integration test loads world DB, sends a notice
+      through the public API, and reads it back via the new accessor. [Tasks 3, 8]
+- [ ] **11b** — Add a "Guestbook" entry to the title menu and a guestbook scene
+      shell that lists the current player's inbox newest-first via `inbox()`. Pin
+      with an `insta` snapshot of the empty-inbox state and a populated state.
+      Existing title-menu snapshots MUST be regenerated only by the additive entry,
+      not by reordering. [11a]
+- [ ] **11c** — Add a guestbook compose modal that picks a recipient (recent-players
+      list) and accepts a subject + body bounded by
+      `NOTICE_SUBJECT_MAX_CHARS` / `[multiplayer].max_notice_body_chars`. On submit,
+      calls `send_notice`. Tests: at-limit pass and one-over-limit fail; submit on
+      empty subject is rejected at the UI layer with a typed error surfaced. [11b]
+- [ ] **11d** — Wire `mark_read` on inbox-detail open and `archive_notice` on the
+      archive action. Tests: idempotent re-read; archived notice disappears from
+      default inbox view. [11b]
+
+### Task 12 — Murder Motel rival challenges screen
+
+Wires the `Challenge` lifecycle into the example so a rival can offer
+a challenge, the target can accept or decline, and resolution flows
+through `resolve_challenge`. Test surface mirrors Task 11's snapshot
++ behavioural pattern.
+
+- [ ] **12a** — Add a "Rival challenges" title-menu entry and a scene listing
+      challenges where the player is challenger or target, grouped by state.
+      Snapshot empty + populated states. [11a, Task 4]
+- [ ] **12b** — Add a "challenge a rival" flow: pick recipient via the recent-players
+      picker, pick a kind from a configured list, supply stake JSON via a
+      structured form. Calls `create_challenge`. Test: created row starts in `open`. [12a]
+- [ ] **12c** — Wire accept/decline actions on inbound challenges via
+      `accept_challenge` / `decline_challenge`. Test: invalid transitions surface
+      as typed errors in the UI. [12b]
+- [ ] **12d** — Wire `resolve_challenge` from an "I won / they won" prompt on
+      accepted challenges; payload schema documented inline. Test:
+      `accepted -> resolved` with payload retained verbatim. [12c]
+
+### Task 13 — Murder Motel lost-and-found market screen
+
+Wires `MarketListing` + `create_listing` / `active_listings` /
+`buy_listing` into the example so completion condition #8's "alice
+lists, bob buys" half is reachable. The buyer-callback rollback
+contract from §Task 5e is the load-bearing piece this screen
+exercises.
+
+- [ ] **13a** — Add a "Lost & Found" title-menu entry + scene listing
+      `active_listings` with deterministic ordering. Snapshot empty + populated. [11a, Task 5]
+- [ ] **13b** — Add "post a listing" flow: item key, display name (bounded by
+      `MARKET_DISPLAY_NAME_MAX_CHARS`), price, quantity. Calls `create_listing`.
+      Tests: at-limit display name passes; negative price/quantity rejected at UI. [13a]
+- [ ] **13c** — Add "buy" action that wires `buy_listing` with a buyer-balance
+      callback against the example's player wallet. Test: successful purchase
+      decrements quantity AND debits wallet AND appends `market.buy` world event;
+      callback failure leaves all three unchanged (the §Task 5e rollback contract
+      exercised end-to-end through the UI). [13b]
+
+### Task 14 — Murder Motel detective agency selector + shared goal
+
+Wires `Faction` / `FactionMembership` / `SharedGoal` +
+`join_faction` / `contribute_to_goal` into the example so completion
+condition #8's "both contribute to the same shared goal" is reachable.
+
+- [ ] **14a** — Add an "Agencies" title-menu entry + scene showing the two seeded
+      factions (`blue-desk`, `red-room`) with descriptions and current shared-goal
+      progress. Snapshot the layout. [Task 6, Task 2c]
+- [ ] **14b** — Wire `join_faction` and `leave_faction` from agency-detail actions.
+      Test: membership row created/removed. [14a]
+- [ ] **14c** — Seed one shared goal per agency at startup via `create_shared_goal`
+      (idempotent). Wire a "contribute" action that calls `contribute_to_goal`
+      with a player-supplied amount; UI reads back the updated `current_amount`
+      on next navigation (refresh-on-navigation, no polling). Test: two players
+      contribute, both see the combined total on next entry; reaching `target_amount`
+      flips state to `completed` per §Task 6g. [14b]
+
+### Task 15 — Murder Motel clue bounty board
+
+Wires `Bounty` + `post_bounty` / `claim_bounty` / `complete_bounty`
+into the example so completion condition #8's "bounty claim" half is
+reachable.
+
+- [ ] **15a** — Add a "Bounty board" title-menu entry + scene listing open and
+      claimed bounties. Snapshot empty + populated. [11a, Task 7]
+- [ ] **15b** — Add "post a bounty" flow: title (bounded by
+      `BOUNTY_TITLE_MAX_CHARS`), description (bounded by `BOUNTY_DESCRIPTION_MAX_CHARS`),
+      reward JSON, optional deadline. Calls `post_bounty`. Tests: at-limit pass,
+      one-over-limit fail. [15a]
+- [ ] **15c** — Wire `claim_bounty` from open-bounty detail and `complete_bounty`
+      from a "submit evidence" prompt on the claimant's claimed bounties. Test:
+      open → claimed → completed; second claimant rejected with typed error
+      surfaced; reward payload retained verbatim through completion. [15b]
+- [ ] **15d** — Add navigation-hook sweepers: call `expire_open_challenges(now)`
+      and `expire_bounties(now)` on title-menu entry so lapsed deadlines are
+      observable without polling. Test: a bounty seeded with a past deadline is
+      `expired` after one navigation cycle. [12, 15c]
+
+### Task 16 — Two-player local-dev async smoke (completion condition #8)
+
+The canonical proof that v3 actually works end-to-end. Documented in
+the commit body or `docs/async-multiplayer.md` per CLAUDE.md
+COMPLETION condition #8.
+
+- [ ] **16a** — Drive `cargo run --example murder_motel -- --local-dev-user alice`
+      and `--local-dev-user bob` through the four-flow smoke (guestbook notice,
+      market list/buy, agency contribution, bounty claim) per
+      SPEC §13.1's manual-verification protocol. Capture evidence (commit body
+      or `docs/async-multiplayer.md` appendix) showing each side observed the
+      other's action on next navigation, with no terminal corruption on quit.
+      [Tasks 11–15]
+- [ ] **16b** — Add a behavioural integration test (no live TUI) driving two
+      `WorldDb` handles against the same on-disk DB and asserting the
+      cross-player visibility of all four flows in one test, so the smoke is
+      regression-pinned. [16a]
 
 ## Acceptance criteria — gate for `<promise>V3_COMPLETE</promise>`
 
