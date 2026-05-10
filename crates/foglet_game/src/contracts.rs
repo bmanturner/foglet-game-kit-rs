@@ -95,13 +95,33 @@ impl ContractState {
 /// Errors for contract write/read helpers.
 #[derive(Debug, Error)]
 pub enum ContractError {
-    /// SQLite failed during a contract mutation or readback.
-    #[error("failed to persist contract row: {source}")]
+    /// SQLite failed during a contract write or read helper.
+    #[error("failed to query contract row: {source}")]
     Sqlite {
         /// Underlying SQL failure.
         #[source]
         source: rusqlite::Error,
     },
+}
+
+/// Optional filters for [`WorldDb::available_contracts`].
+///
+/// `available_contracts` always scopes to `state = "available"`. This
+/// struct narrows that set further without introducing game-specific
+/// vocabulary:
+///
+/// - In a **space exploration** game, `kind = Some("delivery")` can list
+///   only freight jobs currently open at a station.
+/// - In a **dungeon crawler**, `issuer_owner_kind = Some("guild")` can
+///   list only open guild commissions.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AvailableContractsFilter {
+    /// Optional contract kind match (exact string equality).
+    pub kind: Option<String>,
+    /// Optional issuer owner-kind match.
+    pub issuer_owner_kind: Option<String>,
+    /// Optional issuer owner-id match.
+    pub issuer_owner_id: Option<i64>,
 }
 
 /// Input payload for [`WorldDb::create_contract`].
@@ -214,6 +234,85 @@ RETURNING id, key, kind, issuer_owner_kind, issuer_owner_id, \
             )
             .map_err(|source| ContractError::Sqlite { source })
     }
+
+    /// Load a single contract by numeric id.
+    ///
+    /// Returns `Ok(None)` when the id is unknown. This keeps callers
+    /// explicit about "not found" as a normal state while still surfacing
+    /// SQL failures as typed errors.
+    ///
+    /// Genre-neutral examples:
+    ///
+    /// - In a **space exploration** game, open a delivery detail view for
+    ///   a selected board row id.
+    /// - In a **dungeon crawler**, resolve a guild mission id referenced by
+    ///   a room interaction script.
+    pub fn contract_by_id(&self, contract_id: i64) -> Result<Option<Contract>, ContractError> {
+        const SQL: &str = "\
+SELECT id, key, kind, issuer_owner_kind, issuer_owner_id, \
+       acceptor_player_id, state, objective_json, reward_json, metadata_json, \
+       created_at, accepted_at, completed_at, expires_at\n\
+FROM contracts\n\
+WHERE id = ?1";
+
+        match self
+            .connection()
+            .query_row(SQL, rusqlite::params![contract_id], row_to_contract)
+        {
+            Ok(contract) => Ok(Some(contract)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(source) => Err(ContractError::Sqlite { source }),
+        }
+    }
+
+    /// List all currently available contracts in deterministic order.
+    ///
+    /// The helper always scopes rows to `state = "available"` and then
+    /// applies optional filter fields from [`AvailableContractsFilter`].
+    ///
+    /// Deterministic ordering:
+    ///
+    /// - Primary sort: `created_at` ascending.
+    /// - Secondary sort: `id` ascending.
+    ///
+    /// The `id` tiebreaker avoids timestamp-collision nondeterminism when
+    /// multiple contracts are inserted within the same second.
+    pub fn available_contracts(
+        &self,
+        filter: &AvailableContractsFilter,
+    ) -> Result<Vec<Contract>, ContractError> {
+        const SQL: &str = "\
+SELECT id, key, kind, issuer_owner_kind, issuer_owner_id, \
+       acceptor_player_id, state, objective_json, reward_json, metadata_json, \
+       created_at, accepted_at, completed_at, expires_at\n\
+FROM contracts\n\
+WHERE state = ?1\n\
+  AND (?2 IS NULL OR kind = ?2)\n\
+  AND (?3 IS NULL OR issuer_owner_kind = ?3)\n\
+  AND (?4 IS NULL OR issuer_owner_id = ?4)\n\
+ORDER BY created_at ASC, id ASC";
+
+        let mut statement = self
+            .connection()
+            .prepare(SQL)
+            .map_err(|source| ContractError::Sqlite { source })?;
+
+        let rows = statement
+            .query_map(
+                rusqlite::params![
+                    ContractState::Available.as_str(),
+                    filter.kind.as_deref(),
+                    filter.issuer_owner_kind.as_deref(),
+                    filter.issuer_owner_id,
+                ],
+                row_to_contract,
+            )
+            .map_err(|source| ContractError::Sqlite { source })?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|source| ContractError::Sqlite { source })?;
+
+        Ok(rows)
+    }
 }
 
 /// Decode one `contracts` row in the column order used by this module.
@@ -238,9 +337,13 @@ fn row_to_contract(row: &rusqlite::Row<'_>) -> rusqlite::Result<Contract> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ContractState, CreateContractInput, CONTRACTS_MIGRATION};
+    use super::{
+        AvailableContractsFilter, ContractState, CreateContractInput, CONTRACTS_MIGRATION,
+    };
     use crate::world_db::WorldDb;
     use rusqlite::params;
+    use std::thread::sleep;
+    use std::time::Duration;
     use tempfile::tempdir;
 
     #[test]
@@ -413,5 +516,156 @@ mod tests {
             .expect("direct sql read returns contract payloads");
         assert_eq!(stored_objective, objective_json);
         assert_eq!(stored_reward, reward_json);
+    }
+
+    #[test]
+    fn contract_by_id_returns_row_when_present_and_none_when_missing() {
+        let dir = tempdir().expect("tempdir creates");
+        let db_path = dir.path().join("world.sqlite");
+        let mut world = WorldDb::open(&db_path).expect("open succeeds");
+        world
+            .apply_migration(&CONTRACTS_MIGRATION)
+            .expect("contracts migration applies");
+
+        let created = world
+            .create_contract(CreateContractInput {
+                key: Some("guild-relic-001"),
+                kind: "recovery",
+                issuer_owner_kind: "guild",
+                issuer_owner_id: 17,
+                objective_json: r#"{"target":"obsidian-idol"}"#,
+                reward_json: r#"{"favor":{"guild":5}}"#,
+                metadata_json: None,
+                expires_at: None,
+            })
+            .expect("contract creation succeeds");
+
+        let loaded = world
+            .contract_by_id(created.id)
+            .expect("lookup by id succeeds")
+            .expect("inserted id should exist");
+        assert_eq!(loaded, created);
+
+        let missing = world
+            .contract_by_id(created.id + 999)
+            .expect("query succeeds");
+        assert_eq!(missing, None);
+    }
+
+    #[test]
+    fn available_contracts_orders_deterministically_and_filters_fields() {
+        let dir = tempdir().expect("tempdir creates");
+        let db_path = dir.path().join("world.sqlite");
+        let mut world = WorldDb::open(&db_path).expect("open succeeds");
+        world
+            .apply_migration(&CONTRACTS_MIGRATION)
+            .expect("contracts migration applies");
+
+        let first = world
+            .create_contract(CreateContractInput {
+                key: Some("station-delivery"),
+                kind: "delivery",
+                issuer_owner_kind: "station",
+                issuer_owner_id: 10,
+                objective_json: r#"{"to":"sector-1"}"#,
+                reward_json: r#"{"credits":180}"#,
+                metadata_json: None,
+                expires_at: None,
+            })
+            .expect("first insert succeeds");
+
+        sleep(Duration::from_millis(1_100));
+
+        let second = world
+            .create_contract(CreateContractInput {
+                key: Some("guild-clearance"),
+                kind: "clearance",
+                issuer_owner_kind: "guild",
+                issuer_owner_id: 77,
+                objective_json: r#"{"room":"catacomb-west"}"#,
+                reward_json: r#"{"favor":{"guild":2}}"#,
+                metadata_json: None,
+                expires_at: None,
+            })
+            .expect("second insert succeeds");
+
+        // Ensure non-available rows are excluded from the "available" list.
+        world
+            .connection()
+            .execute(
+                "UPDATE contracts SET state = ?1 WHERE id = ?2",
+                rusqlite::params![ContractState::Accepted.as_str(), second.id],
+            )
+            .expect("state update succeeds");
+
+        let third = world
+            .create_contract(CreateContractInput {
+                key: Some("guild-recovery"),
+                kind: "recovery",
+                issuer_owner_kind: "guild",
+                issuer_owner_id: 77,
+                objective_json: r#"{"target":"sun-seal"}"#,
+                reward_json: r#"{"items":["moon-key"]}"#,
+                metadata_json: None,
+                expires_at: None,
+            })
+            .expect("third insert succeeds");
+
+        let all_available = world
+            .available_contracts(&AvailableContractsFilter::default())
+            .expect("available list query succeeds");
+        assert_eq!(
+            all_available
+                .iter()
+                .map(|contract| contract.id)
+                .collect::<Vec<_>>(),
+            vec![first.id, third.id],
+            "stable ordering should follow created_at ASC with id tie-breaks"
+        );
+
+        let guild_only = world
+            .available_contracts(&AvailableContractsFilter {
+                kind: None,
+                issuer_owner_kind: Some("guild".to_string()),
+                issuer_owner_id: None,
+            })
+            .expect("issuer-kind filter query succeeds");
+        assert_eq!(
+            guild_only
+                .iter()
+                .map(|contract| contract.id)
+                .collect::<Vec<_>>(),
+            vec![third.id]
+        );
+
+        let recovery_only = world
+            .available_contracts(&AvailableContractsFilter {
+                kind: Some("recovery".to_string()),
+                issuer_owner_kind: None,
+                issuer_owner_id: None,
+            })
+            .expect("kind filter query succeeds");
+        assert_eq!(
+            recovery_only
+                .iter()
+                .map(|contract| contract.id)
+                .collect::<Vec<_>>(),
+            vec![third.id]
+        );
+
+        let station_issuer = world
+            .available_contracts(&AvailableContractsFilter {
+                kind: None,
+                issuer_owner_kind: None,
+                issuer_owner_id: Some(10),
+            })
+            .expect("issuer-id filter query succeeds");
+        assert_eq!(
+            station_issuer
+                .iter()
+                .map(|contract| contract.id)
+                .collect::<Vec<_>>(),
+            vec![first.id]
+        );
     }
 }
