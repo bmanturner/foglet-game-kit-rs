@@ -42,6 +42,7 @@ pub mod factions;
 pub mod foglet;
 pub mod input;
 pub mod inventory;
+pub mod inventory_capacity;
 pub mod job_board;
 pub mod job_board_screen;
 pub mod leaderboards;
@@ -96,6 +97,7 @@ pub use foglet::{
 };
 pub use input::{from_event, from_key_event, Input};
 pub use inventory::{InventoryError, InventorySlot, INVENTORY_SLOTS_MIGRATION};
+pub use inventory_capacity::{CapacityError, CapacityPolicy};
 pub use job_board::{
     BountyProvider, BuiltInProviders, ChallengeProvider, ContractProvider, JobBoard, JobBoardEntry,
     JobBoardError, JobBoardFilter, JobBoardSort, JobBoardSource, OpportunityProvider,
