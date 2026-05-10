@@ -124,6 +124,15 @@ pub enum RouteError {
         #[source]
         source: rusqlite::Error,
     },
+    /// The underlying SQL query for outbound adjacency failed.
+    #[error("failed to list outbound routes for `{from_place_id}`: {source}")]
+    ListOutbound {
+        /// Source place id for diagnostics.
+        from_place_id: i64,
+        /// Underlying `rusqlite` error.
+        #[source]
+        source: rusqlite::Error,
+    },
 }
 
 /// Migration for the shared `places` table (SPEC_v4 Task 3a).
@@ -303,6 +312,49 @@ RETURNING from_place_id, to_place_id, id, kind, requirements_json, metadata_json
                 to_place_id,
                 source,
             })
+    }
+
+    /// Query all routes whose source is `from_place_id`.
+    ///
+    /// This is the directed adjacency view used by movement logic. It
+    /// does **not** auto-materialise reverse edges; a bidirectional
+    /// connection must be represented as two explicit route rows by game
+    /// code.
+    ///
+    /// In a **space exploration** game, this gives a craft the outgoing
+    /// options from a dock node (toward a mining outpost or customs
+    /// station) without implying any return lanes.
+    ///
+    /// In a **dungeon crawler**, this yields all corridors/chutes/stair
+    /// passages that depart from a chamber, while the reverse direction
+    /// is only available if authored separately.
+    pub fn outbound_routes(&self, from_place_id: i64) -> Result<Vec<Route>, RouteError> {
+        const SQL: &str = "\
+SELECT from_place_id, to_place_id, id, kind, requirements_json, metadata_json, created_at\n\
+FROM routes\n\
+WHERE from_place_id = ?1\n\
+ORDER BY to_place_id ASC, id ASC";
+
+        let mut stmt =
+            self.connection()
+                .prepare(SQL)
+                .map_err(|source| RouteError::ListOutbound {
+                    from_place_id,
+                    source,
+                })?;
+        let routes = stmt
+            .query_map(rusqlite::params![from_place_id], row_to_route)
+            .map_err(|source| RouteError::ListOutbound {
+                from_place_id,
+                source,
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|source| RouteError::ListOutbound {
+                from_place_id,
+                source,
+            })?;
+
+        Ok(routes)
     }
 
     /// Load one place by its stable `key`.
@@ -791,5 +843,86 @@ mod tests {
             .expect("route row should be queryable by id");
 
         assert_eq!(route, by_id);
+    }
+
+    /// SPEC_v4 Task 4c — `outbound_routes` must reflect only the source
+    /// side of the directed route row.
+    ///
+    /// This is a strict-direction test: one route A→B and one route B→A
+    /// are both valid rows, but querying outbound from A only returns A→B.
+    #[test]
+    fn outbound_routes_filters_to_source_only() {
+        let dir = tempdir().expect("tempdir creates");
+        let db_path = dir.path().join("world.sqlite");
+        let mut world = WorldDb::open(&db_path).expect("open succeeds");
+
+        world
+            .apply_migration(&PLACES_MIGRATION)
+            .expect("places migration applies");
+        world
+            .apply_migration(&ROUTES_MIGRATION)
+            .expect("routes migration applies");
+
+        let star_hatch = world
+            .insert_place("star-hatch", "Star Hatch", "hatch", None)
+            .expect("source place inserts");
+        let refinery = world
+            .insert_place("refinery", "Refinery", "facility", None)
+            .expect("destination place inserts");
+        let hangar = world
+            .insert_place("hangar", "Hangar", "hangar", None)
+            .expect("alternate destination inserts");
+
+        let forward = world
+            .create_route(
+                star_hatch.id,
+                refinery.id,
+                "airlock",
+                None,
+                Some(r#"{"route":"hatch-to-refinery"}"#),
+            )
+            .expect("outbound route inserts");
+        world
+            .create_route(
+                refinery.id,
+                star_hatch.id,
+                "airlock",
+                None,
+                Some(r#"{"route":"refinery-return"}"#),
+            )
+            .expect("inbound route inserts");
+        let second_outbound = world
+            .create_route(
+                star_hatch.id,
+                hangar.id,
+                "supply-shaft",
+                None,
+                Some(r#"{"route":"hatch-to-hangar"}"#),
+            )
+            .expect("second outbound route inserts");
+
+        let routes = world
+            .outbound_routes(star_hatch.id)
+            .expect("outbound query should succeed");
+        assert_eq!(routes.len(), 2);
+        assert_eq!(routes[0].from_place_id, star_hatch.id);
+        assert_eq!(routes[1].from_place_id, star_hatch.id);
+        assert_eq!(routes[0].to_place_id, refinery.id);
+        assert_eq!(routes[1].to_place_id, hangar.id);
+        assert_eq!(routes[0].kind, "airlock");
+        assert_eq!(routes[1].kind, "supply-shaft");
+        assert_eq!(routes, vec![forward, second_outbound]);
+
+        let inbound_routes: Vec<_> = world
+            .connection()
+            .prepare("SELECT from_place_id, to_place_id, id, kind, requirements_json, metadata_json, created_at FROM routes WHERE from_place_id = ?1")
+            .expect("inbound query preparable")
+            .query_map(rusqlite::params![refinery.id], super::row_to_route)
+            .expect("inbound queryable")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("inbound decode");
+        assert_eq!(inbound_routes.len(), 1);
+        assert_eq!(inbound_routes[0].from_place_id, refinery.id);
+        assert_eq!(inbound_routes[0].to_place_id, star_hatch.id);
     }
 }
