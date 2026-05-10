@@ -45,6 +45,7 @@ pub mod manifest;
 pub mod map;
 pub mod market;
 pub mod notices;
+pub mod place_recall;
 pub mod players;
 pub mod presence;
 pub mod prompt;
@@ -98,6 +99,7 @@ pub use market::{
     MARKET_LISTINGS_MIGRATION,
 };
 pub use notices::{Notice, NoticeError, NOTICES_MIGRATION, NOTICE_SUBJECT_MAX_CHARS};
+pub use place_recall::PLACE_RECALL_MIGRATION;
 pub use players::{PlayerError, PlayerRecord, PLAYERS_MIGRATION};
 pub use presence::{PresenceRecord, PRESENCE_MIGRATION};
 pub use prompt::{
