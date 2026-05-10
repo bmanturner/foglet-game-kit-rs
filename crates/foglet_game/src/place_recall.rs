@@ -1,5 +1,5 @@
-//! `place_recall` — discovered-place memory schema and touch primitive
-//! (SPEC_v4 Task 6a, Task 6b).
+//! `place_recall` — discovered-place memory schema and touch/query primitives
+//! (SPEC_v4 Task 6a, Task 6b, Task 6e).
 //!
 //! This module introduces the storage primitive for fog-of-war and
 //! place-memory features. The schema is intentionally minimal and keeps
@@ -60,6 +60,15 @@ pub enum PlaceRecallError {
         player_id: i64,
         /// Place identifier used in `touch_recall`.
         place_id: i64,
+        /// Underlying SQL failure (constraint, lock, corruption, etc.).
+        #[source]
+        source: rusqlite::Error,
+    },
+    /// Querying a player's recall list failed.
+    #[error("failed to list recall entries for player `{player_id}`: {source}")]
+    ListFailed {
+        /// Player identifier used in `recall_for_player`.
+        player_id: i64,
         /// Underlying SQL failure (constraint, lock, corruption, etc.).
         #[source]
         source: rusqlite::Error,
@@ -138,6 +147,44 @@ RETURNING player_id, place_id, first_seen_at, last_seen_at, snapshot_json";
                 place_id,
                 source,
             })
+    }
+
+    /// List a player's known places in recall order (most recently
+    /// touched first).
+    ///
+    /// The primitive is intentionally thin. It does **not** infer "seen"
+    /// semantics; games own that decision. The query returns every known
+    /// `(place_id, first_seen_at, last_seen_at)` row for one player
+    /// sorted deterministically so fog-of-war and minimap UIs remain
+    /// stable across process restarts.
+    ///
+    /// # Genre-neutral usage
+    ///
+    /// - In a **space exploration** game, this gives a crew officer a
+    ///   stable list of recently scanned waypoints to render as a
+    ///   recently-visited list.
+    /// - In a **dungeon crawler**, it yields a deterministic revisit
+    ///   order for room-memory panes after a character moves through
+    ///   multiple halls.
+    pub fn recall_for_player(
+        &self,
+        player_id: i64,
+    ) -> Result<Vec<PlaceRecallRecord>, PlaceRecallError> {
+        const SQL: &str = "\
+SELECT player_id, place_id, first_seen_at, last_seen_at, snapshot_json\n\
+FROM place_recall\n\
+WHERE player_id = ?1\n\
+ORDER BY last_seen_at DESC, place_id DESC";
+
+        let mut statement = self
+            .connection()
+            .prepare(SQL)
+            .map_err(|source| PlaceRecallError::ListFailed { player_id, source })?;
+        let rows = statement
+            .query_map(rusqlite::params![player_id], row_to_place_recall)
+            .map_err(|source| PlaceRecallError::ListFailed { player_id, source })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|source| PlaceRecallError::ListFailed { player_id, source })
     }
 }
 
@@ -457,5 +504,70 @@ mod tests {
             row.snapshot_json, third.snapshot_json,
             "persistent row should mirror latest in-memory touch result"
         );
+    }
+
+    /// Task 6e requires `recall_for_player` to return records in
+    /// deterministic newest-first order.
+    ///
+    /// The contract is intentionally simple: a higher-level game UI can
+    /// render visit history for recall panels without reordering, and if
+    /// multiple rows share a timestamp the implementation stays stable.
+    /// This supports both **space exploration** scout logs and **dungeon**
+    /// revisit maps.
+    #[test]
+    fn recall_for_player_returns_newest_first_deterministically() {
+        let dir = tempdir().expect("tempdir creates");
+        let db_path = dir.path().join("world.sqlite");
+        let mut world = WorldDb::open(&db_path).expect("open succeeds");
+
+        world
+            .apply_migration(&PLAYERS_MIGRATION)
+            .expect("players migration applies");
+        world
+            .apply_migration(&PLACES_MIGRATION)
+            .expect("places migration applies");
+        world
+            .apply_migration(&PLACE_RECALL_MIGRATION)
+            .expect("place_recall migration applies");
+
+        let player_id: i64 = world
+            .connection()
+            .query_row(
+                "INSERT INTO players (handle) VALUES (?1) RETURNING id",
+                rusqlite::params!["Signal Operator"],
+                |row| row.get(0),
+            )
+            .expect("fixture player inserts");
+
+        let hub = world
+            .insert_place("orbital-hub", "Orbital Hub", "hub", None)
+            .expect("fixture place insert");
+        let tunnel = world
+            .insert_place("tunnel", "Maintenance Tunnel", "corridor", None)
+            .expect("fixture place insert");
+        let vault = world
+            .insert_place("copper-vault", "Copper Vault", "vault", None)
+            .expect("fixture place insert");
+
+        let hub_recall = world
+            .touch_recall(player_id, hub.id, Some(r#"{"channel":"beacon"}"#))
+            .expect("older recall entry");
+        sleep(Duration::from_secs(1));
+        let tunnel_recall = world
+            .touch_recall(player_id, tunnel.id, Some(r#"{"channel":"maintenance"}"#))
+            .expect("newer recall entry");
+        sleep(Duration::from_secs(1));
+        let vault_recall = world
+            .touch_recall(player_id, vault.id, Some(r#"{"channel":"alarms"}"#))
+            .expect("newest recall entry");
+
+        let items = world
+            .recall_for_player(player_id)
+            .expect("recall_for_player succeeds");
+
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0], vault_recall);
+        assert_eq!(items[1], tunnel_recall);
+        assert_eq!(items[2], hub_recall);
     }
 }
