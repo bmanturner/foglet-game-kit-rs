@@ -68,7 +68,10 @@ pub use dialog::{
 };
 pub use dialog_screen::{DialogAction, DialogLayout, DialogScreen};
 pub use events::{EventError, EventRecord, MAX_EVENT_MESSAGE_LEN, WORLD_EVENTS_MIGRATION};
-pub use factions::{Faction, FactionError, FactionMembership, SharedGoal, FACTIONS_MIGRATION};
+pub use factions::{
+    Faction, FactionError, FactionMembership, SharedGoal, FACTIONS_MIGRATION,
+    FACTION_GOAL_COMPLETED_EVENT_KIND,
+};
 pub use foglet::{
     load_context, load_context_from_env, load_context_from_file, load_context_with_options,
     process_env, synthesize_local_dev, ContextError, ContextSource, FogletContext, LoadOptions,

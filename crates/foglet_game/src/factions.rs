@@ -54,7 +54,19 @@
 use thiserror::Error;
 
 use crate::config::FactionSeed;
+use crate::events::EventError;
 use crate::world_db::{WorldDb, WorldMigration};
+
+/// `world_events.kind` value the kit emits when a shared goal is
+/// flipped from `'active'` to `'completed'` by
+/// [`WorldDb::complete_goal_if_reached`] (SPEC_v3 §4.4 / §Task 6g).
+///
+/// Exposed as a `pub const` (rather than a hard-coded string at the
+/// call site) so consuming games can pattern-match against it in a
+/// lobby-bulletin renderer or per-player history filter without
+/// risking a typo. Same convention as
+/// [`crate::market::MARKET_BUY_EVENT_KIND`].
+pub const FACTION_GOAL_COMPLETED_EVENT_KIND: &str = "faction.goal.completed";
 
 /// Schema for the faction, faction_membership, and shared_goal
 /// tables — SPEC_v3 §4.4 / §Task 6a.
@@ -419,6 +431,26 @@ pub enum FactionError {
         /// [`crate::market::MarketError::BuyerCallback`].
         #[source]
         source: rusqlite::Error,
+    },
+    /// The world-event append that fires after a shared goal is
+    /// flipped from `'active'` to `'completed'` by
+    /// [`WorldDb::complete_goal_if_reached`] failed (SPEC_v3 §4.4 /
+    /// §Task 6g). The wrapping transaction rolls back as a unit, so
+    /// the goal stays `'active'` and `completed_at` stays `NULL` —
+    /// the SPEC §4.4 "completion MUST be transactional with its
+    /// world event" guarantee. Distinct from [`Self::Sqlite`] so the
+    /// agency UI can surface the event-append phase explicitly (in
+    /// practice this is an operator-fix path: the `world_events`
+    /// migration was never applied, or the rendered event message
+    /// blew through `MAX_EVENT_MESSAGE_LEN`). Same shape as
+    /// [`crate::market::MarketError::Event`].
+    #[error(
+        "failed to append faction.goal.completed world event; transaction rolled back: {source}"
+    )]
+    Event {
+        /// Underlying [`EventError`] returned by `append_event_on`.
+        #[source]
+        source: EventError,
     },
 }
 
@@ -1076,6 +1108,189 @@ RETURNING id, faction_id, key, target_amount, current_amount, state, created_at,
             .map_err(|source| FactionError::Sqlite { source })?;
 
         Ok(goal)
+    }
+
+    /// Flip a shared goal from `'active'` to `'completed'` when its
+    /// `current_amount` has reached `target_amount`, atomically
+    /// appending a [`FACTION_GOAL_COMPLETED_EVENT_KIND`] world event
+    /// in the same transaction (SPEC_v3 §4.4 / §Task 6g).
+    ///
+    /// Task 6f's [`Self::contribute_to_goal`] deliberately does not
+    /// flip state — splitting completion into a second helper keeps
+    /// each transactional path testable in isolation and lets games
+    /// decide *when* to evaluate completion (after every contribute,
+    /// at end-of-turn, on screen-render). The expected pairing is
+    /// `contribute_to_goal(...)?` immediately followed by
+    /// `complete_goal_if_reached(goal_id)?`.
+    ///
+    /// # Behaviour matrix
+    ///
+    /// | goal state on entry         | result                                                |
+    /// |-----------------------------|-------------------------------------------------------|
+    /// | not found                   | `Err(GoalNotFound)`                                   |
+    /// | active, current < target    | returns the unchanged active row, no event emitted    |
+    /// | active, current ≥ target    | flips state→completed, stamps `completed_at`, emits 1 |
+    /// | completed (already)         | idempotent: returns existing row, no event emitted    |
+    ///
+    /// The "already completed" path is idempotent rather than an
+    /// error because games are expected to call this helper after
+    /// every contribute — a UI race that lands two completions back-
+    /// to-back must not surface as a failure to the second caller,
+    /// and no second event is emitted so the lobby bulletin renders
+    /// exactly one "goal solved" line per goal lifecycle (SPEC §4.4
+    /// "completion is observable exactly once").
+    ///
+    /// # Atomicity
+    ///
+    /// The state flip and the world-event append run inside one
+    /// `rusqlite::Transaction`. A failure on either side rolls both
+    /// back: a callback-style failure can't happen here (no caller
+    /// hook), but if `append_event_on` fails (missing
+    /// `world_events` migration, message exceeds
+    /// [`crate::events::MAX_EVENT_MESSAGE_LEN`]) the goal stays
+    /// `'active'` and the agency UI's "solved!" toast does not fire
+    /// without a corresponding bulletin entry — SPEC §4.4
+    /// "completion MUST be transactional with its world event".
+    ///
+    /// # Attribution
+    ///
+    /// The emitted event is a *system* row (`player_id = NULL`):
+    /// completion is the consequence of the membership's collective
+    /// effort, not a single player's action. The lobby bulletin
+    /// surfaces it as "the Blue Desk solved its clue board" rather
+    /// than attributing it to whichever player happened to land the
+    /// final tipping contribution. Per-player history surfaces are
+    /// powered by `world_events.player_id IS NOT NULL` (the partial
+    /// index `idx_world_events_player_recent`), so a NULL row here
+    /// stays out of any single player's "your last N actions" view —
+    /// the right shape for a faction-scoped event.
+    ///
+    /// # Concurrency / borrow shape
+    ///
+    /// `&mut self` because the helper opens a transaction, the same
+    /// shape as [`Self::contribute_to_goal`] and
+    /// [`Self::buy_listing`]. SQLite's BEGIN IMMEDIATE plus the
+    /// configured busy timeout serialises concurrent completion
+    /// attempts; whichever transaction commits first observes the
+    /// post-flip state and the other reads `'completed'` on its
+    /// diagnostic SELECT and takes the idempotent return path.
+    pub fn complete_goal_if_reached(&mut self, goal_id: i64) -> Result<SharedGoal, FactionError> {
+        // Snapshot the row inside a transaction so the state
+        // decision and the (optional) flip see a consistent view.
+        // BEGIN IMMEDIATE (rusqlite default for `transaction()`)
+        // takes a write lock up front; concurrent completers hit
+        // the busy timeout and serialise, so the "already
+        // completed" idempotent path triggers cleanly for the
+        // loser of the race.
+        let tx = self
+            .connection_mut()
+            .transaction()
+            .map_err(|source| FactionError::Sqlite { source })?;
+
+        const SELECT_SQL: &str = "\
+SELECT id, faction_id, key, target_amount, current_amount, state, created_at, completed_at \
+FROM shared_goals WHERE id = ?1";
+
+        let goal: SharedGoal =
+            match tx.query_row(SELECT_SQL, rusqlite::params![goal_id], row_to_shared_goal) {
+                Ok(goal) => goal,
+                Err(rusqlite::Error::QueryReturnedNoRows) => {
+                    drop(tx);
+                    return Err(FactionError::GoalNotFound { id: goal_id });
+                }
+                Err(source) => {
+                    drop(tx);
+                    return Err(FactionError::Sqlite { source });
+                }
+            };
+
+        // Idempotent already-completed path: return the existing
+        // row with no flip and no event. The transaction
+        // contributed nothing, so the rollback-on-drop is a
+        // no-op — the explicit drop documents the intent.
+        if goal.state == "completed" {
+            drop(tx);
+            return Ok(goal);
+        }
+
+        // Active but under target: nothing to do. Same drop-and-
+        // return shape as the already-completed path; the
+        // contract is "calling this helper before the goal is
+        // ready is cheap and a no-op".
+        if goal.current_amount < goal.target_amount {
+            drop(tx);
+            return Ok(goal);
+        }
+
+        // Active and target reached: flip state, stamp
+        // `completed_at`, and append the world event — all inside
+        // the open transaction. The conditional `WHERE state =
+        // 'active'` is belt-and-braces: the SELECT above already
+        // saw `'active'`, but pinning the predicate here means a
+        // concurrent completer that somehow slipped in (despite
+        // the IMMEDIATE lock) would receive zero rows and flunk
+        // back into the already-completed branch on retry rather
+        // than double-flipping.
+        const UPDATE_SQL: &str = "\
+UPDATE shared_goals \
+SET state = 'completed', completed_at = CURRENT_TIMESTAMP \
+WHERE id = ?1 AND state = 'active' \
+RETURNING id, faction_id, key, target_amount, current_amount, state, created_at, completed_at";
+
+        let completed = tx
+            .query_row(UPDATE_SQL, rusqlite::params![goal_id], row_to_shared_goal)
+            .map_err(|source| FactionError::Sqlite { source })?;
+
+        let event_message = format_goal_completed_event_message(&completed);
+        crate::events::append_event_on(
+            &tx,
+            FACTION_GOAL_COMPLETED_EVENT_KIND,
+            // System event: completion belongs to the membership
+            // collectively, not the player who landed the final
+            // contribution. See doc-comment "Attribution".
+            None,
+            &event_message,
+            None,
+        )
+        .map_err(|source| FactionError::Event { source })?;
+
+        tx.commit()
+            .map_err(|source| FactionError::Sqlite { source })?;
+
+        Ok(completed)
+    }
+}
+
+/// Render the human-readable `world_events.message` body the kit
+/// emits when a shared goal flips to `'completed'` (SPEC_v3 §Task
+/// 6g). Pulled into a free function so the
+/// `complete_goal_if_reached` callsite stays focused on
+/// transactional plumbing and tests can assert the exact rendered
+/// shape without re-running the full completion round-trip — same
+/// shape as `format_market_buy_event_message`.
+///
+/// Format: `shared goal #{id} ({key}) reached its target of {target}` —
+/// or, when the goal is faction-scoped, the message is prefixed with
+/// the faction id so the bulletin can render "faction #3 …" without
+/// a second SQL round-trip to look up the slug. The post-flip
+/// `current_amount` is intentionally omitted: the flip is the
+/// observable event, and over-shoots are an internal accounting
+/// detail that doesn't belong in a player-facing bulletin line.
+fn format_goal_completed_event_message(goal: &SharedGoal) -> String {
+    match goal.faction_id {
+        Some(faction_id) => format!(
+            "faction #{faction_id} shared goal #{id} ({key}) reached its target of {target}",
+            faction_id = faction_id,
+            id = goal.id,
+            key = goal.key,
+            target = goal.target_amount,
+        ),
+        None => format!(
+            "shared goal #{id} ({key}) reached its target of {target}",
+            id = goal.id,
+            key = goal.key,
+            target = goal.target_amount,
+        ),
     }
 }
 
@@ -2637,6 +2852,287 @@ mod tests {
         );
     }
 
+    /// SPEC_v3 §Task 6g acceptance: a goal whose `current_amount`
+    /// has reached its `target_amount` flips state to `'completed'`,
+    /// stamps `completed_at`, AND appends exactly one
+    /// `faction.goal.completed` world event in the same
+    /// transaction. Three regression vectors layered into one test
+    /// because they form one atomic contract: a regression that
+    /// flipped state without emitting the event, or emitted the
+    /// event without flipping state, would silently break the lobby
+    /// bulletin's "every completed line corresponds to a real
+    /// flip" invariant.
+    #[test]
+    fn complete_goal_if_reached_flips_state_and_emits_event_at_target() {
+        let (_dir, mut world) = world_with_factions();
+        let goal = world.create_shared_goal(None, "blue-desk.cb", 100).unwrap();
+        // Land contributions exactly at target so the helper has
+        // an unambiguous "ready to flip" trigger.
+        world
+            .contribute_to_goal(goal.id, 60, |_, _| Ok(()))
+            .unwrap();
+        world
+            .contribute_to_goal(goal.id, 40, |_, _| Ok(()))
+            .unwrap();
+
+        let completed = world
+            .complete_goal_if_reached(goal.id)
+            .expect("completion succeeds at target");
+        assert_eq!(completed.id, goal.id, "stable id across the flip");
+        assert_eq!(completed.state, "completed");
+        assert!(
+            completed.completed_at.is_some(),
+            "completed_at stamped by SQLite on the flip"
+        );
+        assert_eq!(
+            completed.current_amount, 100,
+            "running total preserved across the flip"
+        );
+
+        // Durability check: the post-flip state survives a fresh
+        // SELECT. Pins the regression vector "the helper builds the
+        // returned struct from in-memory state and forgot to commit".
+        let (state, completed_at): (String, Option<String>) = world
+            .connection()
+            .query_row(
+                "SELECT state, completed_at FROM shared_goals WHERE id = ?1",
+                [goal.id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(state, "completed");
+        assert!(completed_at.is_some());
+
+        // Exactly one `faction.goal.completed` event was appended,
+        // and it's a system row (player_id IS NULL — see the helper
+        // doc-comment on Attribution).
+        let events = world.recent_events(10).unwrap();
+        let completion_events: Vec<_> = events
+            .iter()
+            .filter(|e| e.kind == FACTION_GOAL_COMPLETED_EVENT_KIND)
+            .collect();
+        assert_eq!(
+            completion_events.len(),
+            1,
+            "exactly one completion event emitted"
+        );
+        assert!(
+            completion_events[0].player_id.is_none(),
+            "completion is a system event, not attributed to a player"
+        );
+        assert!(
+            completion_events[0]
+                .message
+                .contains(&format!("#{}", goal.id)),
+            "event message references the goal id"
+        );
+        assert!(
+            completion_events[0].message.contains("blue-desk.cb"),
+            "event message references the goal key"
+        );
+    }
+
+    /// SPEC §Task 6g idempotency: calling `complete_goal_if_reached`
+    /// a second time on an already-completed goal returns the same
+    /// row, does NOT re-flip, and does NOT emit a second event.
+    /// Pins the lobby invariant "completion is observable exactly
+    /// once" against a regression that re-emitted on every call.
+    #[test]
+    fn complete_goal_if_reached_is_idempotent_for_already_completed_goal() {
+        let (_dir, mut world) = world_with_factions();
+        let goal = world.create_shared_goal(None, "k", 50).unwrap();
+        world
+            .contribute_to_goal(goal.id, 50, |_, _| Ok(()))
+            .unwrap();
+        let first = world.complete_goal_if_reached(goal.id).unwrap();
+
+        let second = world
+            .complete_goal_if_reached(goal.id)
+            .expect("second call returns Ok");
+        assert_eq!(first.id, second.id);
+        assert_eq!(
+            first.completed_at, second.completed_at,
+            "completed_at is stable across re-calls — second flip would refresh it"
+        );
+        assert_eq!(first.state, second.state);
+
+        let event_count: i64 = world
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM world_events WHERE kind = ?1",
+                [FACTION_GOAL_COMPLETED_EVENT_KIND],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            event_count, 1,
+            "exactly one completion event across both calls"
+        );
+    }
+
+    /// SPEC §Task 6g: a goal whose `current_amount` is below its
+    /// `target_amount` is a no-op — returns the unchanged active
+    /// row, no flip, no event. The expected pairing is
+    /// `contribute_to_goal` followed by `complete_goal_if_reached`
+    /// after every contribute, so the under-target path needs to be
+    /// cheap and observable as "nothing happened".
+    #[test]
+    fn complete_goal_if_reached_is_noop_when_below_target() {
+        let (_dir, mut world) = world_with_factions();
+        let goal = world.create_shared_goal(None, "k", 100).unwrap();
+        world
+            .contribute_to_goal(goal.id, 25, |_, _| Ok(()))
+            .unwrap();
+
+        let returned = world
+            .complete_goal_if_reached(goal.id)
+            .expect("under-target call succeeds");
+        assert_eq!(returned.state, "active", "stays active");
+        assert!(returned.completed_at.is_none(), "no completed_at stamp");
+        assert_eq!(returned.current_amount, 25);
+
+        let event_count: i64 = world
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM world_events WHERE kind = ?1",
+                [FACTION_GOAL_COMPLETED_EVENT_KIND],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(event_count, 0, "no event emitted under target");
+    }
+
+    /// SPEC §Task 6g: an over-shoot (current_amount > target_amount)
+    /// still triggers completion. The schema deliberately does not
+    /// clamp `current_amount` at `target_amount` (see
+    /// `contribute_to_goal`'s doc on the no-clamp choice), so games
+    /// that don't pre-cap the final contribution must still get a
+    /// completion. Pins the comparison as `>=`, not `==`, against a
+    /// regression that strict-equality'd the trigger and stranded
+    /// over-shot goals in `'active'` forever.
+    #[test]
+    fn complete_goal_if_reached_flips_on_overshoot() {
+        let (_dir, mut world) = world_with_factions();
+        let goal = world.create_shared_goal(None, "k", 100).unwrap();
+        world
+            .contribute_to_goal(goal.id, 150, |_, _| Ok(()))
+            .unwrap();
+
+        let completed = world.complete_goal_if_reached(goal.id).unwrap();
+        assert_eq!(completed.state, "completed");
+        assert_eq!(
+            completed.current_amount, 150,
+            "over-shoot preserved on the flipped row"
+        );
+    }
+
+    /// SPEC §Task 6g: a missing goal id surfaces the typed
+    /// `GoalNotFound` variant — same diagnostic split as
+    /// `contribute_to_goal_returns_not_found_for_missing_goal` so
+    /// the agency UI can render "this goal has been removed" rather
+    /// than swallowing it.
+    #[test]
+    fn complete_goal_if_reached_returns_not_found_for_missing_goal() {
+        let (_dir, mut world) = world_with_factions();
+        let err = world
+            .complete_goal_if_reached(9999)
+            .expect_err("missing goal must error");
+        match err {
+            FactionError::GoalNotFound { id } => assert_eq!(id, 9999),
+            other => panic!("expected GoalNotFound, got {other:?}"),
+        }
+    }
+
+    /// SPEC §4.4 "completion MUST be transactional with its world
+    /// event": if the event append fails, the state flip rolls
+    /// back. Drive the failure by reaching for an event message
+    /// that exceeds [`crate::events::MAX_EVENT_MESSAGE_LEN`] —
+    /// achieved here by setting an obscenely long `key` so the
+    /// rendered message blows the validator. Asserts that
+    /// `Event { source }` surfaces AND the goal is still
+    /// `'active'` with `completed_at IS NULL` and zero events
+    /// emitted — the three rollback vectors that prove atomicity.
+    #[test]
+    fn complete_goal_if_reached_rolls_back_when_event_append_fails() {
+        let (_dir, mut world) = world_with_factions();
+        // Build a key whose rendered event message will exceed
+        // MAX_EVENT_MESSAGE_LEN. The render template prepends
+        // "shared goal #{id} (" and appends ") reached its target
+        // of {target}", so a key longer than the limit on its own
+        // is a guaranteed overflow.
+        let huge_key = "x".repeat(crate::events::MAX_EVENT_MESSAGE_LEN + 50);
+        let goal = world
+            .create_shared_goal(None, &huge_key, 10)
+            .expect("create accepts the long key — schema doesn't constrain key length");
+        world
+            .contribute_to_goal(goal.id, 10, |_, _| Ok(()))
+            .unwrap();
+
+        let err = world
+            .complete_goal_if_reached(goal.id)
+            .expect_err("event-append overflow must error");
+        match err {
+            FactionError::Event { .. } => {}
+            other => panic!("expected Event, got {other:?}"),
+        }
+
+        // Goal stayed 'active' — the flip rolled back with the
+        // failed append.
+        let (state, completed_at): (String, Option<String>) = world
+            .connection()
+            .query_row(
+                "SELECT state, completed_at FROM shared_goals WHERE id = ?1",
+                [goal.id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(state, "active", "state rolled back to active");
+        assert!(completed_at.is_none(), "completed_at rolled back to NULL");
+
+        let event_count: i64 = world
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM world_events WHERE kind = ?1",
+                [FACTION_GOAL_COMPLETED_EVENT_KIND],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(event_count, 0, "no completion event committed");
+    }
+
+    /// SPEC §Task 6g: a faction-scoped goal's completion event
+    /// includes the faction id in the message so the lobby
+    /// bulletin can render "faction #N …" without a second SQL
+    /// round-trip to look up the slug. Pins the format-function
+    /// branch on `faction_id.is_some()` against a regression that
+    /// dropped the prefix.
+    #[test]
+    fn complete_goal_if_reached_event_message_includes_faction_id() {
+        let (_dir, mut world) = world_with_factions();
+        let factions = world
+            .seed_factions(&[FactionSeed {
+                slug: "blue-desk".to_string(),
+                display_name: "Blue Desk".to_string(),
+                description: "the blue agency".to_string(),
+            }])
+            .unwrap();
+        let blue_id = factions[0].id;
+        let goal = world.create_shared_goal(Some(blue_id), "cb", 1).unwrap();
+        world.contribute_to_goal(goal.id, 1, |_, _| Ok(())).unwrap();
+        world.complete_goal_if_reached(goal.id).unwrap();
+
+        let events = world.recent_events(10).unwrap();
+        let completion = events
+            .iter()
+            .find(|e| e.kind == FACTION_GOAL_COMPLETED_EVENT_KIND)
+            .expect("completion event present");
+        assert!(
+            completion.message.contains(&format!("faction #{blue_id}")),
+            "faction-scoped event message references the faction id, got {:?}",
+            completion.message
+        );
+    }
+
     /// Helper to build a `FogletContext` — same shape as
     /// `notices::tests::ctx` and `challenges::tests::ctx`.
     /// Deliberate duplication so the faction tests don't reach
@@ -2667,6 +3163,17 @@ mod tests {
         world
             .apply_migration(&PLAYERS_MIGRATION)
             .expect("players migration applies");
+        // §Task 6g's `complete_goal_if_reached` appends a
+        // `faction.goal.completed` world event inside its wrapping
+        // transaction, so every completion-path test needs
+        // `world_events` present. Applying it unconditionally in
+        // the helper means the seed/join/leave/create/contribute
+        // tests pay a tiny cost (one extra migration on a tempfile)
+        // in exchange for one canonical fixture instead of two —
+        // same convention as `market::tests::world_with_listings`.
+        world
+            .apply_migration(&crate::events::WORLD_EVENTS_MIGRATION)
+            .expect("world_events migration applies");
         world
             .apply_migration(&FACTIONS_MIGRATION)
             .expect("factions migration applies");
