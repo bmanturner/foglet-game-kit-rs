@@ -834,6 +834,12 @@ impl GameConfig {
                 "[job_board].enabled requires [contracts].enabled = true".into(),
             ));
         }
+        if self.travel.enabled && (!self.spatial.enabled || !self.presence.enabled) {
+            return Err(ConfigError::Validate(
+                "[travel].enabled requires [spatial].enabled = true and [presence].enabled = true"
+                    .into(),
+            ));
+        }
         // Leaderboard names must be non-empty and unique. Task 8 will
         // key SQL rows by `name`, so a duplicate would silently merge
         // two boards that the author intended to keep separate, and an
@@ -1268,6 +1274,12 @@ enabled = true
 [job_board]
 enabled = true
 
+[spatial]
+enabled = true
+
+[presence]
+enabled = true
+
 [travel]
 enabled = true
 
@@ -1517,6 +1529,41 @@ enabled = true
                 assert!(
                     msg.contains("[job_board]") && msg.contains("[contracts]"),
                     "error should mention both toggles: {msg}"
+                );
+            }
+            other => panic!("expected Validate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn travel_requires_spatial_and_presence_be_enabled() {
+        // CHECKLIST_v5 Task 2d: the travel helper depends on route
+        // adjacency (`[spatial]`) and a concrete player location
+        // (`[presence]`), so both toggles are mandatory.
+        let err = GameConfig::from_toml_str(
+            r#"
+[game]
+title = "Travel Without Spatial Presence"
+slug = "travel-without-spatial-presence"
+description = ""
+min_width = 80
+min_height = 24
+start_map = "lobby"
+start_x = 0
+start_y = 0
+
+[travel]
+enabled = true
+"#,
+        )
+        .unwrap_err();
+        match err {
+            ConfigError::Validate(msg) => {
+                assert!(
+                    msg.contains("[travel]")
+                        && msg.contains("[spatial]")
+                        && msg.contains("[presence]"),
+                    "error should mention travel/spatial/presence toggles: {msg}"
                 );
             }
             other => panic!("expected Validate, got {other:?}"),
