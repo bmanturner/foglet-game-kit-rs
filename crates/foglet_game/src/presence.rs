@@ -99,6 +99,15 @@ pub enum PresenceError {
         #[source]
         source: rusqlite::Error,
     },
+    /// A query failed while loading occupants for a place.
+    #[error("failed to list occupants for place `{place_id}`: {source}")]
+    ListFailed {
+        /// Place identifier supplied to `players_at`.
+        place_id: i64,
+        /// Underlying `rusqlite` error from the SQL execution.
+        #[source]
+        source: rusqlite::Error,
+    },
 }
 
 /// Migration for `presence` (Task 5a).
@@ -288,6 +297,48 @@ WHERE player_id = ?1";
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(source) => Err(PresenceError::GetFailed { player_id, source }),
         }
+    }
+
+    /// List the players currently present at a place.
+    ///
+    /// This query is intentionally strict: it returns only rows whose
+    /// `presence.place_id` exactly matches the argument at read time.
+    /// Because movement is always executed by mutating the row's
+    /// `place_id`, occupants that have since moved away are naturally
+    /// excluded.
+    ///
+    /// Why this is useful:
+    ///
+    /// - In a **space exploration** flow, a station controller can
+    ///   render the dock manifest by calling `players_at` for a specific
+    ///   `place_id`.
+    /// - In a **dungeon crawler** flow, room fog and encounter logic can
+    ///   list monsters/players currently in that chamber.
+    ///
+    /// Deterministic ordering:
+    ///
+    /// The result is sorted by ascending `player_id`, which keeps callers
+    /// from depending on SQLite insertion ordering and makes tests
+    /// straightforward.
+    pub fn players_at(&self, place_id: i64) -> Result<Vec<PresenceRecord>, PresenceError> {
+        const SQL: &str = "\
+SELECT player_id, place_id, entered_at, metadata_json\n\
+FROM presence\n\
+WHERE place_id = ?1\n\
+ORDER BY player_id";
+
+        let mut statement = self
+            .connection()
+            .prepare(SQL)
+            .map_err(|source| PresenceError::ListFailed { place_id, source })?;
+
+        let rows = statement
+            .query_map(rusqlite::params![place_id], row_to_presence)
+            .map_err(|source| PresenceError::ListFailed { place_id, source })?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|source| PresenceError::ListFailed { place_id, source })?;
+
+        Ok(rows)
     }
 }
 
@@ -606,6 +657,91 @@ mod tests {
             none.is_none(),
             "fresh players should start without presence"
         );
+
+        Ok(())
+    }
+
+    /// Task 5f proves occupant enumeration reflects the current place only:
+    ///
+    /// 1) Only players whose presence row is currently at the queried
+    ///    place are returned.
+    /// 2) A moved player is not included in the old place's occupancy.
+    /// 3) Returned occupants are ordered by ascending `player_id`.
+    #[test]
+    fn players_at_returns_only_current_occupants() -> Result<(), PresenceError> {
+        let dir = tempdir().expect("tempdir creates");
+        let db_path = dir.path().join("world.sqlite");
+        let mut world = WorldDb::open(&db_path).expect("open succeeds");
+
+        world
+            .apply_migration(&PLAYERS_MIGRATION)
+            .expect("players migration applies");
+        world
+            .apply_migration(&PLACES_MIGRATION)
+            .expect("places migration applies");
+        world
+            .apply_migration(&PRESENCE_MIGRATION)
+            .expect("presence migration applies");
+
+        let player_a: i64 = world
+            .connection()
+            .query_row(
+                "INSERT INTO players (handle) VALUES (?1) RETURNING id",
+                rusqlite::params!["Captain Quill"],
+                |row| row.get(0),
+            )
+            .expect("fixture player insert works");
+        let player_b: i64 = world
+            .connection()
+            .query_row(
+                "INSERT INTO players (handle) VALUES (?1) RETURNING id",
+                rusqlite::params!["Captain Finch"],
+                |row| row.get(0),
+            )
+            .expect("fixture player insert works");
+        let player_c: i64 = world
+            .connection()
+            .query_row(
+                "INSERT INTO players (handle) VALUES (?1) RETURNING id",
+                rusqlite::params!["Captain Mora"],
+                |row| row.get(0),
+            )
+            .expect("fixture player insert works");
+
+        let docking_gate = world
+            .insert_place("port-alpha", "Port Alpha", "harbor", None)
+            .expect("fixture place insert works");
+        let cargo_bay = world
+            .insert_place("cargo-bay", "Cargo Bay", "hub", None)
+            .expect("fixture place insert works");
+        let vault = world
+            .insert_place("crypt", "Crypt", "vault", None)
+            .expect("fixture place insert works");
+
+        world.set_presence(player_a, docking_gate.id, None)?;
+        world.set_presence(player_b, docking_gate.id, None)?;
+        world.set_presence(player_c, vault.id, None)?;
+
+        world.move_player(player_b, cargo_bay.id, |_, _| Ok(()))?;
+
+        let gate_occupants = world.players_at(docking_gate.id)?;
+        let cargo_occupants = world.players_at(cargo_bay.id)?;
+        let vault_occupants = world.players_at(vault.id)?;
+
+        assert_eq!(gate_occupants.len(), 1);
+        assert_eq!(cargo_occupants.len(), 1);
+        assert_eq!(vault_occupants.len(), 1);
+        assert_eq!(gate_occupants[0].player_id, player_a);
+        assert_eq!(cargo_occupants[0].player_id, player_b);
+        assert_eq!(vault_occupants[0].player_id, player_c);
+
+        let gate_ids: Vec<i64> = gate_occupants.iter().map(|row| row.player_id).collect();
+        let cargo_ids: Vec<i64> = cargo_occupants.iter().map(|row| row.player_id).collect();
+        let vault_ids: Vec<i64> = vault_occupants.iter().map(|row| row.player_id).collect();
+
+        assert_eq!(gate_ids, vec![player_a]);
+        assert_eq!(cargo_ids, vec![player_b]);
+        assert_eq!(vault_ids, vec![player_c]);
 
         Ok(())
     }
