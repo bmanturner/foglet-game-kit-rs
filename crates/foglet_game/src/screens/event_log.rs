@@ -216,6 +216,19 @@ impl EventLogScreen {
             TimestampStyle::Hidden => format!("{} {}", event.kind, line.primary),
         }
     }
+
+    fn next_page(&mut self) {
+        if self.events.is_empty() {
+            self.page_start = 0;
+            return;
+        }
+        let next = self.page_start.saturating_add(self.page_size);
+        self.page_start = next.min(self.events.len().saturating_sub(1));
+    }
+
+    fn previous_page(&mut self) {
+        self.page_start = self.page_start.saturating_sub(self.page_size);
+    }
 }
 
 impl Screen for EventLogScreen {
@@ -225,6 +238,14 @@ impl Screen for EventLogScreen {
 
     fn handle_input(&mut self, _ctx: &mut GameContext<'_>, input: Input) -> ScreenCommand {
         match input {
+            Input::Right | Input::Down | Input::Char('n' | 'N') => {
+                self.next_page();
+                ScreenCommand::None
+            }
+            Input::Left | Input::Up | Input::Char('p' | 'P') => {
+                self.previous_page();
+                ScreenCommand::None
+            }
             Input::Char('q' | 'Q') | Input::Esc => ScreenCommand::Pop,
             _ => ScreenCommand::None,
         }
@@ -289,10 +310,12 @@ mod tests {
     use crate::config::{
         EventLogScreenSection, GameConfig, GameSection, ManifestSection, SaveSection, SaveStrategy,
     };
+    use crate::events::EventRecord;
     use crate::events::WORLD_EVENTS_MIGRATION;
     use crate::foglet::{ContextSource, FogletContext};
+    use crate::input::Input;
     use crate::players::PLAYERS_MIGRATION;
-    use crate::screen::{GameContext, Screen};
+    use crate::screen::{GameContext, Screen, ScreenCommand};
     use crate::world_db::WorldDb;
     use ratatui::backend::TestBackend;
     use ratatui::buffer::Buffer;
@@ -336,6 +359,33 @@ mod tests {
         let buffer = draw_screen(&mut screen);
 
         assert!(contains_text(&buffer, "(case ledger is empty)"));
+    }
+
+    #[test]
+    fn event_log_screen_pages_forward_and_backward_across_100_events() {
+        let mut screen = EventLogScreen::new(event_fixture(100), 10)
+            .with_timestamp_style(TimestampStyle::Hidden);
+        let (config, foglet) = fixture_context();
+        let mut ctx = GameContext::new(&config, &foglet, (80, 24));
+
+        let first_page = draw_screen(&mut screen);
+        assert!(contains_text(&first_page, "kind event-000"));
+        assert!(!contains_text(&first_page, "kind event-010"));
+
+        assert!(matches!(
+            screen.handle_input(&mut ctx, Input::Right),
+            ScreenCommand::None
+        ));
+        let second_page = draw_screen(&mut screen);
+        assert!(contains_text(&second_page, "kind event-010"));
+        assert!(!contains_text(&second_page, "kind event-000"));
+
+        assert!(matches!(
+            screen.handle_input(&mut ctx, Input::Left),
+            ScreenCommand::None
+        ));
+        let back_to_first = draw_screen(&mut screen);
+        assert!(contains_text(&back_to_first, "kind event-000"));
     }
 
     fn draw_screen(screen: &mut EventLogScreen) -> Buffer {
@@ -407,5 +457,18 @@ mod tests {
         };
 
         (config, foglet)
+    }
+
+    fn event_fixture(count: usize) -> Vec<EventRecord> {
+        (0..count)
+            .map(|idx| EventRecord {
+                id: idx as i64,
+                created_at: "2030-01-01 00:00:00".to_string(),
+                kind: "kind".to_string(),
+                player_id: None,
+                message: format!("event-{idx:03}"),
+                metadata: None,
+            })
+            .collect()
     }
 }

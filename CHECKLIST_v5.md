@@ -76,7 +76,7 @@ One unchecked item per iteration. Dependencies in `[brackets]` must be checked o
 
 - [x] **9a** — Implement `EventLogScreen` widget reading v2 events with configured `scope`, `page_size`, `timestamp_style`, and `empty_state_text`. Test: renders within 80×24. [v2 events]
 - [x] **9b** — Test empty-result rendering uses `empty_state_text`. [9a]
-- [ ] **9c** — Test forward and backward pagination across a 100-event fixture. [9a]
+- [x] **9c** — Test forward and backward pagination across a 100-event fixture. [9a]
 - [ ] **9d** — Test player-scoped filter excludes other players' events. [9a]
 - [ ] **9e** — Test the per-event formatter callback is invoked once per visible event and its return value drives rendering. [9a]
 - [ ] **9f** — Implement embeddable region mode that renders within a caller-supplied rectangle. Test: embedded mode does not redraw outside the region. [9a]
