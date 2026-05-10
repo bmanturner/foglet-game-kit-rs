@@ -69,7 +69,7 @@ One unchecked item per iteration. Dependencies in `[brackets]` must be checked o
 - [x] **8d** — Implement `transfer_with_capacity(source, dest, item_key, quantity, &policy, on_commit?)` performing capacity validation inside the v4 inventory transfer transaction. Test: success path debits and credits as in v4. [8c]
 - [x] **8e** — Test rollback on capacity overflow: source and dest unchanged. [8d]
 - [x] **8f** — Test `owner_capacity = None` allows transfers regardless of volume. [8d]
-- [ ] **8g** — Test policy callback errors propagate as `CapacityError::PolicyError` and roll back. [8d]
+- [x] **8g** — Test policy callback errors propagate as `CapacityError::PolicyError` and roll back. [8d]
 - [ ] **8h** — Test concurrent capacity-validated transfers cannot collectively overflow capacity. [8d]
 
 ### Task 9 — Event Log / News screen

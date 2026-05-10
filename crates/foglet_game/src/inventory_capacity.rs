@@ -838,4 +838,80 @@ mod tests {
         assert_eq!(source.quantity, 0);
         assert_eq!(destination.quantity, 5);
     }
+
+    #[test]
+    fn transfer_with_capacity_propagates_policy_error_and_rolls_back() {
+        let dir = tempdir().expect("tempdir creates");
+        let db_path = dir.path().join("world.sqlite");
+        let mut world = WorldDb::open(&db_path).expect("open succeeds");
+        world
+            .apply_migration(&INVENTORY_SLOTS_MIGRATION)
+            .expect("inventory migration applies");
+        world
+            .create_slot("player", 1, "ration", 5, None, None)
+            .expect("source slot inserts");
+        world
+            .create_slot("chest", 2, "ration", 1, None, None)
+            .expect("destination slot inserts");
+
+        struct BrokenPolicy;
+
+        impl CapacityPolicy for BrokenPolicy {
+            fn item_volume(
+                &self,
+                item_key: &str,
+                _metadata: &serde_json::Value,
+            ) -> Result<i64, CapacityError> {
+                Err(CapacityError::PolicyError(format!(
+                    "cannot size {item_key}"
+                )))
+            }
+
+            fn owner_capacity(
+                &self,
+                _owner_kind: &str,
+                _owner_id: i64,
+            ) -> Result<Option<i64>, CapacityError> {
+                Ok(Some(10))
+            }
+        }
+
+        let rejected = world.transfer_with_capacity(
+            ("player", 1),
+            ("chest", 2),
+            "ration",
+            3,
+            &BrokenPolicy,
+            Option::<
+                fn(
+                    &rusqlite::Transaction<'_>,
+                    &crate::inventory::InventorySlot,
+                    &crate::inventory::InventorySlot,
+                ) -> Result<(), rusqlite::Error>,
+            >::None,
+        );
+
+        match rejected {
+            Err(CapacityError::PolicyError(message)) => {
+                assert_eq!(message, "cannot size ration");
+            }
+            other => panic!("expected policy error, got {other:?}"),
+        }
+        assert_eq!(
+            world
+                .get_slot("player", 1, "ration")
+                .expect("source reads")
+                .expect("source exists")
+                .quantity,
+            5
+        );
+        assert_eq!(
+            world
+                .get_slot("chest", 2, "ration")
+                .expect("destination reads")
+                .expect("destination exists")
+                .quantity,
+            1
+        );
+    }
 }
