@@ -30,7 +30,7 @@ One unchecked item per iteration. Dependencies in `[brackets]` must be checked o
 - [x] **4d** — Implement `inbound_routes(place_id)` query. Test: returns only inbound routes. [4b]
 - [x] **4e** — Allow parallel routes between same two places when `kind` differs. Test: two rows coexist. [4b]
 - [x] **4f** — Test asymmetric topology: route A→B without B→A; outbound from A includes it, outbound from B does not. [4c]
-- [ ] **4g** — Test bidirectional access requires two rows. [4c, 4d]
+- [x] **4g** — Test bidirectional access requires two rows. [4c, 4d]
 
 ### Task 5 — Presence
 

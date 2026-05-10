@@ -6,6 +6,7 @@ Cargo.lock.bak
 .DS_Store
 
 .ralph/
+.ralph_codex/
 CHECKLIST*.md
 PROMPT.md
 SPEC*.md

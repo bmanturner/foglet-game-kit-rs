@@ -1165,4 +1165,76 @@ mod tests {
         assert_eq!(routes[1].kind, "hidden-stairs");
         assert_ne!(routes[0].id, routes[1].id);
     }
+
+    /// SPEC_v4 Task 4g requires bidirectional access to be represented
+    /// by two explicit directed rows, not one implied edge.
+    ///
+    /// In a **space dock** graph, a route from bay-to-satellite is not
+    /// automatically a reverse satellite-to-bay route. In a **dungeon**
+    /// corridor graph, one directed stair route does not grant the reverse
+    /// travel without an explicit second row.
+    #[test]
+    fn bidirectional_routes_require_two_explicit_rows() {
+        let dir = tempdir().expect("tempdir creates");
+        let db_path = dir.path().join("world.sqlite");
+        let mut world = WorldDb::open(&db_path).expect("open succeeds");
+
+        world
+            .apply_migration(&PLACES_MIGRATION)
+            .expect("places migration applies");
+        world
+            .apply_migration(&ROUTES_MIGRATION)
+            .expect("routes migration applies");
+
+        let space_gate = world
+            .insert_place("orbit-gate", "Orbital Gate", "gate", None)
+            .expect("source place inserts");
+        let deep_chamber = world
+            .insert_place("deep-chamber", "Deep Chamber", "chamber", None)
+            .expect("destination place inserts");
+
+        let forward = world
+            .create_route(
+                space_gate.id,
+                deep_chamber.id,
+                "airlock",
+                None,
+                Some(r#"{"mode":"dock"}"#),
+            )
+            .expect("forward route inserts");
+
+        let forward_outbound = world
+            .outbound_routes(space_gate.id)
+            .expect("forward outbound query succeeds");
+        let reverse_outbound_before = world
+            .outbound_routes(deep_chamber.id)
+            .expect("reverse outbound query succeeds");
+
+        assert_eq!(forward_outbound, vec![forward.clone()]);
+        assert!(reverse_outbound_before.is_empty());
+
+        let reverse = world
+            .create_route(
+                deep_chamber.id,
+                space_gate.id,
+                "return-shuttle",
+                None,
+                Some(r#"{"mode":"return"}"#),
+            )
+            .expect("reverse route inserts");
+
+        let reverse_outbound_after = world
+            .outbound_routes(deep_chamber.id)
+            .expect("reverse outbound query succeeds after insert");
+        let reverse_inbound = world
+            .inbound_routes(space_gate.id)
+            .expect("reverse inbound query succeeds after insert");
+
+        assert_eq!(forward_outbound.len(), 1);
+        assert_eq!(forward_outbound[0], forward);
+        assert_eq!(reverse_outbound_after.len(), 1);
+        assert_eq!(reverse_outbound_after[0], reverse);
+        assert_eq!(reverse_inbound.len(), 1);
+        assert_eq!(reverse_inbound[0], reverse);
+    }
 }

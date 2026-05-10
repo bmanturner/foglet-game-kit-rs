@@ -35,7 +35,7 @@ Why it matters:
 
 Current leaning:
 
-- undecided.
+- Separate workspace.
 
 ### Q-MVP-002 — Game-kit P0 first or local game code first?
 
