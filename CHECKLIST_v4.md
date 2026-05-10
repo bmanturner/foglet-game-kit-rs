@@ -122,5 +122,5 @@ One unchecked item per iteration. Dependencies in `[brackets]` must be checked o
 - [x] World ticks are durable, idempotent under concurrency, and bounded by `max_catchup_per_call`
 - [x] `fgk tick` CLI subcommand exists, exits cleanly, and is documented for cron use
 - [x] Documentation explains every v4 primitive in genre-neutral terms with at least two distinct game-family examples each
-- [ ] Documentation explicitly rejects real-time multiplayer and long-lived daemons for v4
+- [x] Documentation explicitly rejects real-time multiplayer and long-lived daemons for v4
 - [ ] Documentation explains the deliberate skip of sample-game integration in this version
