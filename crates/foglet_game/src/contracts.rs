@@ -410,6 +410,64 @@ ORDER BY created_at ASC, id ASC";
 
         Ok(rows)
     }
+
+    /// Accept one contract for a player inside a single SQLite transaction.
+    ///
+    /// This is the Task 4a lifecycle transition primitive. It updates
+    /// one contract row to `accepted`, records `acceptor_player_id`, and
+    /// stamps `accepted_at = CURRENT_TIMESTAMP` atomically.
+    ///
+    /// The optional `on_commit` callback runs after the SQL mutation while
+    /// still inside the active transaction. If the callback returns `Err`,
+    /// the transaction rolls back and no acceptance persists.
+    ///
+    /// Genre-neutral usage:
+    ///
+    /// - In a **space exploration** game, accepting a freight offer can
+    ///   reserve station cargo in the same transaction.
+    /// - In a **dungeon crawler**, accepting a guild commission can append
+    ///   a quest-log row in the same transaction.
+    pub fn accept_contract<F>(
+        &mut self,
+        contract_id: i64,
+        player_id: i64,
+        on_commit: Option<F>,
+    ) -> Result<Contract, ContractError>
+    where
+        F: FnOnce(&rusqlite::Transaction<'_>, &Contract) -> Result<(), rusqlite::Error>,
+    {
+        const SQL: &str = "\
+UPDATE contracts\n\
+SET state = ?2,\n\
+    acceptor_player_id = ?3,\n\
+    accepted_at = CURRENT_TIMESTAMP\n\
+WHERE id = ?1\n\
+RETURNING id, key, kind, issuer_owner_kind, issuer_owner_id, \
+          acceptor_player_id, state, objective_json, reward_json, metadata_json, \
+          created_at, accepted_at, completed_at, expires_at";
+
+        let tx = self
+            .connection_mut()
+            .transaction()
+            .map_err(|source| ContractError::Sqlite { source })?;
+
+        let accepted = tx
+            .query_row(
+                SQL,
+                rusqlite::params![contract_id, ContractState::Accepted.as_str(), player_id],
+                row_to_contract,
+            )
+            .map_err(|source| ContractError::Sqlite { source })?;
+
+        if let Some(on_commit) = on_commit {
+            on_commit(&tx, &accepted).map_err(|source| ContractError::Sqlite { source })?;
+        }
+
+        tx.commit()
+            .map_err(|source| ContractError::Sqlite { source })?;
+
+        Ok(accepted)
+    }
 }
 
 /// Decode one `contracts` row in the column order used by this module.
@@ -946,5 +1004,58 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![guild_accepted_alice.id]
         );
+    }
+
+    #[test]
+    fn accept_contract_sets_state_acceptor_and_accepted_timestamp() {
+        let dir = tempdir().expect("tempdir creates");
+        let db_path = dir.path().join("world.sqlite");
+        let mut world = WorldDb::open(&db_path).expect("open succeeds");
+        world
+            .apply_migration(&CONTRACTS_MIGRATION)
+            .expect("contracts migration applies");
+
+        let created = world
+            .create_contract(CreateContractInput {
+                key: Some("harbor-run"),
+                kind: "delivery",
+                issuer_owner_kind: "station",
+                issuer_owner_id: 9,
+                objective_json: r#"{"to":"sector-19"}"#,
+                reward_json: r#"{"credits":300}"#,
+                metadata_json: Some(r#"{"tier":"starter"}"#),
+                expires_at: None,
+            })
+            .expect("create_contract succeeds");
+
+        let accepted = world
+            .accept_contract(
+                created.id,
+                77,
+                None::<
+                    fn(&rusqlite::Transaction<'_>, &super::Contract) -> Result<(), rusqlite::Error>,
+                >,
+            )
+            .expect("accept_contract succeeds");
+
+        assert_eq!(accepted.id, created.id);
+        assert_eq!(accepted.state, ContractState::Accepted.as_str());
+        assert_eq!(accepted.acceptor_player_id, Some(77));
+        assert!(
+            accepted.accepted_at.is_some(),
+            "accept_contract should stamp accepted_at"
+        );
+        assert_eq!(
+            accepted.completed_at, None,
+            "accepting should not set completed_at"
+        );
+
+        let persisted = world
+            .contract_by_id(created.id)
+            .expect("lookup succeeds")
+            .expect("accepted row exists");
+        assert_eq!(persisted.state, ContractState::Accepted.as_str());
+        assert_eq!(persisted.acceptor_player_id, Some(77));
+        assert_eq!(persisted.accepted_at, accepted.accepted_at);
     }
 }
