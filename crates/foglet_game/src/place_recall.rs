@@ -379,4 +379,83 @@ mod tests {
             "latest snapshot should still replace the previous one"
         );
     }
+
+    /// Task 6d requires each touch call to refresh `snapshot_json`
+    /// independently of historical memory.
+    ///
+    /// Fog-of-war replay in a **space exploration** flow should allow a
+    /// station to be revisited with fresh sensor packets, and a
+    /// **dungeon crawl** should likewise retain the most recent room
+    /// context for rendering revisit hints.
+    #[test]
+    fn touch_recall_updates_snapshot_json_each_time() {
+        let dir = tempdir().expect("tempdir creates");
+        let db_path = dir.path().join("world.sqlite");
+        let mut world = WorldDb::open(&db_path).expect("open succeeds");
+
+        world
+            .apply_migration(&PLAYERS_MIGRATION)
+            .expect("players migration applies");
+        world
+            .apply_migration(&PLACES_MIGRATION)
+            .expect("places migration applies");
+        world
+            .apply_migration(&PLACE_RECALL_MIGRATION)
+            .expect("place_recall migration applies");
+
+        let player_id: i64 = world
+            .connection()
+            .query_row(
+                "INSERT INTO players (handle) VALUES (?1) RETURNING id",
+                rusqlite::params!["Archivist"],
+                |row| row.get(0),
+            )
+            .expect("fixture player inserts");
+
+        let observatory = world
+            .insert_place(
+                "obs-dome",
+                "Observation Dome",
+                "dome",
+                Some(r#"{"lighting":"dim"}"#),
+            )
+            .expect("fixture place insert");
+
+        world
+            .touch_recall(player_id, observatory.id, Some(r#"{"phase":"dock"}"#))
+            .expect("first snapshot capture");
+        sleep(Duration::from_secs(1));
+
+        let second = world
+            .touch_recall(player_id, observatory.id, Some(r#"{"phase":"scan"}"#))
+            .expect("second snapshot capture");
+        assert_eq!(
+            second.snapshot_json,
+            Some(r#"{"phase":"scan"}"#.to_string()),
+            "latest snapshot should replace prior payload"
+        );
+
+        let third = world
+            .touch_recall(player_id, observatory.id, Some(r#"{"phase":"alarm"}"#))
+            .expect("third snapshot capture");
+        assert_eq!(
+            third.snapshot_json,
+            Some(r#"{"phase":"alarm"}"#.to_string()),
+            "snapshot should update on every touch, including after prior updates"
+        );
+
+        let row: PlaceRecallRecord = world
+            .connection()
+            .query_row(
+                "SELECT player_id, place_id, first_seen_at, last_seen_at, snapshot_json FROM place_recall WHERE player_id = ?1 AND place_id = ?2",
+                rusqlite::params![player_id, observatory.id],
+                row_to_place_recall,
+            )
+            .expect("row query");
+
+        assert_eq!(
+            row.snapshot_json, third.snapshot_json,
+            "persistent row should mirror latest in-memory touch result"
+        );
+    }
 }
