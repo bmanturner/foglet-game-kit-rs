@@ -19,7 +19,7 @@ One unchecked item per iteration. Dependencies in `[brackets]` must be checked o
 ### Task 3 — Contract schema and CRUD
 
 - [x] **3a** — Add `contracts` migration with `id`, nullable `key`, `kind`, `issuer_owner_kind`, `issuer_owner_id`, nullable `acceptor_player_id`, `state`, `objective_json`, `reward_json`, `metadata_json`, `created_at`, nullable `accepted_at`, nullable `completed_at`, nullable `expires_at`, plus a CHECK constraint restricting `state` to the allowed enum values. [v4 Task 7]
-- [ ] **3b** — Implement `Contract` type and `create_contract` returning a row in `available` state. Test: round-trip preserves `objective_json` and `reward_json` byte-for-byte. [3a]
+- [x] **3b** — Implement `Contract` type and `create_contract` returning a row in `available` state. Test: round-trip preserves `objective_json` and `reward_json` byte-for-byte. [3a]
 - [ ] **3c** — Implement `contract_by_id` and `available_contracts(filter)` with deterministic ordering. Test: ordering is stable across inserts. [3b]
 - [ ] **3d** — Implement `contracts_for_acceptor(player_id, state?)` and `contracts_by_issuer(owner_kind, owner_id, state?)`. Test: filters narrow results correctly. [3b]
 

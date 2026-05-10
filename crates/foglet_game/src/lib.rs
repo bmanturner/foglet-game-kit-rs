@@ -74,7 +74,9 @@ pub use config::{
     PresenceSection, SaveSection, SaveStrategy, SpatialSection, TurnReset, TurnsSection,
     WorldSection, WorldTicksSection,
 };
-pub use contracts::CONTRACTS_MIGRATION;
+pub use contracts::{
+    Contract, ContractError, ContractState, CreateContractInput, CONTRACTS_MIGRATION,
+};
 pub use dialog::{
     dialog_choice_prompt, dialog_handle_prompt_input, load_dialog, Choice, ChoiceError, Dialog,
     DialogError, DialogState, FlagSet, Node, DIALOG_PROMPT_MAX_CHOICES,
