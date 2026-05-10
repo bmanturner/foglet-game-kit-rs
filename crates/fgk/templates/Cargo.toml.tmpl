@@ -9,12 +9,12 @@ edition = "2021"
 [dependencies]
 # Foglet authoring kit. Pinned to the matching minor while the kit is
 # pre-1.0; bump when you upgrade `fgk`.
-foglet_game = "0.1"
+{foglet_game_dependency}
 
 # `Screen::render` takes a `ratatui::Frame`, so games typically depend
 # on ratatui directly to spell out widgets. Match the version
 # foglet_game targets to avoid duplicate trait impls.
-ratatui = "0.29"
+ratatui = "0.30"
 
 # Process-boundary error chain. The kit's library errors are
 # `thiserror`-based and convert into `anyhow::Error` via `?`.

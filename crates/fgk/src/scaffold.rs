@@ -28,6 +28,32 @@ use std::path::{Path, PathBuf};
 
 use crate::templates::{substitute, TEMPLATES};
 
+/// Minor-version requirement used when `fgk new` cannot resolve a
+/// local checkout of `foglet_game`.
+///
+/// This mirrors the template's pre-v4 behavior (`foglet_game = "0.1"`)
+/// and keeps generated projects usable when `fgk` is installed as a
+/// standalone binary outside this repository.
+const FOGLET_GAME_VERSION_REQ: &str = "0.1";
+
+/// Placeholder token in `templates/Cargo.toml.tmpl` that we replace
+/// with either a local path dependency (for in-repo verification loops)
+/// or a crates.io version requirement (for general end users).
+const FOGLET_GAME_DEP_TOKEN: &str = "{foglet_game_dependency}";
+
+/// Pre-rendered values shared across all template files during one
+/// scaffolding run.
+///
+/// Keeping this context explicit makes behavior easy to test: unit
+/// tests can assert both dependency modes without mutating global
+/// process state.
+#[derive(Debug, Clone)]
+struct ScaffoldRenderContext {
+    /// Fully rendered TOML line for the `foglet_game` dependency in
+    /// the generated `Cargo.toml`.
+    foglet_game_dependency_line: String,
+}
+
 /// Errors surfaced by [`scaffold_project`].
 ///
 /// Variants are intentionally narrow so tests can assert on the
@@ -98,6 +124,13 @@ pub fn scaffold_project_with_name(dest: &Path, name: &str) -> ScaffoldResult<()>
         return Err(ScaffoldError::InvalidName(name.to_string()));
     }
 
+    // Auto-detect whether this `fgk` binary is running from a local
+    // foglet-game-kit checkout. If yes, generated projects point their
+    // dependency at that checkout so `cargo test` works in CI/dev loops
+    // without requiring a published crate. If no, we fall back to the
+    // crates.io dependency string.
+    let render_ctx = ScaffoldRenderContext::auto_detect();
+
     ensure_empty_destination(dest)?;
     create_dir_all(dest)?;
 
@@ -107,11 +140,73 @@ pub fn scaffold_project_with_name(dest: &Path, name: &str) -> ScaffoldResult<()>
         if let Some(parent) = abs.parent() {
             create_dir_all(parent)?;
         }
-        let body = substitute(template.contents, name);
+        let body = render_template_body(template.contents, name, &render_ctx);
         write_file(&abs, body.as_bytes())?;
     }
 
     Ok(())
+}
+
+impl ScaffoldRenderContext {
+    /// Build a render context by probing for a sibling
+    /// `crates/foglet_game` checkout near this crate's manifest dir.
+    fn auto_detect() -> Self {
+        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let local_path = detect_local_foglet_game_path(manifest_dir);
+        Self {
+            foglet_game_dependency_line: render_foglet_game_dependency_line(local_path.as_deref()),
+        }
+    }
+}
+
+/// Render one template file after substitution.
+///
+/// We still keep the templating model intentionally simple: text
+/// replacement only, no parser, no expression language. The only extra
+/// token beyond `{name}` is the dependency line in `Cargo.toml`.
+fn render_template_body(contents: &str, name: &str, ctx: &ScaffoldRenderContext) -> String {
+    let with_name = substitute(contents, name);
+    with_name.replace(FOGLET_GAME_DEP_TOKEN, &ctx.foglet_game_dependency_line)
+}
+
+/// Attempt to locate this repository's `crates/foglet_game` directory
+/// from a known `crates/fgk` manifest directory.
+///
+/// We intentionally look for `Cargo.toml` in the candidate directory so
+/// a stale absolute path (e.g., from `cargo install` build roots) falls
+/// back cleanly to crates.io mode.
+fn detect_local_foglet_game_path(manifest_dir: &Path) -> Option<PathBuf> {
+    let candidate = manifest_dir.join("..").join("foglet_game");
+    if !candidate.join("Cargo.toml").is_file() {
+        return None;
+    }
+
+    // Canonicalize when possible so the generated TOML is stable and
+    // symlink-free in diagnostics. If canonicalization fails (odd FS
+    // permissions), keep the original candidate and still use local mode.
+    std::fs::canonicalize(&candidate).ok().or(Some(candidate))
+}
+
+/// Render the `foglet_game` dependency line for generated Cargo.toml.
+///
+/// - `Some(path)`: path dependency for local verification loops.
+/// - `None`: crates.io version requirement for general usage.
+fn render_foglet_game_dependency_line(local_path: Option<&Path>) -> String {
+    match local_path {
+        Some(path) => format!(
+            "foglet_game = {{ path = \"{}\" }}",
+            escape_toml_basic_string(&path.display().to_string())
+        ),
+        None => format!("foglet_game = \"{FOGLET_GAME_VERSION_REQ}\""),
+    }
+}
+
+/// Escape a value for use inside a TOML basic string (`"..."`).
+///
+/// Paths on Windows can contain backslashes; escaping keeps generated
+/// TOML valid across platforms.
+fn escape_toml_basic_string(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 /// Derive the project name from the destination path's final
@@ -249,6 +344,19 @@ mod tests {
             .and_then(|v| v.as_str())
             .unwrap();
         assert_eq!(pkg_name, SAMPLE_NAME);
+
+        let deps = parsed
+            .get("dependencies")
+            .and_then(|v| v.as_table())
+            .expect("Cargo.toml should define [dependencies]");
+        assert!(
+            deps.get("foglet_game").is_some(),
+            "scaffold should always render foglet_game dependency"
+        );
+        assert!(
+            !cargo.contains(FOGLET_GAME_DEP_TOKEN),
+            "Cargo.toml must not contain unsubstituted dependency token"
+        );
     }
 
     #[test]
@@ -330,5 +438,52 @@ mod tests {
 
         let main_rs = std::fs::read_to_string(dest.join("src/main.rs")).unwrap();
         syn::parse_file(&main_rs).expect("scaffolded main.rs must parse");
+    }
+
+    #[test]
+    fn foglet_game_dependency_line_falls_back_to_crates_io_when_no_local_path() {
+        let line = render_foglet_game_dependency_line(None);
+        assert_eq!(line, "foglet_game = \"0.1\"");
+    }
+
+    #[test]
+    fn foglet_game_dependency_line_uses_path_when_local_checkout_exists() {
+        let td = tempfile::tempdir().unwrap();
+        let local = td.path().join("foglet_game");
+        std::fs::create_dir_all(&local).unwrap();
+        std::fs::write(
+            local.join("Cargo.toml"),
+            "[package]\nname = \"foglet_game\"\n",
+        )
+        .unwrap();
+
+        let line = render_foglet_game_dependency_line(Some(&local));
+        assert!(
+            line.contains("path = "),
+            "expected a path dependency line, got `{line}`"
+        );
+    }
+
+    #[test]
+    fn detect_local_foglet_game_path_finds_sibling_checkout() {
+        let td = tempfile::tempdir().unwrap();
+        let crates_dir = td.path().join("crates");
+        let manifest_dir = crates_dir.join("fgk");
+        let foglet_game_dir = crates_dir.join("foglet_game");
+        std::fs::create_dir_all(&manifest_dir).unwrap();
+        std::fs::create_dir_all(&foglet_game_dir).unwrap();
+        std::fs::write(
+            foglet_game_dir.join("Cargo.toml"),
+            "[package]\nname = \"foglet_game\"\n",
+        )
+        .unwrap();
+
+        let found = detect_local_foglet_game_path(&manifest_dir)
+            .expect("sibling foglet_game checkout should be detected");
+        assert!(
+            found.ends_with("foglet_game"),
+            "expected detected path to end with foglet_game, got `{}`",
+            found.display()
+        );
     }
 }

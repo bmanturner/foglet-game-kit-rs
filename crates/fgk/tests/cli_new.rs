@@ -10,6 +10,7 @@
 
 use assert_cmd::Command;
 use predicates::str::contains;
+use std::process::Command as ProcessCommand;
 
 #[test]
 fn fgk_new_creates_project_files_at_destination() {
@@ -58,5 +59,30 @@ fn fgk_new_rejects_invalid_slug_in_final_component() {
     assert!(
         !dest.exists(),
         "scaffolder must not create the dest dir on validation failure"
+    );
+}
+
+#[test]
+fn fgk_new_scaffold_passes_cargo_test_in_generated_project() {
+    let td = tempfile::tempdir().unwrap();
+    let dest = td.path().join("scaffold-testable-game");
+
+    Command::cargo_bin("fgk")
+        .expect("fgk binary should be built by cargo test")
+        .arg("new")
+        .arg(&dest)
+        .assert()
+        .success();
+
+    let status = ProcessCommand::new("cargo")
+        .arg("test")
+        .arg("--quiet")
+        .current_dir(&dest)
+        .status()
+        .expect("should be able to run cargo test in scaffolded project");
+
+    assert!(
+        status.success(),
+        "cargo test in scaffolded project should pass (status: {status})"
     );
 }

@@ -160,7 +160,11 @@ mod tests {
             .iter()
             .find(|t| t.dest_path == dest_path)
             .unwrap_or_else(|| panic!("template missing: {dest_path}"));
-        substitute(t.contents, SAMPLE_NAME)
+        let with_name = substitute(t.contents, SAMPLE_NAME);
+        // `fgk new` resolves this token at scaffold time. Template-only
+        // tests substitute a default crates.io line so parser checks can
+        // stay focused on fixture validity rather than scaffolder wiring.
+        with_name.replace("{foglet_game_dependency}", "foglet_game = \"0.1\"")
     }
 
     #[test]
