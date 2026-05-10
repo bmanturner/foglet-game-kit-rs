@@ -215,32 +215,6 @@ mod tests {
             )
             .expect("recorded migration row is queryable");
         assert_eq!(row_count, PLACES_MIGRATION.version);
-
-        world
-            .connection()
-            .execute(
-                "INSERT INTO places (key, display_name, kind, metadata_json) \
-                 VALUES (?1, ?2, ?3, ?4)",
-                rusqlite::params![
-                    "docking-bay-01",
-                    "Forward Docking Bay",
-                    "dock",
-                    r#"{\"light\": \"blue\"}"#
-                ],
-            )
-            .expect("inserting a sample place works");
-
-        let duplicate = world.connection().execute(
-            "INSERT INTO places (key, display_name, kind, metadata_json) \
-             VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params![
-                "docking-bay-01",
-                "Duplicate Dock",
-                "chamber",
-                r#"{\"light\": \"red\"}#"#
-            ],
-        );
-        assert!(duplicate.is_err(), "place keys must be unique");
     }
 
     /// SPEC_v4 Task 3b requires a typed round-trip surface for a
@@ -291,5 +265,47 @@ mod tests {
             )
             .expect("stored row should be queryable");
         assert_eq!(inserted, by_id);
+    }
+
+    /// SPEC_v4 Task 3c requires key-level uniqueness enforcement.
+    ///
+    /// Insert the same logical key twice and confirm the second
+    /// operation fails through the `insert_place` path with a
+    /// diagnostic that names the key and the failed operation.
+    #[test]
+    fn insert_place_rejects_duplicate_key() {
+        let dir = tempdir().expect("tempdir creates");
+        let db_path = dir.path().join("world.sqlite");
+        let mut world = WorldDb::open(&db_path).expect("open succeeds");
+        world
+            .apply_migration(&PLACES_MIGRATION)
+            .expect("places migration applies");
+
+        let first = world
+            .insert_place(
+                "shared-hub",
+                "Shared Hub",
+                "junction",
+                Some(r#"{"beacons": 3}"#),
+            )
+            .expect("first insert with this key succeeds");
+        assert!(first.id > 0, "first insert should create a concrete row");
+
+        let duplicate = world.insert_place(
+            "shared-hub",
+            "Second Entry For Same Key",
+            "chamber",
+            Some(r#"{"beacons": 1}"#),
+        );
+        let err = duplicate.expect_err("duplicate place key must fail");
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("shared-hub"),
+            "error should include the conflicting key"
+        );
+        assert!(
+            rendered.contains("failed to insert place"),
+            "error should be emitted from the insert path"
+        );
     }
 }
