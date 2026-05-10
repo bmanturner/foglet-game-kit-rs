@@ -10,6 +10,7 @@
 //!   - `fgk new <path>`            ← Task 10b
 //!   - `fgk emit-manifest`         ← Task 11
 //!   - `fgk package`               ← Task 12
+//!   - `fgk tick --project <path>` ← Task 10
 
 use std::path::PathBuf;
 
@@ -98,6 +99,16 @@ enum Command {
         #[arg(long, value_name = "PATH")]
         binary: Option<PathBuf>,
     },
+
+    /// Run due world-tick tasks once for a project.
+    ///
+    /// This is one-shot maintenance for operator cron or manual
+    /// invocation; it never runs a daemon loop.
+    Tick {
+        /// Project directory (the one containing `assets/game.toml`).
+        #[arg(long, default_value = ".", value_name = "DIR")]
+        project: PathBuf,
+    },
 }
 
 fn main() -> Result<()> {
@@ -114,6 +125,7 @@ fn main() -> Result<()> {
             install_dir,
             binary,
         } => run_package(&project, &out, install_dir.as_deref(), binary.as_deref()),
+        Command::Tick { project } => run_tick(&project),
     }
 }
 
@@ -194,5 +206,16 @@ fn run_package(
         outputs.manifest.display(),
         outputs.assets.display(),
     );
+    Ok(())
+}
+
+/// Entry point for `fgk tick --project <path>`.
+///
+/// This wrapper is intentionally thin so tick scheduling logic stays in
+/// `fgk::tick`, where integration tests can drive it directly.
+fn run_tick(project: &std::path::Path) -> Result<()> {
+    let ran = fgk::tick::run_tick(project)
+        .with_context(|| format!("failed to run scheduled tasks for `{}`", project.display()))?;
+    println!("Ran {ran} scheduled task(s)");
     Ok(())
 }

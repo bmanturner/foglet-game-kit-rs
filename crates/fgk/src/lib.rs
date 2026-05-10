@@ -13,3 +13,4 @@ pub mod emit_manifest;
 pub mod package;
 pub mod scaffold;
 pub mod templates;
+pub mod tick;
