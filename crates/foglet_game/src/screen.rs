@@ -118,6 +118,16 @@ pub struct GameContext<'a> {
     /// violates the "no automatic tick execution in paint loops"
     /// tenet.
     pub world_ticks: Option<&'a WorldDb>,
+    /// Optional v5 contracts handle.
+    pub contracts: Option<&'a WorldDb>,
+    /// Optional v5 job-board handle.
+    pub job_board: Option<&'a WorldDb>,
+    /// Optional v5 travel helper handle.
+    pub travel: Option<&'a WorldDb>,
+    /// Optional v5 inventory-capacity handle.
+    pub inventory_capacity: Option<&'a WorldDb>,
+    /// Optional v5 event-log screen data handle.
+    pub event_log_screen: Option<&'a WorldDb>,
 }
 
 impl<'a> GameContext<'a> {
@@ -142,6 +152,11 @@ impl<'a> GameContext<'a> {
             place_recall: None,
             inventory: None,
             world_ticks: None,
+            contracts: None,
+            job_board: None,
+            travel: None,
+            inventory_capacity: None,
+            event_log_screen: None,
         }
     }
 
