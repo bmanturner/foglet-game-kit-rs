@@ -448,4 +448,81 @@ mod tests {
 
         Ok(())
     }
+
+    /// A movement callback rejection must roll back the write, because
+    /// `move_player` is defined as an atomic transaction that includes
+    /// both the row mutation and the callback side effects.
+    ///
+    /// This proof is genre-neutral:
+    ///
+    /// - In a **space exploration** game, a rejected docking authorization
+    ///   callback must not teleport a captain even temporarily.
+    /// - In a **dungeon crawler** game, a failed "trap check" should not
+    ///   alter the player's chamber just because the callback failed.
+    #[test]
+    fn move_player_rolls_back_when_callback_rejects() {
+        let dir = tempdir().expect("tempdir creates");
+        let db_path = dir.path().join("world.sqlite");
+        let mut world = WorldDb::open(&db_path).expect("open succeeds");
+
+        world
+            .apply_migration(&PLAYERS_MIGRATION)
+            .expect("players migration applies");
+        world
+            .apply_migration(&PLACES_MIGRATION)
+            .expect("places migration applies");
+        world
+            .apply_migration(&PRESENCE_MIGRATION)
+            .expect("presence migration applies");
+
+        let player_id: i64 = world
+            .connection()
+            .query_row(
+                "INSERT INTO players (handle) VALUES (?1) RETURNING id",
+                rusqlite::params!["Captain Quill"],
+                |row| row.get(0),
+            )
+            .expect("fixture player insert works");
+
+        let docking_gate = world
+            .insert_place("port-alpha", "Port Alpha", "harbor", None)
+            .expect("fixture place insert works");
+        let market_square = world
+            .insert_place("cargo-hub", "Cargo Hub", "dock", None)
+            .expect("fixture place insert works");
+
+        let initial = world
+            .set_presence(player_id, docking_gate.id, Some(r#"{"zone":"entry"}"#))
+            .expect("initial presence row exists");
+        sleep(Duration::from_secs(1));
+
+        let reject_result = world.move_player(player_id, market_square.id, |_, _| {
+            Err(rusqlite::Error::InvalidQuery)
+        });
+        match reject_result {
+            Err(PresenceError::MoveRejected {
+                player_id: row_id, ..
+            }) => {
+                assert_eq!(row_id, player_id);
+            }
+            _ => panic!("expected a move-reject error"),
+        }
+
+        let loaded = world
+            .connection()
+            .query_row(
+                "SELECT player_id, place_id, entered_at, metadata_json FROM presence WHERE player_id = ?1",
+                rusqlite::params![player_id],
+                row_to_presence,
+            )
+            .expect("presence row is queryable");
+
+        assert_eq!(loaded.player_id, player_id);
+        assert_eq!(loaded.place_id, docking_gate.id);
+        assert_eq!(
+            loaded.metadata_json,
+            Some(r#"{"zone":"entry"}"#.to_string())
+        );
+        assert_eq!(loaded.entered_at, initial.entered_at);
+    }
 }

@@ -37,7 +37,7 @@ One unchecked item per iteration. Dependencies in `[brackets]` must be checked o
 - [x] **5a** — Add `presence` migration: `player_id` PK, `place_id`, `entered_at`, `metadata_json`. [v2 Task 5, 3a]
 - [x] **5b** — Implement `set_presence(player_id, place_id)` initial-placement API. Test: row created with timestamp. [5a]
 - [x] **5c** — Implement `move_player(player_id, dest_place_id, on_commit)` transactional API. Test: presence updates and `entered_at` advances. [5b]
-- [ ] **5d** — Test rollback when `on_commit` returns an error: presence unchanged. [5c]
+- [x] **5d** — Test rollback when `on_commit` returns an error: presence unchanged. [5c]
 - [ ] **5e** — Implement `get_presence(player_id)` returning optional row. Test: unplaced player returns `None`. [5b]
 - [ ] **5f** — Implement `players_at(place_id)`. Test: returns current occupants and excludes players who have moved on. [5c]
 - [ ] **5g** — Confirm the kit does not auto-place players. Test: a freshly upserted player has no presence row until `set_presence` is called. [5b, v2 Task 5]
