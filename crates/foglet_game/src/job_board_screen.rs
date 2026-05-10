@@ -11,17 +11,18 @@
 //! - A **dungeon crawler** can render guild commissions and rival
 //!   bounty postings from multiple town districts.
 //!
-//! Task 6a intentionally lands the render-only baseline. Navigation,
-//! pagination, modal details, and accept/claim callbacks arrive in
-//! follow-up tasks.
+//! Task 6a lands the render baseline, while Task 6b adds keyboard
+//! navigation, pagination, and a quit hotkey. Detail modals and
+//! accept/claim callbacks arrive in follow-up tasks.
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Alignment, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
+use crate::input::Input;
 use crate::job_board::JobBoardEntry;
-use crate::screen::{GameContext, Screen};
+use crate::screen::{GameContext, Screen, ScreenCommand};
 
 /// Screen rendering an aggregated Job Board table.
 ///
@@ -41,6 +42,8 @@ pub struct JobBoardScreen {
     title: String,
     entries: Vec<JobBoardEntry>,
     empty_state_text: String,
+    selected_index: usize,
+    page_start: usize,
 }
 
 impl JobBoardScreen {
@@ -56,6 +59,9 @@ impl JobBoardScreen {
     const EXPIRES_COL_WIDTH: usize = 20;
     /// Single-cell spacer between logical columns.
     const COL_GAP: usize = 1;
+    /// In the canonical 80x24 frame, border + header + divider leaves
+    /// exactly 20 visible rows for entries.
+    const CANONICAL_PAGE_SIZE: usize = 20;
 
     /// Build a renderable Job Board list from pre-aggregated entries.
     ///
@@ -68,6 +74,8 @@ impl JobBoardScreen {
             title: Self::DEFAULT_TITLE.to_string(),
             entries,
             empty_state_text: Self::DEFAULT_EMPTY_STATE_TEXT.to_string(),
+            selected_index: 0,
+            page_start: 0,
         }
     }
 
@@ -98,12 +106,95 @@ impl JobBoardScreen {
     /// aggregation logic elsewhere.
     pub fn set_entries(&mut self, entries: Vec<JobBoardEntry>) {
         self.entries = entries;
+        self.normalize_page_state(Self::CANONICAL_PAGE_SIZE);
     }
 
     /// Borrow the entries currently scheduled for rendering.
     #[must_use]
     pub fn entries(&self) -> &[JobBoardEntry] {
         &self.entries
+    }
+
+    fn page_size_for_height(height: u16) -> usize {
+        // Outer border consumes two rows, then the table header and
+        // divider consume two more.
+        let inner_height = height.saturating_sub(2) as usize;
+        inner_height.saturating_sub(2).max(1)
+    }
+
+    fn normalize_page_state(&mut self, page_size: usize) {
+        if self.entries.is_empty() {
+            self.selected_index = 0;
+            self.page_start = 0;
+            return;
+        }
+
+        self.selected_index = self.selected_index.min(self.entries.len() - 1);
+        self.page_start = self.page_start.min(self.last_page_start(page_size));
+        if self.selected_index < self.page_start
+            || self.selected_index >= self.page_start + page_size
+        {
+            self.page_start = (self.selected_index / page_size) * page_size;
+        }
+    }
+
+    fn last_page_start(&self, page_size: usize) -> usize {
+        if self.entries.is_empty() {
+            return 0;
+        }
+        ((self.entries.len() - 1) / page_size) * page_size
+    }
+
+    fn move_cursor_down(&mut self, page_size: usize) {
+        if self.entries.is_empty() {
+            return;
+        }
+        self.selected_index = (self.selected_index + 1) % self.entries.len();
+        self.normalize_page_state(page_size);
+    }
+
+    fn move_cursor_up(&mut self, page_size: usize) {
+        if self.entries.is_empty() {
+            return;
+        }
+        self.selected_index = if self.selected_index == 0 {
+            self.entries.len() - 1
+        } else {
+            self.selected_index - 1
+        };
+        self.normalize_page_state(page_size);
+    }
+
+    fn next_page(&mut self, page_size: usize) {
+        if self.entries.is_empty() {
+            return;
+        }
+        let old_start = self.page_start;
+        let offset = self.selected_index.saturating_sub(old_start);
+        let last_start = self.last_page_start(page_size);
+        self.page_start = if self.page_start + page_size > last_start {
+            0
+        } else {
+            self.page_start + page_size
+        };
+        self.selected_index = (self.page_start + offset).min(self.entries.len() - 1);
+        self.normalize_page_state(page_size);
+    }
+
+    fn previous_page(&mut self, page_size: usize) {
+        if self.entries.is_empty() {
+            return;
+        }
+        let old_start = self.page_start;
+        let offset = self.selected_index.saturating_sub(old_start);
+        let last_start = self.last_page_start(page_size);
+        self.page_start = if self.page_start == 0 {
+            last_start
+        } else {
+            self.page_start.saturating_sub(page_size)
+        };
+        self.selected_index = (self.page_start + offset).min(self.entries.len() - 1);
+        self.normalize_page_state(page_size);
     }
 
     fn render_inner(&self, frame: &mut ratatui::Frame<'_>, area: Rect) {
@@ -158,7 +249,8 @@ impl JobBoardScreen {
         }
 
         let visible = (inner.height as usize).saturating_sub(2);
-        for (idx, entry) in self.entries.iter().take(visible).enumerate() {
+        let start = self.page_start.min(self.entries.len());
+        for (idx, entry) in self.entries.iter().skip(start).take(visible).enumerate() {
             let expires = entry.expires_at.as_deref().unwrap_or("-");
             let row = Self::format_row(
                 table_width,
@@ -167,7 +259,13 @@ impl JobBoardScreen {
                 &entry.title,
                 expires,
             );
-            Self::write_row(buf, inner, (idx + 2) as u16, &row, Style::default());
+            let absolute_index = start + idx;
+            let style = if absolute_index == self.selected_index {
+                Style::default().add_modifier(Modifier::REVERSED)
+            } else {
+                Style::default()
+            };
+            Self::write_row(buf, inner, (idx + 2) as u16, &row, style);
         }
     }
 
@@ -229,7 +327,35 @@ impl JobBoardScreen {
 
 impl Screen for JobBoardScreen {
     fn render(&mut self, _ctx: &mut GameContext<'_>, frame: &mut ratatui::Frame<'_>) {
+        let page_size = Self::page_size_for_height(frame.area().height);
+        self.normalize_page_state(page_size);
         self.render_inner(frame, frame.area());
+    }
+
+    fn handle_input(&mut self, ctx: &mut GameContext<'_>, input: Input) -> ScreenCommand {
+        let page_size = Self::page_size_for_height(ctx.terminal_size.1);
+        self.normalize_page_state(page_size);
+
+        match input {
+            Input::Up | Input::Char('k') => {
+                self.move_cursor_up(page_size);
+                ScreenCommand::None
+            }
+            Input::Down | Input::Char('j') => {
+                self.move_cursor_down(page_size);
+                ScreenCommand::None
+            }
+            Input::Left | Input::Char('p') => {
+                self.previous_page(page_size);
+                ScreenCommand::None
+            }
+            Input::Right | Input::Char('n') => {
+                self.next_page(page_size);
+                ScreenCommand::None
+            }
+            Input::Esc | Input::Char('q') => ScreenCommand::Pop,
+            _ => ScreenCommand::None,
+        }
     }
 }
 
@@ -238,6 +364,7 @@ mod tests {
     use super::*;
     use crate::config::{GameConfig, GameSection, ManifestSection, SaveSection, SaveStrategy};
     use crate::foglet::{ContextSource, FogletContext};
+    use crate::input::Input;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
@@ -325,6 +452,25 @@ mod tests {
         }
     }
 
+    fn numbered_entries(total: usize) -> Vec<JobBoardEntry> {
+        (0..total)
+            .map(|idx| {
+                entry(
+                    "Contract",
+                    "available",
+                    &format!("Task #{idx:02}"),
+                    Some("2026-05-10T10:00:00Z"),
+                )
+            })
+            .collect()
+    }
+
+    fn dispatch(screen: &mut JobBoardScreen, input: Input) -> ScreenCommand {
+        let (config, foglet) = fixture_context();
+        let mut ctx = GameContext::new(&config, &foglet, (80, 24));
+        screen.handle_input(&mut ctx, input)
+    }
+
     #[test]
     fn renders_required_columns_in_80x24_layout() {
         let mut screen = JobBoardScreen::new(vec![entry(
@@ -371,5 +517,60 @@ mod tests {
             !next_row.contains("ANCIENT-RUINS-DELIVERY-REQUEST"),
             "expected no wrapped overflow into the following row"
         );
+    }
+
+    #[test]
+    fn cursor_wraps_at_page_boundaries() {
+        let mut screen = JobBoardScreen::new(numbered_entries(25));
+
+        // Walk to the bottom row on page 1 (index 19 in an 80x24 view).
+        for _ in 0..20 {
+            let cmd = dispatch(&mut screen, Input::Down);
+            assert!(matches!(cmd, ScreenCommand::None));
+        }
+        assert_eq!(screen.selected_index, 20);
+        assert_eq!(screen.page_start, 20);
+
+        // Moving up from the top of page 2 wraps back onto page 1.
+        let cmd = dispatch(&mut screen, Input::Up);
+        assert!(matches!(cmd, ScreenCommand::None));
+        assert_eq!(screen.selected_index, 19);
+        assert_eq!(screen.page_start, 0);
+    }
+
+    #[test]
+    fn page_hotkeys_advance_and_wrap() {
+        let mut screen = JobBoardScreen::new(numbered_entries(45));
+
+        let cmd = dispatch(&mut screen, Input::Right);
+        assert!(matches!(cmd, ScreenCommand::None));
+        assert_eq!(screen.page_start, 20);
+        assert_eq!(screen.selected_index, 20);
+
+        let cmd = dispatch(&mut screen, Input::Right);
+        assert!(matches!(cmd, ScreenCommand::None));
+        assert_eq!(screen.page_start, 40);
+        assert_eq!(screen.selected_index, 40);
+
+        let cmd = dispatch(&mut screen, Input::Right);
+        assert!(matches!(cmd, ScreenCommand::None));
+        assert_eq!(screen.page_start, 0);
+        assert_eq!(screen.selected_index, 0);
+
+        let cmd = dispatch(&mut screen, Input::Left);
+        assert!(matches!(cmd, ScreenCommand::None));
+        assert_eq!(screen.page_start, 40);
+        assert_eq!(screen.selected_index, 40);
+    }
+
+    #[test]
+    fn quit_hotkeys_return_control_to_caller() {
+        let mut screen = JobBoardScreen::new(numbered_entries(3));
+
+        let cmd = dispatch(&mut screen, Input::Char('q'));
+        assert!(matches!(cmd, ScreenCommand::Pop));
+
+        let cmd = dispatch(&mut screen, Input::Esc);
+        assert!(matches!(cmd, ScreenCommand::Pop));
     }
 }
