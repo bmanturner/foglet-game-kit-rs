@@ -126,11 +126,24 @@ half is reachable. Per CLAUDE.md "Murder Motel content tasks are
 additive": existing v2/v2.1 screens and tests must keep passing
 unchanged.
 
-- [ ] **11a** — Add `notices` reads to `world.rs`: `WorldDb` accessor on the example's
+- [x] **11a** — Add `notices` reads to `world.rs`: `WorldDb` accessor on the example's
       world handle and a `recent_players_for_picker` wrapper that calls
       `WorldDb::recent_players` so the recipient picker has its data source. Pure
       plumbing; no UI yet. Test: integration test loads world DB, sends a notice
       through the public API, and reads it back via the new accessor. [Tasks 3, 8]
+      → Added `motel_inbox(&WorldDb, recipient_player_id)` (forwards
+      `WorldDb::inbox`) and `recent_players_for_picker(&WorldDb)` (wraps
+      `WorldDb::recent_players` at a pinned `GUESTBOOK_RECIPIENT_PICKER_LIMIT = 20`)
+      to `examples/murder_motel/src/world.rs`. The cap lives in the wrapper rather
+      than `game.toml` so the picker stays a fixed-height widget the renderer can
+      lay out without measuring the registry first; 20 rows comfortably fits 80×24
+      next to the compose form. Tests: round-trip `send_notice` → `motel_inbox`
+      asserting subject/body/sender/recipient and that alice's inbox stays empty
+      when bob is the recipient (scoping invariant); picker surfaces both seeded
+      handles and respects the cap; fresh registry returns `Ok(empty)` not error
+      so first-launch UX renders an empty list rather than a failure modal.
+      Murder Motel test count 232 → 235; workspace 851 → 851 (unchanged — new
+      tests live in the example crate, which `--workspace` doesn't compile in).
 - [ ] **11b** — Add a "Guestbook" entry to the title menu and a guestbook scene
       shell that lists the current player's inbox newest-first via `inbox()`. Pin
       with an `insta` snapshot of the empty-inbox state and a populated state.

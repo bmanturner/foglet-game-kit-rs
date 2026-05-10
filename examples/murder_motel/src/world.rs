@@ -8,7 +8,8 @@
 //! shape is a fixture choice, not a kit convention.
 
 use foglet_game::{
-    DateProvider, FeedbackLine, FogletContext, GameConfig, TurnError, WorldDb, WorldMigration,
+    DateProvider, FeedbackLine, FogletContext, GameConfig, Notice, NoticeError, PlayerError,
+    PlayerRecord, TurnError, WorldDb, WorldMigration,
 };
 use rusqlite::OptionalExtension;
 
@@ -374,6 +375,48 @@ pub fn read_remaining_turns(
         remaining: row.balance,
         daily_allowance: turns.daily_allowance,
     })
+}
+
+/// Maximum recipients surfaced in the guestbook compose modal's
+/// recipient picker (Task 11c). Pinned here — not in `game.toml` — so
+/// the picker stays a fixed-height widget the renderer can lay out
+/// without measuring the registry first. Twenty rows comfortably fits
+/// an 80×24 terminal alongside the compose form's subject/body fields.
+pub const GUESTBOOK_RECIPIENT_PICKER_LIMIT: i64 = 20;
+
+/// Read the current player's active inbox via [`WorldDb::inbox`].
+///
+/// Pure plumbing for the Murder Motel guestbook screen (Task 11b–d):
+/// the UI imports one named function from `world.rs` instead of
+/// reaching into [`foglet_game::WorldDb`] directly, mirroring how
+/// [`room_7_opening`] and [`recent_events`](WorldDb::recent_events)
+/// callers consume world state through example-owned wrappers.
+/// Forwards [`NoticeError`] verbatim so the screen can surface
+/// SQLite-shaped failures without losing typed-error fidelity.
+///
+/// `recipient_player_id` is the canonical [`PlayerRecord::id`] of the
+/// player whose inbox to show (always the *current* player in the
+/// guestbook screen — the wrapper does not enforce that, since
+/// behavioural tests want to drive both alice's and bob's inbox from
+/// the same process).
+pub fn motel_inbox(world: &WorldDb, recipient_player_id: i64) -> Result<Vec<Notice>, NoticeError> {
+    world.inbox(recipient_player_id)
+}
+
+/// Read the recipient picker's data source for the guestbook compose
+/// modal (Task 11c) via [`WorldDb::recent_players`], capped at
+/// [`GUESTBOOK_RECIPIENT_PICKER_LIMIT`].
+///
+/// Wrapping the limit here (rather than threading it through every
+/// caller) keeps the picker's row count consistent across the compose
+/// modal, the rival-challenge picker (Task 12b), and any future
+/// recipient-style flow — they all import the same wrapper. Returns
+/// the rows newest-active-first per [`WorldDb::recent_players`]'s
+/// ordering contract; a fresh world DB returns an empty `Vec` rather
+/// than an error so the modal can render an "(no players yet)" state
+/// without a special-case branch.
+pub fn recent_players_for_picker(world: &WorldDb) -> Result<Vec<PlayerRecord>, PlayerError> {
+    world.recent_players(GUESTBOOK_RECIPIENT_PICKER_LIMIT)
 }
 
 #[cfg(test)]
@@ -1173,6 +1216,152 @@ mod tests {
             top[0].score,
             2 * CLUE_FOUND_LEADERBOARD_DELTA,
             "two clues must accumulate, not overwrite"
+        );
+    }
+
+    /// Task 11a — round-trip through the new guestbook plumbing:
+    /// send a notice via the kit's public API and read it back via
+    /// [`motel_inbox`]. Pinning the wrapper here lets the upcoming
+    /// guestbook screen tests (Task 11b–d) assume `motel_inbox`
+    /// faithfully returns whatever `WorldDb::send_notice` wrote, and
+    /// catches a regression where someone "simplifies" the wrapper
+    /// into something that drops, paginates, or filters notices.
+    #[test]
+    fn motel_inbox_reads_back_notice_sent_via_kit_api() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("world.sqlite");
+        let mut world = WorldDb::open(&db_path).expect("open world db");
+        world
+            .apply_migration(&PLAYERS_MIGRATION)
+            .expect("apply players migration");
+        world
+            .apply_migration(&foglet_game::NOTICES_MIGRATION)
+            .expect("apply notices migration");
+
+        // Seed two players via the connection — we need stable ids for
+        // sender/recipient and `upsert_player` would require a
+        // `FogletContext` per side, which is more setup than this
+        // round-trip needs.
+        world
+            .connection()
+            .execute(
+                "INSERT INTO players (foglet_user_id, handle, role, security_level, \
+                 first_seen_at, last_seen_at) \
+                 VALUES (NULL, 'alice', 'user', 50, \
+                         CURRENT_TIMESTAMP, CURRENT_TIMESTAMP), \
+                        (NULL, 'bob', 'user', 50, \
+                         CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+                [],
+            )
+            .expect("seed alice + bob");
+        let alice_id: i64 = world
+            .connection()
+            .query_row("SELECT id FROM players WHERE handle = 'alice'", [], |r| {
+                r.get(0)
+            })
+            .expect("alice id");
+        let bob_id: i64 = world
+            .connection()
+            .query_row("SELECT id FROM players WHERE handle = 'bob'", [], |r| {
+                r.get(0)
+            })
+            .expect("bob id");
+
+        let sent = world
+            .send_notice(
+                Some(alice_id),
+                bob_id,
+                "guestbook",
+                "Welcome to the motel",
+                "Drop me a postcard if you crack Room 7.",
+                None,
+                None,
+                1_000,
+            )
+            .expect("send_notice succeeds with bounded text");
+
+        let inbox = motel_inbox(&world, bob_id).expect("motel_inbox round-trip");
+        assert_eq!(
+            inbox.len(),
+            1,
+            "the wrapper must surface the one notice we just sent"
+        );
+        let observed = &inbox[0];
+        assert_eq!(observed.id, sent.id);
+        assert_eq!(observed.subject, "Welcome to the motel");
+        assert_eq!(observed.body, "Drop me a postcard if you crack Room 7.");
+        assert_eq!(observed.sender_player_id, Some(alice_id));
+        assert_eq!(observed.recipient_player_id, bob_id);
+
+        // Alice's inbox is independent of Bob's — proves the wrapper
+        // scopes to the requested recipient and doesn't leak the
+        // global notices table.
+        let alice_inbox = motel_inbox(&world, alice_id).expect("alice inbox round-trip");
+        assert!(
+            alice_inbox.is_empty(),
+            "wrapper must scope strictly to the requested recipient"
+        );
+    }
+
+    /// Task 11a — recipient picker plumbing surfaces both seeded
+    /// players newest-active-first. Cap-respect is covered exhaustively
+    /// in `players::recent_players_*` tests; this one just pins that
+    /// the wrapper actually calls through to the kit and the
+    /// configured cap admits both rows for the two-player smoke
+    /// scenario from completion condition #8.
+    #[test]
+    fn recent_players_for_picker_surfaces_seeded_players() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("world.sqlite");
+        let mut world = WorldDb::open(&db_path).expect("open world db");
+        world
+            .apply_migration(&PLAYERS_MIGRATION)
+            .expect("apply players migration");
+        world
+            .connection()
+            .execute(
+                "INSERT INTO players (foglet_user_id, handle, role, security_level, \
+                 first_seen_at, last_seen_at) \
+                 VALUES (NULL, 'alice', 'user', 50, \
+                         CURRENT_TIMESTAMP, CURRENT_TIMESTAMP), \
+                        (NULL, 'bob', 'user', 50, \
+                         CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+                [],
+            )
+            .expect("seed alice + bob");
+
+        let rows = recent_players_for_picker(&world).expect("recent_players_for_picker");
+        let handles: Vec<&str> = rows.iter().map(|p| p.handle.as_str()).collect();
+        assert!(
+            handles.contains(&"alice") && handles.contains(&"bob"),
+            "picker wrapper must surface both seeded handles, got: {handles:?}"
+        );
+        assert!(
+            rows.len() <= GUESTBOOK_RECIPIENT_PICKER_LIMIT as usize,
+            "wrapper must not exceed the documented picker cap (got {} rows)",
+            rows.len()
+        );
+    }
+
+    /// Empty-registry path — the picker MUST NOT surface an error on a
+    /// fresh world DB; the modal will render an empty list instead.
+    /// Pinned because `recent_players` *does* error on negative limits,
+    /// and a regression that flipped the cap to a negative constant
+    /// would silently break the first-launch UX.
+    #[test]
+    fn recent_players_for_picker_returns_empty_vec_on_fresh_registry() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("world.sqlite");
+        let mut world = WorldDb::open(&db_path).expect("open world db");
+        world
+            .apply_migration(&PLAYERS_MIGRATION)
+            .expect("apply players migration");
+
+        let rows =
+            recent_players_for_picker(&world).expect("fresh registry must return Ok, not error");
+        assert!(
+            rows.is_empty(),
+            "fresh registry => empty picker, got {rows:?}"
         );
     }
 
