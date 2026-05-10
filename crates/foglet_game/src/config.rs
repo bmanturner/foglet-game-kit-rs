@@ -679,6 +679,11 @@ impl GameConfig {
                 "[world_ticks].max_catchup_per_call must be greater than zero".into(),
             ));
         }
+        if self.presence.enabled && !self.spatial.enabled {
+            return Err(ConfigError::Validate(
+                "[presence].enabled requires [spatial].enabled = true".into(),
+            ));
+        }
         if self.place_recall.enabled && !self.spatial.enabled {
             return Err(ConfigError::Validate(
                 "[place_recall].enabled requires [spatial].enabled = true".into(),
@@ -1099,6 +1104,39 @@ enabled = true
             ConfigError::Validate(msg) => {
                 assert!(
                     msg.contains("[place_recall]") && msg.contains("[spatial]"),
+                    "error should mention both toggles: {msg}"
+                );
+            }
+            other => panic!("expected Validate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn presence_requires_spatial_be_enabled() {
+        // Task 2d: presence is only meaningful when the place graph is
+        // enabled, so we reject configurations that enable `[presence]`
+        // alone.
+        let err = GameConfig::from_toml_str(
+            r#"
+[game]
+title = "Presence"
+slug = "presence"
+description = ""
+min_width = 80
+min_height = 24
+start_map = "lobby"
+start_x = 0
+start_y = 0
+
+[presence]
+enabled = true
+"#,
+        )
+        .unwrap_err();
+        match err {
+            ConfigError::Validate(msg) => {
+                assert!(
+                    msg.contains("[presence]") && msg.contains("[spatial]"),
                     "error should mention both toggles: {msg}"
                 );
             }
