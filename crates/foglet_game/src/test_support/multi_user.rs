@@ -170,6 +170,11 @@ impl MultiUserHarness {
         &self.world_db
     }
 
+    /// Mutable shared world DB handle.
+    pub fn world_db_mut(&mut self) -> &mut WorldDb {
+        &mut self.world_db
+    }
+
     /// Shared config used by harness contexts.
     #[must_use]
     pub fn config(&self) -> &GameConfig {
@@ -407,7 +412,10 @@ fn harness_config(notices_enabled: bool) -> GameConfig {
 #[cfg(test)]
 mod tests {
     use super::{MultiUserHarness, MultiUserHarnessError};
+    use crate::inventory::INVENTORY_SLOTS_MIGRATION;
+    use crate::place_recall::PLACE_RECALL_MIGRATION;
     use crate::roles::FogletRole;
+    use crate::spatial::PLACES_MIGRATION;
 
     #[test]
     fn builder_creates_one_shared_world_db_and_per_user_save_roots() {
@@ -583,5 +591,81 @@ mod tests {
         assert!(!world_db_path.exists());
         assert!(!alice_save_root.exists());
         assert!(!bob_save_root.exists());
+    }
+
+    #[test]
+    fn self_test_shared_inventory_and_per_player_recall() {
+        let mut harness = MultiUserHarness::builder()
+            .add_user("alice", FogletRole::User)
+            .add_user("bob", FogletRole::User)
+            .build()
+            .expect("harness builds");
+        let alice_id = harness.player_id_for("alice").expect("alice player id");
+        let bob_id = harness.player_id_for("bob").expect("bob player id");
+
+        {
+            let world = harness.world_db_mut();
+            world
+                .apply_migration(&INVENTORY_SLOTS_MIGRATION)
+                .expect("inventory migration applies");
+            world
+                .apply_migration(&PLACES_MIGRATION)
+                .expect("places migration applies");
+            world
+                .apply_migration(&PLACE_RECALL_MIGRATION)
+                .expect("recall migration applies");
+            world
+                .create_slot("player", alice_id, "key", 2, None, None)
+                .expect("alice inventory inserts");
+            world
+                .transfer(
+                    ("player", alice_id),
+                    ("player", bob_id),
+                    "key",
+                    1,
+                    Option::<
+                        fn(
+                            &rusqlite::Transaction<'_>,
+                            &crate::inventory::InventorySlot,
+                            &crate::inventory::InventorySlot,
+                        ) -> Result<(), rusqlite::Error>,
+                    >::None,
+                )
+                .expect("alice transfer to bob succeeds");
+
+            let alice_place = world
+                .insert_place("alice-room", "Alice Room", "room", None)
+                .expect("alice place inserts");
+            let bob_place = world
+                .insert_place("bob-room", "Bob Room", "room", None)
+                .expect("bob place inserts");
+            world
+                .touch_recall(alice_id, alice_place.id, None)
+                .expect("alice recall touches");
+            world
+                .touch_recall(bob_id, bob_place.id, None)
+                .expect("bob recall touches");
+        }
+
+        let bob_inventory = harness
+            .world_db()
+            .slots_for_owner("player", bob_id)
+            .expect("bob inventory reads");
+        assert!(
+            bob_inventory
+                .iter()
+                .any(|slot| slot.item_key == "key" && slot.quantity > 0),
+            "Bob should observe Alice's committed transfer"
+        );
+
+        let alice_recall = harness
+            .world_db()
+            .recall_for_player(alice_id)
+            .expect("alice recall reads");
+        let bob_recall = harness
+            .world_db()
+            .recall_for_player(bob_id)
+            .expect("bob recall reads");
+        assert_ne!(alice_recall, bob_recall);
     }
 }
