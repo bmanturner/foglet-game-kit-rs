@@ -60,6 +60,7 @@ pub mod save;
 pub mod screen;
 pub mod spatial;
 pub mod terminal;
+pub mod travel;
 pub mod turns;
 pub mod widgets;
 pub mod world_db;
@@ -139,6 +140,10 @@ pub use terminal::{
     arm_panic_hook, disarm_panic_hook, flush_stdout, install_panic_hook, install_panic_hook_with,
     is_panic_hook_armed, CrosstermBackend, PanicRestoreFn, TerminalBackend, TerminalError,
     TerminalGuard,
+};
+pub use travel::{
+    TravelAppendEventCallback, TravelChargeCostCallback, TravelError, TravelEventDraft,
+    TravelRequest, TravelResult, TravelValidateCallback,
 };
 pub use turns::{
     DateProvider, FixedDateProvider, LocalDate, TurnError, TurnLedgerRow, TURN_LEDGER_MIGRATION,
