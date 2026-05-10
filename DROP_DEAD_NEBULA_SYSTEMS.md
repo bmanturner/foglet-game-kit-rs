@@ -340,9 +340,9 @@ Per-user save state:
 
 ### Open Questions
 
-1. Is captain name always Foglet username, or player-chosen?
-2. Which captain fields are shared DB vs per-user save?
-3. Should users be allowed multiple captains?
+1. Is captain name always Foglet username, or player-chosen? Player-chosen.
+2. Which captain fields are shared DB vs per-user save? Probably mostly shared DB. per-user save is more for preferences and tutorial flags, etc. Other user's can see Captain information, so should be shared.
+3. Should users be allowed multiple captains? No.
 
 ---
 

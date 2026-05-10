@@ -1666,4 +1666,157 @@ mod tests {
             "callback must observe the post-decrement quantity (4 - 1 = 3)"
         );
     }
+
+    /// SPEC_v3 §Task 5e — when the buyer callback returns `Err`, the
+    /// wrapping transaction MUST roll back as a unit: the kit's own
+    /// quantity decrement is undone *and* every write the callback
+    /// itself attempted is undone. SPEC §4.3 "Buying MUST be atomic"
+    /// and SPEC §7 "no partial debit" both depend on this invariant —
+    /// a regression that committed the decrement before running the
+    /// callback (or that swallowed the callback's `Err` after writes)
+    /// would observably flunk here.
+    ///
+    /// This test exercises the failure mode in three layers, each
+    /// pinned independently so a partial regression still surfaces:
+    ///
+    /// 1. **Typed error surface.** The helper returns
+    ///    [`MarketError::BuyerCallback`] (not `Sqlite`, not `NotFound`)
+    ///    so the marketplace UI can render a buyer-side reason
+    ///    ("insufficient funds") distinct from a SQLite-layer failure.
+    /// 2. **Listing decrement is rolled back.** A follow-up SELECT on
+    ///    the listing row sees the *pre-buy* quantity, not the
+    ///    post-decrement value the helper computed inside the txn.
+    /// 3. **Callback's own writes are rolled back.** The callback
+    ///    inserts into a scratch table that's visible to it inside
+    ///    the txn (proven by the previous test); after the rollback
+    ///    that scratch row MUST NOT exist. Without this assertion a
+    ///    regression that committed the txn even on callback `Err`
+    ///    could pass the listing-quantity check (because the bad
+    ///    callback only wrote, never updated the listing) while
+    ///    leaving a debit-without-credit in production.
+    ///
+    /// We also re-assert via [`WorldDb::active_listings`] that the
+    /// listing is still visible with the pre-buy quantity — the
+    /// post-decrement view (quantity = 0) would have hidden it via
+    /// the partial `idx_market_listings_active` predicate, so this
+    /// is a second, query-path-flavoured proof that the rollback
+    /// took effect.
+    #[test]
+    fn buy_listing_rolls_back_listing_and_callback_writes_when_callback_fails() {
+        let (_dir, mut world, seller_id) = world_with_listings();
+
+        // Seed a listing with a small, exact quantity. Buying every
+        // unit is the strongest test: a regression that committed the
+        // decrement before checking the callback would leave
+        // quantity = 0 and drop the row out of `active_listings`,
+        // which is the second assertion below.
+        let listing = world
+            .create_listing(
+                Some(seller_id),
+                "item.cursed",
+                "Cursed Token",
+                500,
+                3,
+                None,
+                None,
+            )
+            .expect("create_listing succeeds");
+
+        // Scratch table the failing callback writes to *before*
+        // returning Err. If the rollback works, both writes (the
+        // kit's listing decrement and the callback's INSERT) are
+        // undone together; if the rollback only covers one of them,
+        // the assertions below catch which one leaked through.
+        world
+            .connection()
+            .execute(
+                "CREATE TABLE buyer_balance_attempts (\
+                    listing_id INTEGER NOT NULL,\
+                    attempted  INTEGER NOT NULL\
+                )",
+                [],
+            )
+            .expect("scratch table created");
+
+        // The marketplace UI's failure case: balance check fails
+        // *after* the kit has already decremented. We model the
+        // "failed payment" by writing an audit row inside the txn
+        // and *then* returning Err — this is the worst-case shape
+        // for atomicity (the callback did real work before failing).
+        // The callback maps its non-SQLite failure into a
+        // `SqliteFailure` with an explanatory message, matching the
+        // documented convention on `MarketError::BuyerCallback`.
+        let err = world
+            .buy_listing(listing.id, 3, |tx, row| {
+                tx.execute(
+                    "INSERT INTO buyer_balance_attempts (listing_id, attempted) \
+                     VALUES (?1, ?2)",
+                    rusqlite::params![row.id, row.quantity],
+                )?;
+                // Simulate "buyer can't afford this". Using
+                // `SqliteFailure` matches the documented mapping
+                // convention; the marketplace UI would surface the
+                // wrapped `extended_code` / message verbatim.
+                Err(rusqlite::Error::SqliteFailure(
+                    rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT),
+                    Some("insufficient buyer balance".to_string()),
+                ))
+            })
+            .expect_err("failing callback must propagate as Err");
+
+        match err {
+            MarketError::BuyerCallback { source: _ } => {}
+            other => panic!("expected BuyerCallback, got {other:?}"),
+        }
+
+        // (2) The listing's `quantity` is back to the pre-buy value.
+        // A regression that committed the decrement before the
+        // callback (or that ignored callback `Err`) would see 0 here.
+        let still: i64 = world
+            .connection()
+            .query_row(
+                "SELECT quantity FROM market_listings WHERE id = ?1",
+                rusqlite::params![listing.id],
+                |row| row.get(0),
+            )
+            .expect("select quantity");
+        assert_eq!(
+            still, 3,
+            "failing buyer callback must roll back the kit's own decrement"
+        );
+
+        // (3) The callback's INSERT into the scratch table is also
+        // gone. Pinning this separately — rather than only asserting
+        // the listing quantity — catches the asymmetric regression
+        // where the kit's decrement rolls back but the callback's
+        // writes leak through (a debit-without-credit in production).
+        let scratch_rows: i64 = world
+            .connection()
+            .query_row("SELECT COUNT(*) FROM buyer_balance_attempts", [], |row| {
+                row.get(0)
+            })
+            .expect("count scratch rows");
+        assert_eq!(
+            scratch_rows, 0,
+            "callback writes must roll back together with the listing decrement"
+        );
+
+        // Query-path-flavoured proof: the listing is still visible in
+        // `active_listings` with its pre-buy quantity. If the decrement
+        // had silently committed, the partial index predicate
+        // (`quantity > 0`) would still keep it visible at quantity 0?
+        // No — `quantity > 0` filters zero rows out, so a leaked
+        // commit-on-failure would have *hidden* the listing here.
+        // Either way the post-condition is the same: the listing row
+        // matches the pre-buy state.
+        let active = world.active_listings().expect("active_listings runs");
+        let visible = active
+            .iter()
+            .find(|l| l.id == listing.id)
+            .expect("listing still visible after rollback");
+        assert_eq!(
+            visible.quantity, 3,
+            "active_listings must reflect the rolled-back pre-buy quantity"
+        );
+    }
 }
