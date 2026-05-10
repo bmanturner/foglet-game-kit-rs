@@ -116,7 +116,7 @@ One unchecked item per iteration. Dependencies in `[brackets]` must be checked o
 
 - [x] All Task 1–13 items above are checked
 - [x] Spatial graph supports unique-keyed places and asymmetric directed routes
-- [ ] Presence supports transactional move with rollback on rejected `on_commit`
+- [x] Presence supports transactional move with rollback on rejected `on_commit`
 - [ ] Place recall is per-player, idempotent, and never auto-touched by movement
 - [ ] Inventory supports atomic transfer with `on_commit` rollback and distinct error variants
 - [ ] World ticks are durable, idempotent under concurrency, and bounded by `max_catchup_per_call`
