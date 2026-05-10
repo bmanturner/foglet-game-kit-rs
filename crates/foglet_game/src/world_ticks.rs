@@ -530,6 +530,117 @@ mod tests {
         );
     }
 
+    /// Task 9d requires failed callbacks to execute atomically with their row
+    /// updates and be retriable on the next `run_due_ticks` invocation.
+    #[test]
+    fn run_due_ticks_retries_failed_callback_without_advancing_last_run_at() {
+        let dir = tempdir().expect("tempdir creates");
+        let db_path = dir.path().join("world.sqlite");
+        let mut world = WorldDb::open(&db_path).expect("open succeeds");
+
+        world
+            .apply_migration(&WORLD_TICK_TASKS_MIGRATION)
+            .expect("world_tick_tasks migration applies");
+
+        world
+            .connection()
+            .execute(
+                "CREATE TABLE tick_side_effects (\n                task_key TEXT PRIMARY KEY,\n                attempts INTEGER NOT NULL\n             )",
+                [],
+            )
+            .expect("side-effect fixture table exists");
+
+        let attempts = Rc::new(RefCell::new(0_u32));
+
+        world
+            .register_tick("retry_tick", 300, {
+                let attempts = Rc::clone(&attempts);
+                move |tx| {
+                    let attempt = {
+                        let mut attempts = attempts.borrow_mut();
+                        *attempts += 1;
+                        *attempts
+                    };
+
+                    tx.execute(
+                        "INSERT INTO tick_side_effects (task_key, attempts)\n                     VALUES (?1, ?2)",
+                        rusqlite::params!["retry_tick", attempt],
+                    )?;
+
+                    if attempt == 1 {
+                        return Err(rusqlite::Error::QueryReturnedNoRows);
+                    }
+
+                    Ok(())
+                }
+            })
+            .expect("register_tick persists row");
+
+        let first = world.run_due_ticks("2026-01-01 10:45:00");
+        assert!(matches!(
+            first,
+            Err(WorldTickError::CallbackRejected { key, .. }) if key == "retry_tick"
+        ));
+
+        let last_run_after_failure: Option<String> = world
+            .connection()
+            .query_row(
+                "SELECT last_run_at FROM world_tick_tasks WHERE key = ?1",
+                params!["retry_tick"],
+                |row| row.get(0),
+            )
+            .expect("query persisted row");
+        assert!(
+            last_run_after_failure.is_none(),
+            "failed tick should not advance last_run_at"
+        );
+
+        let side_effect_count: i64 = world
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM tick_side_effects WHERE task_key = ?1",
+                params!["retry_tick"],
+                |row| row.get(0),
+            )
+            .expect("query failed inserts from rolled-back attempt");
+        assert_eq!(
+            side_effect_count, 0,
+            "failed callback side-effects must rollback with transaction"
+        );
+
+        let second = world
+            .run_due_ticks("2026-01-01 10:45:00")
+            .expect("retry should now succeed");
+        assert_eq!(second, 1, "one retrying callback should now succeed");
+
+        let last_run_after_retry: Option<String> = world
+            .connection()
+            .query_row(
+                "SELECT last_run_at FROM world_tick_tasks WHERE key = ?1",
+                params!["retry_tick"],
+                |row| row.get(0),
+            )
+            .expect("query persisted row");
+        assert_eq!(
+            last_run_after_retry.as_deref(),
+            Some("2026-01-01 10:45:00"),
+            "successful retry should now stamp last_run_at"
+        );
+
+        let stored_attempts: i64 = world
+            .connection()
+            .query_row(
+                "SELECT attempts FROM tick_side_effects WHERE task_key = ?1",
+                params!["retry_tick"],
+                |row| row.get(0),
+            )
+            .expect("query committed retry attempt");
+        assert_eq!(
+            stored_attempts, 2,
+            "only successful attempt should remain committed"
+        );
+    }
+
     /// Task 9a accepts that the migration creates the documented schema.
     #[test]
     fn applies_world_tick_tasks_migration_with_documented_columns() {
