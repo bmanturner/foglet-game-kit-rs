@@ -1177,6 +1177,61 @@ mod tests {
     }
 
     #[test]
+    fn transfer_rejects_non_positive_quantity() {
+        let dir = tempdir().expect("tempdir creates");
+        let db_path = dir.path().join("world.sqlite");
+        let mut world = WorldDb::open(&db_path).expect("open succeeds");
+
+        world
+            .apply_migration(&INVENTORY_SLOTS_MIGRATION)
+            .expect("inventory_slots migration applies");
+
+        let source = world
+            .create_slot("dock", 9, "fuel-cell", 10, None, None)
+            .expect("source slot exists");
+
+        for quantity in [0, -5] {
+            let err = world
+                .transfer(
+                    ("dock", 9),
+                    ("carrier", 3),
+                    "fuel-cell",
+                    quantity,
+                    None::<
+                        fn(
+                            &rusqlite::Transaction<'_>,
+                            &InventorySlot,
+                            &InventorySlot,
+                        ) -> rusqlite::Result<()>,
+                    >,
+                )
+                .expect_err("non-positive transfer should be rejected");
+
+            match err {
+                InventoryError::InvalidTransferQuantity { quantity: got } => {
+                    assert_eq!(got, quantity);
+                }
+                other => panic!("expected InvalidTransferQuantity, got {other:?}"),
+            }
+        }
+
+        let after_source = world
+            .get_slot("dock", 9, "fuel-cell")
+            .expect("source still readable")
+            .expect("source row still exists");
+        assert_eq!(after_source.id, source.id);
+        assert_eq!(after_source.quantity, 10);
+
+        let missing_destination = world
+            .get_slot("carrier", 3, "fuel-cell")
+            .expect("destination read is okay");
+        assert!(
+            missing_destination.is_none(),
+            "invalid quantity must not create destination rows"
+        );
+    }
+
+    #[test]
     fn transfer_rejects_missing_stock_and_leaves_slots_unchanged() {
         let dir = tempdir().expect("tempdir creates");
         let db_path = dir.path().join("world.sqlite");
