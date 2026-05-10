@@ -7,6 +7,12 @@
 //! registration API here only ensures durable registration and deduplicates
 //! duplicate definitions by key.
 //!
+//! Tick callbacks are designed for a lock-safe, multi-runner world where no
+//! process can assume it has exclusive write ownership of the database. Callers
+//! must therefore treat callback SQL as potentially concurrent with another
+//! `run_due_ticks` invocation and prefer idempotent, conflict-tolerant
+//! statements.
+//!
 //! Genre-neutral framing:
 //!
 //! - In a **space exploration** game, tasks can be used to refresh
@@ -206,6 +212,12 @@ impl WorldDb {
     /// tick-at-a-time when the player returns after disconnection.
     /// `max_catchup_per_call` caps how many due tasks run in one
     /// invocation so long downtime doesn't execute an unbounded backlog.
+    ///
+    /// A callback must not assume this process has the only writer lock on the
+    /// world database. `run_due_ticks` can be called by login flow and by
+    /// `fgk tick`, and there can be more than one process invoking either
+    /// path. Keep callback SQL idempotent (or protected by application-level
+    /// version checks) so retries and concurrent invocations remain safe.
     pub fn run_due_ticks(
         &mut self,
         now: &str,

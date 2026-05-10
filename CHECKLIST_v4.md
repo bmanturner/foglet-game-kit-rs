@@ -77,7 +77,7 @@ One unchecked item per iteration. Dependencies in `[brackets]` must be checked o
 - [x] **9d** — Each tick callback runs inside a transaction; on error, `last_run_at` is unchanged. Test: failed callback retries on next call. [9c]
 - [x] **9e** — Enforce `max_catchup_per_call` upper bound. Test: when more tasks are due than the bound, only that many run; remainder run on subsequent call. [9c, 2b]
 - [x] **9f** — Guarantee no double-invocation under concurrent `run_due_ticks`. Test: two threads hitting `run_due_ticks` together each see disjoint task sets summing to the due set. [9c]
-- [ ] **9g** — Document that tick callbacks must not assume exclusive writer access. [9c]
+- [x] **9g** — Document that tick callbacks must not assume exclusive writer access. [9c]
 
 ### Task 10 — `fgk tick` CLI subcommand
 
