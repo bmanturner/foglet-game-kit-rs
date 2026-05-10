@@ -102,7 +102,7 @@ One unchecked item per iteration. Dependencies in `[brackets]` must be checked o
 - [x] **12e** — Add `docs/spec-v4-overview.md` cross-referencing v1–v3 primitives and showing how v4 composes with them (e.g., place-owned inventory + tick task = restocking trading post). [12a, 12b, 12c, 12d]
 - [x] **12f** — Update top-level `README.md` with a v4 features section linking to the new docs. [12e]
 - [x] **12g** — Update `docs/foglet-install.md` (or equivalent operator doc) with `fgk tick` cron guidance. [10a]
-- [ ] **12h** — Document explicitly that v4 still has no real-time multiplayer and no long-lived daemon. [12d]
+- [x] **12h** — Document explicitly that v4 still has no real-time multiplayer and no long-lived daemon. [12d]
 - [ ] **12i** — Document the deliberate choice to skip sample-game integration of v4 features in this kit's fixture and the reason (genre-neutrality). [12e]
 - [ ] **12j** — Add a backup/maintenance note covering the new tables: `places`, `routes`, `presence`, `place_recall`, `inventory_slots`, `world_tick_tasks`. [12e]
 

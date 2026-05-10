@@ -21,6 +21,14 @@ v4 is additive and structural:
 - It adds new tables and APIs for where entities are, what players
   remember, who owns stock, and when periodic world work runs.
 
+v4 also keeps two explicit non-goals from earlier versions:
+
+- v4 still has **no real-time multiplayer**.
+- v4 still has **no long-lived daemon process**.
+
+World advancement remains lazy catch-up plus one-shot `fgk tick`
+invocations, never a background service.
+
 ## 2. Primitive map by version
 
 ### v1 foundation (runtime safety)
