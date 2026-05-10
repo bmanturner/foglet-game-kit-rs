@@ -54,7 +54,7 @@ One unchecked item per iteration. Dependencies in `[brackets]` must be checked o
 ### Task 7 — Inventory schema
 
 - [x] **7a** — Add `inventory_slots` migration: `id`, `owner_kind`, `owner_id`, `item_key`, `quantity` non-negative, `equilibrium` nullable, `metadata_json`, `created_at`, `updated_at`. [v2 Task 4]
-- [ ] **7b** — Implement `create_slot` and `get_slot(owner_kind, owner_id, item_key)`. Test: round-trips. [7a]
+- [x] **7b** — Implement `create_slot` and `get_slot(owner_kind, owner_id, item_key)`. Test: round-trips. [7a]
 - [ ] **7c** — Add CHECK constraint or runtime guard preventing negative quantity. Test: direct write of negative quantity fails. [7b]
 - [ ] **7d** — Confirm `equilibrium` is advisory. Test: setting `equilibrium` does not alter `quantity`; the kit performs no auto-drift. [7b]
 - [ ] **7e** — Implement `slots_for_owner(owner_kind, owner_id)`. Test: deterministic ordering. [7b]
