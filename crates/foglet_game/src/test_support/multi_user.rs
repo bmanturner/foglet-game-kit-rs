@@ -7,10 +7,12 @@ use tempfile::TempDir;
 use thiserror::Error;
 
 use crate::config::{
-    GameConfig, GameSection, ManifestSection, SaveSection, SaveStrategy, WorldSection,
+    GameConfig, GameSection, ManifestSection, MultiplayerSection, SaveSection, SaveStrategy,
+    WorldSection,
 };
 use crate::events::{EventError, EventRecord, WORLD_EVENTS_MIGRATION};
 use crate::foglet::{ContextSource, FogletContext};
+use crate::notices::{Notice, NoticeError, NOTICES_MIGRATION};
 use crate::players::{PlayerError, PLAYERS_MIGRATION};
 use crate::roles::FogletRole;
 use crate::screen::GameContext;
@@ -24,12 +26,14 @@ pub struct MultiUserHarness {
     world_db: WorldDb,
     config: GameConfig,
     users: HashMap<String, HarnessUser>,
+    notices_enabled: bool,
 }
 
 /// Builder for [`MultiUserHarness`].
 #[derive(Debug, Default)]
 pub struct MultiUserHarnessBuilder {
     users: Vec<UserSpec>,
+    notices_enabled: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -114,6 +118,22 @@ pub enum MultiUserHarnessError {
         /// Underlying player error.
         #[source]
         source: PlayerError,
+    },
+    /// Notice assertions are unavailable because v3 notices are disabled.
+    #[error("harness notices are disabled")]
+    NoticesDisabled,
+    /// Reading notices failed.
+    #[error("failed to read harness notices: {source}")]
+    NoticeRead {
+        /// Underlying notice error.
+        #[source]
+        source: NoticeError,
+    },
+    /// Notice visibility assertion failed.
+    #[error("no notice matched for `{handle}`")]
+    NoticeNotFound {
+        /// User handle.
+        handle: String,
     },
 }
 
@@ -216,6 +236,32 @@ impl MultiUserHarness {
             })
     }
 
+    /// Assert that a matching notice exists for one handle.
+    pub fn assert_notice_for(
+        &self,
+        handle: &str,
+        predicate: impl Fn(&Notice) -> bool,
+    ) -> Result<(), MultiUserHarnessError> {
+        if !self.notices_enabled {
+            return Err(MultiUserHarnessError::NoticesDisabled);
+        }
+        let user = self
+            .users
+            .get(handle)
+            .ok_or_else(|| MultiUserHarnessError::UnknownHandle {
+                handle: handle.to_string(),
+            })?;
+        let notices = self
+            .world_db
+            .inbox(user.player_id)
+            .map_err(|source| MultiUserHarnessError::NoticeRead { source })?;
+        notices.iter().any(predicate).then_some(()).ok_or_else(|| {
+            MultiUserHarnessError::NoticeNotFound {
+                handle: handle.to_string(),
+            }
+        })
+    }
+
     /// Harness temp root. Exposed for cleanup assertions.
     #[must_use]
     pub fn temp_root(&self) -> &Path {
@@ -231,6 +277,13 @@ impl MultiUserHarnessBuilder {
             handle: handle.into(),
             role,
         });
+        self
+    }
+
+    /// Enable v3 notice helpers for the harness.
+    #[must_use]
+    pub fn with_notices_enabled(mut self) -> Self {
+        self.notices_enabled = true;
         self
     }
 
@@ -251,6 +304,11 @@ impl MultiUserHarnessBuilder {
         world_db
             .apply_migration(&WORLD_EVENTS_MIGRATION)
             .map_err(|source| MultiUserHarnessError::Migration { source })?;
+        if self.notices_enabled {
+            world_db
+                .apply_migration(&NOTICES_MIGRATION)
+                .map_err(|source| MultiUserHarnessError::Migration { source })?;
+        }
         let mut users = HashMap::new();
 
         for spec in self.users {
@@ -294,13 +352,14 @@ impl MultiUserHarnessBuilder {
             tempdir,
             world_db_path,
             world_db,
-            config: harness_config(),
+            config: harness_config(self.notices_enabled),
             users,
+            notices_enabled: self.notices_enabled,
         })
     }
 }
 
-fn harness_config() -> GameConfig {
+fn harness_config(notices_enabled: bool) -> GameConfig {
     GameConfig {
         game: GameSection {
             title: "Multi User Harness".into(),
@@ -327,7 +386,10 @@ fn harness_config() -> GameConfig {
         },
         turns: None,
         leaderboards: Vec::new(),
-        multiplayer: None,
+        multiplayer: notices_enabled.then(|| MultiplayerSection {
+            notices: true,
+            ..Default::default()
+        }),
         factions: Default::default(),
         spatial: Default::default(),
         presence: Default::default(),
@@ -447,6 +509,48 @@ mod tests {
         assert!(matches!(
             harness.assert_event_visible_to("alice", |event| event.message == "bob note"),
             Err(MultiUserHarnessError::EventNotVisible { handle }) if handle == "alice"
+        ));
+    }
+
+    #[test]
+    fn assert_notice_for_is_gated_and_functional_when_enabled() {
+        let disabled = MultiUserHarness::builder()
+            .add_user("alice", FogletRole::User)
+            .build()
+            .expect("disabled harness builds");
+        assert!(matches!(
+            disabled.assert_notice_for("alice", |_| true),
+            Err(MultiUserHarnessError::NoticesDisabled)
+        ));
+
+        let enabled = MultiUserHarness::builder()
+            .with_notices_enabled()
+            .add_user("alice", FogletRole::User)
+            .add_user("bob", FogletRole::User)
+            .build()
+            .expect("enabled harness builds");
+        let alice_id = enabled.player_id_for("alice").expect("alice player id");
+        let bob_id = enabled.player_id_for("bob").expect("bob player id");
+        enabled
+            .world_db()
+            .send_notice(
+                Some(bob_id),
+                alice_id,
+                "mail",
+                "hello",
+                "body",
+                None,
+                None,
+                1_000,
+            )
+            .expect("notice sends");
+
+        enabled
+            .assert_notice_for("alice", |notice| notice.subject == "hello")
+            .expect("alice notice is visible");
+        assert!(matches!(
+            enabled.assert_notice_for("bob", |notice| notice.subject == "hello"),
+            Err(MultiUserHarnessError::NoticeNotFound { handle }) if handle == "bob"
         ));
     }
 }
