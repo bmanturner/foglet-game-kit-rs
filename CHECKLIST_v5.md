@@ -117,12 +117,12 @@ One unchecked item per iteration. Dependencies in `[brackets]` must be checked o
 
 ## Acceptance criteria — gate for `<promise>V5_COMPLETE</promise>`
 
-- [ ] All Task 1–13 items above are checked
-- [ ] Contracts support the documented lifecycle with transactional transitions and `on_commit` rollback
-- [ ] Job Board aggregates Contracts and (when v3 is enabled) Bounties and Challenges under one rendered surface, with stable ordering and game-supplied providers
-- [ ] Travel helper executes presence move, recall touch, and event append atomically with rollback on validation or cost failure
-- [ ] Inventory capacity helper validates incoming transfers inside the v4 transfer transaction with distinct error variants
-- [ ] Event Log screen renders v2 events at 80×24 with scope filtering, pagination, embedded mode, and game-supplied formatters
-- [ ] `test-support::MultiUserHarness` builds N isolated `GameContext` instances over one shared world DB, gated by the `test-support` Cargo feature
-- [ ] Documentation explains every v5 primitive in genre-neutral terms with at least two distinct game-family examples each
-- [ ] Documentation explicitly rejects real-time multiplayer, long-lived daemons, scripted-terminal drivers, and sample-game integration of v5 features in this kit's fixture
+- [x] All Task 1–13 items above are checked
+- [x] Contracts support the documented lifecycle with transactional transitions and `on_commit` rollback
+- [x] Job Board aggregates Contracts and (when v3 is enabled) Bounties and Challenges under one rendered surface, with stable ordering and game-supplied providers
+- [x] Travel helper executes presence move, recall touch, and event append atomically with rollback on validation or cost failure
+- [x] Inventory capacity helper validates incoming transfers inside the v4 transfer transaction with distinct error variants
+- [x] Event Log screen renders v2 events at 80×24 with scope filtering, pagination, embedded mode, and game-supplied formatters
+- [x] `test-support::MultiUserHarness` builds N isolated `GameContext` instances over one shared world DB, gated by the `test-support` Cargo feature
+- [x] Documentation explains every v5 primitive in genre-neutral terms with at least two distinct game-family examples each
+- [x] Documentation explicitly rejects real-time multiplayer, long-lived daemons, scripted-terminal drivers, and sample-game integration of v5 features in this kit's fixture
