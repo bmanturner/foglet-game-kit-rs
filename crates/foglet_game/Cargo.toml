@@ -81,6 +81,14 @@ rusqlite   = { workspace = true }
 # from SPEC §10.1. Library code stays on `thiserror`-derived errors per
 # the architecture tenets.
 anyhow = { workspace = true }
+# `rstest` powers SPEC_v3 §Task 4g's invalid-transition table tests
+# for the challenge state machine: one parameterized test per helper
+# (accept/decline/resolve/expire) covering every (from-state, helper)
+# pair so a regression that quietly relaxed a transition gate flunks
+# at `cargo test` rather than in production. Pre-approved in
+# PROMPT.md's crate budget; pulled into the workspace `Cargo.toml`
+# for v3 specifically.
+rstest = { workspace = true }
 
 # --- Examples ---------------------------------------------------------
 #

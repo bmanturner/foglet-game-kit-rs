@@ -2150,4 +2150,337 @@ mod tests {
             "deadline equal to now must be swept (cutoff is <=, not <)"
         );
     }
+
+    // -- SPEC_v3 §Task 4g — invalid-transition table tests -------------
+    //
+    // Standalone tests above already pin specific scenarios with extra
+    // invariants (timestamp preservation, row-count guards, durability
+    // round-trips). The four `rstest` tables below complete the
+    // matrix: one row per (helper, starting-state) pair, asserting the
+    // *exact* outcome — `Ok` on the single SPEC §4.2 legal edge,
+    // typed `InvalidTransition { from }` everywhere else. Without this
+    // exhaustive grid, a regression that (say) relaxed `accept`'s
+    // gate to also accept a `declined` row could pass every existing
+    // test by coincidence; with the grid, that regression is one
+    // failing case.
+    //
+    // The starting state is encoded as the schema-side `state` string
+    // (not the `ChallengeState` enum) so a future state added in code
+    // without a matching test row surfaces as a missing case rather
+    // than as a silent compile-time mapping. The expected `from`
+    // value is the same string, which mirrors how
+    // `diagnose_failed_transition` actually populates the error.
+    //
+    // Notes on edges this table deliberately does *not* cover:
+    //
+    // * `accept_challenge` on an `open` row whose deadline has lapsed
+    //   surfaces `Expired { id }`, not `InvalidTransition`. That edge
+    //   is pinned by `accept_challenge_rejects_expired` above; the 4g
+    //   grid is concerned with state pairs, so every "open" row here
+    //   is built without a deadline.
+    // * `expire_open_challenges` is exercised in its own table below
+    //   because it operates on a set of rows (no addressed `id`) and
+    //   its "invalid transition" is a non-sweep, not a typed error.
+
+    /// Seed a single `challenges` row already in the requested state
+    /// using a raw `INSERT`. Building accepted/declined/resolved/
+    /// expired rows by walking the public helpers chains the success
+    /// paths under test (an accept → decline test would actually be
+    /// testing *two* helpers), so the table tests use a raw insert
+    /// to isolate one helper at a time. The schema-level `CHECK`
+    /// constraint and FKs still apply.
+    ///
+    /// Returns the new row id.
+    fn seed_challenge_in_state(world: &WorldDb, challenger: i64, target: i64, state: &str) -> i64 {
+        // Each non-open state needs the audit fields the SPEC §4.2
+        // lifecycle would have stamped; we synthesise plausible
+        // values (real ISO timestamps, valid result JSON) so a
+        // future test that primary-key-SELECTs the row also sees a
+        // production-shaped record.
+        let (accepted_at, resolved_at, expires_at, result) = match state {
+            "open" => (None, None, None, None),
+            "accepted" => (Some("2026-01-01T00:00:00Z"), None, None, None),
+            "declined" => (None, None, None, None),
+            "resolved" => (
+                Some("2026-01-01T00:00:00Z"),
+                Some("2026-01-01T00:01:00Z"),
+                None,
+                Some(r#"{"winner":"alice"}"#),
+            ),
+            // An expired row was previously open with a past deadline.
+            // The deadline string lets a regression that re-checks
+            // `expires_at` on accept/decline still exercise the lapse
+            // branch on the swept row.
+            "expired" => (None, None, Some("2000-01-01T00:00:00Z"), None),
+            other => panic!("unknown seed state {other:?}"),
+        };
+        world
+            .connection()
+            .query_row(
+                "INSERT INTO challenges \
+                 (challenger_player_id, target_player_id, kind, state, \
+                  accepted_at, resolved_at, expires_at, result) \
+                 VALUES (?1, ?2, 'clue_race', ?3, ?4, ?5, ?6, ?7) \
+                 RETURNING id",
+                rusqlite::params![
+                    challenger,
+                    target,
+                    state,
+                    accepted_at,
+                    resolved_at,
+                    expires_at,
+                    result,
+                ],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap_or_else(|err| panic!("seed {state:?} row: {err}"))
+    }
+
+    /// SPEC_v3 §Task 4g acceptance — `accept_challenge` table.
+    ///
+    /// `open` is the only legal starting state; every other state
+    /// MUST surface as `InvalidTransition { from: <state> }` with
+    /// `to: ChallengeState::Accepted`. The `from` field's exact
+    /// string is asserted so a regression that mapped the schema
+    /// state through a lossy enum conversion (e.g. unknown→"unknown")
+    /// would observably flunk.
+    #[rstest::rstest]
+    #[case::open_is_legal("open")]
+    #[case::accepted_is_invalid("accepted")]
+    #[case::declined_is_invalid("declined")]
+    #[case::resolved_is_invalid("resolved")]
+    #[case::expired_is_invalid("expired")]
+    fn accept_challenge_table(#[case] from: &str) {
+        let (_dir, world) = world_with_challenges();
+        let alice = world.upsert_player(&ctx("u-a", "alice")).unwrap();
+        let bob = world.upsert_player(&ctx("u-b", "bob")).unwrap();
+        let id = seed_challenge_in_state(&world, alice.id, bob.id, from);
+
+        let outcome = world.accept_challenge(id);
+        if from == "open" {
+            let challenge = outcome.expect("open -> accepted is legal");
+            assert_eq!(
+                challenge.state,
+                ChallengeState::Accepted.as_str(),
+                "open -> accepted must land state='accepted'"
+            );
+            assert!(
+                challenge.accepted_at.is_some(),
+                "accept must stamp accepted_at"
+            );
+        } else {
+            match outcome.expect_err("non-open MUST NOT accept") {
+                ChallengeError::InvalidTransition {
+                    id: err_id,
+                    from: err_from,
+                    to,
+                } => {
+                    assert_eq!(err_id, id);
+                    assert_eq!(
+                        err_from, from,
+                        "InvalidTransition.from must echo schema state"
+                    );
+                    assert_eq!(to, ChallengeState::Accepted);
+                }
+                other => panic!("expected InvalidTransition for from={from:?}, got {other:?}"),
+            }
+            // Row state must be unchanged — a regression that
+            // wrote first and validated after would observably
+            // flunk this assertion.
+            let stored: String = world
+                .connection()
+                .query_row(
+                    "SELECT state FROM challenges WHERE id = ?1",
+                    rusqlite::params![id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(stored, from, "rejected accept must not mutate state");
+        }
+    }
+
+    /// SPEC_v3 §Task 4g acceptance — `decline_challenge` table.
+    ///
+    /// `open` is the only legal starting state. Decline does not
+    /// have a deadline gate, so unlike `accept` there is no
+    /// `Expired` outcome to consider here.
+    #[rstest::rstest]
+    #[case::open_is_legal("open")]
+    #[case::accepted_is_invalid("accepted")]
+    #[case::declined_is_invalid("declined")]
+    #[case::resolved_is_invalid("resolved")]
+    #[case::expired_is_invalid("expired")]
+    fn decline_challenge_table(#[case] from: &str) {
+        let (_dir, world) = world_with_challenges();
+        let alice = world.upsert_player(&ctx("u-a", "alice")).unwrap();
+        let bob = world.upsert_player(&ctx("u-b", "bob")).unwrap();
+        let id = seed_challenge_in_state(&world, alice.id, bob.id, from);
+
+        let outcome = world.decline_challenge(id);
+        if from == "open" {
+            let challenge = outcome.expect("open -> declined is legal");
+            assert_eq!(
+                challenge.state,
+                ChallengeState::Declined.as_str(),
+                "open -> declined must land state='declined'"
+            );
+        } else {
+            match outcome.expect_err("non-open MUST NOT decline") {
+                ChallengeError::InvalidTransition {
+                    id: err_id,
+                    from: err_from,
+                    to,
+                } => {
+                    assert_eq!(err_id, id);
+                    assert_eq!(err_from, from);
+                    assert_eq!(to, ChallengeState::Declined);
+                }
+                other => panic!("expected InvalidTransition for from={from:?}, got {other:?}"),
+            }
+            let stored: String = world
+                .connection()
+                .query_row(
+                    "SELECT state FROM challenges WHERE id = ?1",
+                    rusqlite::params![id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(stored, from, "rejected decline must not mutate state");
+        }
+    }
+
+    /// SPEC_v3 §Task 4g acceptance — `resolve_challenge` table.
+    ///
+    /// `accepted` is the only legal starting state. The `result`
+    /// payload is well-formed (`{}`) so the only failure mode under
+    /// test is the state gate — `EmptyResult` is pinned separately
+    /// by `resolve_challenge_rejects_empty_result`.
+    #[rstest::rstest]
+    #[case::open_is_invalid("open")]
+    #[case::accepted_is_legal("accepted")]
+    #[case::declined_is_invalid("declined")]
+    #[case::resolved_is_invalid("resolved")]
+    #[case::expired_is_invalid("expired")]
+    fn resolve_challenge_table(#[case] from: &str) {
+        let (_dir, world) = world_with_challenges();
+        let alice = world.upsert_player(&ctx("u-a", "alice")).unwrap();
+        let bob = world.upsert_player(&ctx("u-b", "bob")).unwrap();
+        let id = seed_challenge_in_state(&world, alice.id, bob.id, from);
+
+        let outcome = world.resolve_challenge(id, "{}");
+        if from == "accepted" {
+            let challenge = outcome.expect("accepted -> resolved is legal");
+            assert_eq!(
+                challenge.state,
+                ChallengeState::Resolved.as_str(),
+                "accepted -> resolved must land state='resolved'"
+            );
+            assert!(
+                challenge.resolved_at.is_some(),
+                "resolve must stamp resolved_at"
+            );
+            assert_eq!(challenge.result.as_deref(), Some("{}"));
+        } else {
+            match outcome.expect_err("non-accepted MUST NOT resolve") {
+                ChallengeError::InvalidTransition {
+                    id: err_id,
+                    from: err_from,
+                    to,
+                } => {
+                    assert_eq!(err_id, id);
+                    assert_eq!(err_from, from);
+                    assert_eq!(to, ChallengeState::Resolved);
+                }
+                other => panic!("expected InvalidTransition for from={from:?}, got {other:?}"),
+            }
+            // The seed `result` for a `resolved` starting row is
+            // `{"winner":"alice"}` — confirming that a rejected
+            // resolve never overwrote it pins SPEC §4.2's "the row
+            // is unchanged" invariant on the audit trail.
+            let (stored_state, stored_result): (String, Option<String>) = world
+                .connection()
+                .query_row(
+                    "SELECT state, result FROM challenges WHERE id = ?1",
+                    rusqlite::params![id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(stored_state, from, "rejected resolve must not mutate state");
+            if from == "resolved" {
+                assert_eq!(
+                    stored_result.as_deref(),
+                    Some(r#"{"winner":"alice"}"#),
+                    "rejected resolve must not overwrite the original result payload"
+                );
+            }
+        }
+    }
+
+    /// SPEC_v3 §Task 4g acceptance — `expire_open_challenges` table.
+    ///
+    /// The sweeper operates on a set, not a single id, and its
+    /// "invalid transition" is silent non-inclusion (no typed
+    /// error). The table covers every starting state plus two
+    /// open-row deadline variants (no deadline / future deadline)
+    /// to pin the `expires_at IS NOT NULL` and `<= now` gates.
+    ///
+    /// The single legal sweep is `open + past deadline -> expired`.
+    /// Every other case MUST stay in its starting state after the
+    /// sweep.
+    #[rstest::rstest]
+    #[case::open_past_deadline_is_swept("open", Some("2000-01-01T00:00:00Z"), true, "expired")]
+    #[case::open_no_deadline_is_not_swept("open", None, false, "open")]
+    #[case::open_future_deadline_is_not_swept("open", Some("2999-12-31T23:59:59Z"), false, "open")]
+    #[case::accepted_is_not_swept("accepted", None, false, "accepted")]
+    #[case::declined_is_not_swept("declined", None, false, "declined")]
+    #[case::resolved_is_not_swept("resolved", None, false, "resolved")]
+    #[case::expired_is_not_swept("expired", None, false, "expired")]
+    fn expire_open_challenges_table(
+        #[case] start_state: &str,
+        #[case] expires_at: Option<&str>,
+        #[case] should_sweep: bool,
+        #[case] end_state: &str,
+    ) {
+        let (_dir, world) = world_with_challenges();
+        let alice = world.upsert_player(&ctx("u-a", "alice")).unwrap();
+        let bob = world.upsert_player(&ctx("u-b", "bob")).unwrap();
+
+        // For "open" rows we want to drive `expires_at` from the
+        // case data; the seed helper sets it `None` for `open`.
+        // For non-open seed states, the seed helper already sets a
+        // plausible value (or None); we ignore the case's
+        // `expires_at` parameter for those rows since the sweeper's
+        // `state = 'open'` gate is what's under test there.
+        let id = if start_state == "open" {
+            world
+                .create_challenge(alice.id, bob.id, "clue_race", None, expires_at)
+                .unwrap()
+                .id
+        } else {
+            seed_challenge_in_state(&world, alice.id, bob.id, start_state)
+        };
+
+        let swept = world
+            .expire_open_challenges("2026-01-01T00:00:00Z")
+            .expect("sweep succeeds");
+        let swept_ids: Vec<i64> = swept.iter().map(|c| c.id).collect();
+        assert_eq!(
+            swept_ids.contains(&id),
+            should_sweep,
+            "row id {id} sweep inclusion mismatch for ({start_state:?}, {expires_at:?})"
+        );
+
+        let stored: String = world
+            .connection()
+            .query_row(
+                "SELECT state FROM challenges WHERE id = ?1",
+                rusqlite::params![id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            stored, end_state,
+            "post-sweep state mismatch for ({start_state:?}, {expires_at:?})"
+        );
+    }
 }
