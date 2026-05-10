@@ -1175,4 +1175,70 @@ mod tests {
 
         Ok(())
     }
+
+    #[test]
+    fn transfer_rejects_missing_stock_and_leaves_slots_unchanged() {
+        let dir = tempdir().expect("tempdir creates");
+        let db_path = dir.path().join("world.sqlite");
+        let mut world = WorldDb::open(&db_path).expect("open succeeds");
+
+        world
+            .apply_migration(&INVENTORY_SLOTS_MIGRATION)
+            .expect("inventory_slots migration applies");
+
+        let source = world
+            .create_slot("player", 1, "ration-pack", 2, None, None)
+            .expect("source slot exists");
+
+        let error = world
+            .transfer(
+                ("player", 1),
+                ("merchant", 3),
+                "ration-pack",
+                5,
+                None::<
+                    fn(
+                        &rusqlite::Transaction<'_>,
+                        &InventorySlot,
+                        &InventorySlot,
+                    ) -> rusqlite::Result<()>,
+                >,
+            )
+            .expect_err("transfer must reject insufficient stock");
+
+        match error {
+            InventoryError::InsufficientStock {
+                owner_kind,
+                owner_id,
+                item_key,
+                requested,
+                available,
+            } => {
+                assert_eq!(owner_kind, "player");
+                assert_eq!(owner_id, 1);
+                assert_eq!(item_key, "ration-pack");
+                assert_eq!(requested, 5);
+                assert_eq!(available, 2);
+            }
+            other => panic!("expected InsufficientStock, got {other:?}"),
+        }
+
+        let after_source = world
+            .get_slot("player", 1, "ration-pack")
+            .expect("slot still readable")
+            .expect("source row still exists");
+        assert_eq!(after_source.id, source.id);
+        assert_eq!(
+            after_source.quantity, 2,
+            "failed transfer must not debit source"
+        );
+
+        let missing_destination = world
+            .get_slot("merchant", 3, "ration-pack")
+            .expect("destination read is okay");
+        assert!(
+            missing_destination.is_none(),
+            "insufficient source stock must not auto-create destination row"
+        );
+    }
 }

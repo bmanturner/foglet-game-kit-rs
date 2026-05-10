@@ -63,7 +63,7 @@ One unchecked item per iteration. Dependencies in `[brackets]` must be checked o
 ### Task 8 — Inventory atomic transfer
 
 - [x] **8a** — Implement `transfer(source, dest, item_key, quantity, on_commit?)` API. Test: source debited, dest credited in single transaction. [7b, v2 Task 9]
-- [ ] **8b** — Test rejection when source lacks stock; no partial mutation. [8a]
+- [x] **8b** — Test rejection when source lacks stock; no partial mutation. [8a]
 - [ ] **8c** — Test rejection of zero or negative quantity. [8a]
 - [ ] **8d** — Pass post-mutation slot snapshots to `on_commit`. Test: callback observes new quantities for both source and dest. [8a]
 - [ ] **8e** — Roll back the entire transfer when `on_commit` returns an error. Test: source and dest unchanged after rejection. [8d]
