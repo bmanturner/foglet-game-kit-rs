@@ -313,6 +313,103 @@ ORDER BY created_at ASC, id ASC";
 
         Ok(rows)
     }
+
+    /// List contracts accepted by one player, optionally narrowed by state.
+    ///
+    /// The helper intentionally keys by Foglet `player_id` so games can show
+    /// one player's active/finished commitments without joining against any
+    /// game-specific profile table.
+    ///
+    /// Genre-neutral usage:
+    ///
+    /// - In a **space exploration** game, list all contracts accepted by the
+    ///   current pilot to render a captain's ledger.
+    /// - In a **dungeon crawler**, list all commissions accepted by the
+    ///   current adventurer before entering a guild hall.
+    ///
+    /// Deterministic ordering:
+    ///
+    /// - Primary sort: `created_at` ascending.
+    /// - Secondary sort: `id` ascending.
+    pub fn contracts_for_acceptor(
+        &self,
+        player_id: i64,
+        state: Option<ContractState>,
+    ) -> Result<Vec<Contract>, ContractError> {
+        const SQL: &str = "\
+SELECT id, key, kind, issuer_owner_kind, issuer_owner_id, \
+       acceptor_player_id, state, objective_json, reward_json, metadata_json, \
+       created_at, accepted_at, completed_at, expires_at\n\
+FROM contracts\n\
+WHERE acceptor_player_id = ?1\n\
+  AND (?2 IS NULL OR state = ?2)\n\
+ORDER BY created_at ASC, id ASC";
+
+        let mut statement = self
+            .connection()
+            .prepare(SQL)
+            .map_err(|source| ContractError::Sqlite { source })?;
+
+        let rows = statement
+            .query_map(
+                rusqlite::params![player_id, state.map(ContractState::as_str)],
+                row_to_contract,
+            )
+            .map_err(|source| ContractError::Sqlite { source })?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|source| ContractError::Sqlite { source })?;
+
+        Ok(rows)
+    }
+
+    /// List contracts issued by one owner bucket and owner id.
+    ///
+    /// Issuer indexing stays generic so the same API works for station boards,
+    /// tavern guild boards, town councils, or any other game-defined issuer.
+    ///
+    /// Genre-neutral usage:
+    ///
+    /// - In a **space exploration** game, query all contracts emitted by a
+    ///   specific station authority.
+    /// - In a **dungeon crawler**, query all contracts emitted by a specific
+    ///   adventurers' guild.
+    ///
+    /// Deterministic ordering:
+    ///
+    /// - Primary sort: `created_at` ascending.
+    /// - Secondary sort: `id` ascending.
+    pub fn contracts_by_issuer(
+        &self,
+        owner_kind: &str,
+        owner_id: i64,
+        state: Option<ContractState>,
+    ) -> Result<Vec<Contract>, ContractError> {
+        const SQL: &str = "\
+SELECT id, key, kind, issuer_owner_kind, issuer_owner_id, \
+       acceptor_player_id, state, objective_json, reward_json, metadata_json, \
+       created_at, accepted_at, completed_at, expires_at\n\
+FROM contracts\n\
+WHERE issuer_owner_kind = ?1\n\
+  AND issuer_owner_id = ?2\n\
+  AND (?3 IS NULL OR state = ?3)\n\
+ORDER BY created_at ASC, id ASC";
+
+        let mut statement = self
+            .connection()
+            .prepare(SQL)
+            .map_err(|source| ContractError::Sqlite { source })?;
+
+        let rows = statement
+            .query_map(
+                rusqlite::params![owner_kind, owner_id, state.map(ContractState::as_str)],
+                row_to_contract,
+            )
+            .map_err(|source| ContractError::Sqlite { source })?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|source| ContractError::Sqlite { source })?;
+
+        Ok(rows)
+    }
 }
 
 /// Decode one `contracts` row in the column order used by this module.
@@ -666,6 +763,188 @@ mod tests {
                 .map(|contract| contract.id)
                 .collect::<Vec<_>>(),
             vec![first.id]
+        );
+    }
+
+    #[test]
+    fn contracts_for_acceptor_and_contracts_by_issuer_filter_results() {
+        let dir = tempdir().expect("tempdir creates");
+        let db_path = dir.path().join("world.sqlite");
+        let mut world = WorldDb::open(&db_path).expect("open succeeds");
+        world
+            .apply_migration(&CONTRACTS_MIGRATION)
+            .expect("contracts migration applies");
+
+        let station_open = world
+            .create_contract(CreateContractInput {
+                key: Some("station-open"),
+                kind: "delivery",
+                issuer_owner_kind: "station",
+                issuer_owner_id: 1,
+                objective_json: r#"{"to":"ring-a"}"#,
+                reward_json: r#"{"credits":25}"#,
+                metadata_json: None,
+                expires_at: None,
+            })
+            .expect("station open insert succeeds");
+        let station_accepted_alice = world
+            .create_contract(CreateContractInput {
+                key: Some("station-accepted-alice"),
+                kind: "delivery",
+                issuer_owner_kind: "station",
+                issuer_owner_id: 1,
+                objective_json: r#"{"to":"ring-b"}"#,
+                reward_json: r#"{"credits":55}"#,
+                metadata_json: None,
+                expires_at: None,
+            })
+            .expect("station accepted/alice insert succeeds");
+        let guild_accepted_alice = world
+            .create_contract(CreateContractInput {
+                key: Some("guild-accepted-alice"),
+                kind: "recovery",
+                issuer_owner_kind: "guild",
+                issuer_owner_id: 2,
+                objective_json: r#"{"room":"ossuary"}"#,
+                reward_json: r#"{"favor":{"guild":2}}"#,
+                metadata_json: None,
+                expires_at: None,
+            })
+            .expect("guild accepted/alice insert succeeds");
+        let station_completed_alice = world
+            .create_contract(CreateContractInput {
+                key: Some("station-completed-alice"),
+                kind: "escort",
+                issuer_owner_kind: "station",
+                issuer_owner_id: 1,
+                objective_json: r#"{"to":"dock-c"}"#,
+                reward_json: r#"{"credits":80}"#,
+                metadata_json: None,
+                expires_at: None,
+            })
+            .expect("station completed/alice insert succeeds");
+        let station_accepted_bob = world
+            .create_contract(CreateContractInput {
+                key: Some("station-accepted-bob"),
+                kind: "delivery",
+                issuer_owner_kind: "station",
+                issuer_owner_id: 1,
+                objective_json: r#"{"to":"ring-d"}"#,
+                reward_json: r#"{"credits":40}"#,
+                metadata_json: None,
+                expires_at: None,
+            })
+            .expect("station accepted/bob insert succeeds");
+
+        world
+            .connection()
+            .execute(
+                "UPDATE contracts SET state = ?1, acceptor_player_id = ?2, accepted_at = CURRENT_TIMESTAMP WHERE id = ?3",
+                rusqlite::params![
+                    ContractState::Accepted.as_str(),
+                    100_i64,
+                    station_accepted_alice.id
+                ],
+            )
+            .expect("station accepted/alice row update succeeds");
+        world
+            .connection()
+            .execute(
+                "UPDATE contracts SET state = ?1, acceptor_player_id = ?2, accepted_at = CURRENT_TIMESTAMP WHERE id = ?3",
+                rusqlite::params![
+                    ContractState::Accepted.as_str(),
+                    100_i64,
+                    guild_accepted_alice.id
+                ],
+            )
+            .expect("guild accepted/alice row update succeeds");
+        world
+            .connection()
+            .execute(
+                "UPDATE contracts SET state = ?1, acceptor_player_id = ?2, accepted_at = CURRENT_TIMESTAMP, completed_at = CURRENT_TIMESTAMP WHERE id = ?3",
+                rusqlite::params![
+                    ContractState::Completed.as_str(),
+                    100_i64,
+                    station_completed_alice.id
+                ],
+            )
+            .expect("station completed/alice row update succeeds");
+        world
+            .connection()
+            .execute(
+                "UPDATE contracts SET state = ?1, acceptor_player_id = ?2, accepted_at = CURRENT_TIMESTAMP WHERE id = ?3",
+                rusqlite::params![
+                    ContractState::Accepted.as_str(),
+                    200_i64,
+                    station_accepted_bob.id
+                ],
+            )
+            .expect("station accepted/bob row update succeeds");
+
+        let alice_all = world
+            .contracts_for_acceptor(100, None)
+            .expect("acceptor query succeeds");
+        assert_eq!(
+            alice_all
+                .iter()
+                .map(|contract| contract.id)
+                .collect::<Vec<_>>(),
+            vec![
+                station_accepted_alice.id,
+                guild_accepted_alice.id,
+                station_completed_alice.id
+            ],
+            "acceptor filter should include only rows accepted by that player"
+        );
+
+        let alice_accepted = world
+            .contracts_for_acceptor(100, Some(ContractState::Accepted))
+            .expect("acceptor+state query succeeds");
+        assert_eq!(
+            alice_accepted
+                .iter()
+                .map(|contract| contract.id)
+                .collect::<Vec<_>>(),
+            vec![station_accepted_alice.id, guild_accepted_alice.id]
+        );
+
+        let station_all_states = world
+            .contracts_by_issuer("station", 1, None)
+            .expect("issuer query succeeds");
+        assert_eq!(
+            station_all_states
+                .iter()
+                .map(|contract| contract.id)
+                .collect::<Vec<_>>(),
+            vec![
+                station_open.id,
+                station_accepted_alice.id,
+                station_completed_alice.id,
+                station_accepted_bob.id
+            ],
+            "issuer filter should include all states when no state filter is provided"
+        );
+
+        let station_only_accepted = world
+            .contracts_by_issuer("station", 1, Some(ContractState::Accepted))
+            .expect("issuer+state query succeeds");
+        assert_eq!(
+            station_only_accepted
+                .iter()
+                .map(|contract| contract.id)
+                .collect::<Vec<_>>(),
+            vec![station_accepted_alice.id, station_accepted_bob.id]
+        );
+
+        let guild_only_accepted = world
+            .contracts_by_issuer("guild", 2, Some(ContractState::Accepted))
+            .expect("guild issuer query succeeds");
+        assert_eq!(
+            guild_only_accepted
+                .iter()
+                .map(|contract| contract.id)
+                .collect::<Vec<_>>(),
+            vec![guild_accepted_alice.id]
         );
     }
 }
