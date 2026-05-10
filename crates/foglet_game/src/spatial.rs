@@ -448,4 +448,36 @@ mod tests {
             "unknown keys should return None without SQL error"
         );
     }
+
+    /// SPEC_v4 Task 3e requires opaque metadata storage semantics: the
+    /// byte sequence in `metadata_json` must be preserved by the write path.
+    ///
+    /// This uses a dense JSON fixture with whitespace, nested objects,
+    /// and escaped characters to catch accidental normalization.
+    #[test]
+    fn insert_place_preserves_metadata_json_byte_for_byte() {
+        let dir = tempdir().expect("tempdir creates");
+        let db_path = dir.path().join("world.sqlite");
+        let mut world = WorldDb::open(&db_path).expect("open succeeds");
+        world
+            .apply_migration(&PLACES_MIGRATION)
+            .expect("places migration applies");
+
+        let metadata = "{\n  \"lore\": \"sector-alpha\\nencounter\\\"gate\\\"\",\n  \"tags\": [\"dock\", \"refuel\"],\n  \"danger\": 7\n}";
+        let inserted = world
+            .insert_place("echo-bay", "Echo Bay", "docking-bay", Some(metadata))
+            .expect("insert_by_key works");
+
+        assert_eq!(inserted.metadata_json.as_deref(), Some(metadata));
+
+        let from_db: String = world
+            .connection()
+            .query_row(
+                "SELECT metadata_json FROM places WHERE id = ?1",
+                rusqlite::params![inserted.id],
+                |row| row.get(0),
+            )
+            .expect("direct metadata read should return a row");
+        assert_eq!(from_db, metadata);
+    }
 }
