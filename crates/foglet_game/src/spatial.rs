@@ -51,6 +51,40 @@ pub struct Place {
     pub created_at: String,
 }
 
+/// A directed edge in the v4 location graph.
+///
+/// The row is designed to be a very small, durable adjacency fact:
+///
+/// - `from_place_id` and `to_place_id` are explicit directed pointers.
+/// - `kind` describes the edge channel in game-local vocabulary (e.g.
+///   `"airlock"`, `"chute"`), with no kit-side semantics.
+/// - `requirements_json` can hold game-defined constraints (minimum
+///   player level, locked-door conditions, one-time gating flags).
+/// - `metadata_json` carries optional opaque payload for your game’s
+///   route metadata model.
+///
+/// In a **space exploration** game, one route might model a one-way cargo
+/// gate while another can represent a return shuttle between the same
+/// pair. In a **dungeon crawler**, one route can represent a fragile
+/// rope ladder while another represents a locked spiral staircase.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Route {
+    /// Source place row id.
+    pub from_place_id: i64,
+    /// Destination place row id.
+    pub to_place_id: i64,
+    /// Stable row identifier.
+    pub id: i64,
+    /// Game-defined channel label.
+    pub kind: String,
+    /// Optional requirements payload (opaque JSON).
+    pub requirements_json: Option<String>,
+    /// Optional route metadata payload (opaque JSON).
+    pub metadata_json: Option<String>,
+    /// UTC creation timestamp assigned by SQLite (`CURRENT_TIMESTAMP`).
+    pub created_at: String,
+}
+
 /// Errors for shared-place mutations.
 ///
 /// Public write paths return a single enum so callers can branch on
@@ -64,6 +98,28 @@ pub enum PlaceError {
     Sqlite {
         /// Place key for caller-friendly diagnostics.
         key: String,
+        /// Underlying `rusqlite` error.
+        #[source]
+        source: rusqlite::Error,
+    },
+}
+
+/// Errors for shared-route mutations.
+///
+/// This keeps route creation errors distinct from place creation
+/// so callers can present route-specific diagnostics or branch on
+/// expected database failures while still preserving typed errors at
+/// the boundary.
+#[derive(Debug, Error)]
+pub enum RouteError {
+    /// The underlying SQL `INSERT` failed (constraint violation, disk,
+    /// lock timeout, schema mismatch).
+    #[error("failed to create route from `{from_place_id}` to `{to_place_id}`: {source}")]
+    Sqlite {
+        /// Source place id for diagnostics.
+        from_place_id: i64,
+        /// Destination place id for diagnostics.
+        to_place_id: i64,
         /// Underlying `rusqlite` error.
         #[source]
         source: rusqlite::Error,
@@ -194,6 +250,61 @@ RETURNING id, key, display_name, kind, metadata_json, created_at";
             })
     }
 
+    /// Create one directed route row and return the stored record.
+    ///
+    /// Route creation is intentionally orthogonal and explicit:
+    ///
+    /// - No route is implied by place creation.
+    /// - No route directionality is inferred by convention.
+    /// - `requirements_json` / `metadata_json` are opaque, so game
+    ///   authors can encode any constraints they want.
+    ///
+    /// This is the first write API for the route table and returns the
+    /// inserted row via `RETURNING` so callers can verify idempotent
+    /// bootstrapping and debug immediately.
+    ///
+    /// # Genre-neutral usage
+    ///
+    /// - In a **space exploration** game, create a one-way cargo gate
+    ///   from `"station-omega-dock"` to `"outpost-gamma"` with kind
+    ///   `"cargo-channel"` and a clearance payload.
+    /// - In a **dungeon crawler** game, create a one-way chute from
+    ///   `"tower-catwalk"` to `"basement-corridor"` with kind
+    ///   `"chute"` and custom hazard metadata.
+    pub fn create_route(
+        &self,
+        from_place_id: i64,
+        to_place_id: i64,
+        kind: &str,
+        requirements_json: Option<&str>,
+        metadata_json: Option<&str>,
+    ) -> Result<Route, RouteError> {
+        const SQL: &str = "\
+INSERT INTO routes (\n\
+    from_place_id, to_place_id, kind, requirements_json, metadata_json\n\
+)\n\
+VALUES (?1, ?2, ?3, ?4, ?5)\n\
+RETURNING from_place_id, to_place_id, id, kind, requirements_json, metadata_json, created_at";
+
+        self.connection()
+            .query_row(
+                SQL,
+                rusqlite::params![
+                    from_place_id,
+                    to_place_id,
+                    kind,
+                    requirements_json,
+                    metadata_json
+                ],
+                row_to_route,
+            )
+            .map_err(|source| RouteError::Sqlite {
+                from_place_id,
+                to_place_id,
+                source,
+            })
+    }
+
     /// Load one place by its stable `key`.
     ///
     /// This is the primary lookup for game code that stores authored
@@ -273,6 +384,18 @@ fn row_to_place(row: &rusqlite::Row<'_>) -> rusqlite::Result<Place> {
         kind: row.get(3)?,
         metadata_json: row.get(4)?,
         created_at: row.get(5)?,
+    })
+}
+
+fn row_to_route(row: &rusqlite::Row<'_>) -> rusqlite::Result<Route> {
+    Ok(Route {
+        from_place_id: row.get(0)?,
+        to_place_id: row.get(1)?,
+        id: row.get(2)?,
+        kind: row.get(3)?,
+        requirements_json: row.get(4)?,
+        metadata_json: row.get(5)?,
+        created_at: row.get(6)?,
     })
 }
 
@@ -596,5 +719,77 @@ mod tests {
             )
             .expect("direct metadata read should return a row");
         assert_eq!(from_db, metadata);
+    }
+
+    /// SPEC_v4 Task 4b accepts `create_route` and that the returned
+    /// `Route` row is the same row written to SQLite.
+    ///
+    /// This test creates two place nodes, then one directed route and
+    /// reads it back by primary id:
+    ///
+    /// - The row includes the caller-provided `kind`, `requirements_json`,
+    ///   and `metadata_json`.
+    /// - The `created_at` timestamp is non-empty and comes from SQLite.
+    #[test]
+    fn create_route_returns_stored_row() {
+        let dir = tempdir().expect("tempdir creates");
+        let db_path = dir.path().join("world.sqlite");
+        let mut world = WorldDb::open(&db_path).expect("open succeeds");
+
+        world
+            .apply_migration(&PLACES_MIGRATION)
+            .expect("places migration applies");
+        world
+            .apply_migration(&ROUTES_MIGRATION)
+            .expect("routes migration applies");
+
+        let source = world
+            .insert_place("docking-ring", "Docking Ring", "dock", None)
+            .expect("source place inserts");
+        let target = world
+            .insert_place("bridge-corridor", "Bridge Corridor", "corridor", None)
+            .expect("target place inserts");
+
+        let route = world
+            .create_route(
+                source.id,
+                target.id,
+                "airlock",
+                Some(r#"{"cargo_ok": true}"#),
+                Some(r#"{"notes":"forward-only, pressure-locked"}"#),
+            )
+            .expect("route creation succeeds");
+
+        assert!(
+            route.id > 0,
+            "SQLite should assign a concrete autoincrement id"
+        );
+        assert_eq!(route.from_place_id, source.id);
+        assert_eq!(route.to_place_id, target.id);
+        assert_eq!(route.kind, "airlock");
+        assert_eq!(
+            route.requirements_json.as_deref(),
+            Some(r#"{"cargo_ok": true}"#)
+        );
+        assert_eq!(
+            route.metadata_json.as_deref(),
+            Some(r#"{"notes":"forward-only, pressure-locked"}"#)
+        );
+        assert!(
+            !route.created_at.is_empty(),
+            "SQLite CURRENT_TIMESTAMP should populate created_at"
+        );
+
+        let by_id = world
+            .connection()
+            .query_row(
+                "SELECT from_place_id, to_place_id, id, kind, requirements_json, metadata_json, created_at \
+                 FROM routes WHERE id = ?1",
+                rusqlite::params![route.id],
+                super::row_to_route,
+            )
+            .expect("route row should be queryable by id");
+
+        assert_eq!(route, by_id);
     }
 }
