@@ -537,6 +537,133 @@ RETURNING id, key, kind, issuer_owner_kind, issuer_owner_id, \
 
         Ok(completed)
     }
+
+    /// Mark one accepted contract as failed inside a single SQLite transaction.
+    ///
+    /// This is the Task 4f lifecycle transition primitive. It updates one
+    /// contract row from `accepted` to `failed` atomically.
+    ///
+    /// Contracts not currently in the `accepted` state are rejected so games
+    /// cannot accidentally fail rows still available (or already terminal).
+    ///
+    /// The optional `on_commit` callback runs after the SQL mutation while
+    /// still inside the active transaction. If the callback returns `Err`,
+    /// the transaction rolls back and no failure persists.
+    ///
+    /// Genre-neutral usage:
+    ///
+    /// - In a **space exploration** game, failing a freight contract can
+    ///   revoke a station permit in the same transaction.
+    /// - In a **dungeon crawler**, failing a guild commission can lower
+    ///   faction standing in the same transaction.
+    pub fn fail_contract<F>(
+        &mut self,
+        contract_id: i64,
+        on_commit: Option<F>,
+    ) -> Result<Contract, ContractError>
+    where
+        F: FnOnce(&rusqlite::Transaction<'_>, &Contract) -> Result<(), rusqlite::Error>,
+    {
+        const SQL: &str = "\
+UPDATE contracts\n\
+SET state = ?2\n\
+WHERE id = ?1\n\
+  AND state = ?3\n\
+RETURNING id, key, kind, issuer_owner_kind, issuer_owner_id, \
+          acceptor_player_id, state, objective_json, reward_json, metadata_json, \
+          created_at, accepted_at, completed_at, expires_at";
+
+        let tx = self
+            .connection_mut()
+            .transaction()
+            .map_err(|source| ContractError::Sqlite { source })?;
+
+        let failed = tx
+            .query_row(
+                SQL,
+                rusqlite::params![
+                    contract_id,
+                    ContractState::Failed.as_str(),
+                    ContractState::Accepted.as_str()
+                ],
+                row_to_contract,
+            )
+            .map_err(|source| ContractError::Sqlite { source })?;
+
+        if let Some(on_commit) = on_commit {
+            on_commit(&tx, &failed).map_err(|source| ContractError::Sqlite { source })?;
+        }
+
+        tx.commit()
+            .map_err(|source| ContractError::Sqlite { source })?;
+
+        Ok(failed)
+    }
+
+    /// Mark one accepted contract as abandoned inside a single SQLite transaction.
+    ///
+    /// This is the Task 4f lifecycle transition primitive. It updates one
+    /// contract row from `accepted` to `abandoned` atomically and clears
+    /// `acceptor_player_id` so later analytics can distinguish abandoned rows
+    /// from actively held commitments.
+    ///
+    /// Contracts not currently in the `accepted` state are rejected so games
+    /// cannot accidentally abandon rows still available (or already terminal).
+    ///
+    /// The optional `on_commit` callback runs after the SQL mutation while
+    /// still inside the active transaction. If the callback returns `Err`,
+    /// the transaction rolls back and no abandonment persists.
+    ///
+    /// Genre-neutral usage:
+    ///
+    /// - In a **space exploration** game, abandoning a freight contract can
+    ///   clear cargo reservations tied to the current pilot.
+    /// - In a **dungeon crawler**, abandoning a guild commission can remove
+    ///   active objective markers from the player's journal.
+    pub fn abandon_contract<F>(
+        &mut self,
+        contract_id: i64,
+        on_commit: Option<F>,
+    ) -> Result<Contract, ContractError>
+    where
+        F: FnOnce(&rusqlite::Transaction<'_>, &Contract) -> Result<(), rusqlite::Error>,
+    {
+        const SQL: &str = "\
+UPDATE contracts\n\
+SET state = ?2,\n\
+    acceptor_player_id = NULL\n\
+WHERE id = ?1\n\
+  AND state = ?3\n\
+RETURNING id, key, kind, issuer_owner_kind, issuer_owner_id, \
+          acceptor_player_id, state, objective_json, reward_json, metadata_json, \
+          created_at, accepted_at, completed_at, expires_at";
+
+        let tx = self
+            .connection_mut()
+            .transaction()
+            .map_err(|source| ContractError::Sqlite { source })?;
+
+        let abandoned = tx
+            .query_row(
+                SQL,
+                rusqlite::params![
+                    contract_id,
+                    ContractState::Abandoned.as_str(),
+                    ContractState::Accepted.as_str()
+                ],
+                row_to_contract,
+            )
+            .map_err(|source| ContractError::Sqlite { source })?;
+
+        if let Some(on_commit) = on_commit {
+            on_commit(&tx, &abandoned).map_err(|source| ContractError::Sqlite { source })?;
+        }
+
+        tx.commit()
+            .map_err(|source| ContractError::Sqlite { source })?;
+
+        Ok(abandoned)
+    }
 }
 
 /// Decode one `contracts` row in the column order used by this module.
@@ -1421,6 +1548,192 @@ mod tests {
         assert_eq!(
             persisted.completed_at, None,
             "failed completion must not set completed_at"
+        );
+    }
+
+    #[test]
+    fn fail_contract_transitions_from_accepted_and_rejects_invalid_source_states() {
+        let dir = tempdir().expect("tempdir creates");
+        let db_path = dir.path().join("world.sqlite");
+        let mut world = WorldDb::open(&db_path).expect("open succeeds");
+        world
+            .apply_migration(&CONTRACTS_MIGRATION)
+            .expect("contracts migration applies");
+
+        let accepted = world
+            .create_contract(CreateContractInput {
+                key: Some("station-fail-ready"),
+                kind: "delivery",
+                issuer_owner_kind: "station",
+                issuer_owner_id: 21,
+                objective_json: r#"{"from":"dock-2","to":"dock-8"}"#,
+                reward_json: r#"{"credits":120}"#,
+                metadata_json: None,
+                expires_at: None,
+            })
+            .expect("accepted candidate insert succeeds");
+        let available = world
+            .create_contract(CreateContractInput {
+                key: Some("station-still-available"),
+                kind: "delivery",
+                issuer_owner_kind: "station",
+                issuer_owner_id: 21,
+                objective_json: r#"{"from":"dock-1","to":"dock-3"}"#,
+                reward_json: r#"{"credits":90}"#,
+                metadata_json: None,
+                expires_at: None,
+            })
+            .expect("available candidate insert succeeds");
+
+        world
+            .accept_contract(
+                accepted.id,
+                700,
+                None::<
+                    fn(&rusqlite::Transaction<'_>, &super::Contract) -> Result<(), rusqlite::Error>,
+                >,
+            )
+            .expect("accept succeeds");
+
+        let failed = world
+            .fail_contract(
+                accepted.id,
+                None::<
+                    fn(&rusqlite::Transaction<'_>, &super::Contract) -> Result<(), rusqlite::Error>,
+                >,
+            )
+            .expect("fail_contract succeeds from accepted");
+        assert_eq!(failed.state, ContractState::Failed.as_str());
+        assert_eq!(
+            failed.acceptor_player_id,
+            Some(700),
+            "failing should preserve who held the contract when it failed"
+        );
+
+        let reject_available = world.fail_contract(
+            available.id,
+            None::<fn(&rusqlite::Transaction<'_>, &super::Contract) -> Result<(), rusqlite::Error>>,
+        );
+        assert!(
+            matches!(
+                reject_available,
+                Err(super::ContractError::Sqlite {
+                    source: rusqlite::Error::QueryReturnedNoRows
+                })
+            ),
+            "fail_contract should reject when source state is not accepted"
+        );
+
+        let reject_already_failed = world.fail_contract(
+            accepted.id,
+            None::<fn(&rusqlite::Transaction<'_>, &super::Contract) -> Result<(), rusqlite::Error>>,
+        );
+        assert!(
+            matches!(
+                reject_already_failed,
+                Err(super::ContractError::Sqlite {
+                    source: rusqlite::Error::QueryReturnedNoRows
+                })
+            ),
+            "fail_contract should reject terminal rows on repeated invocation"
+        );
+    }
+
+    #[test]
+    fn abandon_contract_transitions_from_accepted_clears_acceptor_and_rejects_invalid_states() {
+        let dir = tempdir().expect("tempdir creates");
+        let db_path = dir.path().join("world.sqlite");
+        let mut world = WorldDb::open(&db_path).expect("open succeeds");
+        world
+            .apply_migration(&CONTRACTS_MIGRATION)
+            .expect("contracts migration applies");
+
+        let accepted = world
+            .create_contract(CreateContractInput {
+                key: Some("guild-abandon-ready"),
+                kind: "escort",
+                issuer_owner_kind: "guild",
+                issuer_owner_id: 32,
+                objective_json: r#"{"from":"hall","to":"tower"}"#,
+                reward_json: r#"{"favor":{"guild":1}}"#,
+                metadata_json: None,
+                expires_at: None,
+            })
+            .expect("accepted candidate insert succeeds");
+        let available = world
+            .create_contract(CreateContractInput {
+                key: Some("guild-unaccepted"),
+                kind: "escort",
+                issuer_owner_kind: "guild",
+                issuer_owner_id: 32,
+                objective_json: r#"{"from":"market","to":"river"}"#,
+                reward_json: r#"{"favor":{"guild":1}}"#,
+                metadata_json: None,
+                expires_at: None,
+            })
+            .expect("available candidate insert succeeds");
+
+        let accepted = world
+            .accept_contract(
+                accepted.id,
+                808,
+                None::<
+                    fn(&rusqlite::Transaction<'_>, &super::Contract) -> Result<(), rusqlite::Error>,
+                >,
+            )
+            .expect("accept succeeds");
+        assert_eq!(accepted.acceptor_player_id, Some(808));
+
+        let abandoned = world
+            .abandon_contract(
+                accepted.id,
+                None::<
+                    fn(&rusqlite::Transaction<'_>, &super::Contract) -> Result<(), rusqlite::Error>,
+                >,
+            )
+            .expect("abandon_contract succeeds from accepted");
+        assert_eq!(abandoned.state, ContractState::Abandoned.as_str());
+        assert_eq!(
+            abandoned.acceptor_player_id, None,
+            "abandon_contract should clear the acceptor as documented"
+        );
+
+        let persisted = world
+            .contract_by_id(accepted.id)
+            .expect("lookup succeeds")
+            .expect("abandoned contract persists");
+        assert_eq!(persisted.state, ContractState::Abandoned.as_str());
+        assert_eq!(
+            persisted.acceptor_player_id, None,
+            "persisted abandoned row should keep acceptor cleared"
+        );
+
+        let reject_available = world.abandon_contract(
+            available.id,
+            None::<fn(&rusqlite::Transaction<'_>, &super::Contract) -> Result<(), rusqlite::Error>>,
+        );
+        assert!(
+            matches!(
+                reject_available,
+                Err(super::ContractError::Sqlite {
+                    source: rusqlite::Error::QueryReturnedNoRows
+                })
+            ),
+            "abandon_contract should reject when source state is not accepted"
+        );
+
+        let reject_already_abandoned = world.abandon_contract(
+            accepted.id,
+            None::<fn(&rusqlite::Transaction<'_>, &super::Contract) -> Result<(), rusqlite::Error>>,
+        );
+        assert!(
+            matches!(
+                reject_already_abandoned,
+                Err(super::ContractError::Sqlite {
+                    source: rusqlite::Error::QueryReturnedNoRows
+                })
+            ),
+            "abandon_contract should reject terminal rows on repeated invocation"
         );
     }
 }
