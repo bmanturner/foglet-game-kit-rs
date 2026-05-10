@@ -15,6 +15,9 @@ use std::cmp::Ordering;
 use serde::Deserialize;
 use thiserror::Error;
 
+use crate::bounties::BountyError;
+use crate::challenges::ChallengeError;
+use crate::config::MultiplayerSection;
 use crate::contracts::{AvailableContractsFilter, ContractError};
 use crate::world_db::WorldDb;
 
@@ -225,6 +228,20 @@ pub enum JobBoardError {
         #[source]
         source: ContractError,
     },
+    /// Querying bounty rows for the built-in provider failed.
+    #[error("failed to project bounties into job-board entries: {source}")]
+    BountyQuery {
+        /// Underlying bounty query failure.
+        #[source]
+        source: BountyError,
+    },
+    /// Querying challenge rows for the built-in provider failed.
+    #[error("failed to project challenges into job-board entries: {source}")]
+    ChallengeQuery {
+        /// Underlying challenge query failure.
+        #[source]
+        source: ChallengeError,
+    },
 }
 
 /// Built-in provider that projects v5 `contracts` rows into board
@@ -285,6 +302,233 @@ impl OpportunityProvider for ContractProvider {
     }
 }
 
+/// Built-in provider that projects v3 `bounties` rows into board
+/// entries.
+///
+/// The provider returns one [`JobBoardEntry`] per `open` bounty:
+///
+/// - In a **space exploration** game this can represent "escort a
+///   freighter through a contested lane".
+/// - In a **dungeon crawler** it can represent "recover a relic from a
+///   flooded crypt".
+#[derive(Debug, Default, Clone, Copy)]
+pub struct BountyProvider;
+
+impl BountyProvider {
+    /// Construct a provider for v3 bounty-backed opportunities.
+    #[must_use]
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl OpportunityProvider for BountyProvider {
+    fn entries(&self, world_db: &WorldDb) -> Result<Vec<JobBoardEntry>, JobBoardError> {
+        const SQL: &str = "\
+SELECT id, title, description, reward, state, expires_at \
+FROM bounties \
+WHERE state = 'open' \
+ORDER BY created_at ASC, id ASC";
+
+        let mut stmt =
+            world_db
+                .connection()
+                .prepare(SQL)
+                .map_err(|source| JobBoardError::BountyQuery {
+                    source: BountyError::Sqlite { source },
+                })?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(BountyBoardRow {
+                    id: row.get(0)?,
+                    title: row.get(1)?,
+                    description: row.get(2)?,
+                    reward: row.get(3)?,
+                    state: row.get(4)?,
+                    expires_at: row.get(5)?,
+                })
+            })
+            .map_err(|source| JobBoardError::BountyQuery {
+                source: BountyError::Sqlite { source },
+            })?;
+        let rows = rows
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|source| JobBoardError::BountyQuery {
+                source: BountyError::Sqlite { source },
+            })?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| JobBoardEntry {
+                source: JobBoardSource::Bounty,
+                source_id: row.id,
+                kind_label: "Bounty".to_string(),
+                state_label: row.state,
+                title: row.title,
+                summary: row.description,
+                reward_preview: Some(row.reward),
+                location_preview: None,
+                expires_at: row.expires_at,
+                accept_action: Some(format!("bounty:{}", row.id)),
+            })
+            .collect())
+    }
+}
+
+/// Built-in provider that projects v3 `challenges` rows into board
+/// entries.
+///
+/// The provider returns one [`JobBoardEntry`] per `open` challenge:
+///
+/// - In a **space exploration** game this can represent an open
+///   navigation race challenge.
+/// - In a **town simulation** game this can represent a civic
+///   improvement challenge.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ChallengeProvider;
+
+impl ChallengeProvider {
+    /// Construct a provider for v3 challenge-backed opportunities.
+    #[must_use]
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl OpportunityProvider for ChallengeProvider {
+    fn entries(&self, world_db: &WorldDb) -> Result<Vec<JobBoardEntry>, JobBoardError> {
+        const SQL: &str = "\
+SELECT id, kind, stake, state, challenger_player_id, target_player_id, expires_at \
+FROM challenges \
+WHERE state = 'open' \
+ORDER BY created_at ASC, id ASC";
+
+        let mut stmt =
+            world_db
+                .connection()
+                .prepare(SQL)
+                .map_err(|source| JobBoardError::ChallengeQuery {
+                    source: ChallengeError::Sqlite { source },
+                })?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(ChallengeBoardRow {
+                    id: row.get(0)?,
+                    kind: row.get(1)?,
+                    stake: row.get(2)?,
+                    state: row.get(3)?,
+                    challenger_player_id: row.get(4)?,
+                    target_player_id: row.get(5)?,
+                    expires_at: row.get(6)?,
+                })
+            })
+            .map_err(|source| JobBoardError::ChallengeQuery {
+                source: ChallengeError::Sqlite { source },
+            })?;
+        let rows = rows
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|source| JobBoardError::ChallengeQuery {
+                source: ChallengeError::Sqlite { source },
+            })?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                let fallback_summary = format!(
+                    "Open challenge between player {} and player {}",
+                    row.challenger_player_id, row.target_player_id
+                );
+                JobBoardEntry {
+                    source: JobBoardSource::Challenge,
+                    source_id: row.id,
+                    kind_label: "Challenge".to_string(),
+                    state_label: row.state,
+                    title: format!("Challenge: {}", row.kind),
+                    summary: row.stake.clone().unwrap_or(fallback_summary),
+                    reward_preview: row.stake,
+                    location_preview: None,
+                    expires_at: row.expires_at,
+                    accept_action: Some(format!("challenge:{}", row.id)),
+                }
+            })
+            .collect())
+    }
+}
+
+/// Built-in provider bundle selected from v5/v3 config toggles.
+///
+/// The bundle always includes [`ContractProvider`] because v5's
+/// `job_board` primitive depends on `contracts`. v3 providers are
+/// included only when their specific multiplayer toggles are enabled.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct BuiltInProviders {
+    contract: ContractProvider,
+    bounty: Option<BountyProvider>,
+    challenge: Option<ChallengeProvider>,
+}
+
+impl BuiltInProviders {
+    /// Build the built-in provider set from v3 multiplayer toggles.
+    ///
+    /// Gating rules:
+    ///
+    /// - `multiplayer = None` (v3 disabled): only contracts.
+    /// - `multiplayer.bounties = true`: include [`BountyProvider`].
+    /// - `multiplayer.challenges = true`: include [`ChallengeProvider`].
+    #[must_use]
+    pub fn from_multiplayer(multiplayer: Option<&MultiplayerSection>) -> Self {
+        let bounty = multiplayer
+            .filter(|section| section.bounties)
+            .map(|_| BountyProvider::new());
+        let challenge = multiplayer
+            .filter(|section| section.challenges)
+            .map(|_| ChallengeProvider::new());
+        Self {
+            contract: ContractProvider::new(),
+            bounty,
+            challenge,
+        }
+    }
+
+    /// Return this bundle as trait-object references for
+    /// [`JobBoard::query`].
+    ///
+    /// This is the bridging helper games use before task 11 wires
+    /// these providers into runtime handles.
+    #[must_use]
+    pub fn as_provider_refs(&self) -> Vec<&dyn OpportunityProvider> {
+        let mut providers: Vec<&dyn OpportunityProvider> = vec![&self.contract];
+        if let Some(provider) = self.bounty.as_ref() {
+            providers.push(provider);
+        }
+        if let Some(provider) = self.challenge.as_ref() {
+            providers.push(provider);
+        }
+        providers
+    }
+}
+
+#[derive(Debug)]
+struct BountyBoardRow {
+    id: i64,
+    title: String,
+    description: String,
+    reward: String,
+    state: String,
+    expires_at: Option<String>,
+}
+
+#[derive(Debug)]
+struct ChallengeBoardRow {
+    id: i64,
+    kind: String,
+    stake: Option<String>,
+    state: String,
+    challenger_player_id: i64,
+    target_player_id: i64,
+    expires_at: Option<String>,
+}
+
 /// Optional per-contract projection hints stored in `metadata_json`.
 ///
 /// Deserialization is best-effort so contracts that use metadata for
@@ -308,10 +552,14 @@ fn parse_contract_board_metadata(raw: Option<&str>) -> ContractBoardMetadata {
 #[cfg(test)]
 mod tests {
     use super::{
-        ContractProvider, JobBoard, JobBoardEntry, JobBoardFilter, JobBoardSort, JobBoardSource,
-        OpportunityProvider,
+        BountyProvider, BuiltInProviders, ChallengeProvider, ContractProvider, JobBoard,
+        JobBoardEntry, JobBoardFilter, JobBoardSort, JobBoardSource, OpportunityProvider,
     };
+    use crate::bounties::BOUNTIES_MIGRATION;
+    use crate::challenges::CHALLENGES_MIGRATION;
+    use crate::config::MultiplayerSection;
     use crate::contracts::{ContractState, CreateContractInput, CONTRACTS_MIGRATION};
+    use crate::players::PLAYERS_MIGRATION;
     use crate::world_db::WorldDb;
     use rusqlite::params;
     use tempfile::tempdir;
@@ -574,5 +822,131 @@ mod tests {
         let entries = JobBoard::query(&world, &filter, &providers).expect("query succeeds");
         let titles: Vec<&str> = entries.iter().map(|entry| entry.title.as_str()).collect();
         assert_eq!(titles, vec!["first", "second"]);
+    }
+
+    #[test]
+    fn bounty_provider_returns_only_open_bounties() {
+        let dir = tempdir().expect("tempdir creates");
+        let db_path = dir.path().join("world.sqlite");
+        let mut world = WorldDb::open(&db_path).expect("open succeeds");
+        world
+            .apply_migration(&PLAYERS_MIGRATION)
+            .expect("players migration applies");
+        world
+            .apply_migration(&BOUNTIES_MIGRATION)
+            .expect("bounties migration applies");
+
+        let open = world
+            .post_bounty(
+                None,
+                "Resupply Lantern Post",
+                "Deliver fuel cells before dusk.",
+                r#"{"credits":1200}"#,
+                Some("2035-05-10T14:00:00Z"),
+            )
+            .expect("open bounty inserts");
+        let claimed = world
+            .post_bounty(
+                None,
+                "Recover Archive Ledger",
+                "Retrieve the ledger from the flooded vault.",
+                r#"{"reputation":3}"#,
+                None,
+            )
+            .expect("second bounty inserts");
+        world
+            .connection_mut()
+            .execute(
+                "UPDATE bounties SET state = 'claimed' WHERE id = ?1",
+                params![claimed.id],
+            )
+            .expect("state update succeeds");
+
+        let provider = BountyProvider::new();
+        let entries = provider.entries(&world).expect("provider query succeeds");
+        assert_eq!(entries.len(), 1, "only open bounties should be listed");
+        assert_eq!(entries[0].source, JobBoardSource::Bounty);
+        assert_eq!(entries[0].source_id, open.id);
+        assert_eq!(entries[0].title, "Resupply Lantern Post");
+        assert_eq!(entries[0].summary, "Deliver fuel cells before dusk.");
+        assert_eq!(entries[0].state_label, "open");
+    }
+
+    #[test]
+    fn challenge_provider_returns_only_open_challenges() {
+        let dir = tempdir().expect("tempdir creates");
+        let db_path = dir.path().join("world.sqlite");
+        let mut world = WorldDb::open(&db_path).expect("open succeeds");
+        world
+            .apply_migration(&PLAYERS_MIGRATION)
+            .expect("players migration applies");
+        world
+            .apply_migration(&CHALLENGES_MIGRATION)
+            .expect("challenges migration applies");
+
+        let challenger_id: i64 = world
+            .connection()
+            .query_row(
+                "INSERT INTO players (foglet_user_id, handle) VALUES ('u-1', 'orbit-a') RETURNING id",
+                [],
+                |row| row.get(0),
+            )
+            .expect("challenger inserts");
+        let target_id: i64 = world
+            .connection()
+            .query_row(
+                "INSERT INTO players (foglet_user_id, handle) VALUES ('u-2', 'guild-b') RETURNING id",
+                [],
+                |row| row.get(0),
+            )
+            .expect("target inserts");
+
+        let open = world
+            .create_challenge(
+                challenger_id,
+                target_id,
+                "district-race",
+                Some(r#"{"stake":"market permit"}"#),
+                Some("2035-05-10T14:00:00Z"),
+            )
+            .expect("open challenge inserts");
+        let accepted = world
+            .create_challenge(challenger_id, target_id, "catacomb-sprint", None, None)
+            .expect("second challenge inserts");
+        world
+            .accept_challenge(accepted.id)
+            .expect("accept transition succeeds");
+
+        let provider = ChallengeProvider::new();
+        let entries = provider.entries(&world).expect("provider query succeeds");
+        assert_eq!(entries.len(), 1, "only open challenges should be listed");
+        assert_eq!(entries[0].source, JobBoardSource::Challenge);
+        assert_eq!(entries[0].source_id, open.id);
+        assert_eq!(entries[0].title, "Challenge: district-race");
+        assert_eq!(entries[0].summary, r#"{"stake":"market permit"}"#);
+        assert_eq!(entries[0].state_label, "open");
+    }
+
+    #[test]
+    fn builtin_providers_omit_v3_sources_when_multiplayer_is_disabled() {
+        let builtins = BuiltInProviders::from_multiplayer(None);
+        let providers = builtins.as_provider_refs();
+        assert_eq!(providers.len(), 1, "only contracts should be wired");
+    }
+
+    #[test]
+    fn builtin_providers_include_v3_sources_when_multiplayer_toggles_are_enabled() {
+        let multiplayer = MultiplayerSection {
+            challenges: true,
+            bounties: true,
+            ..MultiplayerSection::default()
+        };
+        let builtins = BuiltInProviders::from_multiplayer(Some(&multiplayer));
+        let providers = builtins.as_provider_refs();
+        assert_eq!(
+            providers.len(),
+            3,
+            "contracts + bounty + challenge providers should be wired"
+        );
     }
 }
