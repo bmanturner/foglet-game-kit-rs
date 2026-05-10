@@ -328,6 +328,21 @@ pub enum FactionError {
         #[source]
         source: rusqlite::Error,
     },
+    /// [`WorldDb::leave_faction`] was called for a `(player_id,
+    /// faction_id)` pair that has no row in `faction_memberships` —
+    /// neither active nor historical. The player has never joined
+    /// this faction, so there is nothing to leave. Distinct from
+    /// "already left" (which the helper handles idempotently and
+    /// returns `Ok` for); the typed variant lets the agency-roster
+    /// UI render "you aren't a member" rather than swallowing it as
+    /// a generic SQL failure.
+    #[error("player {player_id} has no membership row in faction {faction_id}")]
+    NotMember {
+        /// Player id that was supplied to the leave call.
+        player_id: i64,
+        /// Faction id that was supplied to the leave call.
+        faction_id: i64,
+    },
 }
 
 impl WorldDb {
@@ -558,6 +573,118 @@ WHERE player_id = ?1 AND faction_id = ?2 AND left_at IS NULL";
                     row_to_membership,
                 )
                 .map_err(|source| FactionError::Sqlite { source }),
+            Err(source) => Err(FactionError::Sqlite { source }),
+        }
+    }
+
+    /// Soft-delete the player's active membership in `faction_id` —
+    /// SPEC_v3 §4.4 / §Task 6d.
+    ///
+    /// The contract is "after this call returns successfully, the
+    /// `(player_id, faction_id)` pair has no active membership row
+    /// (`left_at IS NULL`), and the returned `FactionMembership`
+    /// describes the row whose departure was recorded". Calling
+    /// again on an already-left player returns the same row
+    /// unchanged — `left_at` is preserved across repeat calls so
+    /// downstream UI surfaces (audit trail, "left at 02:14") render
+    /// a stable timestamp rather than moving forward on every
+    /// defensive UI submit.
+    ///
+    /// # Soft-delete, not row removal
+    ///
+    /// Per [`FACTIONS_MIGRATION`]'s doc on `faction_memberships`,
+    /// the v3 schema reserves `left_at` for the leave timestamp and
+    /// retains the historical row. This mirrors `notices.archived_at`
+    /// — the row stays for audit and replay (Task 6c notes that
+    /// "a player who leaves and rejoins" creates a new active row
+    /// while the old one is preserved). A `DELETE`-based variant
+    /// would also clash with bounty/notice references that captured
+    /// the historical `faction_memberships.id` for attribution.
+    ///
+    /// # Two-arm idempotency
+    ///
+    /// 1. `UPDATE … SET left_at = CURRENT_TIMESTAMP WHERE … AND
+    ///    left_at IS NULL RETURNING …` — fires only when there is
+    ///    an active row. Backed by `idx_faction_memberships_active`
+    ///    so the targeting filter is seek-bound regardless of how
+    ///    many historical rows have accumulated for this player /
+    ///    faction.
+    /// 2. On `QueryReturnedNoRows` (no active row): one follow-up
+    ///    `SELECT … ORDER BY id DESC LIMIT 1` returns the most
+    ///    recent historical row. If even *that* is empty the player
+    ///    has never joined the faction, and the helper raises
+    ///    [`FactionError::NotMember`].
+    ///
+    /// Selecting the *most recent* historical row (highest `id`)
+    /// rather than any-historical row matters for join → leave →
+    /// rejoin → leave cycles: a stale UI that calls
+    /// `leave_faction` after the second leave should observe the
+    /// timestamp of the *second* leave, not the first. `id DESC`
+    /// is the deterministic tiebreaker that pins this — `joined_at`
+    /// alone could collide on the same second.
+    ///
+    /// # Why `WHERE left_at IS NULL` on the UPDATE
+    ///
+    /// Without the `IS NULL` guard the UPDATE would also fire on
+    /// historical rows, refreshing their `left_at` to the current
+    /// time and violating the "stable timestamp" invariant the
+    /// idempotency test pins. The guard is structurally necessary,
+    /// not stylistic.
+    ///
+    /// # Concurrency
+    ///
+    /// Takes `&self`: a single `UPDATE … RETURNING` plus an
+    /// optional follow-up `SELECT` under the configured busy
+    /// timeout. Same borrow shape as
+    /// [`WorldDb::join_faction`] — no explicit `BEGIN`/`COMMIT` is
+    /// needed because the targeted UPDATE is a single statement and
+    /// the fallback SELECT is read-only.
+    pub fn leave_faction(
+        &self,
+        player_id: i64,
+        faction_id: i64,
+    ) -> Result<FactionMembership, FactionError> {
+        // Targets only the active row. The `left_at IS NULL`
+        // predicate is what makes the helper idempotent: a second
+        // call finds nothing to UPDATE, falls through to the
+        // SELECT arm, and returns the historical row with its
+        // original `left_at` preserved.
+        const UPDATE_SQL: &str = "\
+UPDATE faction_memberships \
+SET left_at = CURRENT_TIMESTAMP \
+WHERE player_id = ?1 AND faction_id = ?2 AND left_at IS NULL \
+RETURNING id, player_id, faction_id, role, joined_at, left_at";
+
+        // Fallback for the idempotent / never-joined branch. The
+        // `ORDER BY id DESC LIMIT 1` returns the most recent row,
+        // which under join/leave/rejoin/leave cycles is the row the
+        // caller most likely intends to observe. `id` (autoincrement)
+        // monotonically increases, so it doubles as a tiebreaker
+        // when multiple rows share a `left_at` second.
+        const SELECT_LATEST_SQL: &str = "\
+SELECT id, player_id, faction_id, role, joined_at, left_at \
+FROM faction_memberships \
+WHERE player_id = ?1 AND faction_id = ?2 \
+ORDER BY id DESC LIMIT 1";
+
+        match self.connection().query_row(
+            UPDATE_SQL,
+            rusqlite::params![player_id, faction_id],
+            row_to_membership,
+        ) {
+            Ok(membership) => Ok(membership),
+            Err(rusqlite::Error::QueryReturnedNoRows) => match self.connection().query_row(
+                SELECT_LATEST_SQL,
+                rusqlite::params![player_id, faction_id],
+                row_to_membership,
+            ) {
+                Ok(membership) => Ok(membership),
+                Err(rusqlite::Error::QueryReturnedNoRows) => Err(FactionError::NotMember {
+                    player_id,
+                    faction_id,
+                }),
+                Err(source) => Err(FactionError::Sqlite { source }),
+            },
             Err(source) => Err(FactionError::Sqlite { source }),
         }
     }
@@ -1348,6 +1475,223 @@ mod tests {
             count, 2,
             "alice has two active memberships (one per faction)"
         );
+    }
+
+    /// SPEC_v3 §Task 6d acceptance: `leave_faction` soft-deletes the
+    /// active membership by stamping `left_at` (per the chosen
+    /// schema — see [`FACTIONS_MIGRATION`]'s doc on
+    /// `faction_memberships.left_at`). After the call:
+    ///
+    /// 1. The returned [`FactionMembership`] has `left_at = Some(_)`.
+    /// 2. The `idx_faction_memberships_active`-shaped query (the
+    ///    one every membership-aware UI relies on) sees zero rows.
+    /// 3. The historical row is still present in the table — pinned
+    ///    here so a regression that switched from soft-delete to
+    ///    `DELETE` flunks (audit trail and bounty/notice references
+    ///    that captured the membership id depend on retention).
+    #[test]
+    fn leave_faction_marks_active_membership_inactive() {
+        let (_dir, mut world) = world_with_factions();
+        let alice = world.upsert_player(&ctx("u-a", "alice")).unwrap();
+        let factions = world
+            .seed_factions(&[FactionSeed {
+                slug: "blue-desk".to_string(),
+                display_name: "Blue Desk".to_string(),
+                description: "x".to_string(),
+            }])
+            .unwrap();
+        let blue_desk = &factions[0];
+
+        let joined = world.join_faction(alice.id, blue_desk.id, None).unwrap();
+        let left = world
+            .leave_faction(alice.id, blue_desk.id)
+            .expect("leave succeeds");
+
+        assert_eq!(left.id, joined.id, "same membership row, soft-deleted");
+        assert!(
+            left.left_at.is_some(),
+            "left_at stamped by CURRENT_TIMESTAMP, got {:?}",
+            left.left_at
+        );
+
+        let active: i64 = world
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM faction_memberships \
+                 WHERE player_id = ?1 AND faction_id = ?2 AND left_at IS NULL",
+                rusqlite::params![alice.id, blue_desk.id],
+                |row| row.get(0),
+            )
+            .expect("count query runs");
+        assert_eq!(active, 0, "active-membership view sees zero rows");
+
+        // Audit-trail invariant: the row itself is retained.
+        let total: i64 = world
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM faction_memberships \
+                 WHERE player_id = ?1 AND faction_id = ?2",
+                rusqlite::params![alice.id, blue_desk.id],
+                |row| row.get(0),
+            )
+            .expect("total count query runs");
+        assert_eq!(
+            total, 1,
+            "soft-delete retains the historical row (got {total})"
+        );
+    }
+
+    /// Idempotency: a second `leave_faction` call on an already-left
+    /// player returns the same row with the same `left_at`. Pins
+    /// three independent regression vectors:
+    ///
+    /// 1. The second call returns the same membership id (catches a
+    ///    regression that returned a different historical row).
+    /// 2. The second call returns the same `left_at` (catches a
+    ///    regression that dropped the `WHERE left_at IS NULL` guard
+    ///    on the UPDATE — that would refresh the timestamp on every
+    ///    repeat call).
+    /// 3. The second call still succeeds with `Ok` (catches a
+    ///    regression that raised `NotMember` on the idempotent path,
+    ///    which would force every game-UI leave button into a
+    ///    defensive "are you still a member?" pre-check).
+    #[test]
+    fn leave_faction_is_idempotent_for_already_left_member() {
+        let (_dir, mut world) = world_with_factions();
+        let alice = world.upsert_player(&ctx("u-a", "alice")).unwrap();
+        let factions = world
+            .seed_factions(&[FactionSeed {
+                slug: "blue-desk".to_string(),
+                display_name: "Blue Desk".to_string(),
+                description: "x".to_string(),
+            }])
+            .unwrap();
+
+        world.join_faction(alice.id, factions[0].id, None).unwrap();
+        let first = world.leave_faction(alice.id, factions[0].id).unwrap();
+        let second = world.leave_faction(alice.id, factions[0].id).unwrap();
+
+        assert_eq!(first.id, second.id, "same membership id across calls");
+        assert_eq!(
+            first.left_at, second.left_at,
+            "left_at stable across leave calls (UPDATE must not fire on already-left rows)"
+        );
+        assert!(second.left_at.is_some());
+    }
+
+    /// `leave_faction` for a player who has never joined the faction
+    /// raises `NotMember`. Distinct from the already-left idempotent
+    /// path so the agency-roster UI can render a meaningful "you
+    /// aren't a member" message rather than swallowing the error or
+    /// pretending success.
+    #[test]
+    fn leave_faction_returns_not_member_for_unaffiliated_player() {
+        let (_dir, mut world) = world_with_factions();
+        let alice = world.upsert_player(&ctx("u-a", "alice")).unwrap();
+        let factions = world
+            .seed_factions(&[FactionSeed {
+                slug: "blue-desk".to_string(),
+                display_name: "Blue Desk".to_string(),
+                description: "x".to_string(),
+            }])
+            .unwrap();
+
+        let err = world
+            .leave_faction(alice.id, factions[0].id)
+            .expect_err("leave on never-joined returns NotMember");
+
+        match err {
+            FactionError::NotMember {
+                player_id,
+                faction_id,
+            } => {
+                assert_eq!(player_id, alice.id);
+                assert_eq!(faction_id, factions[0].id);
+            }
+            other => panic!("expected NotMember, got {other:?}"),
+        }
+    }
+
+    /// Leaving one faction MUST NOT touch active memberships in
+    /// other factions for the same player. SPEC §4.4 multi-faction
+    /// guarantee: a player's two memberships are independent.
+    #[test]
+    fn leave_faction_does_not_affect_other_faction_memberships() {
+        let (_dir, mut world) = world_with_factions();
+        let alice = world.upsert_player(&ctx("u-a", "alice")).unwrap();
+        let factions = world
+            .seed_factions(&[
+                FactionSeed {
+                    slug: "blue-desk".to_string(),
+                    display_name: "Blue Desk".to_string(),
+                    description: "x".to_string(),
+                },
+                FactionSeed {
+                    slug: "red-room".to_string(),
+                    display_name: "Red Room".to_string(),
+                    description: "y".to_string(),
+                },
+            ])
+            .unwrap();
+
+        world.join_faction(alice.id, factions[0].id, None).unwrap();
+        world.join_faction(alice.id, factions[1].id, None).unwrap();
+
+        let left = world.leave_faction(alice.id, factions[0].id).unwrap();
+        assert_eq!(left.faction_id, factions[0].id);
+        assert!(left.left_at.is_some());
+
+        // Red Room membership must remain active.
+        let active: i64 = world
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM faction_memberships \
+                 WHERE player_id = ?1 AND faction_id = ?2 AND left_at IS NULL",
+                rusqlite::params![alice.id, factions[1].id],
+                |row| row.get(0),
+            )
+            .expect("count query runs");
+        assert_eq!(active, 1, "leaving Blue Desk MUST NOT affect Red Room");
+    }
+
+    /// Join → leave → rejoin → leave: the latest leave call
+    /// targets the *new* active row, and a subsequent idempotent
+    /// leave returns *that* row (highest id), not the original
+    /// historical one. Pins the `ORDER BY id DESC LIMIT 1` choice
+    /// in the fallback SELECT against a regression that returned
+    /// the first historical row instead of the most recent.
+    #[test]
+    fn leave_faction_targets_latest_membership_on_rejoin() {
+        let (_dir, mut world) = world_with_factions();
+        let alice = world.upsert_player(&ctx("u-a", "alice")).unwrap();
+        let factions = world
+            .seed_factions(&[FactionSeed {
+                slug: "blue-desk".to_string(),
+                display_name: "Blue Desk".to_string(),
+                description: "x".to_string(),
+            }])
+            .unwrap();
+
+        let first_join = world.join_faction(alice.id, factions[0].id, None).unwrap();
+        let first_leave = world.leave_faction(alice.id, factions[0].id).unwrap();
+        assert_eq!(first_leave.id, first_join.id);
+
+        // Rejoin lands a brand-new row (the historical one stays
+        // soft-deleted; `WHERE NOT EXISTS (… active …)` on
+        // join_faction sees no active row and inserts).
+        let second_join = world.join_faction(alice.id, factions[0].id, None).unwrap();
+        assert_ne!(second_join.id, first_join.id);
+
+        let second_leave = world.leave_faction(alice.id, factions[0].id).unwrap();
+        assert_eq!(second_leave.id, second_join.id);
+
+        // Idempotent re-call surfaces the *latest* historical row.
+        let idempotent = world.leave_faction(alice.id, factions[0].id).unwrap();
+        assert_eq!(
+            idempotent.id, second_join.id,
+            "fallback SELECT must return the most recent historical row"
+        );
+        assert_eq!(idempotent.left_at, second_leave.left_at);
     }
 
     /// Helper to build a `FogletContext` — same shape as

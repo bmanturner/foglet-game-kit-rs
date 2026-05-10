@@ -51,7 +51,7 @@ Tempting, but should remain in Drop Dead Nebula until at least two games prove t
 
 | Priority | Candidate | Why it matters |
 | --- | --- | --- |
-| P0 | Generic Contract / Job Board primitive | The MVP needs a delivery Contract; many games need jobs. |
+| P0 | Generic Contract primitive + unified Job Board surface | The MVP needs a delivery Contract; existing Bounties/Challenges should also appear on shared job boards. |
 | P0 | Spatial Travel transaction helper | Many games need route validation + turn spend + move + recall + event. |
 | P0 | Owner Inventory capacity helper | Cargo capacity is needed immediately; capacity is common across genres. |
 | P0 | Reusable Event Log / News screen | The MVP needs readable world memory. |
@@ -70,15 +70,26 @@ Tempting, but should remain in Drop Dead Nebula until at least two games prove t
 
 ---
 
-## 4. P0 Candidate: Generic Contract / Job Board Primitive
+## 4. P0 Candidate: Generic Contract Primitive and Unified Job Board Surface
 
 ### Problem
 
-The game-kit has bounties and challenges, but Drop Dead Nebula’s MVP needs a simpler, broader concept: a structured Contract that can be accepted, completed, expired, abandoned, and rewarded.
+The game-kit already has Bounties and Challenges, and those absolutely belong on a Job Board. Drop Dead Nebula’s MVP also needs a broader non-target work item: a delivery Contract that can be accepted, completed, expired, abandoned, and rewarded.
 
-This is not space-specific. Fantasy RPGs, mystery games, town sims, dungeon crawlers, cyberpunk doors, and trading games all need job boards.
+The key distinction:
 
-### General-Purpose Shape
+- **Contract** is a broad work/obligation lifecycle: deliver, survey, escort, supply, repair, transport, inspect.
+- **Bounty** is a target-oriented work lifecycle: recover this object, clear this hazard, defeat this actor, scan this anomaly.
+- **Challenge** is a contest lifecycle: compete with another player or NPC under defined conditions.
+- **Job Board** is the aggregation surface that can display all of them together.
+
+So the wishlist is not “Contract instead of Bounty.” It is:
+
+> Add a generic Contract primitive for non-bounty work, and provide a Job Board UI/adapter that can aggregate Contracts, Bounties, Challenges, Faction Goals, and other game-defined opportunities.
+
+This is not space-specific. Fantasy RPGs, mystery games, town sims, dungeon crawlers, cyberpunk doors, and trading games all need job boards that mix several opportunity types.
+
+### General-Purpose Shape: Contract Primitive
 
 A Contract primitive should own lifecycle invariants, not objective semantics.
 
@@ -104,8 +115,33 @@ The kit could provide:
 - reward payload JSON, game-defined;
 - metadata JSON;
 - transactional state transitions;
-- query available/accepted/completed contracts;
-- optional player-facing job board adapter.
+- query available/accepted/completed contracts.
+
+### General-Purpose Shape: Job Board Surface
+
+A Job Board helper should be a UI/query aggregation layer, not a separate competing lifecycle.
+
+It could aggregate:
+
+- Contracts;
+- Bounties;
+- Challenges;
+- Faction/shared goals;
+- game-defined opportunities;
+- system notices that advertise work, if a game chooses.
+
+The Job Board could provide:
+
+- common list rendering;
+- opportunity type labels;
+- state labels;
+- expiry display;
+- reward preview;
+- location/issuer preview;
+- hotkeys and pagination;
+- empty-state text;
+- detail modal;
+- game-supplied action callbacks.
 
 ### Game-Supplied Responsibilities
 
@@ -117,22 +153,50 @@ Game code owns:
 - whether multiple players can accept;
 - whether completion consumes inventory;
 - faction/reputation side effects;
-- event/notice wording.
+- event/notice wording;
+- which opportunity types appear on which Job Board;
+- how Bounties, Contracts, Challenges, and Faction Goals are prioritized or grouped.
 
 ### Drop Dead Nebula Use
 
-- First Mercy Run delivery Contract in MVP.
-- Later freight, salvage, smuggling, survey, escort, and faction jobs.
+MVP:
+
+- First Mercy Run delivery Contract appears on Ash Coil’s Job Board.
+
+Later:
+
+- freight Contracts;
+- salvage Bounties;
+- smuggling Contracts;
+- survey Contracts;
+- route-clearing Bounties;
+- player/NPC Challenges;
+- faction shared goals;
+- station emergency requests.
+
+Example board:
+
+```text
+JOBS AT MERCY RELAY
+
+[Contract] Deliver 12 Med Gel to Mercy Relay
+[Bounty]   Recover black box from Blue Blind
+[Bounty]   Clear pirate buoy near Red Maw
+[Challenge] Beat Brass Jory’s cargo run
+[Faction]  Contribute Reactor Coolant to relay repair
+```
 
 ### Other Game Uses
 
-- RPG tavern quests.
-- Noir investigation case board.
-- Dungeon bounty board.
-- Town-sim errands.
-- Survival game supply requests.
+- RPG tavern boards mixing quests, monster bounties, and guild challenges.
+- Noir case boards mixing investigations, warrants, and rival detective challenges.
+- Dungeon boards mixing fetch quests, boss bounties, and party goals.
+- Town-sim errands mixing supply requests, civic projects, and resident favors.
+- Survival games mixing supply contracts, hazard-clearing bounties, and faction calls.
 
 ### Acceptance Criteria for Kit Feature
+
+Contract primitive:
 
 - Can create available Contracts with game-defined payloads.
 - Can accept a Contract transactionally.
@@ -140,7 +204,15 @@ Game code owns:
 - Invalid transitions are rejected.
 - Expired Contracts cannot be accepted.
 - Query APIs support available jobs and a player’s accepted jobs.
-- Optional UI helper can render a keyboard-driven job board without game-specific semantics.
+
+Job Board surface:
+
+- Can display Contracts and existing Bounties in one list.
+- Can include Challenges and Faction Goals without forcing them into Contract semantics.
+- Clearly labels opportunity type.
+- Supports keyboard navigation and detail views.
+- Lets game code provide accept/claim/open/contribute callbacks per opportunity type.
+- Does not prescribe objective, reward, or completion semantics.
 
 ---
 
@@ -1015,7 +1087,7 @@ Possible kit alternative:
 
 Highest leverage:
 
-1. Generic Contract / Job Board primitive.
+1. Generic Contract primitive + unified Job Board surface.
 2. Spatial Travel transaction helper.
 3. Owner Inventory capacity helper.
 4. Reusable Event Log / News screen.
@@ -1088,7 +1160,7 @@ Examples:
 
 Build the Drop Dead Nebula MVP without waiting for all wishlist items, but treat these as early extraction candidates:
 
-1. **Contract / Job Board primitive** — likely worth adding before or during MVP because the need is obvious and generic.
+1. **Contract primitive + unified Job Board surface** — likely worth adding before or during MVP because non-bounty jobs are generic, and existing Bounties/Challenges should still appear on the same board.
 2. **Spatial Travel transaction helper** — likely worth adding during MVP because it composes existing v4/v2 primitives safely.
 3. **Inventory Capacity helper** — likely worth adding during MVP because cargo capacity is immediate and broadly reusable.
 4. **Multi-user local-dev test harness** — worth adding early if async/shared-world tests become painful.
