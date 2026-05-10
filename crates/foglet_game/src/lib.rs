@@ -34,6 +34,7 @@
 pub mod bounties;
 pub mod challenges;
 pub mod config;
+pub mod contracts;
 pub mod dialog;
 pub mod dialog_screen;
 pub mod events;
@@ -73,6 +74,7 @@ pub use config::{
     PresenceSection, SaveSection, SaveStrategy, SpatialSection, TurnReset, TurnsSection,
     WorldSection, WorldTicksSection,
 };
+pub use contracts::CONTRACTS_MIGRATION;
 pub use dialog::{
     dialog_choice_prompt, dialog_handle_prompt_input, load_dialog, Choice, ChoiceError, Dialog,
     DialogError, DialogState, FlagSet, Node, DIALOG_PROMPT_MAX_CHOICES,
