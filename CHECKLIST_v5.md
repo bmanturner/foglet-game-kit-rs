@@ -105,7 +105,7 @@ One unchecked item per iteration. Dependencies in `[brackets]` must be checked o
 - [x] **12b** — Add `docs/job-board.md` covering the aggregation model, providers, sanitization, and at least two non-space examples (e.g., tavern board, noir case board). [Task 5, Task 6]
 - [x] **12c** — Add `docs/travel.md` explaining the transaction order, `validate` and `charge_cost` callbacks, optional recall and events, and two non-space examples (e.g., dungeon room movement, town district navigation). [Task 7]
 - [x] **12d** — Add `docs/inventory-capacity.md` explaining the `CapacityPolicy` trait, in-transaction enforcement, and two non-space examples (e.g., RPG backpack weight, town warehouse slots). [Task 8]
-- [ ] **12e** — Add `docs/event-log-screen.md` covering scope, formatter callback, embedded mode, and two non-space examples (e.g., dungeon death log, mystery case ledger). [Task 9]
+- [x] **12e** — Add `docs/event-log-screen.md` covering scope, formatter callback, embedded mode, and two non-space examples (e.g., dungeon death log, mystery case ledger). [Task 9]
 - [ ] **12f** — Add `docs/test-support-multi-user.md` explaining the feature flag, builder API, and async-BBS test patterns. [Task 10]
 - [ ] **12g** — Add `docs/spec-v5-overview.md` cross-referencing v1–v4 primitives and showing how v5 composes with them (e.g., delivery Contract + Travel helper + capacity-validated transfer + event-log screen). [12a–12f]
 - [ ] **12h** — Update top-level `README.md` with a v5 features section linking to the new docs. [12g]
