@@ -867,6 +867,45 @@ mod tests {
         assert_eq!(loaded_presence.place_id, origin_id);
     }
 
+    #[test]
+    fn travel_touch_recall_false_leaves_recall_unchanged() {
+        let TravelFixture {
+            mut world,
+            player_id,
+            origin_id,
+            destination_id,
+            ..
+        } = setup_travel_fixture();
+        world
+            .touch_recall(player_id, origin_id, Some(r#"{"known":true}"#))
+            .expect("seed recall inserts");
+        let before = world
+            .recall_for_player(player_id)
+            .expect("recall reads before travel");
+
+        let result = world
+            .travel(TravelRequest::new(player_id, destination_id).with_touch_recall(false))
+            .expect("travel succeeds without recall touch");
+
+        let after = world
+            .recall_for_player(player_id)
+            .expect("recall reads after travel");
+        let loaded_presence = world
+            .get_presence(player_id)
+            .expect("presence reads")
+            .expect("presence row exists");
+
+        assert_eq!(result.to_place_id, destination_id);
+        assert_eq!(loaded_presence.place_id, destination_id);
+        assert_eq!(after, before);
+        assert!(
+            !after
+                .iter()
+                .any(|row| row.player_id == player_id && row.place_id == destination_id),
+            "touch_recall=false must not create destination recall"
+        );
+    }
+
     struct TravelFixture {
         world: WorldDb,
         player_id: i64,
