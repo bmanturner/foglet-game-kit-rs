@@ -1185,4 +1185,67 @@ mod tests {
             "failed accept on expired contract must not set accepted_at"
         );
     }
+
+    #[test]
+    fn accept_contract_rolls_back_when_on_commit_returns_error() {
+        let dir = tempdir().expect("tempdir creates");
+        let db_path = dir.path().join("world.sqlite");
+        let mut world = WorldDb::open(&db_path).expect("open succeeds");
+        world
+            .apply_migration(&CONTRACTS_MIGRATION)
+            .expect("contracts migration applies");
+
+        let created = world
+            .create_contract(CreateContractInput {
+                key: Some("market-delivery"),
+                kind: "delivery",
+                issuer_owner_kind: "market",
+                issuer_owner_id: 12,
+                objective_json: r#"{"pickup":"district-east","dropoff":"district-west"}"#,
+                reward_json: r#"{"credits":180}"#,
+                metadata_json: Some(r#"{"urgency":"normal"}"#),
+                expires_at: None,
+            })
+            .expect("create_contract succeeds");
+
+        let accept = world.accept_contract(
+            created.id,
+            44,
+            Some(
+                |_tx: &rusqlite::Transaction<'_>,
+                 _accepted: &super::Contract|
+                 -> Result<(), rusqlite::Error> {
+                    // Force the callback failure branch to verify transaction rollback.
+                    Err(rusqlite::Error::InvalidQuery)
+                },
+            ),
+        );
+        assert!(
+            matches!(
+                accept,
+                Err(super::ContractError::Sqlite {
+                    source: rusqlite::Error::InvalidQuery
+                })
+            ),
+            "accept should surface callback error when on_commit returns Err"
+        );
+
+        let persisted = world
+            .contract_by_id(created.id)
+            .expect("lookup succeeds")
+            .expect("contract row still exists");
+        assert_eq!(
+            persisted.state,
+            ContractState::Available.as_str(),
+            "callback error must roll back state transition"
+        );
+        assert_eq!(
+            persisted.acceptor_player_id, None,
+            "callback error must roll back acceptor assignment"
+        );
+        assert_eq!(
+            persisted.accepted_at, None,
+            "callback error must roll back accepted timestamp"
+        );
+    }
 }
