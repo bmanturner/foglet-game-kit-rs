@@ -110,7 +110,7 @@ One unchecked item per iteration. Dependencies in `[brackets]` must be checked o
 - [x] **12g** — Add `docs/spec-v5-overview.md` cross-referencing v1–v4 primitives and showing how v5 composes with them (e.g., delivery Contract + Travel helper + capacity-validated transfer + event-log screen). [12a–12f]
 - [x] **12h** — Update top-level `README.md` with a v5 features section linking to the new docs. [12g]
 - [x] **12i** — Document explicitly that v5 still has no real-time multiplayer, no long-lived daemon, no scripted-terminal driver, and no sample-game integration of v5 features in this kit's fixture. [12g]
-- [ ] **12j** — Add a backup/maintenance note covering the new tables: `contracts`. [12g]
+- [x] **12j** — Add a backup/maintenance note covering the new tables: `contracts`. [12g]
 
 - [ ] **Task 13 — Final v5 verification**
       Run `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`, `cargo test --workspace`, `cargo test --workspace --features test-support`, and `cargo doc --workspace --no-deps`. Quote results in the final iteration. [all prior tasks]

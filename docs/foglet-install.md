@@ -199,9 +199,10 @@ The shared-world SQLite file is the *only* place durable world state
 lives. That includes v2 game state like the player registry, turn
 ledger, event log, and leaderboards, plus v4 structural state in
 `places`, `routes`, `presence`, `place_recall`, `inventory_slots`, and
-`world_tick_tasks`. None of that is reconstructible from per-player
-saves. Back it up on a schedule that matches your tolerance for losing
-in-game state.
+`world_tick_tasks`. v5 adds `contracts`, which stores accepted work,
+opaque objectives, rewards, deadlines, and lifecycle timestamps. None
+of that is reconstructible from per-player saves. Back it up on a
+schedule that matches your tolerance for losing in-game state.
 
 Two safe backup strategies (SPEC_v2 §8 mandates that backups use one
 of these):
@@ -248,7 +249,8 @@ they leave behind is binding.
 For routine maintenance, run occasional `PRAGMA wal_checkpoint(TRUNCATE);`
 during low traffic and `VACUUM` during scheduled downtime if the world
 file grows from churn in v4-heavy tables like `place_recall` and
-`inventory_slots`. Always take a backup first.
+`inventory_slots`, or v5-heavy tables like `contracts` when games post
+and expire large numbers of jobs. Always take a backup first.
 
 ## 6. Foglet QA standards
 
