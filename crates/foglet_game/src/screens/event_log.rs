@@ -329,6 +329,15 @@ mod tests {
         assert!(contains_text(&buffer, "door_opened The door opened."));
     }
 
+    #[test]
+    fn event_log_screen_empty_result_uses_empty_state_text() {
+        let mut screen =
+            EventLogScreen::new(Vec::new(), 20).with_empty_state_text("(case ledger is empty)");
+        let buffer = draw_screen(&mut screen);
+
+        assert!(contains_text(&buffer, "(case ledger is empty)"));
+    }
+
     fn draw_screen(screen: &mut EventLogScreen) -> Buffer {
         let (config, foglet) = fixture_context();
         let mut ctx = GameContext::new(&config, &foglet, (80, 24));
