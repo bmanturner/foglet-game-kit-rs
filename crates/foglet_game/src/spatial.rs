@@ -1045,4 +1045,72 @@ mod tests {
         assert_eq!(inbound[0].from_place_id, refinery.id);
         assert_eq!(inbound[1].from_place_id, hangar.id);
     }
+
+    /// SPEC_v4 Task 4e requires parallel routes between the same
+    /// source-destination pair to be possible when `kind` differs.
+    ///
+    /// This test models **space** logistics and **dungeon** traversal at
+    /// the same time, showing that two rows can encode distinct channels
+    /// between identical nodes.
+    #[test]
+    fn can_create_parallel_routes_with_different_kinds() {
+        let dir = tempdir().expect("tempdir creates");
+        let db_path = dir.path().join("world.sqlite");
+        let mut world = WorldDb::open(&db_path).expect("open succeeds");
+
+        world
+            .apply_migration(&PLACES_MIGRATION)
+            .expect("places migration applies");
+        world
+            .apply_migration(&ROUTES_MIGRATION)
+            .expect("routes migration applies");
+
+        let from = world
+            .insert_place("bridge-gate", "Bridge Gate", "gate", None)
+            .expect("source place inserts");
+        let to = world
+            .insert_place("signal-array", "Signal Array", "station", None)
+            .expect("destination place inserts");
+
+        let cargo_channel = world
+            .create_route(
+                from.id,
+                to.id,
+                "supply-shuttle",
+                None,
+                Some(r#"{"channel":"cargo"}"#),
+            )
+            .expect("parallel route A inserts");
+        let hidden_stair = world
+            .create_route(
+                from.id,
+                to.id,
+                "hidden-stairs",
+                None,
+                Some(r#"{"channel":"crew-only"}"#),
+            )
+            .expect("parallel route B inserts");
+
+        let routes = world
+            .connection()
+            .prepare(
+                "SELECT from_place_id, to_place_id, id, kind, requirements_json, metadata_json, created_at FROM routes WHERE from_place_id = ?1 AND to_place_id = ?2 ORDER BY id ASC",
+            )
+            .expect("route list query preparable")
+            .query_map(rusqlite::params![from.id, to.id], super::row_to_route)
+            .expect("route query executes")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("route rows decode");
+
+        assert_eq!(
+            routes.len(),
+            2,
+            "parallel rows for same pair should coexist"
+        );
+        assert_eq!(routes[0].id, cargo_channel.id);
+        assert_eq!(routes[1].id, hidden_stair.id);
+        assert_eq!(routes[0].kind, "supply-shuttle");
+        assert_eq!(routes[1].kind, "hidden-stairs");
+        assert_ne!(routes[0].id, routes[1].id);
+    }
 }
