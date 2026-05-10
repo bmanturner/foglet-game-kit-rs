@@ -40,6 +40,16 @@ See [`SPEC.md`](SPEC.md) for the full contract.
   pollers, refresh-on-navigation only. See
   [`docs/async-multiplayer.md`](docs/async-multiplayer.md) for the
   mailbox-multiplayer model and the explicit no-real-time scope.
+  v4 adds **spatial-and-stockpiles primitives** on top of v3:
+  directed place graphs (`Place`, `Route`), per-player presence and
+  recall (`Presence`, `PlaceRecall`), owner-keyed inventory slots with
+  atomic transfer (`InventorySlot`, `transfer`), and durable world
+  ticks (`WorldTickTask`, `register_tick`, `run_due_ticks`). See
+  [`docs/spec-v4-overview.md`](docs/spec-v4-overview.md),
+  [`docs/spatial.md`](docs/spatial.md),
+  [`docs/presence-and-recall.md`](docs/presence-and-recall.md),
+  [`docs/inventory.md`](docs/inventory.md), and
+  [`docs/world-ticks.md`](docs/world-ticks.md).
 - **`fgk`** — `new` (scaffolder), `emit-manifest` (Foglet operator
   JSON), and `package` (deployable bundle with a boring auditable
   `run.sh` wrapper).
