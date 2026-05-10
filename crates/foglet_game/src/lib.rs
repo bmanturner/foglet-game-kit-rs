@@ -99,7 +99,7 @@ pub use market::{
     MARKET_LISTINGS_MIGRATION,
 };
 pub use notices::{Notice, NoticeError, NOTICES_MIGRATION, NOTICE_SUBJECT_MAX_CHARS};
-pub use place_recall::PLACE_RECALL_MIGRATION;
+pub use place_recall::{PlaceRecallError, PlaceRecallRecord, PLACE_RECALL_MIGRATION};
 pub use players::{PlayerError, PlayerRecord, PLAYERS_MIGRATION};
 pub use presence::{PresenceRecord, PRESENCE_MIGRATION};
 pub use prompt::{
