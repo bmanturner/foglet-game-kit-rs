@@ -837,6 +837,145 @@ RETURNING id, created_at, posted_by_player_id, title, description, \
         }
     }
 
+    /// Sweep every `open` or `claimed` bounty whose `expires_at` is
+    /// non-`NULL` and has lapsed at `now`, flipping it to the
+    /// terminal `expired` state and returning the swept rows
+    /// (SPEC_v3 §4.5 / §Task 7e).
+    ///
+    /// SPEC §4.5 lifts a state machine where `expired` is a terminal
+    /// state distinct from `completed`: a bounty whose deadline ran
+    /// out without a successful completion is *not* the same as one
+    /// that paid out — the audit view must keep them apart so an
+    /// operator scanning the board can tell "noisy poster who keeps
+    /// missing deadlines" from "successful payout history". The
+    /// sweep is the only path that produces an `expired` row; no
+    /// player-driven helper transitions to it.
+    ///
+    /// # Why both `open` and `claimed`
+    ///
+    /// Unlike [`Self::expire_open_challenges`] (which only sweeps
+    /// `open` rows because an accepted challenge has passed the
+    /// deadline gate and is in flight), bounty sweep covers BOTH
+    /// `open` and `claimed`. The rationale is in
+    /// [`BOUNTIES_MIGRATION`]'s `idx_bounties_expiring` doc and
+    /// reflects SPEC §4.5: "a claimant who never completes their
+    /// work shouldn't pin the bounty open forever". A bounty board
+    /// with rows stuck in `claimed` because the claimant walked away
+    /// is worse than one that re-opens to a fresh poster — and the
+    /// audit view still preserves who *did* claim it via the
+    /// surviving `claimed_by_player_id` / `claimed_at` columns,
+    /// which the SET list deliberately leaves untouched.
+    ///
+    /// `completed` and already-`expired` rows are out of scope: the
+    /// former is a terminal success the kit must not re-touch (its
+    /// `completed_at` audit row must survive verbatim), and the
+    /// latter would be a no-op that wastes index walks.
+    ///
+    /// # `now` parameter
+    ///
+    /// Same shape as [`Self::expire_open_challenges`]: `now` is an
+    /// ISO-8601 timestamp (typically `'YYYY-MM-DDTHH:MM:SSZ'`).
+    /// Threading the cutoff through the helper keeps the SQL
+    /// identical to the deadline-gate shape used in
+    /// [`Self::claim_bounty`] (the same `datetime(expires_at) <=
+    /// datetime(?1)` comparison that gate inverts), lets tests pin
+    /// the cutoff to a specific instant, and matches SPEC §Task 7e's
+    /// call signature shape (`expire_bounties(now)`). Production
+    /// callers pass an ISO timestamp synthesised from the runtime
+    /// clock at the call site.
+    ///
+    /// # Conditional UPDATE shape
+    ///
+    /// The `WHERE` clause folds three checks into a single statement:
+    ///
+    /// 1. `state IN ('open','claimed')` — terminal states
+    ///    (`completed`, `expired`) are never re-transitioned. The
+    ///    pair-membership matches the partial-index predicate on
+    ///    `idx_bounties_expiring` so the planner can serve the sweep
+    ///    from the index.
+    /// 2. `expires_at IS NOT NULL` — open-ended bounties with no
+    ///    deadline must never be swept. A regression that dropped
+    ///    this gate would silently expire every "ongoing" bounty.
+    /// 3. `datetime(expires_at) <= datetime(?1)` — the deadline has
+    ///    already passed at `now`. The `datetime()` wrapping handles
+    ///    both ISO forms the kit accepts (`'YYYY-MM-DDTHH:MM:SSZ'`
+    ///    from callers, `'YYYY-MM-DD HH:MM:SS'` from
+    ///    `CURRENT_TIMESTAMP` / SQLite-native columns) so the
+    ///    comparison is chronological, not lexicographic — same
+    ///    normalisation Task 7c's claim gate uses, so a row that
+    ///    fails the claim gate is the exact same row this sweep
+    ///    catches on the next pass.
+    ///
+    /// The sweep walks the partial `idx_bounties_expiring` index
+    /// landed in [`BOUNTIES_MIGRATION`] (`(expires_at, id) WHERE
+    /// state IN ('open','claimed') AND expires_at IS NOT NULL`), so
+    /// cost is proportional to the number of expiring open/claimed
+    /// rows, not the total bounty count.
+    ///
+    /// # Preserved columns
+    ///
+    /// The SET list flips `state` to `'expired'` and *only that*.
+    /// `claimed_by_player_id` and `claimed_at` are deliberately
+    /// preserved on a sweep that catches a `claimed` row so the
+    /// audit view can answer "who held this bounty when it
+    /// lapsed" — the same don't-touch-write-once-columns calculus
+    /// [`Self::complete_bounty`] uses for its own SET list.
+    /// `completed_at` is by definition `NULL` on every swept row
+    /// (no `completed` rows make it past the WHERE).
+    ///
+    /// # Return value
+    ///
+    /// Returns the swept rows in `RETURNING` order so the caller
+    /// can log them, append world events (e.g. a "bounty expired"
+    /// bulletin), or render an "expired since last visit"
+    /// notification — all without a follow-up `SELECT`. Callers that
+    /// only need a count call `.len()` on the result. An empty
+    /// `Vec` is the success case when nothing was due. Same return
+    /// shape as [`Self::expire_open_challenges`].
+    ///
+    /// # Failure
+    ///
+    /// - [`BountyError::Sqlite`] — the `UPDATE … RETURNING` failed.
+    ///
+    /// `NotFound` / `InvalidTransition` / `Expired` are not in the
+    /// failure set: a sweeper that finds nothing is a success, not
+    /// an error.
+    ///
+    /// # Concurrency
+    ///
+    /// Takes `&self`: a single `UPDATE … RETURNING` under the
+    /// configured busy timeout. Naturally atomic as a single
+    /// statement (SPEC §4.5 "Claim/complete transitions MUST be
+    /// transactional"; the sweep's `open -> expired` /
+    /// `claimed -> expired` flips inherit the same guarantee). Same
+    /// borrow shape as [`Self::expire_open_challenges`] and the
+    /// other transition helpers.
+    pub fn expire_bounties(&self, now: &str) -> Result<Vec<Bounty>, BountyError> {
+        // Conditional UPDATE: only `open` or `claimed` rows with a
+        // non-NULL deadline that has passed at `now`. The three-clause
+        // WHERE is documented in the helper rustdoc above; keep this
+        // SQL and the doc-list aligned in any future edit.
+        const SWEEP_SQL: &str = "\
+UPDATE bounties \
+SET state = 'expired' \
+WHERE state IN ('open','claimed') \
+  AND expires_at IS NOT NULL \
+  AND datetime(expires_at) <= datetime(?1) \
+RETURNING id, created_at, posted_by_player_id, title, description, \
+          reward, state, claimed_by_player_id, claimed_at, \
+          completed_at, expires_at";
+
+        let mut stmt = self
+            .connection()
+            .prepare(SWEEP_SQL)
+            .map_err(|source| BountyError::Sqlite { source })?;
+        let rows = stmt
+            .query_map(rusqlite::params![now], row_to_bounty)
+            .map_err(|source| BountyError::Sqlite { source })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|source| BountyError::Sqlite { source })
+    }
+
     /// Map a no-rows response from a bounty-transition `UPDATE` onto
     /// the right typed [`BountyError`] by reading the row's current
     /// state.
@@ -1922,6 +2061,278 @@ mod tests {
         assert!(
             matches!(err, BountyError::NotFound { id } if id == 424_242),
             "expected NotFound {{ id: 424242 }}, got {err:?}"
+        );
+    }
+
+    /// SPEC_v3 §Task 7e acceptance, central case: only `open` and
+    /// `claimed` rows whose `expires_at` has lapsed at `now` are
+    /// swept. Pin every cell of the policy matrix in one place so
+    /// a regression in any of them flunks here:
+    ///
+    /// - open + past deadline → swept (the basic case).
+    /// - claimed + past deadline → swept (the bounty-specific
+    ///   contract, the documented "claimant who never completes
+    ///   their work shouldn't pin the bounty open forever" rule).
+    /// - open + future deadline → stays open.
+    /// - claimed + future deadline → stays claimed.
+    /// - open + no deadline → stays open (the `expires_at IS NOT
+    ///   NULL` gate).
+    /// - completed → must not be re-touched (terminal success).
+    /// - already-expired → must not be re-touched (idempotency).
+    ///
+    /// A regression that dropped the `state IN ('open','claimed')`
+    /// gate would still expire the right rows but additionally
+    /// re-stamp completed/expired ones — caught here by the
+    /// per-row durable-state assertion below. Same shape as
+    /// `expire_open_challenges_only_sweeps_due_open_rows`.
+    #[test]
+    fn expire_bounties_only_sweeps_due_open_or_claimed_rows() {
+        let (_dir, world, poster_id, alice_id, bob_id) = world_with_poster_and_two_claimants();
+
+        // Case 1: open + past deadline → SHOULD be swept.
+        let due_open = world
+            .post_bounty(
+                Some(poster_id),
+                "Stale clue bounty",
+                "Already lapsed when the sweep runs.",
+                r#"{"credits":50}"#,
+                Some("2000-01-01T00:00:00Z"),
+            )
+            .unwrap();
+        // Case 2: claimed + past deadline → SHOULD be swept. Built
+        // by posting with a future deadline (so `claim_bounty`'s
+        // deadline gate accepts it), claiming, then back-dating the
+        // deadline to a past instant via raw UPDATE. This is the
+        // production analog of "bounty was claimed in time but the
+        // claimant walked away before the deadline lapsed".
+        let due_claimed = world
+            .post_bounty(
+                Some(poster_id),
+                "Abandoned suspect tail",
+                "Claimed in time, never completed.",
+                r#"{"credits":75}"#,
+                Some("2999-12-31T23:59:59Z"),
+            )
+            .unwrap();
+        let due_claimed = world.claim_bounty(due_claimed.id, alice_id).unwrap();
+        world
+            .connection()
+            .execute(
+                "UPDATE bounties SET expires_at = ?1 WHERE id = ?2",
+                rusqlite::params!["2000-01-02T00:00:00Z", due_claimed.id],
+            )
+            .unwrap();
+        // Case 3: open + future deadline → MUST stay open.
+        let future_open = world
+            .post_bounty(
+                Some(poster_id),
+                "Future job",
+                "Plenty of time left.",
+                r#"{"credits":100}"#,
+                Some("2999-12-31T23:59:59Z"),
+            )
+            .unwrap();
+        // Case 4: claimed + future deadline → MUST stay claimed.
+        let future_claimed = world
+            .post_bounty(
+                Some(poster_id),
+                "Active investigation",
+                "Bob is on it.",
+                r#"{"credits":150}"#,
+                Some("2999-12-31T23:59:59Z"),
+            )
+            .unwrap();
+        let future_claimed = world.claim_bounty(future_claimed.id, bob_id).unwrap();
+        // Case 5: open + no deadline → MUST stay open. The
+        // `expires_at IS NOT NULL` gate exists for exactly this case.
+        let openended = world
+            .post_bounty(
+                Some(poster_id),
+                "Standing offer",
+                "No deadline; ongoing reward.",
+                r#"{"credits":25}"#,
+                None,
+            )
+            .unwrap();
+        // Case 6: completed → MUST stay completed. Built by post →
+        // claim → complete; the row's `completed_at` audit field
+        // must survive a sweep verbatim.
+        let completed = world
+            .post_bounty(
+                Some(poster_id),
+                "Already paid out",
+                "Successfully closed earlier in the day.",
+                r#"{"credits":200}"#,
+                Some("2999-12-31T23:59:59Z"),
+            )
+            .unwrap();
+        let completed = world.claim_bounty(completed.id, alice_id).unwrap();
+        let completed = world.complete_bounty(completed.id).unwrap();
+        // Case 7: already-expired → MUST stay expired (idempotency
+        // against a pre-swept row). Built by raw INSERT because the
+        // public API has no "post a directly-expired bounty" path.
+        let already_expired_id: i64 = world
+            .connection()
+            .query_row(
+                "INSERT INTO bounties \
+                 (posted_by_player_id, title, description, reward, state, expires_at) \
+                 VALUES (?1, 'Long gone', 'Swept on a prior pass.', \
+                         '{\"credits\":10}', 'expired', '2000-01-03T00:00:00Z') \
+                 RETURNING id",
+                rusqlite::params![poster_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        // Sweep at a `now` after Cases 1/2's deadlines but well
+        // before Cases 3/4's. Cases 5/6/7 are out of scope by state
+        // or by the NULL deadline.
+        let swept = world
+            .expire_bounties("2026-01-01T00:00:00Z")
+            .expect("sweep succeeds");
+
+        // Only the two due rows (in expires_at order) should appear.
+        let mut swept_ids: Vec<i64> = swept.iter().map(|b| b.id).collect();
+        swept_ids.sort();
+        let mut expected = vec![due_open.id, due_claimed.id];
+        expected.sort();
+        assert_eq!(swept_ids, expected, "only the two due rows must be swept");
+        for row in &swept {
+            assert_eq!(
+                row.state,
+                BountyState::Expired.as_str(),
+                "every swept row's RETURNING state must be 'expired'"
+            );
+        }
+        // The previously-claimed row's audit attribution MUST
+        // survive the sweep — this is the contract the SET list
+        // bakes in (state-only flip).
+        let swept_claimed = swept.iter().find(|b| b.id == due_claimed.id).unwrap();
+        assert_eq!(
+            swept_claimed.claimed_by_player_id,
+            Some(alice_id),
+            "swept claimed row must preserve claimed_by_player_id"
+        );
+        assert!(
+            swept_claimed.claimed_at.is_some(),
+            "swept claimed row must preserve claimed_at"
+        );
+
+        // Per-row durable invariant: re-read by primary key and
+        // confirm each row landed in the expected state.
+        let state_of = |id: i64| -> String {
+            world
+                .connection()
+                .query_row(
+                    "SELECT state FROM bounties WHERE id = ?1",
+                    rusqlite::params![id],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(state_of(due_open.id), "expired");
+        assert_eq!(state_of(due_claimed.id), "expired");
+        assert_eq!(state_of(future_open.id), "open");
+        assert_eq!(state_of(future_claimed.id), "claimed");
+        assert_eq!(state_of(openended.id), "open");
+        assert_eq!(state_of(completed.id), "completed");
+        assert_eq!(state_of(already_expired_id), "expired");
+
+        // The completed row's `completed_at` must not have been
+        // wiped by an over-broad sweep — pins the SET-list contract
+        // against a regression that started writing across all
+        // lifecycle columns.
+        let completed_at_after: Option<String> = world
+            .connection()
+            .query_row(
+                "SELECT completed_at FROM bounties WHERE id = ?1",
+                rusqlite::params![completed.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            completed_at_after, completed.completed_at,
+            "completed_at on the untouched row must survive the sweep verbatim"
+        );
+    }
+
+    /// A second sweep at the same `now` is a no-op: the previously
+    /// swept rows are now `expired` and the
+    /// `state IN ('open','claimed')` gate excludes them, while
+    /// every still-fresh row's deadline is still in the future.
+    /// Pin idempotency so a regression that (say) dropped the state
+    /// gate and started re-stamping the row on every pass would
+    /// observably flunk on `is_empty()`. Same shape as
+    /// `expire_open_challenges_is_idempotent`.
+    #[test]
+    fn expire_bounties_is_idempotent() {
+        let (_dir, world, poster_id, _alice_id, _bob_id) = world_with_poster_and_two_claimants();
+        let due = world
+            .post_bounty(
+                Some(poster_id),
+                "Stale",
+                "Past its deadline.",
+                r#"{"credits":1}"#,
+                Some("2000-01-01T00:00:00Z"),
+            )
+            .unwrap();
+
+        let first = world.expire_bounties("2026-01-01T00:00:00Z").unwrap();
+        assert_eq!(first.len(), 1, "first sweep expires the due row");
+        assert_eq!(first[0].id, due.id);
+
+        let second = world.expire_bounties("2026-01-01T00:00:00Z").unwrap();
+        assert!(
+            second.is_empty(),
+            "second sweep at same now must be a no-op, got {second:?}"
+        );
+    }
+
+    /// An empty `bounties` table (or a table whose only rows are
+    /// not due) returns an empty `Vec`, not an error. The SPEC §4.5
+    /// sweeper contract treats "nothing to do" as a success — a
+    /// regression that surfaced this as `Sqlite { … }` would force
+    /// every caller to special-case it. Same shape as
+    /// `expire_open_challenges_empty_table_returns_empty_vec`.
+    #[test]
+    fn expire_bounties_empty_table_returns_empty_vec() {
+        let (_dir, world) = world_with_bounties();
+        let swept = world
+            .expire_bounties("2026-01-01T00:00:00Z")
+            .expect("sweep on empty table succeeds");
+        assert!(
+            swept.is_empty(),
+            "sweep with no rows in scope must return Vec::new(), got {swept:?}"
+        );
+    }
+
+    /// The cutoff is `<= now`, not `< now`: a deadline that exactly
+    /// equals `now` MUST sweep. Without this assertion, a future
+    /// regression that flipped the comparator to strict `<` would
+    /// leave on-the-second deadlines stuck until the next sweep
+    /// tick. Using identical text on both sides also pins that the
+    /// `datetime()` normalisation is the same on both sides of the
+    /// comparison. Same shape as
+    /// `expire_open_challenges_includes_exact_deadline`.
+    #[test]
+    fn expire_bounties_includes_exact_deadline() {
+        let (_dir, world, poster_id) = world_with_poster();
+        let exact = world
+            .post_bounty(
+                Some(poster_id),
+                "Exact",
+                "Deadline equals sweep now.",
+                r#"{"credits":1}"#,
+                Some("2026-01-01T00:00:00Z"),
+            )
+            .unwrap();
+
+        let swept = world.expire_bounties("2026-01-01T00:00:00Z").unwrap();
+        let swept_ids: Vec<i64> = swept.iter().map(|b| b.id).collect();
+        assert_eq!(
+            swept_ids,
+            vec![exact.id],
+            "an on-the-second deadline MUST be swept (<= comparator)"
         );
     }
 
