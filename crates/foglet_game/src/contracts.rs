@@ -442,6 +442,7 @@ SET state = ?2,\n\
     acceptor_player_id = ?3,\n\
     accepted_at = CURRENT_TIMESTAMP\n\
 WHERE id = ?1\n\
+  AND acceptor_player_id IS NULL\n\
 RETURNING id, key, kind, issuer_owner_kind, issuer_owner_id, \
           acceptor_player_id, state, objective_json, reward_json, metadata_json, \
           created_at, accepted_at, completed_at, expires_at";
@@ -1057,5 +1058,66 @@ mod tests {
         assert_eq!(persisted.state, ContractState::Accepted.as_str());
         assert_eq!(persisted.acceptor_player_id, Some(77));
         assert_eq!(persisted.accepted_at, accepted.accepted_at);
+    }
+
+    #[test]
+    fn accept_contract_rejects_when_acceptor_already_set() {
+        let dir = tempdir().expect("tempdir creates");
+        let db_path = dir.path().join("world.sqlite");
+        let mut world = WorldDb::open(&db_path).expect("open succeeds");
+        world
+            .apply_migration(&CONTRACTS_MIGRATION)
+            .expect("contracts migration applies");
+
+        let created = world
+            .create_contract(CreateContractInput {
+                key: Some("guild-escort"),
+                kind: "escort",
+                issuer_owner_kind: "guild",
+                issuer_owner_id: 14,
+                objective_json: r#"{"from":"north-gate","to":"sanctum"}"#,
+                reward_json: r#"{"credits":900}"#,
+                metadata_json: Some(r#"{"danger":"medium"}"#),
+                expires_at: None,
+            })
+            .expect("create_contract succeeds");
+
+        let first_accept = world
+            .accept_contract(
+                created.id,
+                51,
+                None::<
+                    fn(&rusqlite::Transaction<'_>, &super::Contract) -> Result<(), rusqlite::Error>,
+                >,
+            )
+            .expect("first accept succeeds");
+
+        let second_accept = world.accept_contract(
+            created.id,
+            88,
+            None::<fn(&rusqlite::Transaction<'_>, &super::Contract) -> Result<(), rusqlite::Error>>,
+        );
+        assert!(
+            matches!(
+                second_accept,
+                Err(super::ContractError::Sqlite {
+                    source: rusqlite::Error::QueryReturnedNoRows
+                })
+            ),
+            "second accept should fail when an acceptor is already recorded"
+        );
+
+        let persisted = world
+            .contract_by_id(created.id)
+            .expect("lookup succeeds")
+            .expect("contract row still exists");
+        assert_eq!(
+            persisted.acceptor_player_id, first_accept.acceptor_player_id,
+            "failed second accept must not replace the original acceptor"
+        );
+        assert_eq!(
+            persisted.accepted_at, first_accept.accepted_at,
+            "failed second accept must not rewrite accepted_at"
+        );
     }
 }
