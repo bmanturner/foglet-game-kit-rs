@@ -165,13 +165,14 @@ impl WorldDb {
             destination_owner_kind,
             destination_owner_id,
         );
-        let tx = self.connection_mut().transaction().map_err(|source| {
-            InventoryError::TransferFailed {
+        let tx = self
+            .connection_mut()
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|source| InventoryError::TransferFailed {
                 transition: transition.clone(),
                 item_key: item_key.to_string(),
                 source,
-            }
-        })?;
+            })?;
 
         let source_slot =
             match find_slot_for_owner(&tx, source_owner_kind, source_owner_id, item_key).map_err(
@@ -468,6 +469,8 @@ mod tests {
     use crate::inventory::INVENTORY_SLOTS_MIGRATION;
     use crate::world_db::WorldDb;
     use serde_json::json;
+    use std::sync::{Arc, Barrier};
+    use std::thread;
     use tempfile::tempdir;
 
     struct FixedPolicy;
@@ -912,6 +915,92 @@ mod tests {
                 .expect("destination exists")
                 .quantity,
             1
+        );
+    }
+
+    #[test]
+    fn concurrent_capacity_transfers_cannot_collectively_overflow() {
+        let dir = tempdir().expect("tempdir creates");
+        let db_path = dir.path().join("world.sqlite");
+        let mut world = WorldDb::open(&db_path).expect("open succeeds");
+        world
+            .apply_migration(&INVENTORY_SLOTS_MIGRATION)
+            .expect("inventory migration applies");
+        world
+            .create_slot("player", 1, "gem", 5, None, None)
+            .expect("first source inserts");
+        world
+            .create_slot("player", 2, "gem", 5, None, None)
+            .expect("second source inserts");
+        drop(world);
+
+        #[derive(Clone, Copy)]
+        struct CapFive;
+
+        impl CapacityPolicy for CapFive {
+            fn item_volume(
+                &self,
+                _item_key: &str,
+                _metadata: &serde_json::Value,
+            ) -> Result<i64, CapacityError> {
+                Ok(1)
+            }
+
+            fn owner_capacity(
+                &self,
+                _owner_kind: &str,
+                _owner_id: i64,
+            ) -> Result<Option<i64>, CapacityError> {
+                Ok(Some(5))
+            }
+        }
+
+        let barrier = Arc::new(Barrier::new(2));
+        let mut handles = Vec::new();
+        for player_id in [1, 2] {
+            let db_path = db_path.clone();
+            let barrier = Arc::clone(&barrier);
+            handles.push(thread::spawn(move || {
+                let mut world = WorldDb::open(&db_path).expect("thread world opens");
+                barrier.wait();
+                world.transfer_with_capacity(
+                    ("player", player_id),
+                    ("chest", 99),
+                    "gem",
+                    5,
+                    &CapFive,
+                    Option::<
+                        fn(
+                            &rusqlite::Transaction<'_>,
+                            &crate::inventory::InventorySlot,
+                            &crate::inventory::InventorySlot,
+                        ) -> Result<(), rusqlite::Error>,
+                    >::None,
+                )
+            }));
+        }
+
+        let outcomes = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("thread joins"))
+            .collect::<Vec<_>>();
+        let success_count = outcomes.iter().filter(|outcome| outcome.is_ok()).count();
+        assert_eq!(
+            success_count, 1,
+            "exactly one full-capacity transfer can commit"
+        );
+
+        let world = WorldDb::open(&db_path).expect("world reopens");
+        let destination = world
+            .get_slot("chest", 99, "gem")
+            .expect("destination reads")
+            .expect("one destination slot exists");
+        assert_eq!(destination.quantity, 5);
+        assert!(
+            outcomes
+                .iter()
+                .any(|outcome| matches!(outcome, Err(CapacityError::InsufficientCapacity { .. }))),
+            "the losing transfer should re-check capacity after the winner commits"
         );
     }
 }

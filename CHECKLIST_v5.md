@@ -70,7 +70,7 @@ One unchecked item per iteration. Dependencies in `[brackets]` must be checked o
 - [x] **8e** — Test rollback on capacity overflow: source and dest unchanged. [8d]
 - [x] **8f** — Test `owner_capacity = None` allows transfers regardless of volume. [8d]
 - [x] **8g** — Test policy callback errors propagate as `CapacityError::PolicyError` and roll back. [8d]
-- [ ] **8h** — Test concurrent capacity-validated transfers cannot collectively overflow capacity. [8d]
+- [x] **8h** — Test concurrent capacity-validated transfers cannot collectively overflow capacity. [8d]
 
 ### Task 9 — Event Log / News screen
 
