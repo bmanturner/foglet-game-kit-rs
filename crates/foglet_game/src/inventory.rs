@@ -58,6 +58,27 @@ pub struct InventorySlot {
 /// branch on while preserving root causes in structured logs.
 #[derive(Debug, Error)]
 pub enum InventoryError {
+    /// Merge attempt was rejected because the two slots are not identity-compatible.
+    #[error("cannot merge inventory slots `{slot_a_id}` and `{slot_b_id}`: {reason}")]
+    MergeNotCompatible {
+        /// Source slot id that could not be merged.
+        slot_a_id: i64,
+        /// Destination slot id that could not be merged.
+        slot_b_id: i64,
+        /// Human-readable reason for why merge preconditions failed.
+        reason: &'static str,
+    },
+    /// SQLite failed while merging two inventory slot rows.
+    #[error("failed to merge inventory slot `{slot_a_id}` into `{slot_b_id}`: {source}")]
+    MergeFailed {
+        /// Source slot id in the merge attempt.
+        slot_a_id: i64,
+        /// Destination slot id in the merge attempt.
+        slot_b_id: i64,
+        /// Underlying database error.
+        #[source]
+        source: rusqlite::Error,
+    },
     /// Slot write failed.
     #[error("failed to create inventory slot for owner `{owner_kind}:{owner_id}`, item `{item_key}`: {source}")]
     CreateFailed {
@@ -285,6 +306,121 @@ ORDER BY item_key ASC, id ASC";
             })?;
 
         Ok(rows)
+    }
+
+    /// Merge one slot into another when metadata and ownership fully match.
+    ///
+    /// The helper does not invent merge policy; it applies the strict
+    /// v4 contract:
+    ///
+    /// - `(owner_kind, owner_id, item_key, metadata_json)` must match
+    ///   exactly across both slots.
+    /// - The two row ids must be distinct.
+    /// - Quantities are added in a single transaction.
+    ///
+    /// This API exists because v4 intentionally keeps stock behavior
+    /// game-agnostic while still allowing explicit consolidation in
+    /// shared logic (for example, combining partial loads in a ship cargo
+    /// hold or combining duplicate stack rows in a dungeon chest without
+    /// creating a game-specific stack policy inside the kit).
+    ///
+    /// # Genre-neutral usage
+    ///
+    /// - In a **space exploration** game, two `"ore"` entries recorded for
+    ///   the same `"cargo-bay"` with identical scan metadata can be merged
+    ///   into a single row for clean ship manifests.
+    /// - In a **dungeon crawler** game, two `"health-potion"` rows under
+    ///   a `"chest"` owner with identical loot metadata can be merged before
+    ///   presenting room contents in UI.
+    pub fn merge_slots(
+        &mut self,
+        destination: &InventorySlot,
+        source: &InventorySlot,
+    ) -> Result<InventorySlot, InventoryError> {
+        if destination.id == source.id {
+            return Err(InventoryError::MergeNotCompatible {
+                slot_a_id: destination.id,
+                slot_b_id: source.id,
+                reason: "cannot merge a slot with itself",
+            });
+        }
+
+        if destination.owner_kind != source.owner_kind
+            || destination.owner_id != source.owner_id
+            || destination.item_key != source.item_key
+            || destination.metadata_json != source.metadata_json
+        {
+            return Err(InventoryError::MergeNotCompatible {
+                slot_a_id: destination.id,
+                slot_b_id: source.id,
+                reason: "slots must match owner, item key, and metadata_json",
+            });
+        }
+
+        let tx = self.connection_mut().transaction().map_err(|source_err| {
+            InventoryError::MergeFailed {
+                slot_a_id: destination.id,
+                slot_b_id: source.id,
+                source: source_err,
+            }
+        })?;
+
+        tx.execute(
+            "UPDATE inventory_slots\nSET quantity = quantity + (SELECT quantity FROM inventory_slots WHERE id = ?2),\nupdated_at = CURRENT_TIMESTAMP\nWHERE id = ?1",
+            rusqlite::params![destination.id, source.id],
+        )
+        .and_then(|updated| {
+            if updated == 0 {
+                Err(rusqlite::Error::QueryReturnedNoRows)
+            } else {
+                Ok(updated)
+            }
+        })
+        .map_err(|source_err| InventoryError::MergeFailed {
+            slot_a_id: destination.id,
+            slot_b_id: source.id,
+            source: source_err,
+        })?;
+
+        tx.execute(
+            "DELETE FROM inventory_slots WHERE id = ?1",
+            rusqlite::params![source.id],
+        )
+        .and_then(|deleted| {
+            if deleted == 0 {
+                Err(rusqlite::Error::QueryReturnedNoRows)
+            } else {
+                Ok(deleted)
+            }
+        })
+        .map_err(|source_err| InventoryError::MergeFailed {
+            slot_a_id: destination.id,
+            slot_b_id: source.id,
+            source: source_err,
+        })?;
+
+        let merged = tx
+            .query_row(
+                "SELECT id, owner_kind, owner_id, item_key, quantity, equilibrium, metadata_json\n\
+                 FROM inventory_slots\n\
+                 WHERE id = ?1",
+                rusqlite::params![destination.id],
+                row_to_inventory_slot,
+            )
+            .map_err(|source_err| InventoryError::MergeFailed {
+                slot_a_id: destination.id,
+                slot_b_id: source.id,
+                source: source_err,
+            })?;
+
+        tx.commit()
+            .map_err(|source_err| InventoryError::MergeFailed {
+                slot_a_id: destination.id,
+                slot_b_id: source.id,
+                source: source_err,
+            })?;
+
+        Ok(merged)
     }
 }
 
@@ -563,5 +699,112 @@ mod tests {
         assert_eq!(listed[2].item_key, "zeta-parts".to_string());
 
         Ok(())
+    }
+
+    #[test]
+    fn merge_slots_adds_quantities_for_matching_metadata() -> Result<(), InventoryError> {
+        let dir = tempdir().expect("tempdir creates");
+        let db_path = dir.path().join("world.sqlite");
+        let mut world = WorldDb::open(&db_path).expect("open succeeds");
+
+        world
+            .apply_migration(&INVENTORY_SLOTS_MIGRATION)
+            .expect("inventory_slots migration applies");
+
+        let first = world.create_slot(
+            "station",
+            7,
+            "repair-drone",
+            2,
+            None,
+            Some(r#"{"quality":"new"}"#),
+        )?;
+        let second = world.create_slot(
+            "station",
+            7,
+            "repair-drone",
+            5,
+            None,
+            Some(r#"{"quality":"new"}"#),
+        )?;
+
+        let merged = world.merge_slots(&first, &second)?;
+
+        assert_eq!(merged.id, first.id);
+        assert_eq!(merged.quantity, 7);
+        assert_eq!(
+            merged.metadata_json,
+            Some(r#"{"quality":"new"}"#.to_string())
+        );
+
+        let owner_total: i64 = world
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM inventory_slots WHERE owner_kind = ?1 AND owner_id = ?2 AND item_key = ?3",
+                rusqlite::params!["station", 7, "repair-drone"],
+                |row| row.get(0),
+            )
+            .expect("count query runs");
+        assert_eq!(owner_total, 1);
+
+        let list = world.slots_for_owner("station", 7)?;
+        assert!(
+            list.iter()
+                .any(|slot| slot.id == merged.id && slot.quantity == 7),
+            "merged quantity should live on one surviving row"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn merge_slots_rejects_mismatched_metadata() {
+        let dir = tempdir().expect("tempdir creates");
+        let db_path = dir.path().join("world.sqlite");
+        let mut world = WorldDb::open(&db_path).expect("open succeeds");
+
+        world
+            .apply_migration(&INVENTORY_SLOTS_MIGRATION)
+            .expect("inventory_slots migration applies");
+
+        let left = world
+            .create_slot("chest", 9, "coin", 10, None, Some(r#"{"origin":"minted"}"#))
+            .expect("fixture slot exists");
+        let right = world
+            .create_slot(
+                "chest",
+                9,
+                "coin",
+                3,
+                None,
+                Some(r#"{"origin":"plundered"}"#),
+            )
+            .expect("fixture slot exists");
+
+        let failed = world.merge_slots(&left, &right);
+        match failed {
+            Err(InventoryError::MergeNotCompatible {
+                slot_a_id,
+                slot_b_id,
+                ..
+            }) => {
+                assert_eq!(slot_a_id, left.id);
+                assert_eq!(slot_b_id, right.id);
+            }
+            other => panic!("expected merge compatibility failure, got {other:?}"),
+        }
+
+        let owner_total: i64 = world
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM inventory_slots WHERE owner_kind = ?1 AND owner_id = ?2 AND item_key = ?3",
+                rusqlite::params!["chest", 9, "coin"],
+                |row| row.get(0),
+            )
+            .expect("count query runs");
+        assert_eq!(
+            owner_total, 2,
+            "mismatched metadata must leave both rows untouched"
+        );
     }
 }
