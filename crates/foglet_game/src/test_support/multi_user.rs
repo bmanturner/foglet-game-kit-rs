@@ -237,7 +237,7 @@ fn harness_config() -> GameConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::MultiUserHarness;
+    use super::{MultiUserHarness, MultiUserHarnessError};
     use crate::roles::FogletRole;
 
     #[test]
@@ -267,5 +267,21 @@ mod tests {
             .save_root_for("bob")
             .expect("bob save root")
             .exists());
+    }
+
+    #[test]
+    fn builder_rejects_duplicate_handles() {
+        let error = MultiUserHarness::builder()
+            .add_user("alice", FogletRole::User)
+            .add_user("alice", FogletRole::Mod)
+            .build()
+            .expect_err("duplicate handles should fail");
+
+        match error {
+            MultiUserHarnessError::DuplicateHandle { handle } => {
+                assert_eq!(handle, "alice");
+            }
+            other => panic!("expected duplicate handle error, got {other:?}"),
+        }
     }
 }
