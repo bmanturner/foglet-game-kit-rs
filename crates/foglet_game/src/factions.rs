@@ -51,7 +51,10 @@
 //! Factions are the fourth v3 primitive to land, so they take 9.
 //! The remaining v3 migration (bounties, §Task 7a) takes 10.
 
-use crate::world_db::WorldMigration;
+use thiserror::Error;
+
+use crate::config::FactionSeed;
+use crate::world_db::{WorldDb, WorldMigration};
 
 /// Schema for the faction, faction_membership, and shared_goal
 /// tables — SPEC_v3 §4.4 / §Task 6a.
@@ -266,6 +269,189 @@ CREATE INDEX IF NOT EXISTS idx_shared_goals_active\n\
     ON shared_goals(faction_id, key) WHERE state = 'active';\n\
 ",
 };
+
+/// Read model for one row of the `factions` table — SPEC_v3 §4.4.
+///
+/// Returned by [`WorldDb::seed_factions`] so callers receive the
+/// canonical row SQLite produced (autoincrement `id`, SQL-side
+/// `created_at`) rather than echoing back the input config. Future
+/// v3 helpers (`join_faction`, agency selector queries) will read
+/// the same shape.
+///
+/// `display_name` and `description` are mirrored from the seed row
+/// because v3 treats faction rows as write-once after first seed —
+/// see [`WorldDb::seed_factions`] for the rationale. If a future
+/// version ever wants editable faction metadata, the change lands
+/// in a new helper, not by mutating this struct's contract.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Faction {
+    /// Autoincrement primary key. Stable for the life of the world
+    /// DB; the kit references factions by id internally and by slug
+    /// at the config boundary.
+    pub id: i64,
+    /// Game-author-controlled stable identifier (e.g. `"blue-desk"`).
+    /// Round-trips verbatim from the `[[factions.seed]]` config
+    /// entry; validated for shape at config-load time.
+    pub slug: String,
+    /// Human-facing label. Pinned at first seed and not updated by
+    /// subsequent seed calls (write-once contract).
+    pub display_name: String,
+    /// One-sentence flavour text. Same write-once contract as
+    /// `display_name`.
+    pub description: String,
+    /// SQLite-assigned UTC ISO timestamp (`CURRENT_TIMESTAMP`) of
+    /// the first seed call that materialised this row. Stable
+    /// across subsequent idempotent seed calls.
+    pub created_at: String,
+}
+
+/// Errors raised while seeding or otherwise mutating faction state.
+///
+/// Library-internal `thiserror` per the v3 convention shared with
+/// [`crate::notices::NoticeError`] and [`crate::market::MarketError`].
+/// Today only the SQL boundary error is needed — config-side
+/// validation (slug shape, non-empty fields, duplicate slugs) is
+/// already enforced by `crate::config::GameConfig::validate` at
+/// load time, so by the time a `&[FactionSeed]` reaches
+/// [`WorldDb::seed_factions`] every entry is structurally sound.
+/// New variants slot in here as later §Task 6 sub-items (membership,
+/// shared goals) ship their own helpers.
+#[derive(Debug, Error)]
+pub enum FactionError {
+    /// A SQL statement in the seed transaction failed. Wrapping
+    /// `rusqlite::Error` keeps the call site readable (one error
+    /// type, one mapping) while preserving the underlying cause for
+    /// `tracing` and operator-facing messages.
+    #[error("failed to seed factions: {source}")]
+    Sqlite {
+        /// Underlying `rusqlite` error from the failing statement.
+        #[source]
+        source: rusqlite::Error,
+    },
+}
+
+impl WorldDb {
+    /// Idempotently upsert configured factions into the world DB —
+    /// SPEC_v3 §4.4 / §Task 6b.
+    ///
+    /// The contract is "every slug in `seeds` corresponds to a
+    /// `factions` row after this call returns, and calling again
+    /// with the same input is a no-op". Concretely:
+    ///
+    /// 1. For each seed, run `INSERT … ON CONFLICT(slug) DO NOTHING`
+    ///    against `factions`. The `UNIQUE(slug)` constraint from
+    ///    [`FACTIONS_MIGRATION`] is what makes the conflict clause
+    ///    safe — a second run sees the existing row and skips the
+    ///    insert without raising.
+    /// 2. SELECT the canonical row by slug inside the same
+    ///    transaction so the helper returns the same id, display_name,
+    ///    description, and created_at every call regardless of which
+    ///    invocation actually inserted the row.
+    /// 3. Commit. If any statement fails the entire batch rolls back
+    ///    so the `factions` table never lands in a "half-seeded"
+    ///    state that the agency picker would render with gaps.
+    ///
+    /// # Write-once contract
+    ///
+    /// `display_name` and `description` are deliberately *not*
+    /// updated when a slug already exists. SPEC_v3 §4.4 + the
+    /// schema doc on [`FACTIONS_MIGRATION`] state that "once seeded
+    /// a faction row is write-once". A game author who wants to
+    /// rename a detective agency mid-run picks a new slug; an
+    /// operator who wants to rewrite history edits the row through
+    /// `sqlite3` directly. This avoids the surprise of a config
+    /// edit silently rewriting historical bounty/membership
+    /// references that game UIs may have rendered with the old
+    /// name.
+    ///
+    /// # Empty input is a valid no-op
+    ///
+    /// `seeds.is_empty()` returns an empty `Vec` without opening a
+    /// transaction. Doors that disable factions in `[multiplayer]`
+    /// (or simply ship none in `[[factions.seed]]`) call this
+    /// helper at startup with an empty slice; paying for a `BEGIN`
+    /// round-trip in that path would be wasted I/O.
+    ///
+    /// # Concurrency
+    ///
+    /// Takes `&mut self` so we can open a `rusqlite::Transaction`
+    /// via the crate-internal `connection_mut` accessor. Same shape as
+    /// [`WorldDb::buy_listing`]; a `&self` variant would force the
+    /// helper to leak SQL across multiple statements without
+    /// transactional grouping, defeating the all-or-nothing seeding
+    /// guarantee under a concurrent door open hitting the same
+    /// world DB file.
+    pub fn seed_factions(&mut self, seeds: &[FactionSeed]) -> Result<Vec<Faction>, FactionError> {
+        if seeds.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Open a single transaction across all seeds: any failure
+        // (a DB lock timeout, a corrupt schema) rolls every insert
+        // back so the `factions` table is either fully seeded or
+        // unchanged — never half-seeded with the agency picker
+        // missing entries the runtime expects. Mirrors the
+        // transactional shape of `buy_listing`.
+        let tx = self
+            .connection_mut()
+            .transaction()
+            .map_err(|source| FactionError::Sqlite { source })?;
+
+        // `INSERT … ON CONFLICT(slug) DO NOTHING` is the
+        // idempotency primitive. The conflict target uses the
+        // schema-level `UNIQUE(slug)` constraint declared in
+        // FACTIONS_MIGRATION; relying on `UNIQUE` rather than a
+        // bespoke "SELECT then INSERT" handshake makes the path
+        // race-free without needing a SAVEPOINT or busy-loop.
+        const INSERT_SQL: &str = "\
+INSERT INTO factions (slug, display_name, description) \
+VALUES (?1, ?2, ?3) \
+ON CONFLICT(slug) DO NOTHING";
+
+        // Read the canonical row back after the upsert so the
+        // returned `Faction` reflects the values actually in the
+        // table — important for the write-once contract: if a
+        // previous seed call established `display_name = "Original"`
+        // and this call ships `"Updated"`, the caller MUST observe
+        // the persisted `"Original"`, not the input it just
+        // submitted. This SELECT runs inside the same transaction
+        // so the read sees a consistent post-insert snapshot.
+        const SELECT_SQL: &str = "\
+SELECT id, slug, display_name, description, created_at \
+FROM factions WHERE slug = ?1";
+
+        let mut out = Vec::with_capacity(seeds.len());
+        for seed in seeds {
+            tx.execute(
+                INSERT_SQL,
+                rusqlite::params![&seed.slug, &seed.display_name, &seed.description],
+            )
+            .map_err(|source| FactionError::Sqlite { source })?;
+
+            let faction = tx
+                .query_row(SELECT_SQL, rusqlite::params![&seed.slug], row_to_faction)
+                .map_err(|source| FactionError::Sqlite { source })?;
+            out.push(faction);
+        }
+
+        tx.commit()
+            .map_err(|source| FactionError::Sqlite { source })?;
+        Ok(out)
+    }
+}
+
+/// Decode one `factions` row in the column order shared by
+/// [`WorldDb::seed_factions`]'s SELECT and any future faction
+/// query helper. Centralised so a column rename touches one place.
+fn row_to_faction(row: &rusqlite::Row<'_>) -> rusqlite::Result<Faction> {
+    Ok(Faction {
+        id: row.get(0)?,
+        slug: row.get(1)?,
+        display_name: row.get(2)?,
+        description: row.get(3)?,
+        created_at: row.get(4)?,
+    })
+}
 
 #[cfg(test)]
 mod tests {
@@ -540,6 +726,228 @@ mod tests {
         world
             .apply_migration(&FACTIONS_MIGRATION)
             .expect("second factions migration applies (idempotent)");
+    }
+
+    /// SPEC_v3 §Task 6b acceptance: `seed_factions` materialises one
+    /// row per input seed and returns the canonical `Faction` rows.
+    /// Pins the happy path so a regression that swapped the SELECT
+    /// to read by id (instead of slug) or that dropped the post-
+    /// insert read entirely flunks here rather than in a
+    /// downstream agency-picker test.
+    #[test]
+    fn seed_factions_inserts_all_seeds_and_returns_canonical_rows() {
+        let (_dir, mut world) = world_with_factions();
+
+        let seeds = vec![
+            FactionSeed {
+                slug: "blue-desk".to_string(),
+                display_name: "Blue Desk Agency".to_string(),
+                description: "Methodical, by-the-book investigators.".to_string(),
+            },
+            FactionSeed {
+                slug: "red-room".to_string(),
+                display_name: "Red Room Detectives".to_string(),
+                description: "Hard-boiled, ask-questions-later types.".to_string(),
+            },
+        ];
+
+        let seeded = world.seed_factions(&seeds).expect("seed succeeds");
+
+        assert_eq!(seeded.len(), 2, "one Faction per input seed");
+        assert_eq!(seeded[0].slug, "blue-desk");
+        assert_eq!(seeded[0].display_name, "Blue Desk Agency");
+        assert_eq!(
+            seeded[0].description,
+            "Methodical, by-the-book investigators."
+        );
+        assert!(
+            seeded[0].id > 0,
+            "id assigned by SQLite autoincrement, got {}",
+            seeded[0].id
+        );
+        assert!(
+            !seeded[0].created_at.is_empty(),
+            "created_at populated by CURRENT_TIMESTAMP default"
+        );
+        assert_eq!(seeded[1].slug, "red-room");
+        assert_ne!(
+            seeded[0].id, seeded[1].id,
+            "distinct slugs must produce distinct ids"
+        );
+
+        // Belt-and-braces: confirm rows are durably committed by
+        // counting through a fresh statement. A regression that
+        // forgot to call `commit()` would leave the rows visible
+        // inside the helper's transaction but absent here.
+        let count: i64 = world
+            .connection()
+            .query_row("SELECT COUNT(*) FROM factions", [], |row| row.get(0))
+            .expect("count query runs");
+        assert_eq!(count, 2, "both seeds committed to the table");
+    }
+
+    /// SPEC_v3 §Task 6b acceptance criterion: "second seed call does
+    /// not duplicate". Doors restart on every player session, so
+    /// `seed_factions` runs at every startup; without idempotency
+    /// the table would grow a duplicate row every restart and the
+    /// agency picker would render N×restart-count entries.
+    ///
+    /// Verifies three independent regression vectors with one test:
+    ///
+    /// 1. The second call returns the *same* ids as the first
+    ///    (catches a regression that re-keyed factions on every run).
+    /// 2. The second call returns the *same* `created_at` (catches
+    ///    a regression that wrote a fresh timestamp on each call).
+    /// 3. The total row count after two calls is still N (catches
+    ///    the most direct regression — `INSERT OR IGNORE` removed
+    ///    or the `ON CONFLICT` clause flipped to `DO UPDATE`).
+    #[test]
+    fn seed_factions_is_idempotent_under_repeated_calls() {
+        let (_dir, mut world) = world_with_factions();
+
+        let seeds = vec![
+            FactionSeed {
+                slug: "blue-desk".to_string(),
+                display_name: "Blue Desk Agency".to_string(),
+                description: "first description".to_string(),
+            },
+            FactionSeed {
+                slug: "red-room".to_string(),
+                display_name: "Red Room Detectives".to_string(),
+                description: "first description".to_string(),
+            },
+        ];
+
+        let first = world.seed_factions(&seeds).expect("first seed succeeds");
+        let second = world.seed_factions(&seeds).expect("second seed succeeds");
+
+        assert_eq!(first.len(), 2);
+        assert_eq!(second.len(), 2);
+        for (a, b) in first.iter().zip(second.iter()) {
+            assert_eq!(
+                a.id, b.id,
+                "id stable across seed calls for slug {}",
+                a.slug
+            );
+            assert_eq!(
+                a.created_at, b.created_at,
+                "created_at stable across seed calls for slug {}",
+                a.slug
+            );
+        }
+
+        let count: i64 = world
+            .connection()
+            .query_row("SELECT COUNT(*) FROM factions", [], |row| row.get(0))
+            .expect("count query runs");
+        assert_eq!(
+            count, 2,
+            "second seed call MUST NOT duplicate rows (got {count})"
+        );
+    }
+
+    /// Write-once contract: when a slug already exists in the
+    /// `factions` table, a subsequent `seed_factions` call with the
+    /// same slug but updated `display_name` / `description` MUST
+    /// return the *persisted* values, not the new input. Pins the
+    /// `ON CONFLICT(slug) DO NOTHING` clause against a regression
+    /// that flipped it to `DO UPDATE` (which would silently rewrite
+    /// historical references in bounty/membership UIs that captured
+    /// the old name).
+    #[test]
+    fn seed_factions_does_not_update_existing_rows() {
+        let (_dir, mut world) = world_with_factions();
+
+        let original = vec![FactionSeed {
+            slug: "blue-desk".to_string(),
+            display_name: "Original Name".to_string(),
+            description: "Original description.".to_string(),
+        }];
+        let first = world.seed_factions(&original).expect("first seed succeeds");
+
+        let updated = vec![FactionSeed {
+            slug: "blue-desk".to_string(),
+            display_name: "Updated Name".to_string(),
+            description: "Updated description.".to_string(),
+        }];
+        let second = world.seed_factions(&updated).expect("second seed succeeds");
+
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].id, first[0].id, "same slug returns same id");
+        assert_eq!(
+            second[0].display_name, "Original Name",
+            "display_name is write-once: updated input MUST NOT overwrite"
+        );
+        assert_eq!(
+            second[0].description, "Original description.",
+            "description is write-once: updated input MUST NOT overwrite"
+        );
+    }
+
+    /// Empty input is a documented no-op: doors that disable
+    /// factions in `[multiplayer]` (or simply ship no seeds) call
+    /// `seed_factions(&[])` at startup. The helper MUST short-
+    /// circuit before opening a transaction so the cold-path I/O
+    /// cost is zero.
+    #[test]
+    fn seed_factions_with_empty_input_is_a_no_op() {
+        let (_dir, mut world) = world_with_factions();
+
+        let seeded = world.seed_factions(&[]).expect("empty seed succeeds");
+        assert!(seeded.is_empty());
+
+        let count: i64 = world
+            .connection()
+            .query_row("SELECT COUNT(*) FROM factions", [], |row| row.get(0))
+            .expect("count query runs");
+        assert_eq!(count, 0, "empty seed MUST NOT touch the table");
+    }
+
+    /// Mixed-state input: some slugs already exist, some are new.
+    /// The single-call mix is what the runtime hits when a game
+    /// author adds a new agency to `[[factions.seed]]` between
+    /// player sessions. The new entry MUST land while the existing
+    /// entries stay write-once.
+    #[test]
+    fn seed_factions_inserts_new_slugs_alongside_existing_ones() {
+        let (_dir, mut world) = world_with_factions();
+
+        let initial = vec![FactionSeed {
+            slug: "blue-desk".to_string(),
+            display_name: "Blue Desk".to_string(),
+            description: "first".to_string(),
+        }];
+        let first = world
+            .seed_factions(&initial)
+            .expect("initial seed succeeds");
+
+        let mixed = vec![
+            FactionSeed {
+                slug: "blue-desk".to_string(),
+                display_name: "Renamed Blue Desk".to_string(),
+                description: "renamed".to_string(),
+            },
+            FactionSeed {
+                slug: "red-room".to_string(),
+                display_name: "Red Room".to_string(),
+                description: "newly added".to_string(),
+            },
+        ];
+        let second = world.seed_factions(&mixed).expect("mixed seed succeeds");
+
+        assert_eq!(second.len(), 2);
+        // Existing slug retains original name (write-once).
+        assert_eq!(second[0].id, first[0].id);
+        assert_eq!(second[0].display_name, "Blue Desk");
+        // New slug gets a fresh id and lands.
+        assert_ne!(second[1].id, first[0].id);
+        assert_eq!(second[1].display_name, "Red Room");
+
+        let count: i64 = world
+            .connection()
+            .query_row("SELECT COUNT(*) FROM factions", [], |row| row.get(0))
+            .expect("count query runs");
+        assert_eq!(count, 2, "one new row added, original retained");
     }
 
     /// Helper: open a fresh world DB with `players` and
