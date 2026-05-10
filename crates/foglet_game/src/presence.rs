@@ -354,6 +354,7 @@ fn row_to_presence(row: &rusqlite::Row<'_>) -> rusqlite::Result<PresenceRecord> 
 #[cfg(test)]
 mod tests {
     use super::{row_to_presence, PresenceError, PRESENCE_MIGRATION};
+    use crate::foglet::{ContextSource, FogletContext};
     use crate::players::PLAYERS_MIGRATION;
     use crate::spatial::PLACES_MIGRATION;
     use crate::world_db::WorldDb;
@@ -657,6 +658,68 @@ mod tests {
             none.is_none(),
             "fresh players should start without presence"
         );
+
+        Ok(())
+    }
+
+    /// A freshly upserted player must not be auto-placed.
+    ///
+    /// Task 5g keeps player creation and presence orthogonal:
+    /// `upsert_player` writes the `players` table only, and
+    /// explicit `set_presence` calls own the initial location decision.
+    ///
+    /// This test is genre-neutral:
+    ///
+    /// - In a **space exploration** game, the captain can persist
+    ///   first and wait for launch placement at a docking node.
+    /// - In a **dungeon crawler**, the hero can exist in shared
+    ///   storage before being dropped into the first chamber.
+    #[test]
+    fn upsert_player_does_not_auto_create_presence_row() -> Result<(), PresenceError> {
+        let dir = tempdir().expect("tempdir creates");
+        let db_path = dir.path().join("world.sqlite");
+        let mut world = WorldDb::open(&db_path).expect("open succeeds");
+
+        world
+            .apply_migration(&PLAYERS_MIGRATION)
+            .expect("players migration applies");
+        world
+            .apply_migration(&PLACES_MIGRATION)
+            .expect("places migration applies");
+        world
+            .apply_migration(&PRESENCE_MIGRATION)
+            .expect("presence migration applies");
+
+        let player = world
+            .upsert_player(&FogletContext {
+                door_id: "space-dock-01".to_string(),
+                user_id: Some("user-captain-quill".to_string()),
+                username: Some("Captain Quill".to_string()),
+                role: Some("user".to_string()),
+                session_id: Some("session-9f0f".to_string()),
+                terminal_width: 80,
+                terminal_height: 24,
+                source: ContextSource::LocalDev,
+            })
+            .expect("upsert creates the player row");
+
+        let none_before = world.get_presence(player.id)?;
+        assert!(
+            none_before.is_none(),
+            "freshly upserted players should not auto-place"
+        );
+
+        let place = world
+            .insert_place("dock-alpha", "Dock Alpha", "harbor", None)
+            .expect("fixture place insert works");
+        let placed = world.set_presence(player.id, place.id, Some(r#"{"zone":"depot"}"#))?;
+        assert_eq!(placed.player_id, player.id);
+        assert_eq!(placed.place_id, place.id);
+
+        let present = world
+            .get_presence(player.id)?
+            .expect("presence should exist after explicit placement");
+        assert_eq!(present.place_id, place.id);
 
         Ok(())
     }

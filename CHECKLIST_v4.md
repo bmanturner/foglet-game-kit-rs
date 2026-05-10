@@ -40,7 +40,7 @@ One unchecked item per iteration. Dependencies in `[brackets]` must be checked o
 - [x] **5d** — Test rollback when `on_commit` returns an error: presence unchanged. [5c]
 - [x] **5e** — Implement `get_presence(player_id)` returning optional row. Test: unplaced player returns `None`. [5b]
 - [x] **5f** — Implement `players_at(place_id)`. Test: returns current occupants and excludes players who have moved on. [5c]
-- [ ] **5g** — Confirm the kit does not auto-place players. Test: a freshly upserted player has no presence row until `set_presence` is called. [5b, v2 Task 5]
+- [x] **5g** — Confirm the kit does not auto-place players. Test: a freshly upserted player has no presence row until `set_presence` is called. [5b, v2 Task 5]
 
 ### Task 6 — Place recall
 
