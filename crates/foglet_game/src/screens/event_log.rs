@@ -167,6 +167,15 @@ impl EventLogScreen {
         self
     }
 
+    /// Render this event log into a caller-supplied rectangle.
+    ///
+    /// This is the embeddable mode for dashboards and composite
+    /// screens. It draws only inside `area`; callers remain responsible
+    /// for rendering any surrounding UI.
+    pub fn render_region(&self, frame: &mut ratatui::Frame<'_>, area: Rect) {
+        self.render_inner(frame, area);
+    }
+
     fn render_inner(&self, frame: &mut ratatui::Frame<'_>, area: Rect) {
         let block = Block::default()
             .borders(Borders::ALL)
@@ -456,6 +465,47 @@ mod tests {
         assert!(contains_text(&buffer, "kind formatted event-000"));
         assert!(contains_text(&buffer, "kind formatted event-001"));
         assert!(!contains_text(&buffer, "event-002"));
+    }
+
+    #[test]
+    fn event_log_screen_embedded_region_does_not_redraw_outside_region() {
+        let screen =
+            EventLogScreen::new(event_fixture(1), 20).with_timestamp_style(TimestampStyle::Hidden);
+        let mut term = Terminal::new(TestBackend::new(80, 24)).expect("test backend");
+        let region = ratatui::layout::Rect {
+            x: 10,
+            y: 5,
+            width: 40,
+            height: 6,
+        };
+
+        term.draw(|frame| {
+            let full = frame.area();
+            for y in full.y..full.y + full.height {
+                for x in full.x..full.x + full.width {
+                    frame.buffer_mut()[(x, y)].set_symbol(".");
+                }
+            }
+            screen.render_region(frame, region);
+        })
+        .expect("draw embedded screen");
+        let buffer = term.backend().buffer().clone();
+
+        assert_eq!(
+            buffer.cell((0, 0)).expect("outside cell").symbol(),
+            ".",
+            "embedded render must not touch top-left outside region"
+        );
+        assert_eq!(
+            buffer.cell((9, 5)).expect("left outside cell").symbol(),
+            ".",
+            "embedded render must not touch cell immediately left of region"
+        );
+        assert_ne!(
+            buffer.cell((10, 5)).expect("region border cell").symbol(),
+            ".",
+            "embedded render should draw inside the requested region"
+        );
     }
 
     fn draw_screen(screen: &mut EventLogScreen) -> Buffer {
