@@ -306,7 +306,7 @@ fn write_row(buf: &mut ratatui::buffer::Buffer, area: Rect, row: u16, text: &str
 
 #[cfg(test)]
 mod tests {
-    use super::{EventLogScreen, TimestampStyle};
+    use super::{EventLogScope, EventLogScreen, TimestampStyle};
     use crate::config::{
         EventLogScreenSection, GameConfig, GameSection, ManifestSection, SaveSection, SaveStrategy,
     };
@@ -386,6 +386,52 @@ mod tests {
         ));
         let back_to_first = draw_screen(&mut screen);
         assert!(contains_text(&back_to_first, "kind event-000"));
+    }
+
+    #[test]
+    fn event_log_screen_player_scope_excludes_other_players_events() {
+        let dir = tempdir().expect("tempdir creates");
+        let db_path = dir.path().join("world.sqlite");
+        let mut world = WorldDb::open(&db_path).expect("open succeeds");
+        world
+            .apply_migration(&PLAYERS_MIGRATION)
+            .expect("players migration applies");
+        world
+            .apply_migration(&WORLD_EVENTS_MIGRATION)
+            .expect("events migration applies");
+        world
+            .connection()
+            .execute(
+                "INSERT INTO players (id, handle, role, security_level) VALUES (?1, ?2, 'user', 0)",
+                rusqlite::params![1, "alice"],
+            )
+            .expect("alice player inserts");
+        world
+            .connection()
+            .execute(
+                "INSERT INTO players (id, handle, role, security_level) VALUES (?1, ?2, 'user', 0)",
+                rusqlite::params![2, "bob"],
+            )
+            .expect("bob player inserts");
+        world
+            .append_event("move", Some(1), "alice moved", None)
+            .expect("alice event appends");
+        world
+            .append_event("move", Some(2), "bob moved", None)
+            .expect("bob event appends");
+
+        let section = EventLogScreenSection {
+            enabled: true,
+            default_page_size: 20,
+        };
+        let mut screen =
+            EventLogScreen::from_world_db_with_scope(&world, &section, EventLogScope::Player(1))
+                .expect("screen loads player-scoped events")
+                .with_timestamp_style(TimestampStyle::Hidden);
+        let buffer = draw_screen(&mut screen);
+
+        assert!(contains_text(&buffer, "alice moved"));
+        assert!(!contains_text(&buffer, "bob moved"));
     }
 
     fn draw_screen(screen: &mut EventLogScreen) -> Buffer {
