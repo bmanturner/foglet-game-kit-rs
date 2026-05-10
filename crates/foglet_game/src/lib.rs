@@ -62,6 +62,8 @@ pub mod screen;
 pub mod screens;
 pub mod spatial;
 pub mod terminal;
+#[cfg(feature = "test-support")]
+pub mod test_support;
 pub mod travel;
 pub mod turns;
 pub mod widgets;

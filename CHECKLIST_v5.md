@@ -84,7 +84,7 @@ One unchecked item per iteration. Dependencies in `[brackets]` must be checked o
 
 ### Task 10 — Multi-user local-dev test harness
 
-- [ ] **10a** — Add a `test-support` Cargo feature to `crates/foglet_game`. Test: feature-off builds do not compile the harness module. [Task 1]
+- [x] **10a** — Add a `test-support` Cargo feature to `crates/foglet_game`. Test: feature-off builds do not compile the harness module. [Task 1]
 - [ ] **10b** — Implement `MultiUserHarness::builder().add_user(handle, role).build()` creating one shared temp world DB and per-user save roots. Test: two users observe the same world DB path. [10a]
 - [ ] **10c** — Reject duplicate handles. Test: clear error variant. [10b]
 - [ ] **10d** — Implement `context_for(handle)` and `with_user(handle, f)`. Test: each handle returns its own `GameContext` with isolated save roots. [10b]

@@ -23,6 +23,12 @@ authors      = { workspace = true }
 name = "foglet_game"
 path = "src/lib.rs"
 
+[features]
+# Test-only harness APIs for local multi-user/shared-world scenarios.
+# Not enabled by default so release game binaries do not compile the
+# harness module.
+test-support = []
+
 [dependencies]
 # Task 2 (Foglet context loader) pulls in serde for the typed
 # `FogletContext` struct, serde_json to parse the
