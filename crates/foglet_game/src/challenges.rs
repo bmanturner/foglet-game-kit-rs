@@ -36,7 +36,9 @@
 //! bounties) MUST pick the next available kit version — game-authored
 //! migrations live in their own higher band and are not affected.
 
-use crate::world_db::WorldMigration;
+use thiserror::Error;
+
+use crate::world_db::{WorldDb, WorldMigration};
 
 /// Schema for the rival-challenge table — SPEC_v3 §4.2 / §Task 4a.
 ///
@@ -182,12 +184,313 @@ CREATE INDEX IF NOT EXISTS idx_challenges_open_expiring\n\
 ",
 };
 
+/// Decoded `challenges` row — SPEC_v3 §4.2 read model.
+///
+/// Mirrors the column shape pinned by [`CHALLENGES_MIGRATION`]
+/// one-for-one, in the same order, so the SQL `RETURNING` clause and
+/// the `query_map` row decoder share a single column list. Authoring
+/// code consumes this struct rather than reaching into raw
+/// `rusqlite::Row`s — that keeps the schema-to-Rust mapping in one
+/// place and turns a column rename into a single compile error
+/// instead of a fan-out of decode failures.
+///
+/// All timestamps stay as raw SQLite ISO text, the same contract as
+/// [`crate::notices::Notice`] and [`crate::events::EventRecord`]:
+/// parsing into a richer type would be a one-way trip that hides
+/// corrupt data and forces a chrono / time dependency on every
+/// consumer. `stake` and `result` are likewise opaque text — game
+/// code that wants structured payloads serialises JSON before
+/// handing it to the kit, and decodes on read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Challenge {
+    /// Autoincrement primary key. Doubles as the deterministic
+    /// tiebreaker for queries that order by `created_at` and need a
+    /// stable secondary sort, the same role as `notices.id`.
+    pub id: i64,
+    /// UTC timestamp written by SQLite at insert time
+    /// (`CURRENT_TIMESTAMP`). Kept as ISO text — see struct docs.
+    pub created_at: String,
+    /// Challenger's `players.id`. Required by the schema — every
+    /// challenge has exactly one initiator.
+    pub challenger_player_id: i64,
+    /// Target's `players.id`. Required by the schema — v3 ships only
+    /// directed challenges (see [`CHALLENGES_MIGRATION`] notes).
+    pub target_player_id: i64,
+    /// Game-authored kind label (e.g. `"clue_race"`,
+    /// `"deduction_duel"`). Round-tripped verbatim; the kit imposes
+    /// no namespace.
+    pub kind: String,
+    /// Optional opaque stake payload (typically JSON). Stored as text
+    /// so `sqlite3 -json` can pretty-print it; the kit does not parse
+    /// it. `None` for a friendly duel with no wager.
+    pub stake: Option<String>,
+    /// Lifecycle state — one of `open`, `accepted`, `declined`,
+    /// `resolved`, `expired`. The schema-level `CHECK` constraint
+    /// pins the vocabulary; see [`CHALLENGES_MIGRATION`].
+    pub state: String,
+    /// ISO timestamp the target accepted the challenge, or `None`
+    /// while it has not been accepted (still open, declined,
+    /// expired).
+    pub accepted_at: Option<String>,
+    /// ISO timestamp the challenge was resolved, or `None` if it has
+    /// not been resolved.
+    pub resolved_at: Option<String>,
+    /// Optional ISO deadline. After this time, an `open` challenge
+    /// can be transitioned to `expired` by the Task 4f sweeper.
+    /// `None` means open-ended (no deadline).
+    pub expires_at: Option<String>,
+    /// Optional opaque result payload (typically JSON describing
+    /// winner, payouts, narrative beats). Populated by Task 4e on
+    /// the `accepted -> resolved` transition; the kit treats it as
+    /// opaque, same contract as `stake`.
+    pub result: Option<String>,
+}
+
+/// Lifecycle state for a [`Challenge`] — SPEC_v3 §4.2 vocabulary.
+///
+/// The kit's helpers ([`WorldDb::create_challenge`] and the upcoming
+/// 4c–4f transitions) use this enum at their boundaries so call
+/// sites get exhaustive matches and a typed transition target rather
+/// than stringly-typed magic. The wire/storage representation stays
+/// as `TEXT` (see [`CHALLENGES_MIGRATION`]); [`Self::as_str`] is the
+/// one place the mapping lives so a future state addition is a
+/// single edit, schema migration plus enum variant.
+///
+/// Values are listed in the natural lifecycle order — `Open` first,
+/// terminal states last — so `Debug` output reads naturally in
+/// failure messages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ChallengeState {
+    /// Freshly created and awaiting the target's accept/decline.
+    /// SPEC §4.2 default; matches the schema-level `DEFAULT 'open'`.
+    Open,
+    /// Target accepted; the challenge is in flight and awaiting
+    /// resolution by Task 4e.
+    Accepted,
+    /// Target declined the challenge. Terminal state.
+    Declined,
+    /// Resolved by game code via Task 4e. Terminal state; carries
+    /// the `result` payload.
+    Resolved,
+    /// Expired without acceptance via Task 4f's deadline sweeper.
+    /// Terminal state.
+    Expired,
+}
+
+impl ChallengeState {
+    /// Short text encoding used in the `state` column and the
+    /// schema-level `CHECK` constraint. The kit never persists a
+    /// state via any other path, so this method is the single
+    /// source-of-truth for how the enum hits SQLite.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ChallengeState::Open => "open",
+            ChallengeState::Accepted => "accepted",
+            ChallengeState::Declined => "declined",
+            ChallengeState::Resolved => "resolved",
+            ChallengeState::Expired => "expired",
+        }
+    }
+}
+
+/// Failure modes for [`WorldDb::create_challenge`] and the upcoming
+/// challenge-lifecycle helpers.
+///
+/// Library-internal `thiserror` shape — the runtime wraps these with
+/// `anyhow` at the process boundary. Mirrors
+/// [`crate::notices::NoticeError`] so all v3 multiplayer write paths
+/// surface errors with the same shape (a future code review pass
+/// can fold these into a single multiplayer-error trait if a third
+/// primitive needs the same variants, but two primitives doesn't
+/// justify the abstraction yet — SPEC tenet "no premature
+/// abstraction").
+///
+/// Task 4b only needs three variants — `EmptyKind`, `Sqlite`, and
+/// `NotFound` (latter reserved for 4c–4f). Validation variants for
+/// length caps or self-challenge are deferred to follow-up tasks if
+/// SPEC ever calls for them; SPEC §4.2 does not require either.
+#[derive(Debug, Error)]
+pub enum ChallengeError {
+    /// `kind` was empty. SPEC §4.2 lists `kind` as required; the kit
+    /// additionally rejects an empty string here so a challenge can
+    /// always be filtered/rendered by category. A regression that
+    /// silently accepted `""` would surface as a phantom row in
+    /// every "challenges of kind X" query.
+    #[error("challenge kind must not be empty")]
+    EmptyKind,
+    /// The `INSERT … RETURNING` round-trip (or future `UPDATE` on a
+    /// transition) failed. Wrapping `rusqlite::Error` keeps the call
+    /// site readable while preserving the underlying cause for
+    /// `tracing` and operator-facing messages.
+    #[error("failed to write challenge to world database: {source}")]
+    Sqlite {
+        /// Underlying `rusqlite` error from the statement.
+        #[source]
+        source: rusqlite::Error,
+    },
+    /// No `challenges` row exists with the given id. Reserved for
+    /// the upcoming 4c–4f transition helpers; declared now so call
+    /// sites can match exhaustively from the start.
+    #[error("challenge {id} does not exist")]
+    NotFound {
+        /// The id the caller looked up. Echoed so log lines and
+        /// operator-facing errors can name the missing row.
+        id: i64,
+    },
+}
+
+impl WorldDb {
+    /// Insert one row into `challenges` and return the canonical
+    /// [`Challenge`] SQLite produced (SPEC_v3 §4.2 / §Task 4b).
+    ///
+    /// The contract is "the challenge I asked you to create is now
+    /// durably in the table, addressed to the named target, in
+    /// state `open`, with the id and `created_at` SQLite assigned,
+    /// and `accepted_at` / `resolved_at` / `result` all still
+    /// `NULL`". The state is intentionally not a parameter — SPEC
+    /// §4.2 mandates "open" as the entry state, and the kit owns
+    /// that invariant. The schema-level `DEFAULT 'open'` plus this
+    /// helper's `RETURNING` round-trip keeps the lifecycle honest:
+    /// even an operator who tampered with the helper signature
+    /// can't smuggle a row in at `accepted` without also dropping
+    /// the migration's CHECK.
+    ///
+    /// `challenger_player_id` and `target_player_id` are required
+    /// by the schema. `kind` is required text (e.g. `"clue_race"`).
+    /// `stake`, `expires_at` are optional — `None` means "no
+    /// wager" / "no deadline". The `result` column is intentionally
+    /// not a parameter on this path: a brand-new challenge has no
+    /// result, and exposing it as a parameter would invite a
+    /// regression where game code populated it before the
+    /// `accepted -> resolved` transition.
+    ///
+    /// # Validation order
+    ///
+    /// The empty-kind check (the only validation Task 4b needs)
+    /// runs **before** the SQL round-trip so a rejected challenge
+    /// never produces a row, an autoincrement gap, or an event-log
+    /// entry. Same rationale and ordering as
+    /// [`Self::send_notice`].
+    ///
+    /// We use SQLite's `RETURNING` clause (≥ 3.35) to read the
+    /// canonical row — `id`, the SQL-side `created_at`, plus every
+    /// other column — without a second round-trip, the same pattern
+    /// as [`Self::send_notice`] and [`Self::append_event`].
+    ///
+    /// # Concurrency
+    ///
+    /// Takes `&self`: a single insert statement under the configured
+    /// busy timeout. SPEC §4.2 requires "Challenge state transitions
+    /// MUST be transactional"; the *creation* path is a single
+    /// `INSERT` and thus already atomic, so no explicit
+    /// transactional wrapper is needed here. The 4c–4f transition
+    /// helpers will need explicit transactions because they read
+    /// the current state, validate, and then write.
+    pub fn create_challenge(
+        &self,
+        challenger_player_id: i64,
+        target_player_id: i64,
+        kind: &str,
+        stake: Option<&str>,
+        expires_at: Option<&str>,
+    ) -> Result<Challenge, ChallengeError> {
+        // Validation runs before the SQL round-trip so a rejected
+        // challenge never produces a row. SPEC §4.2 lists `kind` as
+        // required; the kit additionally rejects the empty string.
+        if kind.is_empty() {
+            return Err(ChallengeError::EmptyKind);
+        }
+
+        // `RETURNING` echoes the full row back — including the
+        // SQL-side `CURRENT_TIMESTAMP` default for `created_at` and
+        // the `'open'` default for `state`. The column order here
+        // matches `row_to_challenge` so all read paths share one
+        // decoder.
+        const SQL: &str = "\
+INSERT INTO challenges \
+    (challenger_player_id, target_player_id, kind, stake, expires_at) \
+VALUES (?1, ?2, ?3, ?4, ?5) \
+RETURNING id, created_at, challenger_player_id, target_player_id, \
+          kind, stake, state, accepted_at, resolved_at, expires_at, result";
+
+        self.connection()
+            .query_row(
+                SQL,
+                rusqlite::params![
+                    challenger_player_id,
+                    target_player_id,
+                    kind,
+                    stake,
+                    expires_at,
+                ],
+                row_to_challenge,
+            )
+            .map_err(|source| ChallengeError::Sqlite { source })
+    }
+}
+
+/// Decode a `challenges` row into [`Challenge`].
+///
+/// Pulled out so the Task 4b write path and the upcoming 4c–4f
+/// transition / query helpers can share one decoder. Column order
+/// matches the `RETURNING` clause in [`WorldDb::create_challenge`];
+/// a regression that reorders columns will surface here as a type
+/// error rather than as a silent field swap. Same shape as
+/// [`crate::notices::Notice`]'s `row_to_notice`.
+fn row_to_challenge(row: &rusqlite::Row<'_>) -> rusqlite::Result<Challenge> {
+    Ok(Challenge {
+        id: row.get(0)?,
+        created_at: row.get(1)?,
+        challenger_player_id: row.get(2)?,
+        target_player_id: row.get(3)?,
+        kind: row.get(4)?,
+        stake: row.get(5)?,
+        state: row.get(6)?,
+        accepted_at: row.get(7)?,
+        resolved_at: row.get(8)?,
+        expires_at: row.get(9)?,
+        result: row.get(10)?,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::foglet::{ContextSource, FogletContext};
     use crate::players::PLAYERS_MIGRATION;
-    use crate::world_db::WorldDb;
     use tempfile::tempdir;
+
+    /// Helper: build a [`FogletContext`] just complete enough for
+    /// `upsert_player` to land a row. Mirrors the helper in
+    /// `notices::tests`; deliberate duplication so the two
+    /// primitives' tests don't reach across modules.
+    fn ctx(user_id: &str, username: &str) -> FogletContext {
+        FogletContext {
+            door_id: "test-door".to_string(),
+            user_id: Some(user_id.to_string()),
+            username: Some(username.to_string()),
+            role: None,
+            session_id: None,
+            terminal_width: 80,
+            terminal_height: 24,
+            source: ContextSource::ContextFile,
+        }
+    }
+
+    /// Helper: open a fresh world DB with players + challenges
+    /// migrations applied. Used by every Task 4 behavioural test.
+    fn world_with_challenges() -> (tempfile::TempDir, WorldDb) {
+        let dir = tempdir().expect("tempdir creates");
+        let db_path = dir.path().join("world.sqlite");
+        let mut world = WorldDb::open(&db_path).expect("open succeeds");
+        world
+            .apply_migration(&PLAYERS_MIGRATION)
+            .expect("players migration applies");
+        world
+            .apply_migration(&CHALLENGES_MIGRATION)
+            .expect("challenges migration applies");
+        (dir, world)
+    }
 
     /// SPEC_v3 §Task 4a acceptance: applying [`CHALLENGES_MIGRATION`]
     /// creates the documented `challenges` table with the column shape
@@ -427,5 +730,158 @@ mod tests {
         world
             .apply_migration(&CHALLENGES_MIGRATION)
             .expect("second challenges migration applies (idempotent)");
+    }
+
+    /// SPEC_v3 §Task 4b acceptance: a freshly created challenge
+    /// lands in state `open`, with the schema-side `created_at`
+    /// populated, the `RETURNING` row matching the request inputs,
+    /// and `accepted_at` / `resolved_at` / `result` all `NULL`.
+    /// The "starts in open" half is the explicit Task 4b ask; the
+    /// other field assertions guard against a refactor that
+    /// quietly populated a transition timestamp at insert time
+    /// (which would defeat the audit-view contract documented on
+    /// [`Challenge::accepted_at`]).
+    ///
+    /// We also verify the row is visible by primary key directly,
+    /// so a regression that returned a `Challenge` from `RETURNING`
+    /// without actually persisting (e.g. a future change that
+    /// wrapped the insert in a transaction and forgot to commit)
+    /// flunks here rather than only in a 4c/4f follow-up test.
+    /// Same shape as `send_notice_stores_unread_notice`.
+    #[test]
+    fn create_challenge_starts_in_open() {
+        let (_dir, world) = world_with_challenges();
+        let alice = world
+            .upsert_player(&ctx("u-alice", "alice"))
+            .expect("alice upsert succeeds");
+        let bob = world
+            .upsert_player(&ctx("u-bob", "bob"))
+            .expect("bob upsert succeeds");
+
+        let created = world
+            .create_challenge(
+                alice.id,
+                bob.id,
+                "clue_race",
+                Some(r#"{"xp":100}"#),
+                Some("2026-12-31T23:59:59Z"),
+            )
+            .expect("create_challenge succeeds");
+
+        // The central Task 4b claim: starts in `open`.
+        assert_eq!(
+            created.state,
+            ChallengeState::Open.as_str(),
+            "freshly created challenge must be in state 'open' (SPEC §4.2)"
+        );
+
+        // Returned record reflects the inputs and SQL-side defaults.
+        assert!(created.id > 0, "RETURNING must echo an autoincrement id");
+        assert!(
+            !created.created_at.is_empty(),
+            "RETURNING must echo CURRENT_TIMESTAMP"
+        );
+        assert_eq!(created.challenger_player_id, alice.id);
+        assert_eq!(created.target_player_id, bob.id);
+        assert_eq!(created.kind, "clue_race");
+        assert_eq!(created.stake.as_deref(), Some(r#"{"xp":100}"#));
+        assert_eq!(created.expires_at.as_deref(), Some("2026-12-31T23:59:59Z"));
+
+        // Transition timestamps and result MUST be NULL on a fresh
+        // challenge — populating any of them at insert time would
+        // break the lifecycle contract (see SPEC §4.2 transitions).
+        assert!(
+            created.accepted_at.is_none(),
+            "freshly created challenge must not be accepted"
+        );
+        assert!(
+            created.resolved_at.is_none(),
+            "freshly created challenge must not be resolved"
+        );
+        assert!(
+            created.result.is_none(),
+            "freshly created challenge must have no result payload"
+        );
+
+        // Round-trip via primary-key SELECT to prove the row really
+        // landed — guards against a future refactor that returns
+        // the row from `RETURNING` without committing.
+        let stored = world
+            .connection()
+            .query_row(
+                "SELECT id, created_at, challenger_player_id, target_player_id, \
+                        kind, stake, state, accepted_at, resolved_at, expires_at, result \
+                 FROM challenges WHERE id = ?1",
+                rusqlite::params![created.id],
+                row_to_challenge,
+            )
+            .expect("primary-key SELECT decodes the row");
+        assert_eq!(stored, created, "stored row must equal RETURNING row");
+    }
+
+    /// SPEC §4.2 lists `kind` as required. The schema's `NOT NULL`
+    /// would accept `""`; the kit refuses at the boundary so a
+    /// "challenges of kind X" filter never has to skip phantom
+    /// rows. Pin both the typed error and the "no row landed"
+    /// invariant — same shape as `send_notice_rejects_empty_subject`.
+    #[test]
+    fn create_challenge_rejects_empty_kind() {
+        let (_dir, world) = world_with_challenges();
+        let alice = world.upsert_player(&ctx("u-a", "alice")).unwrap();
+        let bob = world.upsert_player(&ctx("u-b", "bob")).unwrap();
+
+        let err = world
+            .create_challenge(alice.id, bob.id, "", None, None)
+            .expect_err("empty kind must be rejected");
+        assert!(matches!(err, ChallengeError::EmptyKind), "got {err:?}");
+
+        let count: i64 = world
+            .connection()
+            .query_row("SELECT COUNT(*) FROM challenges", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0, "rejected challenge must not produce a row");
+    }
+
+    /// `stake` and `expires_at` are both optional on the create
+    /// path. Pin that `None` round-trips as `NULL` and the rest of
+    /// the lifecycle still starts clean. Without this test, a
+    /// future signature change that "helpfully" defaulted either
+    /// field to a sentinel (e.g. the empty JSON object `{}` for
+    /// stake) would silently break SPEC §4.2's "challenges may
+    /// carry no stake" contract.
+    #[test]
+    fn create_challenge_supports_optional_stake_and_deadline() {
+        let (_dir, world) = world_with_challenges();
+        let alice = world.upsert_player(&ctx("u-a", "alice")).unwrap();
+        let bob = world.upsert_player(&ctx("u-b", "bob")).unwrap();
+
+        let created = world
+            .create_challenge(alice.id, bob.id, "deduction_duel", None, None)
+            .expect("create_challenge with no stake/deadline succeeds");
+
+        assert_eq!(created.state, ChallengeState::Open.as_str());
+        assert!(
+            created.stake.is_none(),
+            "None stake must round-trip as NULL"
+        );
+        assert!(
+            created.expires_at.is_none(),
+            "None expires_at must round-trip as NULL"
+        );
+    }
+
+    /// [`ChallengeState::as_str`] is the single source-of-truth
+    /// mapping the enum to the storage encoding pinned by the
+    /// schema-level `CHECK` constraint. A regression that ever
+    /// returned the wrong text for any variant would silently break
+    /// the create / transition paths (state would not match the
+    /// `CHECK` vocabulary). Pin every variant here.
+    #[test]
+    fn challenge_state_as_str_matches_schema_vocabulary() {
+        assert_eq!(ChallengeState::Open.as_str(), "open");
+        assert_eq!(ChallengeState::Accepted.as_str(), "accepted");
+        assert_eq!(ChallengeState::Declined.as_str(), "declined");
+        assert_eq!(ChallengeState::Resolved.as_str(), "resolved");
+        assert_eq!(ChallengeState::Expired.as_str(), "expired");
     }
 }

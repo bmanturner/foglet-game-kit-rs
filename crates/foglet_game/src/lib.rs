@@ -54,7 +54,7 @@ pub mod turns;
 pub mod widgets;
 pub mod world_db;
 
-pub use challenges::CHALLENGES_MIGRATION;
+pub use challenges::{Challenge, ChallengeError, ChallengeState, CHALLENGES_MIGRATION};
 pub use config::{
     ConfigError, FactionSeed, FactionsSection, GameConfig, GameSection, LeaderboardSection,
     LeaderboardSort, ManifestSection, MultiplayerSection, SaveSection, SaveStrategy, TurnReset,
