@@ -560,6 +560,76 @@ RETURNING id, created_at, sender_player_id, recipient_player_id, \
             Err(source) => Err(NoticeError::Sqlite { source }),
         }
     }
+
+    /// Archive a notice; idempotent (SPEC_v3 §4.1 / §Task 3f).
+    ///
+    /// Archiving flips `archived_at` from `NULL` to a timestamp the first
+    /// time it's called and is a no-op on every subsequent call — the
+    /// same `COALESCE(archived_at, CURRENT_TIMESTAMP)` shape as
+    /// [`Self::mark_read`] uses for `read_at`. Once archived, the notice
+    /// is hidden from the default [`Self::inbox`] view (which filters
+    /// `WHERE archived_at IS NULL` against the partial
+    /// `idx_notices_inbox` index documented on [`NOTICES_MIGRATION`]).
+    /// The row itself is preserved so a future "show archived" toggle
+    /// (covered by `idx_notices_recipient_all`) can surface it without
+    /// resurrecting deleted rows from a backup.
+    ///
+    /// Idempotency matters for the same reason as `mark_read`: a
+    /// confirmation screen that re-renders may fire `archive_notice`
+    /// more than once during a single user action. The `COALESCE`
+    /// guarantees the *first* archive timestamp is the one that sticks
+    /// — important for any future audit view ("archived 2026-05-09")
+    /// and for the contract that "archive then archive again" is not an
+    /// error.
+    ///
+    /// # Scope
+    ///
+    /// Authenticates by `id` only — same call-site contract as
+    /// [`Self::mark_read`]: v3 UIs reach `archive_notice` from the
+    /// recipient's own inbox, where ownership is already established.
+    /// A future hardening pass can add an `archive_notice_for(recipient,
+    /// id)` overload if a screen ever exposes raw ids that didn't come
+    /// from `inbox()`.
+    ///
+    /// # Failure
+    ///
+    /// Returns [`NoticeError::NotFound`] if no row matches `notice_id`.
+    /// `rusqlite` errors propagate as [`NoticeError::Sqlite`].
+    ///
+    /// # Concurrency
+    ///
+    /// Takes `&self`: a single `UPDATE … RETURNING` under the configured
+    /// busy timeout. Same shape as [`Self::mark_read`].
+    pub fn archive_notice(&self, notice_id: i64) -> Result<Notice, NoticeError> {
+        // `COALESCE(archived_at, CURRENT_TIMESTAMP)` is the idempotency
+        // hinge — symmetric with `mark_read`. Doing the conditional
+        // assignment in SQL collapses to one statement and removes the
+        // read/write race window between a SELECT and a follow-up
+        // UPDATE.
+        //
+        // Column list mirrors `RETURNING` in `send_notice` and `mark_read`
+        // and the `inbox` SELECT — `row_to_notice` is the single
+        // decoder, so a future schema edit that reorders columns will
+        // surface as a type error here rather than as a silent field
+        // swap in the returned `Notice`.
+        const SQL: &str = "\
+UPDATE notices \
+SET archived_at = COALESCE(archived_at, CURRENT_TIMESTAMP) \
+WHERE id = ?1 \
+RETURNING id, created_at, sender_player_id, recipient_player_id, \
+          kind, subject, body, read_at, archived_at, expires_at, metadata";
+
+        match self
+            .connection()
+            .query_row(SQL, rusqlite::params![notice_id], row_to_notice)
+        {
+            Ok(notice) => Ok(notice),
+            Err(rusqlite::Error::QueryReturnedNoRows) => {
+                Err(NoticeError::NotFound { id: notice_id })
+            }
+            Err(source) => Err(NoticeError::Sqlite { source }),
+        }
+    }
 }
 
 /// Decode a `notices` row into [`Notice`].
@@ -1425,5 +1495,145 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM notices", [], |row| row.get(0))
             .unwrap();
         assert_eq!(count, 0, "rejected notice must not produce a row");
+    }
+
+    /// SPEC_v3 §Task 3f headline: archiving a notice removes it from
+    /// the default [`WorldDb::inbox`] view. Pinned via the real helper
+    /// (the parallel test `inbox_excludes_archived_notices` exercises
+    /// the same filter through a hand-flipped `archived_at`); together
+    /// they lock both halves of the contract — the SQL filter AND the
+    /// helper that flips the column. The other notice in the inbox
+    /// must remain visible so a regression that archived everything
+    /// flunks on the `len() == 1` half.
+    #[test]
+    fn archive_notice_hides_notice_from_default_inbox() {
+        let (_dir, world) = world_with_notices();
+        let alice = world.upsert_player(&ctx("u-a", "alice")).unwrap();
+        let bob = world.upsert_player(&ctx("u-b", "bob")).unwrap();
+        let kept = world
+            .send_notice(Some(alice.id), bob.id, "k", "kept", "b", None, None, 1_000)
+            .unwrap();
+        let to_archive = world
+            .send_notice(
+                Some(alice.id),
+                bob.id,
+                "k",
+                "archived",
+                "b",
+                None,
+                None,
+                1_000,
+            )
+            .unwrap();
+
+        let archived = world
+            .archive_notice(to_archive.id)
+            .expect("archive_notice succeeds");
+        assert!(
+            archived.archived_at.is_some(),
+            "archive_notice must set archived_at"
+        );
+
+        let inbox = world.inbox(bob.id).expect("inbox runs");
+        assert_eq!(
+            inbox.len(),
+            1,
+            "archived notice must disappear from default inbox"
+        );
+        assert_eq!(inbox[0].id, kept.id);
+    }
+
+    /// SPEC_v3 §Task 3f: archiving is idempotent — the second call is
+    /// a no-op and `archived_at` does NOT advance. Same shape as the
+    /// `mark_read_is_idempotent` test (sleep ≥1.1 s between calls so a
+    /// non-idempotent regression to plain `SET archived_at =
+    /// CURRENT_TIMESTAMP` would observably flunk). Also pins that the
+    /// notice stays archived (still hidden from the inbox) after the
+    /// second call — a second archive must not somehow un-archive.
+    #[test]
+    fn archive_notice_is_idempotent() {
+        let (_dir, world) = world_with_notices();
+        let alice = world.upsert_player(&ctx("u-a", "alice")).unwrap();
+        let bob = world.upsert_player(&ctx("u-b", "bob")).unwrap();
+        let sent = world
+            .send_notice(Some(alice.id), bob.id, "k", "hi", "body", None, None, 1_000)
+            .unwrap();
+
+        let first = world.archive_notice(sent.id).expect("first archive");
+        let archived_at = first
+            .archived_at
+            .clone()
+            .expect("first archive must set archived_at");
+
+        std::thread::sleep(std::time::Duration::from_millis(1_100));
+
+        let second = world.archive_notice(sent.id).expect("second archive");
+        assert_eq!(
+            second.archived_at.as_deref(),
+            Some(archived_at.as_str()),
+            "second archive_notice must be a no-op (timestamp must not advance)"
+        );
+
+        // Round-trip via primary-key SELECT — guards against a regression
+        // that returned a frozen `Notice` from RETURNING but still
+        // advanced the row's column.
+        let stored: Option<String> = world
+            .connection()
+            .query_row(
+                "SELECT archived_at FROM notices WHERE id = ?1",
+                rusqlite::params![sent.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored.as_deref(), Some(archived_at.as_str()));
+
+        // Still hidden from the default inbox after a second archive.
+        let inbox = world.inbox(bob.id).expect("inbox runs");
+        assert!(
+            inbox.is_empty(),
+            "twice-archived notice must remain hidden from default inbox"
+        );
+    }
+
+    /// SPEC_v3 §Task 3f: archiving a missing id returns
+    /// [`NoticeError::NotFound`] — same typed-error contract as
+    /// [`WorldDb::mark_read`], so the UI layer can recover (refresh
+    /// inbox) without escalating to the operator.
+    #[test]
+    fn archive_notice_missing_id_returns_not_found() {
+        let (_dir, world) = world_with_notices();
+        let err = world
+            .archive_notice(999_999)
+            .expect_err("missing id must error");
+        match err {
+            NoticeError::NotFound { id } => assert_eq!(id, 999_999),
+            other => panic!("expected NotFound, got {other:?}"),
+        }
+    }
+
+    /// SPEC_v3 §Task 3f: archiving a previously-read notice preserves
+    /// the original `read_at` timestamp (the COALESCE only touches
+    /// `archived_at`). A regression that reset `read_at` during archive
+    /// would observably flunk the equality check here. Important for
+    /// any future "archived mail" view that wants to show "you read
+    /// this on …" alongside "you archived this on …".
+    #[test]
+    fn archive_notice_preserves_read_at() {
+        let (_dir, world) = world_with_notices();
+        let alice = world.upsert_player(&ctx("u-a", "alice")).unwrap();
+        let bob = world.upsert_player(&ctx("u-b", "bob")).unwrap();
+        let sent = world
+            .send_notice(Some(alice.id), bob.id, "k", "hi", "body", None, None, 1_000)
+            .unwrap();
+        let read = world.mark_read(sent.id).unwrap();
+        let read_at = read.read_at.clone().expect("mark_read sets read_at");
+
+        let archived = world.archive_notice(sent.id).expect("archive succeeds");
+        assert_eq!(
+            archived.read_at.as_deref(),
+            Some(read_at.as_str()),
+            "archive_notice must preserve the original read_at"
+        );
+        assert!(archived.archived_at.is_some());
     }
 }
