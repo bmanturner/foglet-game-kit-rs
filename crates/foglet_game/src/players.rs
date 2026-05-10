@@ -440,6 +440,92 @@ RETURNING id, foglet_user_id, handle, role, security_level, \
             Err(source) => Err(PlayerError::Sqlite { source }),
         }
     }
+
+    /// Search the player registry by case-insensitive handle prefix.
+    ///
+    /// Added for SPEC_v3 §Task 8a — Murder Motel's async multiplayer
+    /// screens (notice send target picker, challenge-rival selector,
+    /// bounty claim attribution UI) need a way to autocomplete a
+    /// handle the local player typed in the box. The kit already owns
+    /// the `players` registry, so providing a single typed helper
+    /// keeps every screen from rolling its own raw `LIKE` query and
+    /// drifting on case-folding rules.
+    ///
+    /// # Semantics
+    ///
+    /// - The match is **case-insensitive prefix** — `"AL"` matches
+    ///   `"alice"` and `"Albert"` but not `"calico"`. Implemented via
+    ///   SQLite's `instr(lower(handle), lower(?1)) = 1`, which sidesteps
+    ///   `LIKE`'s `%` / `_` / backslash escaping rules entirely: the
+    ///   needle is treated as a literal substring whose only privileged
+    ///   property is "starts at column 1". A future regression that
+    ///   reaches for `LIKE ?1 || '%'` without escaping would let a
+    ///   player with `_` in their handle wildcard-match the entire
+    ///   roster — `instr` cannot do that.
+    /// - Results are ordered by `handle ASC` (using the same
+    ///   case-insensitive comparison as the match) so the autocomplete
+    ///   list is stable across calls and across SQLite page-cache
+    ///   states. Ties (two players with the same handle in different
+    ///   identity namespaces — the explicit case from
+    ///   `local_dev_and_foglet_namespaces_do_not_collide`) fall back to
+    ///   `id ASC` so the order is fully deterministic.
+    /// - An **empty prefix** matches every row, capped by `limit`.
+    ///   Useful for a "browse" screen that opens before the player has
+    ///   typed anything; callers who want to require typing should
+    ///   guard at the call site.
+    /// - `limit` MUST be `>= 0`. A negative limit is rejected as a
+    ///   typed error — passing `-1` to mean "unlimited" is a footgun
+    ///   on a player table that grows unboundedly across launches, so
+    ///   the caller must opt in to a specific cap.
+    ///
+    /// # Concurrency
+    ///
+    /// Takes `&self`: a single `SELECT` under the busy timeout, same
+    /// shape as [`Self::player_handle`]. Multiple screens can call
+    /// this concurrently from the same `GameContext` borrow.
+    pub fn search_players_by_handle_prefix(
+        &self,
+        prefix: &str,
+        limit: i64,
+    ) -> Result<Vec<PlayerRecord>, PlayerError> {
+        // Reject negative limits at the typed boundary instead of
+        // letting them flow through to SQLite, which would silently
+        // treat `LIMIT -1` as "no limit". Returning the same
+        // `PlayerError::Sqlite` variant we already use lets the call
+        // site funnel every search failure through one match arm —
+        // synthesising a `rusqlite::Error::InvalidParameterCount` would
+        // misrepresent the cause, so we use `InvalidQuery` which is the
+        // closest fit for "the caller passed a value SQLite would have
+        // accepted but we refuse to forward".
+        if limit < 0 {
+            return Err(PlayerError::Sqlite {
+                source: rusqlite::Error::InvalidQuery,
+            });
+        }
+        // `instr(lower(handle), lower(?1)) = 1` is the prefix match —
+        // see the doc comment for why this beats `LIKE ?1 || '%'`. The
+        // `lower()` wrapper handles the case-insensitive contract; the
+        // `= 1` pins the match to column 1 (SQLite's `instr` is
+        // 1-indexed and returns 0 for "no match"). `ORDER BY
+        // lower(handle), id` keeps the output deterministic across
+        // collations and across page-cache shuffles.
+        const SQL: &str = "\
+SELECT id, foglet_user_id, handle, role, security_level, \
+       first_seen_at, last_seen_at, local_dev_key \
+FROM players \
+WHERE instr(lower(handle), lower(?1)) = 1 \
+ORDER BY lower(handle), id \
+LIMIT ?2";
+        let conn = self.connection();
+        let mut stmt = conn
+            .prepare(SQL)
+            .map_err(|source| PlayerError::Sqlite { source })?;
+        let rows = stmt
+            .query_map(rusqlite::params![prefix, limit], row_to_record)
+            .map_err(|source| PlayerError::Sqlite { source })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|source| PlayerError::Sqlite { source })
+    }
 }
 
 /// Decode a `players` row into [`PlayerRecord`].
@@ -1172,5 +1258,162 @@ mod tests {
             .player_handle(424_242)
             .expect("lookup succeeds")
             .is_none());
+    }
+
+    /// Helper for the §Task 8a search tests: seed a roster of
+    /// distinct-handle local-dev players so a single test body can
+    /// assert on the ordered match set without restating the upsert
+    /// boilerplate per row. Handles deliberately span case and
+    /// alphabetical neighbours so prefix / case-folding / ordering
+    /// regressions surface independently.
+    fn seed_search_roster(world: &WorldDb) {
+        for handle in ["alice", "Albert", "albus", "Bob", "calico", "carol"] {
+            world
+                .upsert_player(&ctx_with(None, Some(handle)))
+                .expect("seed upsert succeeds");
+        }
+    }
+
+    /// SPEC_v3 §Task 8a acceptance: the search is **case-insensitive
+    /// prefix** match, ordered alphabetically. A query of `"AL"` must
+    /// surface `Albert`, `albus`, and `alice` (all three share the
+    /// `al` prefix regardless of case) and MUST NOT surface `calico`
+    /// (which contains `al` but not at column 1) — pinning both halves
+    /// in one test catches a regression that swaps `instr(...) = 1`
+    /// for a plain `instr(...) > 0` substring search.
+    #[test]
+    fn search_players_by_handle_prefix_is_case_insensitive_prefix_match() {
+        let dir = tempdir().expect("tempdir creates");
+        let mut world = WorldDb::open(dir.path().join("world.sqlite")).expect("open");
+        world
+            .apply_migration(&PLAYERS_MIGRATION)
+            .expect("migration applies");
+        seed_search_roster(&world);
+
+        let hits = world
+            .search_players_by_handle_prefix("AL", 100)
+            .expect("search succeeds");
+        let handles: Vec<&str> = hits.iter().map(|p| p.handle.as_str()).collect();
+        assert_eq!(
+            handles,
+            vec!["Albert", "albus", "alice"],
+            "case-insensitive prefix; alphabetised by lower(handle)"
+        );
+    }
+
+    /// A prefix that no row starts with returns an empty `Vec` rather
+    /// than an error. Pinning empty-result-as-Ok keeps screen code
+    /// honest: an autocomplete with zero hits is a normal UI state.
+    #[test]
+    fn search_players_by_handle_prefix_returns_empty_for_no_match() {
+        let dir = tempdir().expect("tempdir creates");
+        let mut world = WorldDb::open(dir.path().join("world.sqlite")).expect("open");
+        world
+            .apply_migration(&PLAYERS_MIGRATION)
+            .expect("migration applies");
+        seed_search_roster(&world);
+
+        let hits = world
+            .search_players_by_handle_prefix("zz", 100)
+            .expect("search succeeds");
+        assert!(hits.is_empty());
+    }
+
+    /// `limit` caps the returned set. A roster with three matching
+    /// handles and a limit of 2 returns the alphabetically-first two —
+    /// the order contract from the prefix test pins which two survive.
+    #[test]
+    fn search_players_by_handle_prefix_respects_limit() {
+        let dir = tempdir().expect("tempdir creates");
+        let mut world = WorldDb::open(dir.path().join("world.sqlite")).expect("open");
+        world
+            .apply_migration(&PLAYERS_MIGRATION)
+            .expect("migration applies");
+        seed_search_roster(&world);
+
+        let hits = world
+            .search_players_by_handle_prefix("al", 2)
+            .expect("search succeeds");
+        let handles: Vec<&str> = hits.iter().map(|p| p.handle.as_str()).collect();
+        assert_eq!(handles, vec!["Albert", "albus"]);
+    }
+
+    /// An empty prefix matches every row (capped by `limit`) — the
+    /// "browse roster" screen relies on this. Documented in the helper's
+    /// doc comment; this test pins the contract so a future "reject
+    /// empty prefix" patch is a deliberate decision rather than silent
+    /// drift.
+    #[test]
+    fn search_players_by_handle_prefix_empty_string_matches_all() {
+        let dir = tempdir().expect("tempdir creates");
+        let mut world = WorldDb::open(dir.path().join("world.sqlite")).expect("open");
+        world
+            .apply_migration(&PLAYERS_MIGRATION)
+            .expect("migration applies");
+        seed_search_roster(&world);
+
+        let hits = world
+            .search_players_by_handle_prefix("", 100)
+            .expect("search succeeds");
+        let handles: Vec<&str> = hits.iter().map(|p| p.handle.as_str()).collect();
+        assert_eq!(
+            handles,
+            vec!["Albert", "albus", "alice", "Bob", "calico", "carol"]
+        );
+    }
+
+    /// An empty registry returns an empty `Vec` — Murder Motel's first
+    /// launch hits this path before any player has registered, and the
+    /// search screen MUST NOT surface an error there.
+    #[test]
+    fn search_players_by_handle_prefix_empty_registry_returns_empty() {
+        let dir = tempdir().expect("tempdir creates");
+        let mut world = WorldDb::open(dir.path().join("world.sqlite")).expect("open");
+        world
+            .apply_migration(&PLAYERS_MIGRATION)
+            .expect("migration applies");
+
+        let hits = world
+            .search_players_by_handle_prefix("anything", 100)
+            .expect("search succeeds");
+        assert!(hits.is_empty());
+    }
+
+    /// A negative limit is rejected as a typed error rather than
+    /// silently forwarded as "unlimited" (which is what SQLite does
+    /// with `LIMIT -1`). The doc comment calls out that callers who
+    /// want everything pass an explicit cap; this test pins the guard.
+    #[test]
+    fn search_players_by_handle_prefix_rejects_negative_limit() {
+        let dir = tempdir().expect("tempdir creates");
+        let mut world = WorldDb::open(dir.path().join("world.sqlite")).expect("open");
+        world
+            .apply_migration(&PLAYERS_MIGRATION)
+            .expect("migration applies");
+
+        let err = world
+            .search_players_by_handle_prefix("a", -1)
+            .expect_err("negative limit is rejected");
+        assert!(matches!(err, PlayerError::Sqlite { .. }));
+    }
+
+    /// A `limit` of zero returns no rows even with matches present —
+    /// pins the "explicit cap" contract. Without this, a future
+    /// regression that special-cased `0` to mean "no limit" would
+    /// silently page the entire roster into a screen that asked for
+    /// nothing.
+    #[test]
+    fn search_players_by_handle_prefix_zero_limit_returns_empty() {
+        let dir = tempdir().expect("tempdir creates");
+        let mut world = WorldDb::open(dir.path().join("world.sqlite")).expect("open");
+        world
+            .apply_migration(&PLAYERS_MIGRATION)
+            .expect("migration applies");
+        seed_search_roster(&world);
+
+        let hits = world
+            .search_players_by_handle_prefix("a", 0)
+            .expect("search succeeds");
+        assert!(hits.is_empty());
     }
 }
