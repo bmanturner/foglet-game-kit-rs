@@ -95,7 +95,8 @@ pub use foglet::{
 pub use input::{from_event, from_key_event, Input};
 pub use inventory::{InventoryError, InventorySlot, INVENTORY_SLOTS_MIGRATION};
 pub use job_board::{
-    ContractProvider, JobBoardEntry, JobBoardError, JobBoardSource, OpportunityProvider,
+    ContractProvider, JobBoard, JobBoardEntry, JobBoardError, JobBoardFilter, JobBoardSort,
+    JobBoardSource, OpportunityProvider,
 };
 pub use leaderboards::{LeaderboardError, ScoreRecord, LEADERBOARD_SCORES_MIGRATION};
 pub use manifest::{

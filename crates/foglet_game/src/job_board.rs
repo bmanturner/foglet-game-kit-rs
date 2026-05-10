@@ -10,6 +10,8 @@
 //! - In a **dungeon crawler**, a row can represent a guild commission
 //!   to clear a crypt wing.
 
+use std::cmp::Ordering;
+
 use serde::Deserialize;
 use thiserror::Error;
 
@@ -78,6 +80,124 @@ pub struct JobBoardEntry {
     pub expires_at: Option<String>,
     /// Optional opaque token forwarded to game accept/claim handlers.
     pub accept_action: Option<String>,
+}
+
+/// Sort strategy for [`JobBoard::query`].
+///
+/// The default strategy follows the v5 contract:
+///
+/// - first by `expires_at` ascending,
+/// - then by `source`,
+/// - then by `source_id`.
+///
+/// Games that want to preserve provider emission order exactly can use
+/// [`Self::ProviderOrder`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum JobBoardSort {
+    /// Canonical v5 default ordering.
+    #[default]
+    Default,
+    /// Leave rows in provider emission order.
+    ProviderOrder,
+}
+
+/// Query filter for [`JobBoard::query`].
+///
+/// `allowed_sources` defaults to empty (include all sources). This
+/// keeps the default behavior broad enough for cross-genre boards:
+///
+/// - A **space exploration** board can show contracts plus bounties.
+/// - A **town simulation** board can show municipal contracts plus
+///   game-defined external opportunities.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct JobBoardFilter {
+    /// Whitelist of sources to include.
+    ///
+    /// Empty means "include every source the providers return".
+    pub allowed_sources: Vec<JobBoardSource>,
+    /// Ordering strategy for the aggregated rows.
+    pub sort: JobBoardSort,
+}
+
+impl JobBoardFilter {
+    /// Returns `true` when an entry from `source` should be included in
+    /// the result set.
+    #[must_use]
+    pub fn includes_source(&self, source: JobBoardSource) -> bool {
+        self.allowed_sources.is_empty() || self.allowed_sources.contains(&source)
+    }
+}
+
+/// Aggregation façade for composing rows from multiple opportunity
+/// providers.
+///
+/// The board itself is stateless; it combines provider output for one
+/// query call and applies a deterministic ordering policy.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct JobBoard;
+
+impl JobBoard {
+    /// Aggregate rows from all `providers`, apply `filter`, and return
+    /// one stable-ordered list.
+    ///
+    /// Default ordering is SPEC_v5 §4.2: `expires_at` ascending, then
+    /// `source`, then `source_id`.
+    pub fn query(
+        world_db: &WorldDb,
+        filter: &JobBoardFilter,
+        providers: &[&dyn OpportunityProvider],
+    ) -> Result<Vec<JobBoardEntry>, JobBoardError> {
+        let mut decorated = Vec::new();
+        for (provider_index, provider) in providers.iter().enumerate() {
+            let provider_entries = provider.entries(world_db)?;
+            for (entry_index, entry) in provider_entries.into_iter().enumerate() {
+                if filter.includes_source(entry.source) {
+                    decorated.push(DecoratedEntry {
+                        provider_index,
+                        entry_index,
+                        entry,
+                    });
+                }
+            }
+        }
+
+        if matches!(filter.sort, JobBoardSort::Default) {
+            decorated.sort_by(compare_default_order);
+        }
+
+        Ok(decorated.into_iter().map(|item| item.entry).collect())
+    }
+}
+
+#[derive(Debug)]
+struct DecoratedEntry {
+    provider_index: usize,
+    entry_index: usize,
+    entry: JobBoardEntry,
+}
+
+fn compare_default_order(left: &DecoratedEntry, right: &DecoratedEntry) -> Ordering {
+    // `None` expires_at means "no deadline", so it sorts after rows
+    // with concrete timestamps.
+    compare_expiration(
+        left.entry.expires_at.as_deref(),
+        right.entry.expires_at.as_deref(),
+    )
+    .then_with(|| left.entry.source.cmp(&right.entry.source))
+    .then_with(|| left.entry.source_id.cmp(&right.entry.source_id))
+    // Preserve deterministic output even when providers emit two
+    // rows with matching source/id/expiry.
+    .then_with(|| left.provider_index.cmp(&right.provider_index))
+    .then_with(|| left.entry_index.cmp(&right.entry_index))
+}
+
+fn compare_expiration(left: Option<&str>, right: Option<&str>) -> Ordering {
+    match (left, right) {
+        (Some(left_ts), Some(right_ts)) => left_ts.cmp(right_ts),
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
+    }
 }
 
 /// Shared provider contract for Job Board opportunity sources.
@@ -187,11 +307,25 @@ fn parse_contract_board_metadata(raw: Option<&str>) -> ContractBoardMetadata {
 
 #[cfg(test)]
 mod tests {
-    use super::{ContractProvider, JobBoardSource, OpportunityProvider};
+    use super::{
+        ContractProvider, JobBoard, JobBoardEntry, JobBoardFilter, JobBoardSort, JobBoardSource,
+        OpportunityProvider,
+    };
     use crate::contracts::{ContractState, CreateContractInput, CONTRACTS_MIGRATION};
     use crate::world_db::WorldDb;
     use rusqlite::params;
     use tempfile::tempdir;
+
+    #[derive(Debug)]
+    struct StaticProvider {
+        entries: Vec<JobBoardEntry>,
+    }
+
+    impl OpportunityProvider for StaticProvider {
+        fn entries(&self, _world_db: &WorldDb) -> Result<Vec<JobBoardEntry>, super::JobBoardError> {
+            Ok(self.entries.clone())
+        }
+    }
 
     #[test]
     fn contract_provider_returns_one_entry_per_available_contract_with_documented_shape() {
@@ -303,5 +437,142 @@ mod tests {
             second.accept_action.as_deref(),
             Some(format!("contract:{}", available_with_fallbacks.id).as_str())
         );
+    }
+
+    #[test]
+    fn query_default_sort_orders_by_expiry_then_source_then_source_id_stably() {
+        let dir = tempdir().expect("tempdir creates");
+        let db_path = dir.path().join("world.sqlite");
+        let world = WorldDb::open(&db_path).expect("open succeeds");
+
+        let alpha = StaticProvider {
+            entries: vec![
+                JobBoardEntry {
+                    source: JobBoardSource::External,
+                    source_id: 42,
+                    kind_label: "Town Errand".to_string(),
+                    state_label: "open".to_string(),
+                    title: "alpha external tie".to_string(),
+                    summary: "alpha summary".to_string(),
+                    reward_preview: None,
+                    location_preview: None,
+                    expires_at: None,
+                    accept_action: None,
+                },
+                JobBoardEntry {
+                    source: JobBoardSource::Bounty,
+                    source_id: 2,
+                    kind_label: "Bounty".to_string(),
+                    state_label: "open".to_string(),
+                    title: "bounty row".to_string(),
+                    summary: "bounty summary".to_string(),
+                    reward_preview: None,
+                    location_preview: None,
+                    expires_at: Some("2030-01-02T00:00:00Z".to_string()),
+                    accept_action: None,
+                },
+            ],
+        };
+        let bravo = StaticProvider {
+            entries: vec![
+                JobBoardEntry {
+                    source: JobBoardSource::Contract,
+                    source_id: 7,
+                    kind_label: "Contract".to_string(),
+                    state_label: "available".to_string(),
+                    title: "contract row".to_string(),
+                    summary: "contract summary".to_string(),
+                    reward_preview: None,
+                    location_preview: None,
+                    expires_at: Some("2030-01-02T00:00:00Z".to_string()),
+                    accept_action: None,
+                },
+                JobBoardEntry {
+                    source: JobBoardSource::Challenge,
+                    source_id: 4,
+                    kind_label: "Challenge".to_string(),
+                    state_label: "open".to_string(),
+                    title: "challenge row".to_string(),
+                    summary: "challenge summary".to_string(),
+                    reward_preview: None,
+                    location_preview: None,
+                    expires_at: Some("2029-12-31T23:00:00Z".to_string()),
+                    accept_action: None,
+                },
+                JobBoardEntry {
+                    source: JobBoardSource::External,
+                    source_id: 42,
+                    kind_label: "Town Errand".to_string(),
+                    state_label: "open".to_string(),
+                    title: "bravo external tie".to_string(),
+                    summary: "bravo summary".to_string(),
+                    reward_preview: None,
+                    location_preview: None,
+                    expires_at: None,
+                    accept_action: None,
+                },
+            ],
+        };
+
+        let providers: [&dyn OpportunityProvider; 2] = [&alpha, &bravo];
+        let entries = JobBoard::query(&world, &JobBoardFilter::default(), &providers)
+            .expect("query succeeds");
+
+        let titles: Vec<&str> = entries.iter().map(|entry| entry.title.as_str()).collect();
+        assert_eq!(
+            titles,
+            vec![
+                "challenge row",
+                "contract row",
+                "bounty row",
+                "alpha external tie",
+                "bravo external tie",
+            ]
+        );
+    }
+
+    #[test]
+    fn query_can_preserve_provider_order_when_requested() {
+        let dir = tempdir().expect("tempdir creates");
+        let db_path = dir.path().join("world.sqlite");
+        let world = WorldDb::open(&db_path).expect("open succeeds");
+
+        let provider = StaticProvider {
+            entries: vec![
+                JobBoardEntry {
+                    source: JobBoardSource::External,
+                    source_id: 5,
+                    kind_label: "Guild".to_string(),
+                    state_label: "open".to_string(),
+                    title: "first".to_string(),
+                    summary: "first".to_string(),
+                    reward_preview: None,
+                    location_preview: None,
+                    expires_at: Some("2035-01-01T00:00:00Z".to_string()),
+                    accept_action: None,
+                },
+                JobBoardEntry {
+                    source: JobBoardSource::Contract,
+                    source_id: 1,
+                    kind_label: "Contract".to_string(),
+                    state_label: "available".to_string(),
+                    title: "second".to_string(),
+                    summary: "second".to_string(),
+                    reward_preview: None,
+                    location_preview: None,
+                    expires_at: Some("2020-01-01T00:00:00Z".to_string()),
+                    accept_action: None,
+                },
+            ],
+        };
+
+        let filter = JobBoardFilter {
+            allowed_sources: Vec::new(),
+            sort: JobBoardSort::ProviderOrder,
+        };
+        let providers: [&dyn OpportunityProvider; 1] = [&provider];
+        let entries = JobBoard::query(&world, &filter, &providers).expect("query succeeds");
+        let titles: Vec<&str> = entries.iter().map(|entry| entry.title.as_str()).collect();
+        assert_eq!(titles, vec!["first", "second"]);
     }
 }
