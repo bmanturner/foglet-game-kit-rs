@@ -575,6 +575,17 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct ExternalProvider {
+        entries: Vec<JobBoardEntry>,
+    }
+
+    impl OpportunityProvider for ExternalProvider {
+        fn entries(&self, _world_db: &WorldDb) -> Result<Vec<JobBoardEntry>, super::JobBoardError> {
+            Ok(self.entries.clone())
+        }
+    }
+
     #[test]
     fn contract_provider_returns_one_entry_per_available_contract_with_documented_shape() {
         let dir = tempdir().expect("tempdir creates");
@@ -776,6 +787,86 @@ mod tests {
                 "alpha external tie",
                 "bravo external tie",
             ]
+        );
+    }
+
+    #[test]
+    fn query_accepts_game_supplied_external_provider_with_stable_ordering() {
+        let dir = tempdir().expect("tempdir creates");
+        let db_path = dir.path().join("world.sqlite");
+        let world = WorldDb::open(&db_path).expect("open succeeds");
+
+        let first_custom = ExternalProvider {
+            entries: vec![
+                JobBoardEntry {
+                    source: JobBoardSource::External,
+                    source_id: 9,
+                    kind_label: "Tavern".to_string(),
+                    state_label: "open".to_string(),
+                    title: "Bandit sightings".to_string(),
+                    summary: "Patrol the old bridge.".to_string(),
+                    reward_preview: None,
+                    location_preview: None,
+                    expires_at: Some("2032-01-01T00:00:00Z".to_string()),
+                    accept_action: Some("external:bandits".to_string()),
+                },
+                JobBoardEntry {
+                    source: JobBoardSource::External,
+                    source_id: 22,
+                    kind_label: "Harbor Office".to_string(),
+                    state_label: "open".to_string(),
+                    title: "Dock inventory count".to_string(),
+                    summary: "Audit warehouse crates.".to_string(),
+                    reward_preview: None,
+                    location_preview: None,
+                    expires_at: Some("2032-01-02T00:00:00Z".to_string()),
+                    accept_action: Some("external:inventory".to_string()),
+                },
+            ],
+        };
+        let second_custom = ExternalProvider {
+            entries: vec![JobBoardEntry {
+                source: JobBoardSource::External,
+                source_id: 9,
+                kind_label: "Guild Hall".to_string(),
+                state_label: "open".to_string(),
+                title: "Bandit sightings (duplicate tie)".to_string(),
+                summary: "Cross-check yesterday's reports.".to_string(),
+                reward_preview: None,
+                location_preview: None,
+                expires_at: Some("2032-01-01T00:00:00Z".to_string()),
+                accept_action: Some("external:bandits-followup".to_string()),
+            }],
+        };
+        let providers: [&dyn OpportunityProvider; 2] = [&first_custom, &second_custom];
+
+        let entries = JobBoard::query(&world, &JobBoardFilter::default(), &providers)
+            .expect("query succeeds");
+        let external_entries: Vec<&JobBoardEntry> = entries
+            .iter()
+            .filter(|entry| entry.source == JobBoardSource::External)
+            .collect();
+
+        assert_eq!(external_entries.len(), 3, "all custom rows are retained");
+        assert_eq!(
+            external_entries
+                .iter()
+                .map(|entry| entry.source.as_str())
+                .collect::<Vec<_>>(),
+            vec!["external", "external", "external"],
+            "custom provider rows keep the external source marker"
+        );
+        assert_eq!(
+            external_entries
+                .iter()
+                .map(|entry| entry.title.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "Bandit sightings",
+                "Bandit sightings (duplicate tie)",
+                "Dock inventory count",
+            ],
+            "ties use deterministic provider/index fallback ordering"
         );
     }
 

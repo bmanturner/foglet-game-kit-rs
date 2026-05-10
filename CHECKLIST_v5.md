@@ -39,7 +39,7 @@ One unchecked item per iteration. Dependencies in `[brackets]` must be checked o
 - [x] **5a** — Define `JobBoardEntry`, `OpportunityProvider` trait, and a `ContractProvider` built-in. Test: provider returns one entry per `available` Contract with the documented field shape. [3b]
 - [x] **5b** — Implement `JobBoard::query(filter, providers)` returning a stable-ordered list. Test: default ordering is `expires_at` asc, `source`, `source_id`. [5a]
 - [x] **5c** — Add a `BountyProvider` and a `ChallengeProvider` gated on v3 enablement. Test: providers omitted when v3 is disabled; included when enabled. [5b]
-- [ ] **5d** — Test that a game-supplied custom provider injects entries with `source = external` and that ordering remains stable. [5b]
+- [x] **5d** — Test that a game-supplied custom provider injects entries with `source = external` and that ordering remains stable. [5b]
 - [ ] **5e** — Sanitize provider-supplied `title` and `summary` strings at the aggregation boundary using v3's bounded-text rules. Test: control sequences and overlong strings are normalized. [5b]
 
 ### Task 6 — Job Board screen
