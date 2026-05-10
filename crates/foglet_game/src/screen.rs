@@ -142,6 +142,10 @@ impl<'a> GameContext<'a> {
     /// DB has been opened, and by tests that need to exercise screens
     /// against a real `WorldDb`.
     ///
+    /// V4 primitive handles are attached only when their section is
+    /// enabled in [`GameConfig`]. This avoids accidentally exposing
+    /// gameplay primitives to games that have not opted in.
+    ///
     /// Kept as a `with_*` builder rather than a fourth positional
     /// argument to [`GameContext::new`] so the dozens of existing
     /// `new(&cfg, &fc, size)` call sites in tests and example games
@@ -150,11 +154,21 @@ impl<'a> GameContext<'a> {
     #[must_use]
     pub fn with_world_db(mut self, world_db: &'a WorldDb) -> Self {
         self.world_db = Some(world_db);
-        self.spatial = Some(world_db);
-        self.presence = Some(world_db);
-        self.place_recall = Some(world_db);
-        self.inventory = Some(world_db);
-        self.world_ticks = Some(world_db);
+        if self.config.spatial.enabled {
+            self.spatial = Some(world_db);
+        }
+        if self.config.presence.enabled {
+            self.presence = Some(world_db);
+        }
+        if self.config.place_recall.enabled {
+            self.place_recall = Some(world_db);
+        }
+        if self.config.inventory.enabled {
+            self.inventory = Some(world_db);
+        }
+        if self.config.world_ticks.enabled {
+            self.world_ticks = Some(world_db);
+        }
         self
     }
 }
@@ -530,7 +544,7 @@ mod tests {
     }
 
     #[test]
-    fn game_context_with_world_db_attaches_handle() {
+    fn game_context_with_world_db_attaches_enabled_v4_handles_only() {
         // Builder threads a real `WorldDb` borrow into the context so
         // Task 10b can hand screens a working handle without touching
         // any of the existing `GameContext::new(...)` call sites. We
@@ -538,7 +552,12 @@ mod tests {
         // object the test opened, not a copy.
         use crate::world_db::WorldDb;
 
-        let cfg = fixture_config();
+        let mut cfg = fixture_config();
+        cfg.spatial.enabled = true;
+        cfg.presence.enabled = true;
+        cfg.place_recall.enabled = true;
+        cfg.inventory.enabled = true;
+        cfg.world_ticks.enabled = true;
         let fc = fixture_context();
         let tmp = tempfile::tempdir().expect("tempdir");
         let db = WorldDb::open(tmp.path().join("world.sqlite")).expect("open world db");
@@ -547,17 +566,52 @@ mod tests {
         assert!(ctx.world_db.is_some(), "builder attaches world_db");
         assert!(
             ctx.spatial.is_some() && ctx.presence.is_some() && ctx.place_recall.is_some(),
-            "Task 11a attaches all v4 handles when world_db is present"
+            "Task 11b enables requested v4 handles when sections are on"
         );
         assert!(
             ctx.inventory.is_some() && ctx.world_ticks.is_some(),
-            "Task 11a attaches all v4 handles when world_db is present"
+            "Task 11b enables requested v4 handles when sections are on"
         );
         // SQLite reports the connection it gave us, confirming the
         // borrow points at the same `WorldDb` we opened above.
         assert_eq!(
             ctx.world_db.expect("attached above").journal_mode(),
             db.journal_mode()
+        );
+    }
+
+    #[test]
+    fn game_context_with_world_db_leaves_disabled_v4_handles_none() {
+        // Task 11b: disabling a v4 section leaves its handle as `None`
+        // even when a shared-world database is present.
+        use crate::world_db::WorldDb;
+
+        let cfg = fixture_config();
+        let fc = fixture_context();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db = WorldDb::open(tmp.path().join("world.sqlite")).expect("open world db");
+
+        let ctx = GameContext::new(&cfg, &fc, (80, 24)).with_world_db(&db);
+        assert!(ctx.world_db.is_some(), "builder still attaches world_db");
+        assert!(
+            ctx.spatial.is_none(),
+            "Task 11b keeps disabled `spatial` handle absent"
+        );
+        assert!(
+            ctx.presence.is_none(),
+            "Task 11b keeps disabled `presence` handle absent"
+        );
+        assert!(
+            ctx.place_recall.is_none(),
+            "Task 11b keeps disabled `place_recall` handle absent"
+        );
+        assert!(
+            ctx.inventory.is_none(),
+            "Task 11b keeps disabled `inventory` handle absent"
+        );
+        assert!(
+            ctx.world_ticks.is_none(),
+            "Task 11b keeps disabled `world_ticks` handle absent"
         );
     }
 
