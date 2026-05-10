@@ -104,7 +104,7 @@ One unchecked item per iteration. Dependencies in `[brackets]` must be checked o
 - [x] **12g** — Update `docs/foglet-install.md` (or equivalent operator doc) with `fgk tick` cron guidance. [10a]
 - [x] **12h** — Document explicitly that v4 still has no real-time multiplayer and no long-lived daemon. [12d]
 - [x] **12i** — Document the deliberate choice to skip sample-game integration of v4 features in this kit's fixture and the reason (genre-neutrality). [12e]
-- [ ] **12j** — Add a backup/maintenance note covering the new tables: `places`, `routes`, `presence`, `place_recall`, `inventory_slots`, `world_tick_tasks`. [12e]
+- [x] **12j** — Add a backup/maintenance note covering the new tables: `places`, `routes`, `presence`, `place_recall`, `inventory_slots`, `world_tick_tasks`. [12e]
 
 - [ ] **Task 13 — Final v4 verification**
       Run `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`, `cargo doc --workspace --no-deps`, and `cargo run -p fgk -- tick --project <fixture>` against a synthetic v4 fixture. Quote results in the final iteration. [all prior tasks]

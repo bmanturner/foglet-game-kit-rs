@@ -193,12 +193,15 @@ The kit refuses to read inherited host environment beyond the
 documented `FOGLET_*` variables, and save files contain only
 game-defined state — never the Foglet context (SPEC §5.6, §12).
 
-### 5.1 Backing up the shared world
+### 5.1 Backing up and maintaining the shared world
 
-The shared-world SQLite file is the *only* place v2 game state like
-the player registry, turn ledger, event log, and leaderboards lives.
-It is not reconstructible from saves. Back it up on a schedule that
-matches your tolerance for losing in-game state.
+The shared-world SQLite file is the *only* place durable world state
+lives. That includes v2 game state like the player registry, turn
+ledger, event log, and leaderboards, plus v4 structural state in
+`places`, `routes`, `presence`, `place_recall`, `inventory_slots`, and
+`world_tick_tasks`. None of that is reconstructible from per-player
+saves. Back it up on a schedule that matches your tolerance for losing
+in-game state.
 
 Two safe backup strategies (SPEC_v2 §8 mandates that backups use one
 of these):
@@ -241,6 +244,11 @@ The kit does not migrate world data for you. If a migration in
 `assets/world/migrations/` is destructive, take a backup first; world
 migrations run idempotently on launch (SPEC_v2 §4) but the schema
 they leave behind is binding.
+
+For routine maintenance, run occasional `PRAGMA wal_checkpoint(TRUNCATE);`
+during low traffic and `VACUUM` during scheduled downtime if the world
+file grows from churn in v4-heavy tables like `place_recall` and
+`inventory_slots`. Always take a backup first.
 
 ## 6. Foglet QA standards
 
