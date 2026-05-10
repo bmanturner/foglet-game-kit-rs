@@ -64,7 +64,7 @@ One unchecked item per iteration. Dependencies in `[brackets]` must be checked o
 ### Task 8 — Inventory capacity helper
 
 - [x] **8a** — Define `CapacityPolicy` trait and `CapacityError` variants `InsufficientCapacity`, `PolicyError`, `InventoryError`. [v4 Task 8]
-- [ ] **8b** — Implement `used_capacity(owner_kind, owner_id, &policy)`. Test: sums `volume * quantity` across all owner slots. [8a]
+- [x] **8b** — Implement `used_capacity(owner_kind, owner_id, &policy)`. Test: sums `volume * quantity` across all owner slots. [8a]
 - [ ] **8c** — Implement `validate_incoming(owner_kind, owner_id, item_key, quantity, &policy)`. Test: rejects when adding the proposed quantity would exceed capacity. [8b]
 - [ ] **8d** — Implement `transfer_with_capacity(source, dest, item_key, quantity, &policy, on_commit?)` performing capacity validation inside the v4 inventory transfer transaction. Test: success path debits and credits as in v4. [8c]
 - [ ] **8e** — Test rollback on capacity overflow: source and dest unchanged. [8d]

@@ -13,6 +13,7 @@ use serde_json::Value;
 use thiserror::Error;
 
 use crate::inventory::InventoryError;
+use crate::world_db::WorldDb;
 
 /// Game-supplied capacity policy used by v5 inventory helpers.
 ///
@@ -67,10 +68,42 @@ impl From<InventoryError> for CapacityError {
     }
 }
 
+impl WorldDb {
+    /// Sum used capacity for every inventory slot owned by one owner.
+    ///
+    /// Each slot contributes `policy.item_volume(item_key, metadata) *
+    /// quantity`. Missing metadata is passed to the policy as JSON
+    /// `null`; malformed metadata is surfaced as [`CapacityError::PolicyError`]
+    /// because the game-authored policy cannot reason about it safely.
+    pub fn used_capacity(
+        &self,
+        owner_kind: &str,
+        owner_id: i64,
+        policy: &impl CapacityPolicy,
+    ) -> Result<i64, CapacityError> {
+        let mut used = 0;
+        for slot in self.slots_for_owner(owner_kind, owner_id)? {
+            let metadata = slot
+                .metadata_json
+                .as_deref()
+                .map(serde_json::from_str::<Value>)
+                .transpose()
+                .map_err(|source| CapacityError::PolicyError(source.to_string()))?
+                .unwrap_or(Value::Null);
+            let volume = policy.item_volume(&slot.item_key, &metadata)?;
+            used += volume * slot.quantity;
+        }
+        Ok(used)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{CapacityError, CapacityPolicy};
+    use crate::inventory::INVENTORY_SLOTS_MIGRATION;
+    use crate::world_db::WorldDb;
     use serde_json::json;
+    use tempfile::tempdir;
 
     struct FixedPolicy;
 
@@ -128,5 +161,60 @@ mod tests {
             CapacityError::PolicyError("bad item".to_string()).to_string(),
         ];
         assert_eq!(errors.len(), 2);
+    }
+
+    #[test]
+    fn used_capacity_sums_volume_times_quantity_for_owner_slots() {
+        let dir = tempdir().expect("tempdir creates");
+        let db_path = dir.path().join("world.sqlite");
+        let mut world = WorldDb::open(&db_path).expect("open succeeds");
+        world
+            .apply_migration(&INVENTORY_SLOTS_MIGRATION)
+            .expect("inventory migration applies");
+        world
+            .create_slot("player", 7, "ration", 3, None, None)
+            .expect("ration slot inserts");
+        world
+            .create_slot("player", 7, "lantern", 2, None, Some(r#"{"bulky":true}"#))
+            .expect("lantern slot inserts");
+        world
+            .create_slot("player", 8, "lantern", 99, None, None)
+            .expect("other owner slot inserts");
+
+        struct VolumePolicy;
+
+        impl CapacityPolicy for VolumePolicy {
+            fn item_volume(
+                &self,
+                item_key: &str,
+                metadata: &serde_json::Value,
+            ) -> Result<i64, CapacityError> {
+                Ok(
+                    match (
+                        item_key,
+                        metadata.get("bulky").and_then(|value| value.as_bool()),
+                    ) {
+                        ("ration", _) => 1,
+                        ("lantern", Some(true)) => 5,
+                        ("lantern", _) => 2,
+                        _ => 0,
+                    },
+                )
+            }
+
+            fn owner_capacity(
+                &self,
+                _owner_kind: &str,
+                _owner_id: i64,
+            ) -> Result<Option<i64>, CapacityError> {
+                Ok(Some(100))
+            }
+        }
+
+        let used = world
+            .used_capacity("player", 7, &VolumePolicy)
+            .expect("used capacity computes");
+
+        assert_eq!(used, 13);
     }
 }
