@@ -115,6 +115,34 @@ authored by the game on first launch, then evolves through the
 migrations declared in `assets/world/migrations/`. Treat the file as
 durable game state, not a build artifact.
 
+### 3.2 Scheduling `fgk tick` from cron (v4 world ticks)
+
+If your game enables `[world_ticks].enabled = true`, run `fgk tick`
+outside the active TUI on a schedule (for example, once per minute).
+`fgk tick` is one-shot: each invocation opens the world DB, runs due
+tasks once, prints a summary, and exits.
+
+For a door installed at `/srv/foglet/doors/<slug>`:
+
+```bash
+* * * * * /usr/local/bin/fgk tick --project /srv/foglet/doors/<slug> >> /var/log/foglet/<slug>-tick.log 2>&1
+```
+
+Notes:
+
+- Run the cron entry as the same user/group that owns the door's
+  `world/` directory.
+- Keep the cadence conservative (for example, 1-5 minutes) unless your
+  tick callbacks are known to be quick and idempotent.
+- Verify with a manual run first:
+
+```bash
+fgk tick --project /srv/foglet/doors/<slug>
+```
+
+If your platform prefers systemd timers over cron, use the same
+command in `ExecStart=` and keep it as a short-lived oneshot unit.
+
 ## 4. Install the manifest
 
 Foglet reads operator manifests from its configured manifest directory.
