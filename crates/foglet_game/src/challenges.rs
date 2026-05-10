@@ -749,6 +749,104 @@ RETURNING id, created_at, challenger_player_id, target_player_id, \
         }
     }
 
+    /// Sweep `open` challenges whose `expires_at` deadline has passed
+    /// at `now` and transition them to `expired` (SPEC_v3 §4.2 / §Task
+    /// 4f).
+    ///
+    /// The contract is "every `open` row with a non-NULL `expires_at`
+    /// less than or equal to `now` becomes `expired` in one batch;
+    /// every other row is untouched". This is the kit-owned
+    /// counterpart to the Task 4c deadline gate: `accept_challenge`
+    /// refuses lapsed open rows in real time, and this sweeper
+    /// eventually flips them to `expired` so inboxes and audit views
+    /// can stop showing them as "open".
+    ///
+    /// # Why a `now` parameter rather than `CURRENT_TIMESTAMP`?
+    ///
+    /// Wiring tests through `CURRENT_TIMESTAMP` would force every
+    /// expiry test to either sleep through real wall-clock time or
+    /// poke the deadline column into the past — both of which
+    /// drift away from the production code path. Threading `now`
+    /// through the helper keeps the SQL identical to the production
+    /// shape (the same `datetime(expires_at) <= datetime(?1)`
+    /// comparison the accept gate uses), lets tests pin the cutoff
+    /// to a specific instant, and matches SPEC §4.2's call signature
+    /// shape (`expire_open_challenges(now)`). Production callers
+    /// pass an ISO timestamp synthesised from the runtime clock at
+    /// the call site.
+    ///
+    /// # Conditional UPDATE shape
+    ///
+    /// The `WHERE` clause folds three checks into a single statement:
+    ///
+    /// 1. `state = 'open'` — terminal states (`accepted`, `declined`,
+    ///    `resolved`, `expired`) are never re-transitioned. SPEC §4.2
+    ///    only lists `open -> expired` for the sweeper.
+    /// 2. `expires_at IS NOT NULL` — open-ended challenges with no
+    ///    deadline must never be swept. A regression that dropped
+    ///    this gate would silently expire every friendly duel.
+    /// 3. `datetime(expires_at) <= datetime(?1)` — the deadline has
+    ///    already passed at `now`. The `datetime()` wrapping handles
+    ///    both ISO forms the kit accepts (`'YYYY-MM-DDTHH:MM:SSZ'`
+    ///    from callers, `'YYYY-MM-DD HH:MM:SS'` from
+    ///    `CURRENT_TIMESTAMP`) so the comparison is chronological,
+    ///    not lexicographic — same normalisation the Task 4c accept
+    ///    gate uses, so a row that fails the accept gate also gets
+    ///    swept here on the next pass.
+    ///
+    /// The sweep walks the partial `idx_challenges_open_expiring`
+    /// index landed in [`CHALLENGES_MIGRATION`] (`(expires_at, id)
+    /// WHERE state = 'open' AND expires_at IS NOT NULL`), so cost is
+    /// proportional to the number of expiring open rows, not the
+    /// total challenge count.
+    ///
+    /// # Return value
+    ///
+    /// Returns the swept rows in `RETURNING` order so the caller can
+    /// log them, append world events, or render an "expired since
+    /// last visit" notification — all without a follow-up `SELECT`.
+    /// Callers that only need a count call `.len()` on the result.
+    /// An empty `Vec` is the success case when nothing was due.
+    ///
+    /// # Failure
+    ///
+    /// - [`ChallengeError::Sqlite`] — the `UPDATE … RETURNING` failed.
+    ///
+    /// `NotFound` / `InvalidTransition` / `Expired` are not in the
+    /// failure set: a sweeper that finds nothing is a success, not
+    /// an error.
+    ///
+    /// # Concurrency
+    ///
+    /// Takes `&self`: a single `UPDATE … RETURNING` under the
+    /// configured busy timeout. Naturally atomic as a single
+    /// statement (SPEC §4.2 "transitions MUST be transactional").
+    /// Same borrow shape as the other transition helpers.
+    pub fn expire_open_challenges(&self, now: &str) -> Result<Vec<Challenge>, ChallengeError> {
+        // Conditional UPDATE: only `open` rows with a non-NULL
+        // deadline that has passed at `now`. The three-clause WHERE
+        // is documented in the helper rustdoc above; keep this SQL
+        // and the doc-list aligned in any future edit.
+        const SWEEP_SQL: &str = "\
+UPDATE challenges \
+SET state = 'expired' \
+WHERE state = 'open' \
+  AND expires_at IS NOT NULL \
+  AND datetime(expires_at) <= datetime(?1) \
+RETURNING id, created_at, challenger_player_id, target_player_id, \
+          kind, stake, state, accepted_at, resolved_at, expires_at, result";
+
+        let mut stmt = self
+            .connection()
+            .prepare(SWEEP_SQL)
+            .map_err(|source| ChallengeError::Sqlite { source })?;
+        let rows = stmt
+            .query_map(rusqlite::params![now], row_to_challenge)
+            .map_err(|source| ChallengeError::Sqlite { source })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|source| ChallengeError::Sqlite { source })
+    }
+
     /// Map a no-rows response from a transition `UPDATE` onto the
     /// right typed [`ChallengeError`] by reading the row state.
     ///
@@ -1855,5 +1953,201 @@ mod tests {
         assert_eq!(ChallengeState::Declined.as_str(), "declined");
         assert_eq!(ChallengeState::Resolved.as_str(), "resolved");
         assert_eq!(ChallengeState::Expired.as_str(), "expired");
+    }
+
+    /// SPEC_v3 §Task 4f acceptance: only `open` challenges with a
+    /// `expires_at` deadline at or before `now` get swept to
+    /// `expired`. Every other row — open with no deadline, open
+    /// with a future deadline, already-accepted (regardless of
+    /// deadline), already-resolved, already-declined — is left
+    /// untouched.
+    ///
+    /// The fixture below seeds one row per relevant case so a
+    /// single sweep call exercises the full WHERE clause. Pin both
+    /// halves: the swept set's ids and final state, AND every
+    /// non-swept row's state is unchanged. Without the second
+    /// half, a regression that dropped the `state = 'open'` gate
+    /// (and accidentally re-expired `accepted` rows) would still
+    /// pass a "swept the right ids" assertion but flunk the
+    /// invariant.
+    #[test]
+    fn expire_open_challenges_only_sweeps_due_open_rows() {
+        let (_dir, world) = world_with_challenges();
+        let alice = world.upsert_player(&ctx("u-a", "alice")).unwrap();
+        let bob = world.upsert_player(&ctx("u-b", "bob")).unwrap();
+
+        // Case 1: open + past deadline → SHOULD be swept.
+        let due_open = world
+            .create_challenge(
+                alice.id,
+                bob.id,
+                "clue_race",
+                None,
+                Some("2000-01-01T00:00:00Z"),
+            )
+            .unwrap();
+        // Case 2: open + future deadline → MUST stay open.
+        let future_open = world
+            .create_challenge(
+                alice.id,
+                bob.id,
+                "clue_race",
+                None,
+                Some("2999-12-31T23:59:59Z"),
+            )
+            .unwrap();
+        // Case 3: open + no deadline → MUST stay open. SPEC §4.2
+        // "expires_at TIMESTAMP NULL"; an open-ended challenge
+        // never expires.
+        let openended = world
+            .create_challenge(alice.id, bob.id, "clue_race", None, None)
+            .unwrap();
+        // Case 4: already-accepted with past deadline → MUST stay
+        // accepted. The sweeper's `state = 'open'` gate exists for
+        // exactly this case — an accepted challenge has passed the
+        // deadline gate and the deadline is irrelevant once it's
+        // in flight. Built via raw `INSERT` because
+        // `accept_challenge` (correctly) refuses a lapsed deadline,
+        // so we cannot reach this state through the helper API; the
+        // production analog is "row was accepted before the deadline
+        // lapsed and still hasn't been resolved".
+        let accepted_id: i64 = world
+            .connection()
+            .query_row(
+                "INSERT INTO challenges \
+                 (challenger_player_id, target_player_id, kind, state, \
+                  accepted_at, expires_at) \
+                 VALUES (?1, ?2, 'clue_race', 'accepted', \
+                         '1999-12-31T23:59:00Z', '2000-01-01T00:00:00Z') \
+                 RETURNING id",
+                rusqlite::params![alice.id, bob.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        // Sweep at a `now` after Case 1 / Case 4's deadline but
+        // well before Case 2's. Case 3 has no deadline so it's
+        // never in scope.
+        let swept = world
+            .expire_open_challenges("2026-01-01T00:00:00Z")
+            .expect("sweep succeeds");
+
+        // Only Case 1 should appear in the returned set.
+        let swept_ids: Vec<i64> = swept.iter().map(|c| c.id).collect();
+        assert_eq!(
+            swept_ids,
+            vec![due_open.id],
+            "only the due open challenge must be swept"
+        );
+        assert_eq!(
+            swept[0].state,
+            ChallengeState::Expired.as_str(),
+            "swept row's RETURNING state must be 'expired'"
+        );
+
+        // Per-row state invariant: re-read each seeded row by
+        // primary key and confirm it's in the state we expected.
+        let state_of = |id: i64| -> String {
+            world
+                .connection()
+                .query_row(
+                    "SELECT state FROM challenges WHERE id = ?1",
+                    rusqlite::params![id],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(state_of(due_open.id), "expired");
+        assert_eq!(state_of(future_open.id), "open");
+        assert_eq!(state_of(openended.id), "open");
+        assert_eq!(state_of(accepted_id), "accepted");
+    }
+
+    /// A second sweep at the same `now` is a no-op: the previously
+    /// swept rows are now `expired` and the `state = 'open'` gate
+    /// excludes them, while every still-open row's deadline is
+    /// still in the future. Pin idempotency so a regression that
+    /// (say) dropped the state gate and started re-stamping the
+    /// row on every pass would observably flunk on `is_empty()`.
+    /// Same shape as `mark_read_is_idempotent` and
+    /// `archive_notice_is_idempotent`.
+    #[test]
+    fn expire_open_challenges_is_idempotent() {
+        let (_dir, world) = world_with_challenges();
+        let alice = world.upsert_player(&ctx("u-a", "alice")).unwrap();
+        let bob = world.upsert_player(&ctx("u-b", "bob")).unwrap();
+        let due = world
+            .create_challenge(
+                alice.id,
+                bob.id,
+                "clue_race",
+                None,
+                Some("2000-01-01T00:00:00Z"),
+            )
+            .unwrap();
+
+        let first = world
+            .expire_open_challenges("2026-01-01T00:00:00Z")
+            .unwrap();
+        assert_eq!(first.len(), 1, "first sweep expires the due row");
+        assert_eq!(first[0].id, due.id);
+
+        let second = world
+            .expire_open_challenges("2026-01-01T00:00:00Z")
+            .unwrap();
+        assert!(
+            second.is_empty(),
+            "second sweep at same now must be a no-op"
+        );
+    }
+
+    /// An empty `challenges` table (or a table whose only rows are
+    /// not due) returns an empty `Vec`, not an error. The SPEC §4.2
+    /// sweeper contract treats "nothing to do" as a success — a
+    /// regression that surfaced this as `Sqlite { … }` would force
+    /// every caller to special-case it.
+    #[test]
+    fn expire_open_challenges_empty_table_returns_empty_vec() {
+        let (_dir, world) = world_with_challenges();
+        let swept = world
+            .expire_open_challenges("2026-01-01T00:00:00Z")
+            .expect("sweep on empty table succeeds");
+        assert!(
+            swept.is_empty(),
+            "sweep with no rows in scope must return Vec::new(), got {swept:?}"
+        );
+    }
+
+    /// The cutoff is `<= now`, not `< now`: a deadline that exactly
+    /// equals `now` MUST sweep. Without this assertion, a future
+    /// regression that flipped the comparator to strict `<` would
+    /// leave on-the-second deadlines stuck in `open` until the
+    /// next sweep tick. Using identical text on both sides also
+    /// pins that the `datetime()` normalisation is the same on
+    /// both sides of the comparison.
+    #[test]
+    fn expire_open_challenges_includes_exact_deadline() {
+        let (_dir, world) = world_with_challenges();
+        let alice = world.upsert_player(&ctx("u-a", "alice")).unwrap();
+        let bob = world.upsert_player(&ctx("u-b", "bob")).unwrap();
+        let exact = world
+            .create_challenge(
+                alice.id,
+                bob.id,
+                "clue_race",
+                None,
+                Some("2026-01-01T00:00:00Z"),
+            )
+            .unwrap();
+
+        let swept = world
+            .expire_open_challenges("2026-01-01T00:00:00Z")
+            .unwrap();
+        let swept_ids: Vec<i64> = swept.iter().map(|c| c.id).collect();
+        assert_eq!(
+            swept_ids,
+            vec![exact.id],
+            "deadline equal to now must be swept (cutoff is <=, not <)"
+        );
     }
 }
