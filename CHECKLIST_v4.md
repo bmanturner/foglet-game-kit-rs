@@ -98,7 +98,7 @@ One unchecked item per iteration. Dependencies in `[brackets]` must be checked o
 - [x] **12a** — Add `docs/spatial.md` covering places and routes with at least two distinct game-family examples per concept (e.g., space exploration and dungeon crawling). [Task 3, Task 4]
 - [x] **12b** — Add `docs/presence-and-recall.md` explaining presence vs. recall as separate primitives, with examples for each. [Task 5, Task 6]
 - [x] **12c** — Add `docs/inventory.md` covering owner-keyed slots, atomic transfer, the `on_commit` callback pattern, and worked examples for at least two genres (e.g., RPG inventory transfer and trading-post commerce). [Task 7, Task 8]
-- [ ] **12d** — Add `docs/world-ticks.md` explaining the tick model, the lazy-on-login vs. cron `fgk tick` patterns, idempotency guarantees, and the `max_catchup_per_call` bound. [Task 9, Task 10]
+- [x] **12d** — Add `docs/world-ticks.md` explaining the tick model, the lazy-on-login vs. cron `fgk tick` patterns, idempotency guarantees, and the `max_catchup_per_call` bound. [Task 9, Task 10]
 - [ ] **12e** — Add `docs/spec-v4-overview.md` cross-referencing v1–v3 primitives and showing how v4 composes with them (e.g., place-owned inventory + tick task = restocking trading post). [12a, 12b, 12c, 12d]
 - [ ] **12f** — Update top-level `README.md` with a v4 features section linking to the new docs. [12e]
 - [ ] **12g** — Update `docs/foglet-install.md` (or equivalent operator doc) with `fgk tick` cron guidance. [10a]
