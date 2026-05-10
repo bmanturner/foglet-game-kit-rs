@@ -192,6 +192,21 @@ impl<'a> GameContext<'a> {
         if self.config.world_ticks.enabled {
             self.world_ticks = Some(world_db);
         }
+        if self.config.contracts.enabled {
+            self.contracts = Some(world_db);
+        }
+        if self.config.job_board.enabled {
+            self.job_board = Some(world_db);
+        }
+        if self.config.travel.enabled {
+            self.travel = Some(world_db);
+        }
+        if self.config.inventory_capacity.enabled {
+            self.inventory_capacity = Some(world_db);
+        }
+        if self.config.screens.event_log.enabled {
+            self.event_log_screen = Some(world_db);
+        }
         self
     }
 }
@@ -569,6 +584,11 @@ mod tests {
             ctx.world_ticks.is_none(),
             "Task 11a keeps optional handles defaulting to None"
         );
+        assert!(ctx.contracts.is_none());
+        assert!(ctx.job_board.is_none());
+        assert!(ctx.travel.is_none());
+        assert!(ctx.inventory_capacity.is_none());
+        assert!(ctx.event_log_screen.is_none());
     }
 
     #[test]
@@ -641,6 +661,45 @@ mod tests {
             ctx.world_ticks.is_none(),
             "Task 11b keeps disabled `world_ticks` handle absent"
         );
+    }
+
+    #[test]
+    fn game_context_with_world_db_attaches_enabled_v5_handles_only() {
+        use crate::world_db::WorldDb;
+
+        let mut cfg = fixture_config();
+        cfg.contracts.enabled = true;
+        cfg.job_board.enabled = true;
+        cfg.travel.enabled = true;
+        cfg.inventory_capacity.enabled = true;
+        cfg.screens.event_log.enabled = true;
+        let fc = fixture_context();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db = WorldDb::open(tmp.path().join("world.sqlite")).expect("open world db");
+
+        let ctx = GameContext::new(&cfg, &fc, (80, 24)).with_world_db(&db);
+        assert!(ctx.contracts.is_some());
+        assert!(ctx.job_board.is_some());
+        assert!(ctx.travel.is_some());
+        assert!(ctx.inventory_capacity.is_some());
+        assert!(ctx.event_log_screen.is_some());
+    }
+
+    #[test]
+    fn game_context_with_world_db_leaves_disabled_v5_handles_none() {
+        use crate::world_db::WorldDb;
+
+        let cfg = fixture_config();
+        let fc = fixture_context();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db = WorldDb::open(tmp.path().join("world.sqlite")).expect("open world db");
+
+        let ctx = GameContext::new(&cfg, &fc, (80, 24)).with_world_db(&db);
+        assert!(ctx.contracts.is_none());
+        assert!(ctx.job_board.is_none());
+        assert!(ctx.travel.is_none());
+        assert!(ctx.inventory_capacity.is_none());
+        assert!(ctx.event_log_screen.is_none());
     }
 
     #[test]

@@ -96,7 +96,7 @@ One unchecked item per iteration. Dependencies in `[brackets]` must be checked o
 ### Task 11 — Runtime context integration
 
 - [x] **11a** — Add optional `contracts`, `job_board`, `travel`, `inventory_capacity`, and `event_log_screen` handles to `GameContext`. [v4 Task 11]
-- [ ] **11b** — Construct each handle only when its config section enables the primitive. Test: disabled sections leave the corresponding handle as `None`. [11a, 2a]
+- [x] **11b** — Construct each handle only when its config section enables the primitive. Test: disabled sections leave the corresponding handle as `None`. [11a, 2a]
 - [ ] **11c** — Document that the Event Log screen MUST NOT be invoked from inside paint loops. [11a]
 
 ### Task 12 — Documentation
