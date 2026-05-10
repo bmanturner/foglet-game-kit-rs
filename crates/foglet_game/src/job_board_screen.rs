@@ -38,6 +38,15 @@ use crate::widgets::{centred_rect, render_modal};
 /// - A **dungeon crawler** can return a patron note plus hazard hints.
 type DetailBodyCallback = Arc<dyn Fn(&JobBoardEntry) -> String + 'static>;
 
+/// Callback signature used by [`JobBoardScreen`] to route an opaque
+/// provider token back into game-authored accept/claim logic.
+///
+/// The token remains intentionally uninterpreted by the kit:
+///
+/// - A **space exploration** game can decode `"accept:freight:42"`.
+/// - A **town simulation** game can decode `"claim:district:water-crew"`.
+type AcceptActionCallback = Arc<dyn Fn(&str) -> ScreenCommand + 'static>;
+
 /// Captured detail modal snapshot for the currently selected entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DetailModal {
@@ -64,6 +73,7 @@ pub struct JobBoardScreen {
     entries: Vec<JobBoardEntry>,
     empty_state_text: String,
     detail_body_callback: Option<DetailBodyCallback>,
+    accept_action_callback: Option<AcceptActionCallback>,
     detail_modal: Option<DetailModal>,
     selected_index: usize,
     page_start: usize,
@@ -78,6 +88,10 @@ impl fmt::Debug for JobBoardScreen {
             .field(
                 "detail_body_callback_registered",
                 &self.detail_body_callback.is_some(),
+            )
+            .field(
+                "accept_action_callback_registered",
+                &self.accept_action_callback.is_some(),
             )
             .field("detail_modal", &self.detail_modal)
             .field("selected_index", &self.selected_index)
@@ -123,6 +137,7 @@ impl JobBoardScreen {
             entries,
             empty_state_text: Self::DEFAULT_EMPTY_STATE_TEXT.to_string(),
             detail_body_callback: None,
+            accept_action_callback: None,
             detail_modal: None,
             selected_index: 0,
             page_start: 0,
@@ -169,6 +184,30 @@ impl JobBoardScreen {
         F: Fn(&JobBoardEntry) -> String + 'static,
     {
         self.detail_body_callback = Some(Arc::new(callback));
+        self
+    }
+
+    /// Register a game callback used for accept/claim actions.
+    ///
+    /// The callback receives the selected entry's `accept_action`
+    /// token exactly as the provider emitted it. This keeps semantics
+    /// in game code instead of baking one lifecycle into the kit.
+    ///
+    /// Keyboard contract:
+    ///
+    /// - Press `a` to trigger a canonical "accept" action.
+    /// - Press `c` to trigger a canonical "claim" action.
+    ///
+    /// Both hotkeys route to this same callback so games can map one
+    /// token space onto multiple opportunity families.
+    ///
+    /// Calling this replaces any previously registered callback.
+    #[must_use]
+    pub fn with_accept_action_callback<F>(mut self, callback: F) -> Self
+    where
+        F: Fn(&str) -> ScreenCommand + 'static,
+    {
+        self.accept_action_callback = Some(Arc::new(callback));
         self
     }
 
@@ -290,6 +329,19 @@ impl JobBoardScreen {
 
     fn close_detail_modal(&mut self) {
         self.detail_modal = None;
+    }
+
+    fn invoke_accept_action_callback(&self) -> ScreenCommand {
+        let Some(callback) = self.accept_action_callback.as_ref() else {
+            return ScreenCommand::None;
+        };
+        let Some(entry) = self.entries.get(self.selected_index) else {
+            return ScreenCommand::None;
+        };
+        let Some(token) = entry.accept_action.as_deref() else {
+            return ScreenCommand::None;
+        };
+        callback(token)
     }
 
     fn render_inner(&self, frame: &mut ratatui::Frame<'_>, area: Rect) {
@@ -475,6 +527,7 @@ impl Screen for JobBoardScreen {
                 self.next_page(page_size);
                 ScreenCommand::None
             }
+            Input::Char('a') | Input::Char('c') => self.invoke_accept_action_callback(),
             Input::Esc | Input::Char('q') => ScreenCommand::Pop,
             _ => ScreenCommand::None,
         }
@@ -489,6 +542,8 @@ mod tests {
     use crate::input::Input;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
+    use std::cell::RefCell;
+    use std::rc::Rc;
 
     fn fixture_context() -> (GameConfig, FogletContext) {
         let config = GameConfig {
@@ -758,6 +813,44 @@ mod tests {
             all_rows(&baseline),
             all_rows(&after_close),
             "closing the detail modal must restore the list rendering exactly"
+        );
+    }
+
+    #[test]
+    fn accept_hotkey_passes_provider_token_to_game_callback_verbatim() {
+        let seen_tokens: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+        let seen_tokens_for_callback = Rc::clone(&seen_tokens);
+
+        let mut screen = JobBoardScreen::new(vec![JobBoardEntry {
+            source: crate::job_board::JobBoardSource::External,
+            source_id: 7,
+            kind_label: "Dispatch".to_string(),
+            state_label: "available".to_string(),
+            title: "Repair the old mill wheel".to_string(),
+            summary: "Bring spare timber and iron nails.".to_string(),
+            reward_preview: Some("Town favor + supplies".to_string()),
+            location_preview: Some("Riverside district".to_string()),
+            expires_at: Some("2026-05-10T10:00:00Z".to_string()),
+            accept_action: Some("claim::riverside/mill?crew=west".to_string()),
+        }])
+        .with_accept_action_callback(move |token| {
+            seen_tokens_for_callback
+                .borrow_mut()
+                .push(token.to_string());
+            ScreenCommand::Message("handled".to_string())
+        });
+
+        let command = dispatch(&mut screen, Input::Char('a'));
+        assert!(
+            matches!(command, ScreenCommand::Message(ref body) if body == "handled"),
+            "callback return command should flow through handle_input"
+        );
+
+        let tokens = seen_tokens.borrow();
+        assert_eq!(
+            tokens.as_slice(),
+            ["claim::riverside/mill?crew=west"],
+            "expected exact opaque token from provider"
         );
     }
 }
