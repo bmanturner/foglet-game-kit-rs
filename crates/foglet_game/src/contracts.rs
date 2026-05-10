@@ -95,6 +95,62 @@ impl ContractState {
 /// Errors for contract write/read helpers.
 #[derive(Debug, Error)]
 pub enum ContractError {
+    /// No `contracts` row exists with the given id.
+    ///
+    /// Surfaced by lifecycle transitions when a caller targets an id that
+    /// no longer exists in the shared world database.
+    #[error("contract {id} does not exist")]
+    NotFound {
+        /// Caller-supplied id that could not be found.
+        id: i64,
+    },
+    /// A lifecycle transition was attempted from an incompatible source state.
+    ///
+    /// Carrying both the observed `from` state and desired `to` state lets
+    /// game UIs explain the failure precisely.
+    #[error("cannot transition contract {id} from {from:?} to {to:?}")]
+    InvalidTransition {
+        /// Contract id the caller attempted to mutate.
+        id: i64,
+        /// Current persisted state read from SQLite.
+        from: String,
+        /// Desired state the helper attempted to set.
+        to: ContractState,
+    },
+    /// `accept_contract` failed because another player already accepted it.
+    ///
+    /// This dedicated variant separates "already held" from the broader
+    /// `InvalidTransition` bucket so games can render the right UX copy.
+    #[error("contract {id} is already accepted by player {acceptor_player_id}")]
+    AlreadyAccepted {
+        /// Contract id the caller attempted to accept.
+        id: i64,
+        /// Existing acceptor recorded on the row.
+        acceptor_player_id: i64,
+    },
+    /// `accept_contract` failed because the row's deadline already lapsed.
+    ///
+    /// This remains separate from `InvalidTransition` so games can present a
+    /// clear "expired before accept" message.
+    #[error("contract {id} expired before it could be accepted")]
+    ExpiredOnAccept {
+        /// Contract id the caller attempted to accept.
+        id: i64,
+    },
+    /// A game callback rejected a transition while the SQL transaction was open.
+    ///
+    /// The helper always rolls back in this case; this variant carries both
+    /// the attempted lifecycle edge and the callback error source.
+    #[error("on_commit rejected transition for contract {id} to {attempted:?}: {source}")]
+    OnCommitRejected {
+        /// Contract id being transitioned when the callback failed.
+        id: i64,
+        /// Target state attempted by the helper.
+        attempted: ContractState,
+        /// Underlying callback error.
+        #[source]
+        source: rusqlite::Error,
+    },
     /// SQLite failed during a contract write or read helper.
     #[error("failed to query contract row: {source}")]
     Sqlite {
@@ -456,16 +512,24 @@ RETURNING id, key, kind, issuer_owner_kind, issuer_owner_id, \
             .transaction()
             .map_err(|source| ContractError::Sqlite { source })?;
 
-        let accepted = tx
-            .query_row(
-                SQL,
-                rusqlite::params![contract_id, ContractState::Accepted.as_str(), player_id],
-                row_to_contract,
-            )
-            .map_err(|source| ContractError::Sqlite { source })?;
+        let accepted = match tx.query_row(
+            SQL,
+            rusqlite::params![contract_id, ContractState::Accepted.as_str(), player_id],
+            row_to_contract,
+        ) {
+            Ok(contract) => contract,
+            Err(rusqlite::Error::QueryReturnedNoRows) => {
+                return Err(Self::diagnose_failed_accept_contract(&tx, contract_id));
+            }
+            Err(source) => return Err(ContractError::Sqlite { source }),
+        };
 
         if let Some(on_commit) = on_commit {
-            on_commit(&tx, &accepted).map_err(|source| ContractError::Sqlite { source })?;
+            on_commit(&tx, &accepted).map_err(|source| ContractError::OnCommitRejected {
+                id: contract_id,
+                attempted: ContractState::Accepted,
+                source,
+            })?;
         }
 
         tx.commit()
@@ -516,20 +580,32 @@ RETURNING id, key, kind, issuer_owner_kind, issuer_owner_id, \
             .transaction()
             .map_err(|source| ContractError::Sqlite { source })?;
 
-        let completed = tx
-            .query_row(
-                SQL,
-                rusqlite::params![
+        let completed = match tx.query_row(
+            SQL,
+            rusqlite::params![
+                contract_id,
+                ContractState::Completed.as_str(),
+                ContractState::Accepted.as_str()
+            ],
+            row_to_contract,
+        ) {
+            Ok(contract) => contract,
+            Err(rusqlite::Error::QueryReturnedNoRows) => {
+                return Err(Self::diagnose_failed_state_transition(
+                    &tx,
                     contract_id,
-                    ContractState::Completed.as_str(),
-                    ContractState::Accepted.as_str()
-                ],
-                row_to_contract,
-            )
-            .map_err(|source| ContractError::Sqlite { source })?;
+                    ContractState::Completed,
+                ));
+            }
+            Err(source) => return Err(ContractError::Sqlite { source }),
+        };
 
         if let Some(on_commit) = on_commit {
-            on_commit(&tx, &completed).map_err(|source| ContractError::Sqlite { source })?;
+            on_commit(&tx, &completed).map_err(|source| ContractError::OnCommitRejected {
+                id: contract_id,
+                attempted: ContractState::Completed,
+                source,
+            })?;
         }
 
         tx.commit()
@@ -578,20 +654,32 @@ RETURNING id, key, kind, issuer_owner_kind, issuer_owner_id, \
             .transaction()
             .map_err(|source| ContractError::Sqlite { source })?;
 
-        let failed = tx
-            .query_row(
-                SQL,
-                rusqlite::params![
+        let failed = match tx.query_row(
+            SQL,
+            rusqlite::params![
+                contract_id,
+                ContractState::Failed.as_str(),
+                ContractState::Accepted.as_str()
+            ],
+            row_to_contract,
+        ) {
+            Ok(contract) => contract,
+            Err(rusqlite::Error::QueryReturnedNoRows) => {
+                return Err(Self::diagnose_failed_state_transition(
+                    &tx,
                     contract_id,
-                    ContractState::Failed.as_str(),
-                    ContractState::Accepted.as_str()
-                ],
-                row_to_contract,
-            )
-            .map_err(|source| ContractError::Sqlite { source })?;
+                    ContractState::Failed,
+                ));
+            }
+            Err(source) => return Err(ContractError::Sqlite { source }),
+        };
 
         if let Some(on_commit) = on_commit {
-            on_commit(&tx, &failed).map_err(|source| ContractError::Sqlite { source })?;
+            on_commit(&tx, &failed).map_err(|source| ContractError::OnCommitRejected {
+                id: contract_id,
+                attempted: ContractState::Failed,
+                source,
+            })?;
         }
 
         tx.commit()
@@ -643,20 +731,32 @@ RETURNING id, key, kind, issuer_owner_kind, issuer_owner_id, \
             .transaction()
             .map_err(|source| ContractError::Sqlite { source })?;
 
-        let abandoned = tx
-            .query_row(
-                SQL,
-                rusqlite::params![
+        let abandoned = match tx.query_row(
+            SQL,
+            rusqlite::params![
+                contract_id,
+                ContractState::Abandoned.as_str(),
+                ContractState::Accepted.as_str()
+            ],
+            row_to_contract,
+        ) {
+            Ok(contract) => contract,
+            Err(rusqlite::Error::QueryReturnedNoRows) => {
+                return Err(Self::diagnose_failed_state_transition(
+                    &tx,
                     contract_id,
-                    ContractState::Abandoned.as_str(),
-                    ContractState::Accepted.as_str()
-                ],
-                row_to_contract,
-            )
-            .map_err(|source| ContractError::Sqlite { source })?;
+                    ContractState::Abandoned,
+                ));
+            }
+            Err(source) => return Err(ContractError::Sqlite { source }),
+        };
 
         if let Some(on_commit) = on_commit {
-            on_commit(&tx, &abandoned).map_err(|source| ContractError::Sqlite { source })?;
+            on_commit(&tx, &abandoned).map_err(|source| ContractError::OnCommitRejected {
+                id: contract_id,
+                attempted: ContractState::Abandoned,
+                source,
+            })?;
         }
 
         tx.commit()
@@ -698,22 +798,107 @@ RETURNING id, key, kind, issuer_owner_kind, issuer_owner_id, \
             .transaction()
             .map_err(|source| ContractError::Sqlite { source })?;
 
-        let expired = tx
-            .query_row(
-                SQL,
-                rusqlite::params![
+        let expired = match tx.query_row(
+            SQL,
+            rusqlite::params![
+                contract_id,
+                ContractState::Expired.as_str(),
+                ContractState::Available.as_str()
+            ],
+            row_to_contract,
+        ) {
+            Ok(contract) => contract,
+            Err(rusqlite::Error::QueryReturnedNoRows) => {
+                return Err(Self::diagnose_failed_state_transition(
+                    &tx,
                     contract_id,
-                    ContractState::Expired.as_str(),
-                    ContractState::Available.as_str()
-                ],
-                row_to_contract,
-            )
-            .map_err(|source| ContractError::Sqlite { source })?;
+                    ContractState::Expired,
+                ));
+            }
+            Err(source) => return Err(ContractError::Sqlite { source }),
+        };
 
         tx.commit()
             .map_err(|source| ContractError::Sqlite { source })?;
 
         Ok(expired)
+    }
+
+    /// Map a failed `accept_contract` mutation onto a typed lifecycle error.
+    ///
+    /// The acceptance SQL gate intentionally combines multiple invariants:
+    /// "still available", "no existing acceptor", and "deadline not lapsed".
+    /// When SQLite reports "no rows updated", this diagnostic query identifies
+    /// which invariant failed so callers get a precise variant.
+    fn diagnose_failed_accept_contract(
+        tx: &rusqlite::Transaction<'_>,
+        contract_id: i64,
+    ) -> ContractError {
+        const DIAG_SQL: &str = "\
+SELECT state, acceptor_player_id, \
+       CASE \
+           WHEN expires_at IS NOT NULL \
+               AND datetime(expires_at) <= CURRENT_TIMESTAMP \
+           THEN 1 ELSE 0 \
+       END AS deadline_lapsed \
+FROM contracts \
+WHERE id = ?1";
+
+        let row = tx.query_row(DIAG_SQL, rusqlite::params![contract_id], |row| {
+            let state: String = row.get(0)?;
+            let acceptor_player_id: Option<i64> = row.get(1)?;
+            let deadline_lapsed: i64 = row.get(2)?;
+            Ok((state, acceptor_player_id, deadline_lapsed != 0))
+        });
+
+        match row {
+            Err(rusqlite::Error::QueryReturnedNoRows) => {
+                ContractError::NotFound { id: contract_id }
+            }
+            Err(source) => ContractError::Sqlite { source },
+            Ok((_state, Some(acceptor_player_id), _)) => ContractError::AlreadyAccepted {
+                id: contract_id,
+                acceptor_player_id,
+            },
+            Ok((state, _, true)) if state == ContractState::Available.as_str() => {
+                ContractError::ExpiredOnAccept { id: contract_id }
+            }
+            Ok((state, _, _)) => ContractError::InvalidTransition {
+                id: contract_id,
+                from: state,
+                to: ContractState::Accepted,
+            },
+        }
+    }
+
+    /// Map a failed state-to-state transition onto `NotFound` or `InvalidTransition`.
+    ///
+    /// Lifecycle helpers with fixed source-state preconditions call this after
+    /// a guarded `UPDATE ... RETURNING` reports no rows. The diagnostic read is
+    /// intentionally tiny: if the row exists we surface its current `state` as
+    /// `from`; otherwise we surface `NotFound`.
+    fn diagnose_failed_state_transition(
+        tx: &rusqlite::Transaction<'_>,
+        contract_id: i64,
+        attempted: ContractState,
+    ) -> ContractError {
+        let row = tx.query_row(
+            "SELECT state FROM contracts WHERE id = ?1",
+            rusqlite::params![contract_id],
+            |row| row.get::<_, String>(0),
+        );
+
+        match row {
+            Err(rusqlite::Error::QueryReturnedNoRows) => {
+                ContractError::NotFound { id: contract_id }
+            }
+            Err(source) => ContractError::Sqlite { source },
+            Ok(state) => ContractError::InvalidTransition {
+                id: contract_id,
+                from: state,
+                to: attempted,
+            },
+        }
     }
 
     /// Expire all overdue available contracts whose deadline is at-or-before `now`.
@@ -1419,9 +1604,11 @@ mod tests {
         assert!(
             matches!(
                 second_accept,
-                Err(super::ContractError::Sqlite {
-                    source: rusqlite::Error::QueryReturnedNoRows
+                Err(super::ContractError::AlreadyAccepted {
+                    id,
+                    acceptor_player_id: 51
                 })
+                if id == created.id
             ),
             "second accept should fail when an acceptor is already recorded"
         );
@@ -1475,9 +1662,7 @@ mod tests {
         assert!(
             matches!(
                 accept,
-                Err(super::ContractError::Sqlite {
-                    source: rusqlite::Error::QueryReturnedNoRows
-                })
+                Err(super::ContractError::ExpiredOnAccept { id }) if id == created.id
             ),
             "accept should fail when expires_at is at-or-before current timestamp"
         );
@@ -1538,9 +1723,11 @@ mod tests {
         assert!(
             matches!(
                 accept,
-                Err(super::ContractError::Sqlite {
+                Err(super::ContractError::OnCommitRejected {
+                    id,
+                    attempted: ContractState::Accepted,
                     source: rusqlite::Error::InvalidQuery
-                })
+                }) if id == created.id
             ),
             "accept should surface callback error when on_commit returns Err"
         );
@@ -1653,9 +1840,11 @@ mod tests {
         assert!(
             matches!(
                 complete,
-                Err(super::ContractError::Sqlite {
-                    source: rusqlite::Error::QueryReturnedNoRows
-                })
+                Err(super::ContractError::InvalidTransition {
+                    id,
+                    from,
+                    to: ContractState::Completed
+                }) if id == created.id && from == ContractState::Available.as_str()
             ),
             "complete should fail unless the contract is currently accepted"
         );
@@ -1741,9 +1930,11 @@ mod tests {
         assert!(
             matches!(
                 reject_available,
-                Err(super::ContractError::Sqlite {
-                    source: rusqlite::Error::QueryReturnedNoRows
-                })
+                Err(super::ContractError::InvalidTransition {
+                    id,
+                    from,
+                    to: ContractState::Failed
+                }) if id == available.id && from == ContractState::Available.as_str()
             ),
             "fail_contract should reject when source state is not accepted"
         );
@@ -1755,9 +1946,11 @@ mod tests {
         assert!(
             matches!(
                 reject_already_failed,
-                Err(super::ContractError::Sqlite {
-                    source: rusqlite::Error::QueryReturnedNoRows
-                })
+                Err(super::ContractError::InvalidTransition {
+                    id,
+                    from,
+                    to: ContractState::Failed
+                }) if id == accepted.id && from == ContractState::Failed.as_str()
             ),
             "fail_contract should reject terminal rows on repeated invocation"
         );
@@ -1839,9 +2032,11 @@ mod tests {
         assert!(
             matches!(
                 reject_available,
-                Err(super::ContractError::Sqlite {
-                    source: rusqlite::Error::QueryReturnedNoRows
-                })
+                Err(super::ContractError::InvalidTransition {
+                    id,
+                    from,
+                    to: ContractState::Abandoned
+                }) if id == available.id && from == ContractState::Available.as_str()
             ),
             "abandon_contract should reject when source state is not accepted"
         );
@@ -1853,9 +2048,11 @@ mod tests {
         assert!(
             matches!(
                 reject_already_abandoned,
-                Err(super::ContractError::Sqlite {
-                    source: rusqlite::Error::QueryReturnedNoRows
-                })
+                Err(super::ContractError::InvalidTransition {
+                    id,
+                    from,
+                    to: ContractState::Abandoned
+                }) if id == accepted.id && from == ContractState::Abandoned.as_str()
             ),
             "abandon_contract should reject terminal rows on repeated invocation"
         );
@@ -1927,9 +2124,11 @@ mod tests {
         assert!(
             matches!(
                 reject_future,
-                Err(super::ContractError::Sqlite {
-                    source: rusqlite::Error::QueryReturnedNoRows
-                })
+                Err(super::ContractError::InvalidTransition {
+                    id,
+                    from,
+                    to: ContractState::Expired
+                }) if id == future_available.id && from == ContractState::Available.as_str()
             ),
             "future deadline rows should not expire early"
         );
@@ -1938,9 +2137,11 @@ mod tests {
         assert!(
             matches!(
                 reject_accepted,
-                Err(super::ContractError::Sqlite {
-                    source: rusqlite::Error::QueryReturnedNoRows
-                })
+                Err(super::ContractError::InvalidTransition {
+                    id,
+                    from,
+                    to: ContractState::Expired
+                }) if id == accepted_past_due.id && from == ContractState::Accepted.as_str()
             ),
             "accepted rows should not transition via expire_contract"
         );
