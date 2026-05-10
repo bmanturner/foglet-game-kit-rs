@@ -326,6 +326,71 @@ pub enum MarketError {
         /// screen can re-render the offending input.
         actual: i64,
     },
+    /// `buy_listing` was called with a non-positive quantity. SPEC §4.3
+    /// frames the buy as "decrement quantity by N"; N must be strictly
+    /// positive — buying zero or a negative number is meaningless and
+    /// would leave the listing unchanged while still appearing to
+    /// "succeed" to UI callers. Pinning the typed error means a UI
+    /// regression that fed a stuck "0" through the buy keypad surfaces
+    /// here rather than as a silent no-op. Same defensive shape as
+    /// [`Self::NegativeQuantity`].
+    #[error("market listing buy quantity must be positive (got {actual})")]
+    NonPositiveBuyQuantity {
+        /// Actual quantity the caller requested. Echoed so the buy
+        /// screen can re-render the offending input.
+        actual: i64,
+    },
+    /// `buy_listing` referenced a listing id that does not exist in
+    /// `market_listings`. Distinct from
+    /// [`Self::InsufficientQuantity`] so the marketplace UI can offer a
+    /// targeted "this listing has been removed, refresh your view"
+    /// recovery rather than a generic "couldn't buy" toast. Same shape
+    /// as [`crate::notices::NoticeError::NotFound`] and
+    /// [`crate::challenges::ChallengeError::NotFound`].
+    #[error("market listing id {id} was not found")]
+    NotFound {
+        /// Listing id the caller passed.
+        id: i64,
+    },
+    /// `buy_listing` requested more units than the listing has
+    /// available (race-safe against concurrent buys: the conditional
+    /// `UPDATE` only succeeds when `quantity >= requested`, so a
+    /// listing that was sufficient at the read but exhausted by the
+    /// time the write commits surfaces here, not as a silent partial
+    /// fill). Echoes both the requested and the actual on-row quantity
+    /// so the marketplace UI can render "only 2 left, you asked for 5"
+    /// without re-querying.
+    #[error(
+        "market listing {id} has only {available} available; cannot fulfil buy of {requested}"
+    )]
+    InsufficientQuantity {
+        /// Listing id the caller passed.
+        id: i64,
+        /// Quantity the caller requested.
+        requested: i64,
+        /// Quantity actually on the listing row at the moment the
+        /// conditional update ran.
+        available: i64,
+    },
+    /// The buyer callback inside [`crate::WorldDb::buy_listing`]
+    /// returned `Err`. The wrapping transaction has already rolled
+    /// back, so the listing's `quantity` is unchanged and any side
+    /// effects the callback attempted (inventory grant, balance
+    /// debit, seller credit) are undone — that's the SPEC §4.3
+    /// "Buying MUST be atomic" contract. Distinct from
+    /// [`Self::Sqlite`] so the marketplace UI can surface a buyer-
+    /// side reason ("you can't afford this") separately from a
+    /// SQLite-layer failure.
+    #[error("buyer callback inside buy_listing failed; listing quantity rolled back: {source}")]
+    BuyerCallback {
+        /// Underlying `rusqlite::Error` returned by the callback. The
+        /// callback is expected to map any non-SQLite failure into a
+        /// [`rusqlite::Error::SqliteFailure`] with an explanatory
+        /// message before returning, the same convention as
+        /// [`crate::world_db::SpendAndEmitError::Mutation`].
+        #[source]
+        source: rusqlite::Error,
+    },
     /// The `INSERT … RETURNING` round-trip (or a future `UPDATE` on
     /// the buy path) failed. Wrapping `rusqlite::Error` keeps the call
     /// site readable (one error type, one mapping) while preserving
@@ -530,6 +595,174 @@ ORDER BY created_at DESC, id DESC";
             .map_err(|source| MarketError::Sqlite { source })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(|source| MarketError::Sqlite { source })
+    }
+
+    /// Atomically decrement a listing's `quantity` and run a buyer
+    /// callback inside the same SQLite transaction (SPEC_v3 §4.3 /
+    /// §Task 5d).
+    ///
+    /// The contract is the SPEC §4.3 invariant verbatim: "Buying MUST
+    /// be atomic: quantity decrement, buyer inventory/balance callback,
+    /// seller credit callback if used, event append." Tasks 5d–5f land
+    /// the three observable phases incrementally — 5d here lays down
+    /// the kit-owned quantity decrement plus the buyer callback hook;
+    /// 5e adds the rollback test when the callback fails (no signature
+    /// change); 5f layers the world-event append after the callback
+    /// inside the same transaction. Game code that already wires a
+    /// callback today gets the event-append for free when 5f lands.
+    ///
+    /// # Atomicity model
+    ///
+    /// The decrement is a single conditional `UPDATE … RETURNING` whose
+    /// `WHERE` clause folds the existence + sufficiency check:
+    /// `id = ?1 AND quantity >= ?2`. Combining the two predicates means
+    /// the decrement is race-safe under concurrent buys — a listing
+    /// that was sufficient at read time but exhausted by the time this
+    /// statement commits returns `QueryReturnedNoRows`, not a silent
+    /// partial fill. The whole flow runs inside an explicit
+    /// `Connection::transaction` so the callback's writes (inventory
+    /// grant, balance debit, future event append) commit atomically
+    /// with the decrement; if any of them returns `Err`, dropping the
+    /// transaction without `commit()` rolls every write back, which is
+    /// the SPEC §7 "A failed transaction MUST NOT partially debit
+    /// turns, consume inventory, or change challenge state" guarantee
+    /// — extended here to listings.
+    ///
+    /// # Buyer callback shape
+    ///
+    /// Receives `(tx, post_decrement_listing)`. The tx borrow lets the
+    /// callback issue its own writes against the same transaction
+    /// (game-defined inventory and balance tables); the listing argument
+    /// is the post-decrement row, so the callback knows exactly which
+    /// item to grant, at what price, on whose behalf. Returning
+    /// `rusqlite::Error` keeps the helper minimal — game code with
+    /// richer error needs maps non-SQLite failures into
+    /// `Error::SqliteFailure` with an explanatory message, the same
+    /// convention as
+    /// [`crate::world_db::WorldDb::spend_turn_and_emit`]. Callbacks that
+    /// don't need to do anything (system listing, "kit decides
+    /// inventory") can pass a no-op closure.
+    ///
+    /// # Error mapping
+    ///
+    /// - [`MarketError::NonPositiveBuyQuantity`] — caller asked to buy
+    ///   `<= 0` units. Caught **before** opening the transaction so a
+    ///   broken UI doesn't pay for a `BEGIN` round-trip.
+    /// - [`MarketError::NotFound`] — listing id does not exist. Surfaced
+    ///   via a follow-up SELECT after `QueryReturnedNoRows`, so the UI
+    ///   can render "this listing has been removed".
+    /// - [`MarketError::InsufficientQuantity`] — listing exists but
+    ///   has fewer units available than requested. Carries both the
+    ///   requested and the actual on-row quantity so the buy screen
+    ///   can render "only 2 left" without a second query.
+    /// - [`MarketError::BuyerCallback`] — callback returned `Err`. The
+    ///   transaction has already rolled back; this is the only error
+    ///   variant the rollback path produces.
+    /// - [`MarketError::Sqlite`] — SQLite-layer failure on the
+    ///   transaction begin/commit, the `UPDATE … RETURNING`, or the
+    ///   diagnostic `SELECT`.
+    ///
+    /// # Concurrency
+    ///
+    /// Takes `&mut self`: the wrapping transaction needs a unique
+    /// borrow on the connection, same as
+    /// [`Self::spend_turn_and_emit`] and [`Self::transaction`]. Game
+    /// code that drives buy from a screen tick does so via a
+    /// `&mut WorldDb` borrow scoped to the tick, mirroring the existing
+    /// `spend_turn_and_emit` call sites in `murder_motel`.
+    pub fn buy_listing<F>(
+        &mut self,
+        listing_id: i64,
+        quantity_to_buy: i64,
+        buyer: F,
+    ) -> Result<MarketListing, MarketError>
+    where
+        F: FnOnce(&rusqlite::Transaction<'_>, &MarketListing) -> Result<(), rusqlite::Error>,
+    {
+        // Reject non-positive buys before opening the transaction so a
+        // broken UI doesn't pay for a `BEGIN` round-trip and the
+        // rollback branch doesn't need a "but the txn was empty" case.
+        if quantity_to_buy <= 0 {
+            return Err(MarketError::NonPositiveBuyQuantity {
+                actual: quantity_to_buy,
+            });
+        }
+
+        // `RETURNING` echoes the post-decrement row back so the buyer
+        // callback can inspect it and the helper can return it to the
+        // caller. Column order matches `row_to_listing` so the decoder
+        // and the SQL stay locked together.
+        const UPDATE_SQL: &str = "\
+UPDATE market_listings \
+SET quantity = quantity - ?2 \
+WHERE id = ?1 AND quantity >= ?2 \
+RETURNING id, created_at, seller_player_id, item_key, display_name, \
+          price, quantity, expires_at, metadata";
+
+        let tx = self
+            .connection_mut()
+            .transaction()
+            .map_err(|source| MarketError::Sqlite { source })?;
+
+        // Conditional decrement. SQLite's per-statement atomicity plus
+        // the wrapping transaction guarantees no concurrent buy can
+        // interleave between the predicate check and the write.
+        let listing = match tx.query_row(
+            UPDATE_SQL,
+            rusqlite::params![listing_id, quantity_to_buy],
+            row_to_listing,
+        ) {
+            Ok(listing) => listing,
+            Err(rusqlite::Error::QueryReturnedNoRows) => {
+                // Diagnose why the conditional update affected zero
+                // rows: either the listing doesn't exist (NotFound) or
+                // it has fewer units than requested (InsufficientQuantity).
+                // A second read inside the same transaction sees a
+                // consistent snapshot (the UPDATE didn't change
+                // anything) and lets us surface a typed error rather
+                // than a generic "no rows".
+                use rusqlite::OptionalExtension;
+                let available: Option<i64> = tx
+                    .query_row(
+                        "SELECT quantity FROM market_listings WHERE id = ?1",
+                        rusqlite::params![listing_id],
+                        |row| row.get(0),
+                    )
+                    .optional()
+                    .map_err(|source| MarketError::Sqlite { source })?;
+                // Drop the transaction without commit — rolls back
+                // automatically. The diagnostic SELECT didn't write
+                // anything, so the rollback is observably a no-op, but
+                // the explicit drop here documents the intent.
+                drop(tx);
+                return Err(match available {
+                    None => MarketError::NotFound { id: listing_id },
+                    Some(available) => MarketError::InsufficientQuantity {
+                        id: listing_id,
+                        requested: quantity_to_buy,
+                        available,
+                    },
+                });
+            }
+            Err(source) => {
+                drop(tx);
+                return Err(MarketError::Sqlite { source });
+            }
+        };
+
+        // Run the buyer callback inside the same transaction. A
+        // callback `Err` propagates as `BuyerCallback` and the
+        // transaction drops without commit — every write the callback
+        // attempted, plus the kit's own decrement, rolls back as a
+        // unit. SPEC §7's "no partial debit" guarantee.
+        if let Err(source) = buyer(&tx, &listing) {
+            return Err(MarketError::BuyerCallback { source });
+        }
+
+        tx.commit()
+            .map_err(|source| MarketError::Sqlite { source })?;
+
+        Ok(listing)
     }
 }
 
@@ -1197,6 +1430,240 @@ mod tests {
         assert!(
             !visible_ids.contains(&past.id),
             "lapsed listing must be filtered out"
+        );
+    }
+
+    /// SPEC_v3 §Task 5d happy path: buying decrements the listing's
+    /// `quantity` by exactly the requested amount, returns the post-
+    /// decrement row, and the new value is durably visible to a
+    /// follow-up read. Pinning a primary-key SELECT after the call
+    /// means a regression that returned a stale view (e.g. read the
+    /// row before the UPDATE) flunks here, not in production where the
+    /// inconsistency would manifest as a buy that "didn't take" the
+    /// next time the marketplace screen renders.
+    #[test]
+    fn buy_listing_decrements_quantity_and_returns_post_row() {
+        let (_dir, mut world, seller_id) = world_with_listings();
+
+        let listing = world
+            .create_listing(
+                Some(seller_id),
+                "item.lockpick",
+                "Lockpick",
+                25,
+                5,
+                None,
+                None,
+            )
+            .expect("create_listing succeeds");
+
+        // Buy 2 of 5 — no callback work needed for the decrement test.
+        let post = world
+            .buy_listing(listing.id, 2, |_tx, _row| Ok(()))
+            .expect("buy_listing succeeds with sufficient quantity");
+
+        assert_eq!(post.id, listing.id, "returned row must be the same listing");
+        assert_eq!(post.quantity, 3, "5 - 2 = 3");
+
+        // Durability check: a follow-up SELECT MUST see the same value
+        // the helper returned, otherwise the helper read pre-UPDATE.
+        let durable: i64 = world
+            .connection()
+            .query_row(
+                "SELECT quantity FROM market_listings WHERE id = ?1",
+                rusqlite::params![listing.id],
+                |row| row.get(0),
+            )
+            .expect("select quantity");
+        assert_eq!(
+            durable, 3,
+            "post-buy quantity must persist; helper saw {} but DB has {}",
+            post.quantity, durable
+        );
+    }
+
+    /// Buying down to exactly zero MUST succeed (the schema CHECK is
+    /// `quantity >= 0`, not `> 0`) and the now-exhausted listing MUST
+    /// fall out of `active_listings` because the partial
+    /// `idx_market_listings_active` index filters `quantity > 0`. Pins
+    /// the boundary value: a regression that off-by-oned the gate
+    /// (`quantity > N` instead of `>= N`) would flunk on the buy, and a
+    /// regression that dropped the partial-index predicate would flunk
+    /// on the post-buy `active_listings` assertion.
+    #[test]
+    fn buy_listing_to_zero_exhausts_listing_and_hides_it_from_active() {
+        let (_dir, mut world, seller_id) = world_with_listings();
+
+        let listing = world
+            .create_listing(Some(seller_id), "item.last", "Last One", 10, 3, None, None)
+            .expect("create_listing succeeds");
+
+        let post = world
+            .buy_listing(listing.id, 3, |_tx, _row| Ok(()))
+            .expect("buy_listing of exact remaining quantity must succeed");
+        assert_eq!(post.quantity, 0, "buying every unit leaves quantity at 0");
+
+        let active = world.active_listings().expect("active_listings runs");
+        assert!(
+            !active.iter().any(|l| l.id == listing.id),
+            "exhausted listing must drop out of active_listings"
+        );
+    }
+
+    /// Non-positive buy quantities are typed errors at the boundary,
+    /// caught **before** the transaction opens (the helper docs pin
+    /// this as a deliberate design choice — a broken UI shouldn't pay
+    /// for a `BEGIN`). Both `0` and a negative number must surface as
+    /// [`MarketError::NonPositiveBuyQuantity`] with the offending
+    /// value echoed back, and the listing's quantity must be unchanged.
+    #[test]
+    fn buy_listing_rejects_non_positive_quantity() {
+        let (_dir, mut world, seller_id) = world_with_listings();
+
+        let listing = world
+            .create_listing(Some(seller_id), "item.x", "Item X", 1, 5, None, None)
+            .expect("create_listing succeeds");
+
+        for bad in [0_i64, -1, -100] {
+            let err = world
+                .buy_listing(listing.id, bad, |_tx, _row| Ok(()))
+                .expect_err("non-positive buy quantity must be rejected");
+            match err {
+                MarketError::NonPositiveBuyQuantity { actual } => assert_eq!(actual, bad),
+                other => panic!("expected NonPositiveBuyQuantity for {bad}, got {other:?}"),
+            }
+        }
+
+        // The listing's quantity must be unchanged across all rejected
+        // buys — otherwise a regression that "validated after BEGIN"
+        // would have flunked silently against an absent assertion.
+        let still: i64 = world
+            .connection()
+            .query_row(
+                "SELECT quantity FROM market_listings WHERE id = ?1",
+                rusqlite::params![listing.id],
+                |row| row.get(0),
+            )
+            .expect("select quantity");
+        assert_eq!(still, 5, "rejected buys must not touch the listing");
+    }
+
+    /// A buy targeting a listing id that doesn't exist surfaces as
+    /// [`MarketError::NotFound`]. The diagnostic SELECT runs inside
+    /// the wrapping transaction (see helper docs) so the discrimination
+    /// between "missing" and "insufficient" is consistent even if a
+    /// hostile concurrent writer were trying to race the listing in.
+    #[test]
+    fn buy_listing_rejects_missing_listing() {
+        let (_dir, mut world, _seller) = world_with_listings();
+
+        let err = world
+            .buy_listing(9_999, 1, |_tx, _row| Ok(()))
+            .expect_err("missing listing id must be rejected");
+        match err {
+            MarketError::NotFound { id } => assert_eq!(id, 9_999),
+            other => panic!("expected NotFound, got {other:?}"),
+        }
+    }
+
+    /// Buying more units than the listing has available surfaces as
+    /// [`MarketError::InsufficientQuantity`] with both the requested
+    /// and the actual on-row quantity echoed. Pinning the row-unchanged
+    /// invariant here means a regression that wrote *before* checking
+    /// (e.g. unconditional `quantity = quantity - ?` then a compensating
+    /// read) would observably flunk on the post-call SELECT.
+    #[test]
+    fn buy_listing_rejects_insufficient_quantity() {
+        let (_dir, mut world, seller_id) = world_with_listings();
+
+        let listing = world
+            .create_listing(Some(seller_id), "item.rare", "Rare", 100, 3, None, None)
+            .expect("create_listing succeeds");
+
+        let err = world
+            .buy_listing(listing.id, 10, |_tx, _row| {
+                panic!("callback must not run when quantity is insufficient");
+            })
+            .expect_err("insufficient quantity must be rejected");
+        match err {
+            MarketError::InsufficientQuantity {
+                id,
+                requested,
+                available,
+            } => {
+                assert_eq!(id, listing.id);
+                assert_eq!(requested, 10);
+                assert_eq!(available, 3);
+            }
+            other => panic!("expected InsufficientQuantity, got {other:?}"),
+        }
+
+        let still: i64 = world
+            .connection()
+            .query_row(
+                "SELECT quantity FROM market_listings WHERE id = ?1",
+                rusqlite::params![listing.id],
+                |row| row.get(0),
+            )
+            .expect("select quantity");
+        assert_eq!(
+            still, 3,
+            "rejected over-buy must leave the listing's quantity untouched"
+        );
+    }
+
+    /// The buyer callback receives the **post-decrement** listing row,
+    /// not the pre-decrement view. Game code that uses the listing's
+    /// current quantity in the callback (e.g. "if this was the last
+    /// one, also award the achievement") relies on this contract, so
+    /// pin it explicitly — a regression that swapped to passing the
+    /// pre-decrement row would flunk here. Also pins that the callback
+    /// runs inside the same transaction by issuing a writes-itself
+    /// statement and asserting it's durably committed after the call
+    /// returns successfully.
+    #[test]
+    fn buy_listing_callback_runs_in_transaction_with_post_decrement_listing() {
+        let (_dir, mut world, seller_id) = world_with_listings();
+        let listing = world
+            .create_listing(Some(seller_id), "item.k", "Item K", 50, 4, None, None)
+            .expect("create_listing succeeds");
+
+        // Game code's stand-in: a tiny scratch table the callback
+        // writes to. If the callback ran outside the transaction or
+        // didn't commit, the write would be missing after the call.
+        world
+            .connection()
+            .execute(
+                "CREATE TABLE buy_callback_log (\
+                    listing_id     INTEGER NOT NULL,\
+                    post_quantity  INTEGER NOT NULL\
+                )",
+                [],
+            )
+            .expect("scratch table created");
+
+        let _post = world
+            .buy_listing(listing.id, 1, |tx, row| {
+                tx.execute(
+                    "INSERT INTO buy_callback_log (listing_id, post_quantity) VALUES (?1, ?2)",
+                    rusqlite::params![row.id, row.quantity],
+                )?;
+                Ok(())
+            })
+            .expect("buy_listing with successful callback");
+
+        let (logged_id, logged_qty): (i64, i64) = world
+            .connection()
+            .query_row(
+                "SELECT listing_id, post_quantity FROM buy_callback_log",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("callback row durable after commit");
+        assert_eq!(logged_id, listing.id);
+        assert_eq!(
+            logged_qty, 3,
+            "callback must observe the post-decrement quantity (4 - 1 = 3)"
         );
     }
 }

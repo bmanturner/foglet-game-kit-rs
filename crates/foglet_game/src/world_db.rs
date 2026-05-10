@@ -281,6 +281,21 @@ impl WorldDb {
         &self.conn
     }
 
+    /// Crate-internal mutable accessor to the underlying [`Connection`].
+    ///
+    /// Exposed so v3 multiplayer modules whose transactional helpers
+    /// need to surface their own typed errors (e.g.
+    /// [`crate::market::WorldDb::buy_listing`]) can open their own
+    /// `rusqlite::Transaction` without funneling failures through
+    /// [`WorldDbError`]. Deliberately `pub(crate)` rather than `pub` —
+    /// an external caller that grabs `&mut Connection` could re-apply
+    /// migrations, smuggle in schema changes, or roll back the
+    /// idempotency bookkeeping. In-tree modules already speak the kit
+    /// invariants and are reviewed alongside this accessor.
+    pub(crate) fn connection_mut(&mut self) -> &mut Connection {
+        &mut self.conn
+    }
+
     /// Apply a single [`WorldMigration`], recording its version in
     /// `world_migrations` on success.
     ///
