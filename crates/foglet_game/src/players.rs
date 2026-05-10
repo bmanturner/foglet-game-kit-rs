@@ -526,6 +526,79 @@ LIMIT ?2";
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(|source| PlayerError::Sqlite { source })
     }
+
+    /// Return the most-recently-active players, newest first.
+    ///
+    /// Added for SPEC_v3 §Task 8b — async-multiplayer target-selection
+    /// screens (notice recipient picker, challenge rival selector,
+    /// bounty claim attribution) need a "who's been around lately"
+    /// list to seed the picker before the player has typed anything
+    /// into the [`Self::search_players_by_handle_prefix`] box.
+    /// Pairing the two helpers in `players.rs` keeps the registry as
+    /// the single source of truth for handle-shaped reads.
+    ///
+    /// # Semantics
+    ///
+    /// - Ordering is `last_seen_at DESC` so the most recently active
+    ///   player appears first. SQLite's `CURRENT_TIMESTAMP` is
+    ///   second-precision, so multiple upserts inside the same second
+    ///   will share a `last_seen_at` value; the tiebreak is `id DESC`
+    ///   (the larger primary key was inserted later, which is the
+    ///   closest stand-in for "most recent" the registry can offer
+    ///   without a higher-resolution clock). Pinning the tiebreak
+    ///   keeps the picker order deterministic across launches and
+    ///   across SQLite page-cache shuffles.
+    /// - `limit` MUST be `>= 0` for the same reason as
+    ///   [`Self::search_players_by_handle_prefix`]: SQLite treats
+    ///   `LIMIT -1` as "no limit", which is a footgun on a registry
+    ///   that grows unboundedly across launches. Negative limits are
+    ///   rejected at the typed boundary.
+    /// - An empty registry returns an empty `Vec` rather than an
+    ///   error — Murder Motel's first launch hits this before any
+    ///   player has registered, and the picker MUST NOT surface an
+    ///   error there.
+    /// - A `limit` of zero returns no rows even when the registry is
+    ///   populated; the doc-comment contract is "explicit cap", same
+    ///   as the prefix search.
+    ///
+    /// # Concurrency
+    ///
+    /// Takes `&self`: a single `SELECT` under the busy timeout, same
+    /// shape as [`Self::search_players_by_handle_prefix`]. Multiple
+    /// screens can call this concurrently from the same
+    /// `GameContext` borrow.
+    pub fn recent_players(&self, limit: i64) -> Result<Vec<PlayerRecord>, PlayerError> {
+        // Reject negative limits at the typed boundary — see the doc
+        // comment and `search_players_by_handle_prefix` for the
+        // rationale. Funnelling both helpers through the same
+        // `PlayerError::Sqlite { InvalidQuery }` shape lets call sites
+        // share one match arm for "the search box rejected my input".
+        if limit < 0 {
+            return Err(PlayerError::Sqlite {
+                source: rusqlite::Error::InvalidQuery,
+            });
+        }
+        // `last_seen_at DESC, id DESC` — see the doc comment for why
+        // `id` is the tiebreak. Selecting all columns keeps the helper
+        // returning `PlayerRecord` directly so screens that want
+        // `handle` and `role` (sysop badge in the picker, for
+        // instance) don't need a follow-up `player_handle` round-trip.
+        const SQL: &str = "\
+SELECT id, foglet_user_id, handle, role, security_level, \
+       first_seen_at, last_seen_at, local_dev_key \
+FROM players \
+ORDER BY last_seen_at DESC, id DESC \
+LIMIT ?1";
+        let conn = self.connection();
+        let mut stmt = conn
+            .prepare(SQL)
+            .map_err(|source| PlayerError::Sqlite { source })?;
+        let rows = stmt
+            .query_map(rusqlite::params![limit], row_to_record)
+            .map_err(|source| PlayerError::Sqlite { source })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|source| PlayerError::Sqlite { source })
+    }
 }
 
 /// Decode a `players` row into [`PlayerRecord`].
@@ -1415,5 +1488,209 @@ mod tests {
             .search_players_by_handle_prefix("a", 0)
             .expect("search succeeds");
         assert!(hits.is_empty());
+    }
+
+    /// Helper for the §Task 8b recent-players tests: stamp a known
+    /// `last_seen_at` on a specific player so the test can pin the
+    /// ordering contract without relying on `CURRENT_TIMESTAMP`'s
+    /// one-second resolution. SQLite stores the column as `TEXT`, so
+    /// any ISO-shaped string sorts lexicographically the same way the
+    /// `CURRENT_TIMESTAMP` form does — the chronology under test is
+    /// preserved.
+    fn stamp_last_seen(world: &WorldDb, player_id: i64, last_seen_at: &str) {
+        world
+            .connection()
+            .execute(
+                "UPDATE players SET last_seen_at = ?1 WHERE id = ?2",
+                rusqlite::params![last_seen_at, player_id],
+            )
+            .expect("stamp last_seen_at succeeds");
+    }
+
+    /// SPEC_v3 §Task 8b acceptance: results are ordered by
+    /// `last_seen_at DESC`. Manually stamping distinct timestamps
+    /// sidesteps `CURRENT_TIMESTAMP`'s second-precision so this test
+    /// pins the chronology contract without sleeping. A regression
+    /// that flipped the sort to ASC (or used `first_seen_at`) flunks
+    /// the assertion.
+    #[test]
+    fn recent_players_orders_by_last_seen_at_desc() {
+        let dir = tempdir().expect("tempdir creates");
+        let mut world = WorldDb::open(dir.path().join("world.sqlite")).expect("open");
+        world
+            .apply_migration(&PLAYERS_MIGRATION)
+            .expect("migration applies");
+
+        let alice = world
+            .upsert_player(&ctx_with(None, Some("alice")))
+            .expect("alice upsert");
+        let bob = world
+            .upsert_player(&ctx_with(None, Some("bob")))
+            .expect("bob upsert");
+        let carol = world
+            .upsert_player(&ctx_with(None, Some("carol")))
+            .expect("carol upsert");
+
+        // Distinct timestamps, deliberately not in id order: bob is
+        // most recent, alice in the middle, carol oldest. A regression
+        // that fell back to id-DESC for the primary sort would
+        // surface as carol/bob/alice rather than bob/alice/carol.
+        stamp_last_seen(&world, alice.id, "2025-01-02T00:00:00Z");
+        stamp_last_seen(&world, bob.id, "2025-01-03T00:00:00Z");
+        stamp_last_seen(&world, carol.id, "2025-01-01T00:00:00Z");
+
+        let hits = world.recent_players(100).expect("recent_players succeeds");
+        let handles: Vec<&str> = hits.iter().map(|p| p.handle.as_str()).collect();
+        assert_eq!(handles, vec!["bob", "alice", "carol"]);
+    }
+
+    /// When two rows share `last_seen_at` (the common case under
+    /// `CURRENT_TIMESTAMP`'s second-precision), the tiebreak is `id
+    /// DESC` — the larger primary key was inserted later. Pinning the
+    /// tiebreak keeps the picker order deterministic across launches
+    /// and across SQLite page-cache shuffles.
+    #[test]
+    fn recent_players_tiebreaks_by_id_desc_for_equal_last_seen_at() {
+        let dir = tempdir().expect("tempdir creates");
+        let mut world = WorldDb::open(dir.path().join("world.sqlite")).expect("open");
+        world
+            .apply_migration(&PLAYERS_MIGRATION)
+            .expect("migration applies");
+
+        let alice = world
+            .upsert_player(&ctx_with(None, Some("alice")))
+            .expect("alice upsert");
+        let bob = world
+            .upsert_player(&ctx_with(None, Some("bob")))
+            .expect("bob upsert");
+        let carol = world
+            .upsert_player(&ctx_with(None, Some("carol")))
+            .expect("carol upsert");
+
+        // Force the tie so the test is independent of how fast the
+        // upserts ran. Without this, a runner that crossed a second
+        // boundary mid-test would silently rely on the primary sort.
+        let same = "2025-01-01T00:00:00Z";
+        stamp_last_seen(&world, alice.id, same);
+        stamp_last_seen(&world, bob.id, same);
+        stamp_last_seen(&world, carol.id, same);
+
+        let hits = world.recent_players(100).expect("recent_players succeeds");
+        let ids: Vec<i64> = hits.iter().map(|p| p.id).collect();
+        assert_eq!(ids, vec![carol.id, bob.id, alice.id]);
+    }
+
+    /// `limit` caps the returned set to the most-recent N. Pairing
+    /// this with the ordering test pins which N survive.
+    #[test]
+    fn recent_players_respects_limit() {
+        let dir = tempdir().expect("tempdir creates");
+        let mut world = WorldDb::open(dir.path().join("world.sqlite")).expect("open");
+        world
+            .apply_migration(&PLAYERS_MIGRATION)
+            .expect("migration applies");
+
+        let alice = world
+            .upsert_player(&ctx_with(None, Some("alice")))
+            .expect("alice upsert");
+        let bob = world
+            .upsert_player(&ctx_with(None, Some("bob")))
+            .expect("bob upsert");
+        let carol = world
+            .upsert_player(&ctx_with(None, Some("carol")))
+            .expect("carol upsert");
+        stamp_last_seen(&world, alice.id, "2025-01-01T00:00:00Z");
+        stamp_last_seen(&world, bob.id, "2025-01-02T00:00:00Z");
+        stamp_last_seen(&world, carol.id, "2025-01-03T00:00:00Z");
+
+        let hits = world.recent_players(2).expect("recent_players succeeds");
+        let handles: Vec<&str> = hits.iter().map(|p| p.handle.as_str()).collect();
+        assert_eq!(handles, vec!["carol", "bob"]);
+    }
+
+    /// An empty registry returns an empty `Vec` — Murder Motel's first
+    /// launch hits this path before any player has registered, and the
+    /// picker MUST NOT surface an error there.
+    #[test]
+    fn recent_players_empty_registry_returns_empty() {
+        let dir = tempdir().expect("tempdir creates");
+        let mut world = WorldDb::open(dir.path().join("world.sqlite")).expect("open");
+        world
+            .apply_migration(&PLAYERS_MIGRATION)
+            .expect("migration applies");
+
+        let hits = world.recent_players(100).expect("recent_players succeeds");
+        assert!(hits.is_empty());
+    }
+
+    /// A negative limit is rejected as a typed error rather than
+    /// silently forwarded as "unlimited" (which is what SQLite does
+    /// with `LIMIT -1`). Pins the same guard the prefix-search helper
+    /// enforces.
+    #[test]
+    fn recent_players_rejects_negative_limit() {
+        let dir = tempdir().expect("tempdir creates");
+        let mut world = WorldDb::open(dir.path().join("world.sqlite")).expect("open");
+        world
+            .apply_migration(&PLAYERS_MIGRATION)
+            .expect("migration applies");
+
+        let err = world
+            .recent_players(-1)
+            .expect_err("negative limit is rejected");
+        assert!(matches!(err, PlayerError::Sqlite { .. }));
+    }
+
+    /// A `limit` of zero returns no rows even with matches present —
+    /// pins the "explicit cap" contract. A future regression that
+    /// special-cased `0` to mean "no limit" would silently page the
+    /// entire roster into a screen that asked for nothing.
+    #[test]
+    fn recent_players_zero_limit_returns_empty() {
+        let dir = tempdir().expect("tempdir creates");
+        let mut world = WorldDb::open(dir.path().join("world.sqlite")).expect("open");
+        world
+            .apply_migration(&PLAYERS_MIGRATION)
+            .expect("migration applies");
+        seed_search_roster(&world);
+
+        let hits = world.recent_players(0).expect("recent_players succeeds");
+        assert!(hits.is_empty());
+    }
+
+    /// A repeat upsert refreshes `last_seen_at` (Task 5d), so a player
+    /// who relaunches the game bubbles to the top of the picker. Pins
+    /// the integration between `upsert_player` and `recent_players`:
+    /// the picker reflects activity, not registration order.
+    #[test]
+    fn recent_players_reflects_repeat_upsert_refreshing_last_seen_at() {
+        let dir = tempdir().expect("tempdir creates");
+        let mut world = WorldDb::open(dir.path().join("world.sqlite")).expect("open");
+        world
+            .apply_migration(&PLAYERS_MIGRATION)
+            .expect("migration applies");
+
+        let alice = world
+            .upsert_player(&ctx_with(None, Some("alice")))
+            .expect("alice upsert");
+        let bob = world
+            .upsert_player(&ctx_with(None, Some("bob")))
+            .expect("bob upsert");
+        // Stamp distinct historical timestamps so the initial state
+        // is alice-then-bob (newest first). Without this the test
+        // would race `CURRENT_TIMESTAMP`'s second-precision and pass
+        // by accident on a fast runner.
+        stamp_last_seen(&world, alice.id, "2025-01-01T00:00:00Z");
+        stamp_last_seen(&world, bob.id, "2025-01-02T00:00:00Z");
+
+        // alice relaunches and her timestamp jumps ahead of bob's.
+        // Re-upserting via the public path exercises the Task 5d
+        // refresh contract end-to-end rather than reaching for raw
+        // SQL — the column under test is what `upsert_player` writes.
+        stamp_last_seen(&world, alice.id, "2025-01-03T00:00:00Z");
+
+        let hits = world.recent_players(100).expect("recent_players succeeds");
+        let ids: Vec<i64> = hits.iter().map(|p| p.id).collect();
+        assert_eq!(ids, vec![alice.id, bob.id]);
     }
 }
