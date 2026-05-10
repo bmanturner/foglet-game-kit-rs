@@ -41,6 +41,7 @@ pub mod input;
 pub mod leaderboards;
 pub mod manifest;
 pub mod map;
+pub mod market;
 pub mod notices;
 pub mod players;
 pub mod prompt;
@@ -79,6 +80,7 @@ pub use manifest::{
 pub use map::{
     parse_map, EntityPlacement, Map, MapError, Tile, TileKind, TileLegend, PLAYER_GLYPH,
 };
+pub use market::MARKET_LISTINGS_MIGRATION;
 pub use notices::{Notice, NoticeError, NOTICES_MIGRATION, NOTICE_SUBJECT_MAX_CHARS};
 pub use players::{PlayerError, PlayerRecord, PLAYERS_MIGRATION};
 pub use prompt::{
