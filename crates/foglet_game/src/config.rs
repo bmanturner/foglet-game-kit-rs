@@ -845,6 +845,11 @@ impl GameConfig {
                 "[inventory_capacity].enabled requires [inventory].enabled = true".into(),
             ));
         }
+        if self.screens.event_log.enabled && !self.world.enabled {
+            return Err(ConfigError::Validate(
+                "[screens.event_log].enabled requires v2 events via [world].enabled = true".into(),
+            ));
+        }
         // Leaderboard names must be non-empty and unique. Task 8 will
         // key SQL rows by `name`, so a duplicate would silently merge
         // two boards that the author intended to keep separate, and an
@@ -1294,6 +1299,9 @@ enabled = true
 [inventory_capacity]
 enabled = true
 
+[world]
+enabled = true
+
 [screens.event_log]
 enabled = true
 default_page_size = 42
@@ -1322,6 +1330,9 @@ min_height = 24
 start_map = "lobby"
 start_x = 0
 start_y = 0
+
+[world]
+enabled = true
 
 [screens.event_log]
 enabled = true
@@ -1605,6 +1616,39 @@ enabled = true
                 assert!(
                     msg.contains("[inventory_capacity]") && msg.contains("[inventory]"),
                     "error should mention both toggles: {msg}"
+                );
+            }
+            other => panic!("expected Validate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn event_log_screen_requires_world_events_be_enabled() {
+        // CHECKLIST_v5 Task 2f: the v5 Event Log screen reads the v2
+        // shared-world event table, so `[screens.event_log]` must not
+        // be enabled unless `[world]` is enabled.
+        let err = GameConfig::from_toml_str(
+            r#"
+[game]
+title = "Event Log Without World"
+slug = "event-log-without-world"
+description = ""
+min_width = 80
+min_height = 24
+start_map = "lobby"
+start_x = 0
+start_y = 0
+
+[screens.event_log]
+enabled = true
+"#,
+        )
+        .unwrap_err();
+        match err {
+            ConfigError::Validate(msg) => {
+                assert!(
+                    msg.contains("[screens.event_log]") && msg.contains("[world]"),
+                    "error should mention event-log/world toggles: {msg}"
                 );
             }
             other => panic!("expected Validate, got {other:?}"),
