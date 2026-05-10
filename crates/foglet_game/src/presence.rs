@@ -60,6 +60,15 @@ pub enum PresenceError {
         #[source]
         source: rusqlite::Error,
     },
+    /// A presence query failed while reading a player's row.
+    #[error("failed to read presence for player `{player_id}`: {source}")]
+    GetFailed {
+        /// Player identifier supplied to `get_presence`.
+        player_id: i64,
+        /// Underlying `rusqlite` error with the true SQLite cause.
+        #[source]
+        source: rusqlite::Error,
+    },
     /// A move was requested for a player that has no existing row.
     #[error("player `{player_id}` has no presence row; call `set_presence` before moving")]
     MissingPresence {
@@ -247,6 +256,38 @@ RETURNING player_id, place_id, entered_at, metadata_json";
         })?;
 
         Ok(moved)
+    }
+
+    /// Read the current presence row for one player, if present.
+    ///
+    /// This is the v4 Task 5e query:
+    ///
+    /// - It returns `Ok(Some(...))` when the player has an active
+    ///   presence row.
+    /// - It returns `Ok(None)` before any initial placement.
+    /// - It performs no write side effects so it stays cheap for
+    ///   frequent lookup.
+    ///
+    /// Why this is useful:
+    ///
+    /// - In a **space exploration** game, UI can resolve a captain's
+    ///   current dock without forcing movement.
+    /// - In a **dungeon crawler**, a room map can start with `None`
+    ///   and defer spawning checks.
+    pub fn get_presence(&self, player_id: i64) -> Result<Option<PresenceRecord>, PresenceError> {
+        const SQL: &str = "\
+SELECT player_id, place_id, entered_at, metadata_json\n\
+FROM presence\n\
+WHERE player_id = ?1";
+
+        match self
+            .connection()
+            .query_row(SQL, rusqlite::params![player_id], row_to_presence)
+        {
+            Ok(presence) => Ok(Some(presence)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(source) => Err(PresenceError::GetFailed { player_id, source }),
+        }
     }
 }
 
@@ -524,5 +565,48 @@ mod tests {
             Some(r#"{"zone":"entry"}"#.to_string())
         );
         assert_eq!(loaded.entered_at, initial.entered_at);
+    }
+
+    /// Task 5e proves the read path and the optional return:
+    /// players that have never been placed report `None`.
+    ///
+    /// This keeps the primitive intentionally genre-neutral:
+    ///
+    /// - A **space exploration** captain can be created without a
+    ///   starting station until story setup assigns one.
+    /// - A **dungeon crawler** hero can exist in persistence before
+    ///   entering the first room or chamber.
+    #[test]
+    fn get_presence_returns_none_for_unplaced_player() -> Result<(), PresenceError> {
+        let dir = tempdir().expect("tempdir creates");
+        let db_path = dir.path().join("world.sqlite");
+        let mut world = WorldDb::open(&db_path).expect("open succeeds");
+
+        world
+            .apply_migration(&PLAYERS_MIGRATION)
+            .expect("players migration applies");
+        world
+            .apply_migration(&PLACES_MIGRATION)
+            .expect("places migration applies");
+        world
+            .apply_migration(&PRESENCE_MIGRATION)
+            .expect("presence migration applies");
+
+        let player_id: i64 = world
+            .connection()
+            .query_row(
+                "INSERT INTO players (handle) VALUES (?1) RETURNING id",
+                rusqlite::params!["Captain Quill"],
+                |row| row.get(0),
+            )
+            .expect("fixture player insert works");
+
+        let none = world.get_presence(player_id)?;
+        assert!(
+            none.is_none(),
+            "fresh players should start without presence"
+        );
+
+        Ok(())
     }
 }
