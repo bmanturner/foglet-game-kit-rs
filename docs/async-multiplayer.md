@@ -402,21 +402,80 @@ v3 is mailbox multiplayer; the contract is refresh-on-navigation.
 
 ## 10. What v3 is not
 
-[`SPEC_v3 §2.2`](../SPEC_v3.md#22-non-goals) is the canonical list.
-The headline exclusions:
+### 10.1 v3 has no real-time multiplayer — by design
 
-- **No live sockets between running door sessions.** Players never
-  share a connection.
-- **No real-time combat, chat, or co-op.** Every interaction settles
-  on a state-machine edge that another player observes on next
-  login.
-- **No Foglet board posting or profile badges.** Bounties are local
-  to the game world and do not imply Foglet-side posts.
-- **No cross-game identities.** Each game's world DB is its own
-  scope.
-- **No payment, external economy, or real-money mechanics.** Market
-  prices are integer game-units only.
+This is the load-bearing exclusion the rest of the document is built
+around, so it gets its own subsection rather than a bullet in a
+list. [`SPEC_v3 §2.2`](../SPEC_v3.md#22-non-goals) is the canonical
+contract; this section explains what that means in practice for a
+game author who has just finished reading §§3–7 and is now wondering
+"can I add a chat window?"
 
-If a v4-shaped feature pulls toward any of those, append to
-`DECISIONS.md` § Open Questions rather than implementing it under
-the v3 contract.
+**No.** v3 explicitly forbids:
+
+- **Live sockets between running door sessions.** Two players running
+  `murder_motel` at the same time never share a connection. The
+  runtime opens the world DB, reads, writes, closes — that is the
+  entire IPC surface. There is no broker, no pub/sub, no fanout.
+- **Real-time combat, chat, or co-op.** A player's action becomes
+  visible to other players when *they* navigate to the screen that
+  reads it. There is no push, no notification stream, no "alice is
+  typing…" indicator. The SPEC §10 design bias is *mailbox over
+  live*; everything else follows from that.
+- **Background pollers, daemons, or long-lived threads** to simulate
+  the above. The runtime contract from §9 is refresh-on-navigation;
+  a 1-second poll loop that updates an inbox badge is still
+  forbidden, because it pulls the runtime away from the BBS-native
+  model and toward a presence-aware client. (Sweepers like
+  `expire_open_challenges` and `expire_bounties` run from navigation
+  hooks or login flows — never from a background thread — and take
+  an explicit `now` parameter so they remain deterministic.)
+- **Cross-game identity, Foglet board posting, profile badges.** Each
+  game's world DB is its own scope. A bounty in `murder_motel` does
+  not surface on the Foglet bulletin board, and a player's faction
+  membership in one game has no bearing on any other game.
+- **Payment, external economy, real-money mechanics.** Market prices
+  are integer game-units. The kit will not gain a callback for
+  charging a credit card, redeeming a coupon, or talking to a
+  payment processor.
+
+### 10.2 Why the line is drawn here
+
+Three reasons, in priority order:
+
+1. **Terminal safety is release-critical.** SPEC §13/§17 (v1) require
+   that every TUI path exits through the terminal guard, on every
+   termination — normal quit, controlled error, panic, Ctrl-C, resize.
+   A background socket reader that owns an `&mut Terminal` for stdout
+   updates is a second uncoordinated path to the terminal, and that
+   is the exact failure mode the guard exists to prevent. Mailbox
+   multiplayer keeps the terminal-owning thread the *only* writer.
+2. **Transactional state machines over ad-hoc flags.** Every
+   v3 lifecycle edge is a single conditional `UPDATE … RETURNING`
+   (§§3–7). That works because there is exactly one writer per row at
+   a time, serialised by SQLite's write lock. A real-time layer
+   re-introduces the optimistic-concurrency / merge-conflict problem
+   the mailbox model sidesteps.
+3. **BBS sweet spot.** A door game's audience is asynchronous by
+   nature — players call in once a day, leave traces, and read what
+   other callers left. Building real-time on top of `:external_pty`
+   would compete with chat applications, not with door games.
+
+### 10.3 If you find yourself reaching for real-time
+
+Stop. Append to `DECISIONS.md` § Open Questions describing the
+use-case, and check whether one of these mailbox-shaped alternatives
+solves it instead:
+
+| Pull toward real-time                  | Mailbox-shaped alternative                                            |
+| -------------------------------------- | --------------------------------------------------------------------- |
+| "Notify alice the moment bob replies." | bob's reply lands as a `notice` in alice's inbox; alice sees it on login. |
+| "Show a live count of bounty claims."  | The bounty board re-reads `state='open'` on screen open; the count is fresh-on-navigation. |
+| "Live chat between agency members."    | Faction-scoped notices with `kind='faction-chat'`; refresh-on-navigation. |
+| "Race two players on the same clue."   | Challenge with a deadline; the second-to-resolve loses on `accept_challenge`'s conditional UPDATE. |
+| "Push leaderboard updates."            | Leaderboard screen reads the v2 events table on entry; the kit already does this. |
+
+If none of those fit, the feature is a v4-shaped concern, not a v3
+one. Do not silently add a poller, a socket, or a thread to make it
+work under the v3 contract — those changes break the terminal-safety
+guarantee that the v1/v2/v3 architecture stack rests on.
