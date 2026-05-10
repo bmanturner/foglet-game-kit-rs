@@ -977,6 +977,58 @@ mod tests {
         assert_eq!(inbound_routes[0].to_place_id, star_hatch.id);
     }
 
+    /// SPEC_v4 Task 4f requires route topology to remain directional:
+    /// a route from a station to an engine room does not imply the reverse
+    /// path unless a separate reverse row exists, which keeps directed world
+    /// graphs explicit for both space and dungeon games.
+    #[test]
+    fn directional_routes_do_not_imply_reverse_connections() {
+        let dir = tempdir().expect("tempdir creates");
+        let db_path = dir.path().join("world.sqlite");
+        let mut world = WorldDb::open(&db_path).expect("open succeeds");
+
+        world
+            .apply_migration(&PLACES_MIGRATION)
+            .expect("places migration applies");
+        world
+            .apply_migration(&ROUTES_MIGRATION)
+            .expect("routes migration applies");
+
+        let space_node = world
+            .insert_place("space-station-hub", "Space Station Hub", "hub", None)
+            .expect("source place inserts");
+        let dungeon_node = world
+            .insert_place("dungeon-engine-room", "Dungeon Engine Room", "room", None)
+            .expect("destination place inserts");
+
+        let tunnel = world
+            .create_route(
+                space_node.id,
+                dungeon_node.id,
+                "pressure-lock",
+                None,
+                Some(r#"{"facing":"outbound"}"#),
+            )
+            .expect("directed route inserts");
+
+        let from_space = world
+            .outbound_routes(space_node.id)
+            .expect("outbound query should return forward row");
+        assert_eq!(from_space.len(), 1);
+        assert_eq!(from_space[0], tunnel);
+
+        let from_dungeon = world
+            .outbound_routes(dungeon_node.id)
+            .expect("outbound query should not imply reverse edge");
+        assert!(from_dungeon.is_empty());
+
+        let to_dungeon = world
+            .inbound_routes(dungeon_node.id)
+            .expect("inbound query should return reverse set");
+        assert_eq!(to_dungeon.len(), 1);
+        assert_eq!(to_dungeon[0], tunnel);
+    }
+
     /// SPEC_v4 Task 4d — `inbound_routes` should return only routes whose
     /// destination is the provided place.
     ///
