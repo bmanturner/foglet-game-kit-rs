@@ -486,7 +486,9 @@ pub struct InventorySection {
 /// `[world_ticks]` section: durable scheduler controls (v4 Task 9).
 ///
 /// `enabled` gates registration and execution entrypoints. The
-/// catch-up budget defaults to `100` and must be positive.
+/// catch-up budget defaults to `100` and must be positive. The
+/// login hook stays opt-in so projects control exactly when catch-up
+/// runs in-session.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorldTicksSection {
     /// Enable scheduled world-tick callbacks.
@@ -497,6 +499,15 @@ pub struct WorldTicksSection {
     /// invocation.
     #[serde(default = "default_max_catchup_per_call")]
     pub max_catchup_per_call: u32,
+
+    /// Opt-in runtime hook that runs one `run_due_ticks` pass during
+    /// session startup.
+    ///
+    /// This remains disabled by default so games can keep explicit
+    /// control over catch-up boundaries (for example, on a menu screen
+    /// transition instead of immediately at login).
+    #[serde(default)]
+    pub run_due_ticks_on_login: bool,
 }
 
 impl Default for WorldTicksSection {
@@ -504,6 +515,7 @@ impl Default for WorldTicksSection {
         Self {
             enabled: false,
             max_catchup_per_call: default_max_catchup_per_call(),
+            run_due_ticks_on_login: false,
         }
     }
 }
@@ -677,6 +689,11 @@ impl GameConfig {
         if self.world_ticks.max_catchup_per_call == 0 {
             return Err(ConfigError::Validate(
                 "[world_ticks].max_catchup_per_call must be greater than zero".into(),
+            ));
+        }
+        if self.world_ticks.run_due_ticks_on_login && !self.world_ticks.enabled {
+            return Err(ConfigError::Validate(
+                "[world_ticks].run_due_ticks_on_login requires [world_ticks].enabled = true".into(),
             ));
         }
         if self.presence.enabled && !self.spatial.enabled {
@@ -1036,6 +1053,7 @@ start_y = 0
         assert!(!config.inventory.enabled);
         assert!(!config.world_ticks.enabled);
         assert_eq!(config.world_ticks.max_catchup_per_call, 100);
+        assert!(!config.world_ticks.run_due_ticks_on_login);
     }
 
     #[test]
@@ -1076,6 +1094,62 @@ enabled = true
         assert!(config.inventory.enabled);
         assert!(config.world_ticks.enabled);
         assert_eq!(config.world_ticks.max_catchup_per_call, 100);
+        assert!(!config.world_ticks.run_due_ticks_on_login);
+    }
+
+    #[test]
+    fn parses_world_ticks_login_hook_when_enabled() {
+        // Task 11d: login-driven catch-up is opt-in and explicit.
+        let config = GameConfig::from_toml_str(
+            r#"
+[game]
+title = "Login Hook"
+slug = "login-hook"
+description = ""
+min_width = 80
+min_height = 24
+start_map = "lobby"
+start_x = 0
+start_y = 0
+
+[world_ticks]
+enabled = true
+run_due_ticks_on_login = true
+"#,
+        )
+        .unwrap();
+        assert!(config.world_ticks.enabled);
+        assert!(config.world_ticks.run_due_ticks_on_login);
+    }
+
+    #[test]
+    fn world_ticks_login_hook_requires_world_ticks_enabled() {
+        let err = GameConfig::from_toml_str(
+            r#"
+[game]
+title = "Login Hook Without Scheduler"
+slug = "login-hook-off"
+description = ""
+min_width = 80
+min_height = 24
+start_map = "lobby"
+start_x = 0
+start_y = 0
+
+[world_ticks]
+run_due_ticks_on_login = true
+"#,
+        )
+        .unwrap_err();
+        match err {
+            ConfigError::Validate(msg) => {
+                assert!(
+                    msg.contains("run_due_ticks_on_login") && msg.contains("[world_ticks].enabled"),
+                    "error should mention enabling world_ticks: {msg}"
+                );
+            }
+            other => panic!("expected Validate, got {other:?}"),
+        }
     }
 
     #[test]

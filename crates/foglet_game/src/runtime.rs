@@ -98,6 +98,7 @@ use crate::terminal::{
     arm_panic_hook, install_panic_hook, CrosstermBackend as TermCrosstermBackend, TerminalGuard,
 };
 use crate::world_db::{WorldDb, WorldDbError, WorldDbOptions};
+use crate::world_ticks::WorldTickError;
 
 /// How long the runtime is willing to wait on the event source before
 /// firing a [`Screen::tick`].
@@ -237,6 +238,16 @@ pub enum GameError {
     /// the operator without any raw-mode side effects.
     #[error(transparent)]
     WorldOpen(#[from] WorldDbError),
+
+    /// Querying the canonical SQLite timestamp for the optional
+    /// login-time world-tick catch-up hook failed.
+    #[error("failed to query login tick timestamp: {0}")]
+    WorldTickNow(String),
+
+    /// The optional login-time world-tick catch-up hook failed while
+    /// running due tasks.
+    #[error("failed to run world ticks on login: {0}")]
+    WorldTickOnLogin(String),
 }
 
 /// Convenience alias matching SPEC §8.1's `GameResult<T>`.
@@ -743,7 +754,7 @@ pub fn run_built_with_opener(mut built: BuiltGame, open_world: &WorldOpenerFn) -
     // inside the alternate screen" hazard that SPEC §7.3 explicitly
     // forbids. The opener is injected so tests can substitute a
     // failing implementation without needing a real broken path.
-    let world_db = open_world(&config)?;
+    let mut world_db = open_world(&config)?;
 
     // Live terminal size. crossterm::terminal::size works on a TTY
     // before raw mode is engaged; using it here keeps the size check
@@ -795,7 +806,7 @@ pub fn run_built_with_opener(mut built: BuiltGame, open_world: &WorldOpenerFn) -
         built,
         &config,
         &foglet,
-        world_db.as_ref(),
+        world_db.as_mut(),
         (w, h),
         &mut terminal,
         &mut events,
@@ -840,6 +851,36 @@ fn invoke_save(on_save: &mut dyn FnMut() -> Result<(), GameError>) -> GameResult
     })
 }
 
+/// Run one optional login-time world-tick catch-up pass.
+///
+/// This hook is intentionally opt-in via
+/// `[world_ticks].run_due_ticks_on_login`; most games should decide
+/// explicitly whether to pay callback latency during session startup
+/// versus on a later screen transition.
+fn run_due_ticks_on_login_if_enabled(
+    config: &GameConfig,
+    world_db: Option<&mut WorldDb>,
+) -> GameResult<()> {
+    if !config.world_ticks.enabled || !config.world_ticks.run_due_ticks_on_login {
+        return Ok(());
+    }
+
+    let Some(world_db) = world_db else {
+        return Ok(());
+    };
+
+    let now: String = world_db
+        .connection()
+        .query_row("SELECT datetime('now')", [], |row| row.get(0))
+        .map_err(|source| GameError::WorldTickNow(source.to_string()))?;
+
+    world_db
+        .run_due_ticks(&now, config.world_ticks.max_catchup_per_call)
+        .map_err(|source: WorldTickError| GameError::WorldTickOnLogin(source.to_string()))?;
+
+    Ok(())
+}
+
 /// Drive the runtime loop against caller-supplied I/O.
 ///
 /// This is the testable seam. All the orchestration lives here; the
@@ -855,6 +896,9 @@ fn invoke_save(on_save: &mut dyn FnMut() -> Result<(), GameError>) -> GameResult
 ///
 /// ## Behaviour summary
 ///
+/// - **Optional login catch-up**: when
+///   `[world_ticks].run_due_ticks_on_login = true`, run one bounded
+///   `WorldDb::run_due_ticks` pass before first render.
 /// - **Render** the top screen each iteration *before* polling for
 ///   input. Rendering first means the player sees the new state
 ///   immediately after a transition rather than after the next event.
@@ -873,7 +917,7 @@ pub fn run_with_io<B, E>(
     mut built: BuiltGame,
     config: &GameConfig,
     foglet: &FogletContext,
-    world_db: Option<&WorldDb>,
+    mut world_db: Option<&mut WorldDb>,
     initial_size: (u16, u16),
     terminal: &mut Terminal<B>,
     events: &mut E,
@@ -883,6 +927,8 @@ where
     B: Backend,
     E: EventSource,
 {
+    run_due_ticks_on_login_if_enabled(config, world_db.as_deref_mut())?;
+
     // Defensive: `BuiltGame` invariant says the stack is non-empty,
     // but we re-check here so a future BuiltGame that allows zero
     // screens cannot accidentally drive the loop into a `last_mut()
@@ -910,7 +956,7 @@ where
                 .last_mut()
                 .expect("non-empty: checked above and after every transition");
             let mut ctx = GameContext::new(config, foglet, size);
-            if let Some(db) = world_db {
+            if let Some(db) = world_db.as_deref() {
                 ctx = ctx.with_world_db(db);
             }
             terminal
@@ -934,7 +980,7 @@ where
                 size = (width, height);
                 let top = built.screens.last_mut().expect("non-empty");
                 let mut ctx = GameContext::new(config, foglet, size);
-                if let Some(db) = world_db {
+                if let Some(db) = world_db.as_deref() {
                     ctx = ctx.with_world_db(db);
                 }
                 top.on_resize(&mut ctx, width, height)
@@ -942,7 +988,7 @@ where
             Some(other) => {
                 let top = built.screens.last_mut().expect("non-empty");
                 let mut ctx = GameContext::new(config, foglet, size);
-                if let Some(db) = world_db {
+                if let Some(db) = world_db.as_deref() {
                     ctx = ctx.with_world_db(db);
                 }
                 top.handle_input(&mut ctx, other)
@@ -954,7 +1000,7 @@ where
                 next_tick = Instant::now() + TICK_INTERVAL;
                 let top = built.screens.last_mut().expect("non-empty");
                 let mut ctx = GameContext::new(config, foglet, size);
-                if let Some(db) = world_db {
+                if let Some(db) = world_db.as_deref() {
                     ctx = ctx.with_world_db(db);
                 }
                 top.tick(&mut ctx)
@@ -1012,6 +1058,8 @@ mod tests {
     use std::cell::RefCell;
     use std::collections::VecDeque;
     use std::rc::Rc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
 
     /// A do-nothing screen for builder tests. Render is required by
     /// the trait; nothing else needs to be implemented.
@@ -2352,7 +2400,7 @@ mod tests {
         }
 
         let tmp = tempfile::tempdir().expect("tempdir");
-        let db = WorldDb::open(tmp.path().join("world.sqlite")).expect("open db");
+        let mut db = WorldDb::open(tmp.path().join("world.sqlite")).expect("open db");
 
         let cfg = fixture_config();
         let fc = fixture_context();
@@ -2372,7 +2420,7 @@ mod tests {
             built,
             &cfg,
             &fc,
-            Some(&db),
+            Some(&mut db),
             (40, 10),
             &mut term,
             &mut events,
@@ -2435,6 +2483,102 @@ mod tests {
         assert!(
             !*saw_some.borrow(),
             "ctx.world_db must remain None when run_with_io is given None"
+        );
+    }
+
+    #[test]
+    fn run_with_io_runs_due_ticks_on_login_when_enabled() {
+        // Task 11d: the runtime may opt in to one login-time catch-up
+        // pass before entering the normal event loop.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut db = WorldDb::open(tmp.path().join("world.sqlite")).expect("open db");
+        db.apply_migration(&crate::world_ticks::WORLD_TICK_TASKS_MIGRATION)
+            .expect("install world_tick_tasks migration");
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_cb = Arc::clone(&calls);
+        db.register_tick("dock-restock", 60, move |_tx| {
+            calls_for_cb.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        })
+        .expect("register due task");
+
+        let mut cfg = fixture_config();
+        cfg.world_ticks.enabled = true;
+        cfg.world_ticks.run_due_ticks_on_login = true;
+
+        let fc = fixture_context();
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let screen = ScriptedScreen::new("title", log, vec![ScreenCommand::Quit], vec![], vec![]);
+        let built = make_built(Box::new(screen));
+        let mut term = make_terminal();
+        let mut events = VecEventSource::new(vec![Some(Input::Char('q'))]);
+        let mut on_save: Box<dyn FnMut() -> Result<(), GameError>> = Box::new(|| Ok(()));
+
+        let reason = run_with_io(
+            built,
+            &cfg,
+            &fc,
+            Some(&mut db),
+            (40, 10),
+            &mut term,
+            &mut events,
+            &mut on_save,
+        )
+        .expect("loop ok");
+
+        assert_eq!(reason, ExitReason::Quit);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "enabled login hook should run one due tick callback before loop dispatch"
+        );
+    }
+
+    #[test]
+    fn run_with_io_skips_login_tick_hook_when_disabled() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut db = WorldDb::open(tmp.path().join("world.sqlite")).expect("open db");
+        db.apply_migration(&crate::world_ticks::WORLD_TICK_TASKS_MIGRATION)
+            .expect("install world_tick_tasks migration");
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_cb = Arc::clone(&calls);
+        db.register_tick("room-reset", 60, move |_tx| {
+            calls_for_cb.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        })
+        .expect("register due task");
+
+        let mut cfg = fixture_config();
+        cfg.world_ticks.enabled = true;
+        cfg.world_ticks.run_due_ticks_on_login = false;
+
+        let fc = fixture_context();
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let screen = ScriptedScreen::new("title", log, vec![ScreenCommand::Quit], vec![], vec![]);
+        let built = make_built(Box::new(screen));
+        let mut term = make_terminal();
+        let mut events = VecEventSource::new(vec![Some(Input::Char('q'))]);
+        let mut on_save: Box<dyn FnMut() -> Result<(), GameError>> = Box::new(|| Ok(()));
+
+        let reason = run_with_io(
+            built,
+            &cfg,
+            &fc,
+            Some(&mut db),
+            (40, 10),
+            &mut term,
+            &mut events,
+            &mut on_save,
+        )
+        .expect("loop ok");
+
+        assert_eq!(reason, ExitReason::Quit);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "disabled login hook must not run due tick callbacks"
         );
     }
 }
