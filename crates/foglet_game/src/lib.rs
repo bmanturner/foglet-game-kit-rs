@@ -36,6 +36,7 @@ pub mod config;
 pub mod dialog;
 pub mod dialog_screen;
 pub mod events;
+pub mod factions;
 pub mod foglet;
 pub mod input;
 pub mod leaderboards;
@@ -67,6 +68,7 @@ pub use dialog::{
 };
 pub use dialog_screen::{DialogAction, DialogLayout, DialogScreen};
 pub use events::{EventError, EventRecord, MAX_EVENT_MESSAGE_LEN, WORLD_EVENTS_MIGRATION};
+pub use factions::FACTIONS_MIGRATION;
 pub use foglet::{
     load_context, load_context_from_env, load_context_from_file, load_context_with_options,
     process_env, synthesize_local_dev, ContextError, ContextSource, FogletContext, LoadOptions,
