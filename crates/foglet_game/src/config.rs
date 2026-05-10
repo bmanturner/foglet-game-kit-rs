@@ -679,6 +679,11 @@ impl GameConfig {
                 "[world_ticks].max_catchup_per_call must be greater than zero".into(),
             ));
         }
+        if self.place_recall.enabled && !self.spatial.enabled {
+            return Err(ConfigError::Validate(
+                "[place_recall].enabled requires [spatial].enabled = true".into(),
+            ));
+        }
         // Leaderboard names must be non-empty and unique. Task 8 will
         // key SQL rows by `name`, so a duplicate would silently merge
         // two boards that the author intended to keep separate, and an
@@ -1066,6 +1071,39 @@ enabled = true
         assert!(config.inventory.enabled);
         assert!(config.world_ticks.enabled);
         assert_eq!(config.world_ticks.max_catchup_per_call, 100);
+    }
+
+    #[test]
+    fn place_recall_requires_spatial_be_enabled() {
+        // Task 2c: recall is only meaningful when the place graph is
+        // enabled, so we reject configurations that enable
+        // `[place_recall]` alone.
+        let err = GameConfig::from_toml_str(
+            r#"
+[game]
+title = "Recall"
+slug = "recall"
+description = ""
+min_width = 80
+min_height = 24
+start_map = "lobby"
+start_x = 0
+start_y = 0
+
+[place_recall]
+enabled = true
+"#,
+        )
+        .unwrap_err();
+        match err {
+            ConfigError::Validate(msg) => {
+                assert!(
+                    msg.contains("[place_recall]") && msg.contains("[spatial]"),
+                    "error should mention both toggles: {msg}"
+                );
+            }
+            other => panic!("expected Validate, got {other:?}"),
+        }
     }
 
     #[test]

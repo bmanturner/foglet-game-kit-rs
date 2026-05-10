@@ -11,7 +11,7 @@ One unchecked item per iteration. Dependencies in `[brackets]` must be checked o
 
 - [x] **2a** — Add optional `[spatial]`, `[presence]`, `[place_recall]`, `[inventory]`, and `[world_ticks]` sections to `GameConfig`, each with an `enabled` flag. Test: absent sections leave each primitive disabled. [Task 1]
 - [x] **2b** — Parse `[world_ticks].max_catchup_per_call` as a positive integer with a documented default. Test: zero/negative values fail clearly; absent value applies default. [2a]
-- [ ] **2c** — Reject configs that enable `place_recall` without enabling `spatial`. Test: clear error message. [2a]
+- [x] **2c** — Reject configs that enable `place_recall` without enabling `spatial`. Test: clear error message. [2a]
 - [ ] **2d** — Reject configs that enable `presence` without enabling `spatial`. Test: clear error message. [2a]
 
 ### Task 3 — Place schema and CRUD
