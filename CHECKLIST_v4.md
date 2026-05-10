@@ -95,7 +95,7 @@ One unchecked item per iteration. Dependencies in `[brackets]` must be checked o
 
 ### Task 12 — Documentation
 
-- [ ] **12a** — Add `docs/spatial.md` covering places and routes with at least two distinct game-family examples per concept (e.g., space exploration and dungeon crawling). [Task 3, Task 4]
+- [x] **12a** — Add `docs/spatial.md` covering places and routes with at least two distinct game-family examples per concept (e.g., space exploration and dungeon crawling). [Task 3, Task 4]
 - [ ] **12b** — Add `docs/presence-and-recall.md` explaining presence vs. recall as separate primitives, with examples for each. [Task 5, Task 6]
 - [ ] **12c** — Add `docs/inventory.md` covering owner-keyed slots, atomic transfer, the `on_commit` callback pattern, and worked examples for at least two genres (e.g., RPG inventory transfer and trading-post commerce). [Task 7, Task 8]
 - [ ] **12d** — Add `docs/world-ticks.md` explaining the tick model, the lazy-on-login vs. cron `fgk tick` patterns, idempotency guarantees, and the `max_catchup_per_call` bound. [Task 9, Task 10]
