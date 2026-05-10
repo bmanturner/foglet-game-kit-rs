@@ -120,7 +120,7 @@ One unchecked item per iteration. Dependencies in `[brackets]` must be checked o
 - [x] Place recall is per-player, idempotent, and never auto-touched by movement
 - [x] Inventory supports atomic transfer with `on_commit` rollback and distinct error variants
 - [x] World ticks are durable, idempotent under concurrency, and bounded by `max_catchup_per_call`
-- [ ] `fgk tick` CLI subcommand exists, exits cleanly, and is documented for cron use
+- [x] `fgk tick` CLI subcommand exists, exits cleanly, and is documented for cron use
 - [ ] Documentation explains every v4 primitive in genre-neutral terms with at least two distinct game-family examples each
 - [ ] Documentation explicitly rejects real-time multiplayer and long-lived daemons for v4
 - [ ] Documentation explains the deliberate skip of sample-game integration in this version
