@@ -12,6 +12,8 @@
 //! - A **dungeon crawler** door can interpret it as patrol reset.
 
 use std::fs;
+use std::process::Command as StdCommand;
+use std::time::Duration;
 
 use assert_cmd::Command;
 use foglet_game::{WorldDb, WORLD_TICK_TASKS_MIGRATION};
@@ -118,5 +120,74 @@ fn fgk_tick_reports_missing_world_db_and_does_not_create_file() {
     assert!(
         !project.join("world").exists(),
         "failure should not create world directory"
+    );
+}
+
+#[test]
+fn fgk_tick_can_be_interrupted_during_a_callback_without_advancing_last_run_at() {
+    let td = tempfile::tempdir().expect("tempdir");
+    let project = td.path().join("interruption-project");
+    fs::create_dir_all(&project).expect("create project dir");
+    write_fixture_project(&project);
+
+    let world_path = project.join("world").join("world.sqlite");
+    let mut world = WorldDb::open(&world_path).expect("seed world db");
+    world
+        .apply_migration(&WORLD_TICK_TASKS_MIGRATION)
+        .expect("world tick migration exists");
+
+    world
+        .register_tick("interruption_tick", 600, |_tx| Ok(()))
+        .expect("seed interruption task");
+
+    let mut command = StdCommand::new(env!("CARGO_BIN_EXE_fgk"));
+    command
+        .arg("tick")
+        .arg("--project")
+        .arg(&project)
+        .env("FGK_TICK_TEST_CALLBACK_DELAY_MS", "2000");
+
+    let mut child = command.spawn().expect("spawn fgk tick command");
+    std::thread::sleep(Duration::from_millis(250));
+    assert!(
+        child
+            .try_wait()
+            .expect("checking fgk tick child status")
+            .is_none(),
+        "fgk tick should still be running while interruption test waits"
+    );
+
+    #[cfg(unix)]
+    {
+        let signal = std::process::Command::new("kill")
+            .arg("-INT")
+            .arg(child.id().to_string())
+            .status()
+            .expect("send Ctrl-C to fgk tick");
+        assert!(signal.success(), "SIGINT dispatch should work");
+    }
+
+    #[cfg(not(unix))]
+    {
+        child.kill().expect("terminate fgk tick command");
+    }
+
+    let output = child.wait_with_output().expect("wait for interrupted tick");
+    assert!(
+        !output.status.success(),
+        "interrupted command should not succeed"
+    );
+
+    let last_run: Option<String> = world
+        .connection()
+        .query_row(
+            "SELECT last_run_at FROM world_tick_tasks WHERE key = ?1",
+            ["interruption_tick"],
+            |row| row.get(0),
+        )
+        .expect("query last_run_at");
+    assert!(
+        last_run.is_none(),
+        "interrupted callback must not advance last_run_at"
     );
 }

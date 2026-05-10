@@ -22,6 +22,8 @@
 //!   room cycle.
 
 use std::path::Path;
+use std::thread;
+use std::time::Duration;
 
 use foglet_game::{
     ConfigError, GameConfig, WorldDb, WorldDbError, WorldTickError, WORLD_TICK_TASKS_MIGRATION,
@@ -155,6 +157,11 @@ pub fn run_tick(project_dir: &Path) -> Result<TickRunSummary, TickCommandError> 
             source,
         })?;
 
+    let callback_delay_ms = std::env::var("FGK_TICK_TEST_CALLBACK_DELAY_MS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .filter(|delay_ms| *delay_ms > 0);
+
     world
         .apply_migration(&WORLD_TICK_TASKS_MIGRATION)
         .map_err(|source| TickCommandError::EnsureTickTable { source })?;
@@ -182,8 +189,14 @@ pub fn run_tick(project_dir: &Path) -> Result<TickRunSummary, TickCommandError> 
     };
 
     for (key, interval_seconds) in tasks {
+        let delay_ms = callback_delay_ms;
         world
-            .register_tick(&key, interval_seconds, |_tx| Ok(()))
+            .register_tick(&key, interval_seconds, move |_tx| {
+                if let Some(delay_ms) = delay_ms {
+                    thread::sleep(Duration::from_millis(delay_ms));
+                }
+                Ok(())
+            })
             .map_err(|source| TickCommandError::RegisterCallback { key, source })?;
     }
 
