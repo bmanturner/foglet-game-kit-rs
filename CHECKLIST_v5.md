@@ -13,7 +13,7 @@ One unchecked item per iteration. Dependencies in `[brackets]` must be checked o
 - [x] **2b** — Parse `[screens.event_log].default_page_size` as a positive integer with a documented default. Test: zero/negative values fail clearly; absent value applies default. [2a]
 - [x] **2c** — Reject configs that enable `job_board` without `contracts`. Test: clear error message. [2a]
 - [x] **2d** — Reject configs that enable `travel` without `spatial` and `presence`. Test: clear error message. [2a]
-- [ ] **2e** — Reject configs that enable `inventory_capacity` without `inventory`. Test: clear error message. [2a]
+- [x] **2e** — Reject configs that enable `inventory_capacity` without `inventory`. Test: clear error message. [2a]
 - [ ] **2f** — Reject configs that enable `screens.event_log` without v2 events. Test: clear error message. [2a]
 
 ### Task 3 — Contract schema and CRUD

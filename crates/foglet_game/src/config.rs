@@ -840,6 +840,11 @@ impl GameConfig {
                     .into(),
             ));
         }
+        if self.inventory_capacity.enabled && !self.inventory.enabled {
+            return Err(ConfigError::Validate(
+                "[inventory_capacity].enabled requires [inventory].enabled = true".into(),
+            ));
+        }
         // Leaderboard names must be non-empty and unique. Task 8 will
         // key SQL rows by `name`, so a duplicate would silently merge
         // two boards that the author intended to keep separate, and an
@@ -1283,6 +1288,9 @@ enabled = true
 [travel]
 enabled = true
 
+[inventory]
+enabled = true
+
 [inventory_capacity]
 enabled = true
 
@@ -1564,6 +1572,39 @@ enabled = true
                         && msg.contains("[spatial]")
                         && msg.contains("[presence]"),
                     "error should mention travel/spatial/presence toggles: {msg}"
+                );
+            }
+            other => panic!("expected Validate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn inventory_capacity_requires_inventory_be_enabled() {
+        // CHECKLIST_v5 Task 2e: capacity enforcement sits on top of
+        // inventory slots, so enabling `[inventory_capacity]` without
+        // `[inventory]` would expose a helper with no backing rows.
+        let err = GameConfig::from_toml_str(
+            r#"
+[game]
+title = "Capacity Without Inventory"
+slug = "capacity-without-inventory"
+description = ""
+min_width = 80
+min_height = 24
+start_map = "lobby"
+start_x = 0
+start_y = 0
+
+[inventory_capacity]
+enabled = true
+"#,
+        )
+        .unwrap_err();
+        match err {
+            ConfigError::Validate(msg) => {
+                assert!(
+                    msg.contains("[inventory_capacity]") && msg.contains("[inventory]"),
+                    "error should mention both toggles: {msg}"
                 );
             }
             other => panic!("expected Validate, got {other:?}"),
