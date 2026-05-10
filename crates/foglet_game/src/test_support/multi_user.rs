@@ -11,6 +11,7 @@ use crate::config::{
 };
 use crate::foglet::{ContextSource, FogletContext};
 use crate::roles::FogletRole;
+use crate::screen::GameContext;
 use crate::world_db::{WorldDb, WorldDbError};
 
 /// Test-only harness with one shared world DB and per-user roots.
@@ -78,6 +79,12 @@ pub enum MultiUserHarnessError {
         #[source]
         source: WorldDbError,
     },
+    /// A requested handle is not registered in the harness.
+    #[error("unknown harness user handle `{handle}`")]
+    UnknownHandle {
+        /// Requested handle.
+        handle: String,
+    },
 }
 
 impl MultiUserHarness {
@@ -123,6 +130,27 @@ impl MultiUserHarness {
     #[must_use]
     pub fn foglet_for(&self, handle: &str) -> Option<&FogletContext> {
         self.users.get(handle).map(|user| &user.foglet)
+    }
+
+    /// Build a [`GameContext`] for one registered user.
+    pub fn context_for(&self, handle: &str) -> Result<GameContext<'_>, MultiUserHarnessError> {
+        let user = self
+            .users
+            .get(handle)
+            .ok_or_else(|| MultiUserHarnessError::UnknownHandle {
+                handle: handle.to_string(),
+            })?;
+        Ok(GameContext::new(&self.config, &user.foglet, (80, 24)).with_world_db(&self.world_db))
+    }
+
+    /// Run a closure with one registered user's [`GameContext`].
+    pub fn with_user<R>(
+        &self,
+        handle: &str,
+        f: impl FnOnce(&GameContext<'_>) -> R,
+    ) -> Result<R, MultiUserHarnessError> {
+        let ctx = self.context_for(handle)?;
+        Ok(f(&ctx))
     }
 
     /// Harness temp root. Exposed for cleanup assertions.
@@ -283,5 +311,28 @@ mod tests {
             }
             other => panic!("expected duplicate handle error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn context_for_and_with_user_return_per_handle_contexts_with_isolated_save_roots() {
+        let harness = MultiUserHarness::builder()
+            .add_user("alice", FogletRole::User)
+            .add_user("bob", FogletRole::Sysop)
+            .build()
+            .expect("harness builds");
+
+        let alice = harness.context_for("alice").expect("alice context");
+        let bob_username = harness
+            .with_user("bob", |ctx| ctx.foglet.username.clone())
+            .expect("bob callback runs");
+
+        assert_eq!(alice.foglet.username.as_deref(), Some("alice"));
+        assert_eq!(bob_username.as_deref(), Some("bob"));
+        assert!(alice.world_db.is_some());
+        assert_ne!(
+            harness.save_root_for("alice"),
+            harness.save_root_for("bob"),
+            "per-user save roots must be isolated"
+        );
     }
 }
