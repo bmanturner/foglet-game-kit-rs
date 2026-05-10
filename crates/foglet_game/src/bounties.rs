@@ -731,6 +731,112 @@ RETURNING id, created_at, posted_by_player_id, title, description, \
         }
     }
 
+    /// Transition a bounty from `claimed` to `completed` and stamp
+    /// `completed_at` (SPEC_v3 §4.5 / §Task 7d).
+    ///
+    /// The contract is "if and only if the row was still `claimed`,
+    /// it is now `completed` with a `completed_at` timestamp; the
+    /// `reward`, `claimed_by_player_id`, and `claimed_at` columns
+    /// are preserved verbatim so the audit view shows who claimed
+    /// the bounty, when, and what payout they earned. Any other
+    /// current state (still `open`, already `completed`, swept to
+    /// `expired`) surfaces as [`BountyError::InvalidTransition`]".
+    ///
+    /// SPEC §4.5 says "Game code validates completion evidence" —
+    /// the kit's responsibility is the transactional state flip,
+    /// not the evidence. Game code calls `complete_bounty` after
+    /// it has validated whatever the player submitted (a photograph
+    /// id, a captured suspect, a delivered item) against its own
+    /// bounty schema. Mirrors the split between
+    /// [`Self::resolve_challenge`] (kit owns the transition) and
+    /// the game-side `result` payload (game owns the schema).
+    ///
+    /// # No claimant gate
+    ///
+    /// `complete_bounty` does not take a `completer_player_id` and
+    /// does not gate on `claimed_by_player_id`. Game-design choices
+    /// like "anyone can submit evidence" vs "only the claimant can
+    /// complete" vs "the poster confirms completion" all live in
+    /// the calling code's evidence-validation step. Pinning the
+    /// claimant inside the kit would force one of those choices on
+    /// every consuming game; SPEC §4.5 deliberately leaves it open.
+    /// Same convention as [`Self::resolve_challenge`], which doesn't
+    /// gate on which side calls it either.
+    ///
+    /// # Conditional UPDATE shape
+    ///
+    /// One statement folds the two checks into the WHERE clause so
+    /// the success path is a single round-trip:
+    ///
+    /// 1. `id = ?1` — addresses the row.
+    /// 2. `state = 'claimed'` — only the `claimed -> completed`
+    ///    transition is legal (SPEC §4.5); any other current state
+    ///    falls through to the diagnostic SELECT for typed-error
+    ///    mapping.
+    ///
+    /// The bookkeeping fields written in the same statement are
+    /// `state = 'completed'` and `completed_at = CURRENT_TIMESTAMP`.
+    /// `reward`, `claimed_by_player_id`, and `claimed_at` are
+    /// deliberately not in the SET list — they were set on earlier
+    /// transitions and must survive untouched so the §Task 7d
+    /// "reward payload retained" acceptance criterion holds.
+    ///
+    /// Note this path does NOT gate on `expires_at`: a `claimed`
+    /// row already passed the deadline gate at claim time
+    /// ([`Self::claim_bounty`]), and the deadline is irrelevant
+    /// once the bounty is in flight. The shared
+    /// `diagnose_failed_bounty_transition` helper restricts
+    /// [`BountyError::Expired`] to `attempted == Claimed` so this
+    /// path can never accidentally surface it. (A separate sweeper
+    /// path — Task 7e — will flip lapsed `claimed` rows to
+    /// `expired`, after which a future `complete_bounty` against
+    /// the same id surfaces `InvalidTransition` from `expired`.)
+    ///
+    /// # Failure
+    ///
+    /// - [`BountyError::NotFound`] — no row matches `id`.
+    /// - [`BountyError::InvalidTransition`] — row is in any state
+    ///   other than `claimed` (still `open`, already `completed`,
+    ///   or swept to `expired` by Task 7e).
+    /// - [`BountyError::Sqlite`] — any other `rusqlite` error.
+    ///
+    /// # Concurrency
+    ///
+    /// Takes `&self`: a single `UPDATE … RETURNING` plus an
+    /// optional diagnostic `SELECT` under the configured busy
+    /// timeout. SPEC §4.5 requires "Claim/complete transitions
+    /// MUST be transactional"; a single conditional `UPDATE` is
+    /// natively atomic in SQLite, so no explicit `BEGIN`/`COMMIT`
+    /// wrapper is needed here. Same borrow shape as
+    /// [`Self::claim_bounty`].
+    pub fn complete_bounty(&self, bounty_id: i64) -> Result<Bounty, BountyError> {
+        // Conditional UPDATE: only a `claimed` row gets transitioned.
+        // The SET list intentionally excludes `reward`,
+        // `claimed_by_player_id`, and `claimed_at` so the §Task 7d
+        // "reward payload retained" acceptance and the audit-view
+        // attribution survive the flip.
+        const UPDATE_SQL: &str = "\
+UPDATE bounties \
+SET state = 'completed', \
+    completed_at = CURRENT_TIMESTAMP \
+WHERE id = ?1 \
+  AND state = 'claimed' \
+RETURNING id, created_at, posted_by_player_id, title, description, \
+          reward, state, claimed_by_player_id, claimed_at, \
+          completed_at, expires_at";
+
+        match self
+            .connection()
+            .query_row(UPDATE_SQL, rusqlite::params![bounty_id], row_to_bounty)
+        {
+            Ok(bounty) => Ok(bounty),
+            Err(rusqlite::Error::QueryReturnedNoRows) => {
+                Err(self.diagnose_failed_bounty_transition(bounty_id, BountyState::Completed))
+            }
+            Err(source) => Err(BountyError::Sqlite { source }),
+        }
+    }
+
     /// Map a no-rows response from a bounty-transition `UPDATE` onto
     /// the right typed [`BountyError`] by reading the row's current
     /// state.
@@ -1575,6 +1681,248 @@ mod tests {
         assert_eq!(claimed.state, "claimed");
         assert_eq!(claimed.claimed_by_player_id, Some(alice_id));
         assert!(claimed.expires_at.is_none());
+    }
+
+    /// SPEC_v3 §Task 7d acceptance, half 1: a `claimed` bounty
+    /// transitions to `completed` and stamps `completed_at`. Pin
+    /// the full post-conditions in one place so a regression in
+    /// any of them flunks here:
+    ///
+    /// - `state` flips from `'claimed'` to `'completed'`.
+    /// - `completed_at` is stamped (not left NULL).
+    /// - The post-completion row is *durable* — re-reading by
+    ///   primary key matches the `RETURNING` echo, guarding
+    ///   against a regression that returned a phantom row from
+    ///   `RETURNING` without committing.
+    #[test]
+    fn complete_bounty_transitions_claimed_to_completed() {
+        let (_dir, world, poster_id, alice_id, _bob_id) = world_with_poster_and_two_claimants();
+        let posted = world
+            .post_bounty(
+                Some(poster_id),
+                "Find the missing pocketwatch",
+                "Bring photographic evidence.",
+                r#"{"credits":250}"#,
+                None,
+            )
+            .expect("post_bounty succeeds");
+        let claimed = world
+            .claim_bounty(posted.id, alice_id)
+            .expect("claim_bounty succeeds");
+
+        let completed = world
+            .complete_bounty(posted.id)
+            .expect("complete_bounty succeeds on a claimed bounty");
+
+        assert_eq!(
+            completed.state,
+            BountyState::Completed.as_str(),
+            "claimed bounty must transition to 'completed'"
+        );
+        assert_eq!(completed.state, "completed");
+        assert!(
+            completed.completed_at.is_some(),
+            "complete_bounty must stamp completed_at"
+        );
+
+        // Durability: re-read by primary key and confirm the row
+        // matches the RETURNING echo. Catches a regression where
+        // RETURNING echoed an in-flight UPDATE that never
+        // committed.
+        let stored = world
+            .connection()
+            .query_row(
+                "SELECT id, created_at, posted_by_player_id, title, description, \
+                        reward, state, claimed_by_player_id, claimed_at, \
+                        completed_at, expires_at \
+                 FROM bounties WHERE id = ?1",
+                rusqlite::params![posted.id],
+                row_to_bounty,
+            )
+            .expect("primary-key SELECT decodes the row");
+        assert_eq!(stored, completed, "stored row must equal RETURNING row");
+        // Sanity: the durable row's claim attribution must match
+        // what `claim_bounty` originally wrote — pinning the audit
+        // chain end-to-end.
+        assert_eq!(stored.claimed_by_player_id, claimed.claimed_by_player_id);
+        assert_eq!(stored.claimed_at, claimed.claimed_at);
+    }
+
+    /// SPEC_v3 §Task 7d acceptance, half 2: the **reward payload
+    /// is retained** through completion. Same applies to every
+    /// other write-once column (`title`, `description`,
+    /// `posted_by_player_id`, `created_at`, `expires_at`) and the
+    /// claim-time bookkeeping (`claimed_by_player_id`,
+    /// `claimed_at`). A regression that broadened the SET list
+    /// would null out one of these mid-UPDATE; pin every survivor
+    /// here so that flunks at `cargo test`. Without this pin the
+    /// only test on the path is the state flip, and a "completed
+    /// but reward NULL" row is the worst kind of corruption:
+    /// payable but empty.
+    #[test]
+    fn complete_bounty_retains_reward_and_claim_attribution() {
+        let (_dir, world, poster_id, alice_id, _bob_id) = world_with_poster_and_two_claimants();
+        // A realistic reward payload that exercises a few JSON
+        // shapes — credits, items, faction reputation — so a
+        // regression that re-serialised the column would corrupt
+        // visibly.
+        let reward_json = r#"{"credits":250,"items":["pocketwatch"],"rep":{"blue_desk":3}}"#;
+        let posted = world
+            .post_bounty(
+                Some(poster_id),
+                "Find the missing pocketwatch",
+                "Bring photographic evidence.",
+                reward_json,
+                Some("2099-01-01T00:00:00Z"),
+            )
+            .expect("post_bounty succeeds");
+        let claimed = world
+            .claim_bounty(posted.id, alice_id)
+            .expect("claim_bounty succeeds");
+
+        let completed = world
+            .complete_bounty(posted.id)
+            .expect("complete_bounty succeeds");
+
+        // The §Task 7d "reward payload retained" acceptance —
+        // verbatim, byte-for-byte. Pinning equality on the JSON
+        // string (not a parsed shape) catches a regression that
+        // re-encoded the value through a JSON round-trip and lost
+        // key ordering or whitespace.
+        assert_eq!(
+            completed.reward, reward_json,
+            "reward must be preserved verbatim through completion"
+        );
+        // Every other write-once / claim-time column must survive.
+        assert_eq!(completed.id, posted.id);
+        assert_eq!(completed.created_at, posted.created_at);
+        assert_eq!(completed.posted_by_player_id, posted.posted_by_player_id);
+        assert_eq!(completed.title, posted.title);
+        assert_eq!(completed.description, posted.description);
+        assert_eq!(completed.expires_at, posted.expires_at);
+        assert_eq!(
+            completed.claimed_by_player_id,
+            Some(alice_id),
+            "claim attribution must survive completion"
+        );
+        assert_eq!(
+            completed.claimed_at, claimed.claimed_at,
+            "claimed_at timestamp must survive completion"
+        );
+    }
+
+    /// Completing a bounty that is still `open` (never claimed)
+    /// must surface `InvalidTransition { from: "open", to:
+    /// Completed }` rather than silently flipping or surfacing a
+    /// confusing `NotFound`. The SPEC §4.5 lifecycle is
+    /// `open -> claimed -> completed`; skipping the claim step is
+    /// not a legal transition.
+    #[test]
+    fn complete_bounty_rejects_unclaimed_open_bounty() {
+        let (_dir, world, poster_id) = world_with_poster();
+        let posted = world
+            .post_bounty(
+                Some(poster_id),
+                "Find the missing pocketwatch",
+                "Bring photographic evidence.",
+                r#"{"credits":250}"#,
+                None,
+            )
+            .expect("post_bounty succeeds");
+
+        let err = world
+            .complete_bounty(posted.id)
+            .expect_err("completing an unclaimed bounty must fail");
+        assert!(
+            matches!(
+                &err,
+                BountyError::InvalidTransition { id, from, to }
+                    if *id == posted.id && from == "open" && *to == BountyState::Completed
+            ),
+            "expected InvalidTransition from 'open' to Completed, got {err:?}"
+        );
+
+        // Row-unchanged invariant: state still 'open',
+        // completed_at still NULL. Catches a regression that
+        // wrote completed_at before checking state.
+        let (state, completed_at): (String, Option<String>) = world
+            .connection()
+            .query_row(
+                "SELECT state, completed_at FROM bounties WHERE id = ?1",
+                rusqlite::params![posted.id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("durable lookup");
+        assert_eq!(state, "open");
+        assert!(completed_at.is_none());
+    }
+
+    /// Completing a bounty that has already been completed must be
+    /// rejected with `InvalidTransition { from: "completed", to:
+    /// Completed }`. SPEC §4.5 makes `completed` a terminal state.
+    /// Pinning this guards against a regression that loosened the
+    /// `state = 'claimed'` predicate to permit a completion
+    /// re-stamp (which would also re-stamp `completed_at`,
+    /// corrupting the audit timeline).
+    #[test]
+    fn complete_bounty_rejects_already_completed_bounty() {
+        let (_dir, world, poster_id, alice_id, _bob_id) = world_with_poster_and_two_claimants();
+        let posted = world
+            .post_bounty(Some(poster_id), "title", "desc", r#"{"credits":1}"#, None)
+            .expect("post_bounty succeeds");
+        world
+            .claim_bounty(posted.id, alice_id)
+            .expect("claim_bounty succeeds");
+        let first = world
+            .complete_bounty(posted.id)
+            .expect("first complete_bounty succeeds");
+
+        let err = world
+            .complete_bounty(posted.id)
+            .expect_err("second complete_bounty must fail");
+        assert!(
+            matches!(
+                &err,
+                BountyError::InvalidTransition { id, from, to }
+                    if *id == posted.id && from == "completed" && *to == BountyState::Completed
+            ),
+            "expected InvalidTransition from 'completed' to Completed, got {err:?}"
+        );
+
+        // The original completed_at timestamp must NOT have been
+        // overwritten by the rejected re-completion. Pin this
+        // explicitly: a regression that stamped completed_at
+        // before checking state would silently advance the audit
+        // timeline on every duplicate call.
+        let durable_completed_at: Option<String> = world
+            .connection()
+            .query_row(
+                "SELECT completed_at FROM bounties WHERE id = ?1",
+                rusqlite::params![posted.id],
+                |row| row.get(0),
+            )
+            .expect("durable lookup");
+        assert_eq!(
+            durable_completed_at, first.completed_at,
+            "rejected re-completion must not advance completed_at"
+        );
+    }
+
+    /// A stale id (bounty was deleted, or the caller fabricated
+    /// one) must surface [`BountyError::NotFound`] rather than a
+    /// generic SQL error or a misleading `InvalidTransition`.
+    /// Same shape as `claim_bounty_missing_id_returns_not_found`
+    /// — the §Task 7c equivalent.
+    #[test]
+    fn complete_bounty_missing_id_returns_not_found() {
+        let (_dir, world, _poster_id, _alice_id, _bob_id) = world_with_poster_and_two_claimants();
+        let err = world
+            .complete_bounty(424_242)
+            .expect_err("complete against a missing id must fail");
+        assert!(
+            matches!(err, BountyError::NotFound { id } if id == 424_242),
+            "expected NotFound {{ id: 424242 }}, got {err:?}"
+        );
     }
 
     /// Read column names from `pragma_table_info` in cid order —
