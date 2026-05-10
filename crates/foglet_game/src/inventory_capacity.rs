@@ -785,4 +785,57 @@ mod tests {
             8
         );
     }
+
+    #[test]
+    fn transfer_with_capacity_allows_uncapped_destination() {
+        let dir = tempdir().expect("tempdir creates");
+        let db_path = dir.path().join("world.sqlite");
+        let mut world = WorldDb::open(&db_path).expect("open succeeds");
+        world
+            .apply_migration(&INVENTORY_SLOTS_MIGRATION)
+            .expect("inventory migration applies");
+        world
+            .create_slot("player", 1, "anvil", 5, None, None)
+            .expect("source slot inserts");
+
+        struct UncappedPolicy;
+
+        impl CapacityPolicy for UncappedPolicy {
+            fn item_volume(
+                &self,
+                _item_key: &str,
+                _metadata: &serde_json::Value,
+            ) -> Result<i64, CapacityError> {
+                Ok(10_000)
+            }
+
+            fn owner_capacity(
+                &self,
+                _owner_kind: &str,
+                _owner_id: i64,
+            ) -> Result<Option<i64>, CapacityError> {
+                Ok(None)
+            }
+        }
+
+        let (source, destination) = world
+            .transfer_with_capacity(
+                ("player", 1),
+                ("warehouse", 2),
+                "anvil",
+                5,
+                &UncappedPolicy,
+                Option::<
+                    fn(
+                        &rusqlite::Transaction<'_>,
+                        &crate::inventory::InventorySlot,
+                        &crate::inventory::InventorySlot,
+                    ) -> Result<(), rusqlite::Error>,
+                >::None,
+            )
+            .expect("uncapped transfer succeeds");
+
+        assert_eq!(source.quantity, 0);
+        assert_eq!(destination.quantity, 5);
+    }
 }
