@@ -50,6 +50,16 @@ See [`SPEC.md`](SPEC.md) for the full contract.
   [`docs/presence-and-recall.md`](docs/presence-and-recall.md),
   [`docs/inventory.md`](docs/inventory.md), and
   [`docs/world-ticks.md`](docs/world-ticks.md).
+  v5 adds **workflow composition primitives**: generic Contracts,
+  a unified Job Board, transactional Travel, policy-driven Inventory
+  Capacity, an Event Log screen, and a feature-gated Multi-User local
+  test harness. See [`docs/spec-v5-overview.md`](docs/spec-v5-overview.md),
+  [`docs/contracts.md`](docs/contracts.md),
+  [`docs/job-board.md`](docs/job-board.md),
+  [`docs/travel.md`](docs/travel.md),
+  [`docs/inventory-capacity.md`](docs/inventory-capacity.md),
+  [`docs/event-log-screen.md`](docs/event-log-screen.md), and
+  [`docs/test-support-multi-user.md`](docs/test-support-multi-user.md).
 - **`fgk`** — `new` (scaffolder), `emit-manifest` (Foglet operator
   JSON), and `package` (deployable bundle with a boring auditable
   `run.sh` wrapper).
