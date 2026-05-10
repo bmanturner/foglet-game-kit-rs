@@ -102,7 +102,7 @@ One unchecked item per iteration. Dependencies in `[brackets]` must be checked o
 ### Task 12 — Documentation
 
 - [x] **12a** — Add `docs/contracts.md` covering the lifecycle, opaque payloads, and at least two distinct game-family examples (e.g., RPG escort quest vs. trading-game delivery). [Task 3, Task 4]
-- [ ] **12b** — Add `docs/job-board.md` covering the aggregation model, providers, sanitization, and at least two non-space examples (e.g., tavern board, noir case board). [Task 5, Task 6]
+- [x] **12b** — Add `docs/job-board.md` covering the aggregation model, providers, sanitization, and at least two non-space examples (e.g., tavern board, noir case board). [Task 5, Task 6]
 - [ ] **12c** — Add `docs/travel.md` explaining the transaction order, `validate` and `charge_cost` callbacks, optional recall and events, and two non-space examples (e.g., dungeon room movement, town district navigation). [Task 7]
 - [ ] **12d** — Add `docs/inventory-capacity.md` explaining the `CapacityPolicy` trait, in-transaction enforcement, and two non-space examples (e.g., RPG backpack weight, town warehouse slots). [Task 8]
 - [ ] **12e** — Add `docs/event-log-screen.md` covering scope, formatter callback, embedded mode, and two non-space examples (e.g., dungeon death log, mystery case ledger). [Task 9]
