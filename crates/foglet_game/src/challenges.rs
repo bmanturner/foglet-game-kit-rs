@@ -562,6 +562,78 @@ RETURNING id, created_at, challenger_player_id, target_player_id, \
         }
     }
 
+    /// Transition a challenge from `open` to `declined` (SPEC_v3 §4.2
+    /// / §Task 4d).
+    ///
+    /// The contract is "if and only if the row was still `open`, it
+    /// is now `declined`; otherwise the row is unchanged and the
+    /// helper returns a typed error explaining why". SPEC §4.2 lists
+    /// `open -> declined` as the only legal decline transition; any
+    /// other current state (`accepted`, `declined`, `resolved`,
+    /// `expired`) must surface as
+    /// [`ChallengeError::InvalidTransition`].
+    ///
+    /// Unlike [`Self::accept_challenge`], the decline path does
+    /// **not** gate on `expires_at`: a target can always decline
+    /// while the row is open, even if its deadline has lapsed and
+    /// the sweeper hasn't run yet. SPEC §4.2's "Expired challenges
+    /// cannot be accepted" is specifically scoped to the accept
+    /// transition; declining a stale challenge is harmless and
+    /// occasionally the right outcome (the target sees the lapsed
+    /// challenge in their inbox and explicitly says "no thanks"
+    /// before the sweeper runs).
+    ///
+    /// There is no `declined_at` column in the schema (see
+    /// [`CHALLENGES_MIGRATION`]) — declined is a terminal state with
+    /// no follow-up audit timestamp, so the transition only flips
+    /// `state`. If a future SPEC revision adds a decline timestamp,
+    /// the migration and `Challenge` struct change first, and this
+    /// helper stamps it in the same `UPDATE`.
+    ///
+    /// # Failure
+    ///
+    /// - [`ChallengeError::NotFound`] — no row matches `id`.
+    /// - [`ChallengeError::InvalidTransition`] — row is in any state
+    ///   other than `open`.
+    /// - [`ChallengeError::Sqlite`] — any other `rusqlite` error.
+    ///
+    /// Note that [`ChallengeError::Expired`] is intentionally not in
+    /// the failure set: per SPEC §4.2 the expired-deadline gate
+    /// applies only to acceptance, and the shared
+    /// `diagnose_failed_transition` helper already scopes `Expired`
+    /// to `attempted == Accepted` so a future caller can't
+    /// accidentally surface it on the decline path.
+    ///
+    /// # Concurrency
+    ///
+    /// Takes `&self`: a single `UPDATE … RETURNING` plus an optional
+    /// diagnostic `SELECT` under the configured busy timeout. Same
+    /// borrow shape as [`Self::accept_challenge`].
+    pub fn decline_challenge(&self, challenge_id: i64) -> Result<Challenge, ChallengeError> {
+        // Conditional UPDATE: only an `open` row gets transitioned.
+        // No deadline gate — see helper docs for the SPEC §4.2
+        // rationale.
+        const UPDATE_SQL: &str = "\
+UPDATE challenges \
+SET state = 'declined' \
+WHERE id = ?1 \
+  AND state = 'open' \
+RETURNING id, created_at, challenger_player_id, target_player_id, \
+          kind, stake, state, accepted_at, resolved_at, expires_at, result";
+
+        match self.connection().query_row(
+            UPDATE_SQL,
+            rusqlite::params![challenge_id],
+            row_to_challenge,
+        ) {
+            Ok(challenge) => Ok(challenge),
+            Err(rusqlite::Error::QueryReturnedNoRows) => {
+                Err(self.diagnose_failed_transition(challenge_id, ChallengeState::Declined))
+            }
+            Err(source) => Err(ChallengeError::Sqlite { source }),
+        }
+    }
+
     /// Map a no-rows response from a transition `UPDATE` onto the
     /// right typed [`ChallengeError`] by reading the row state.
     ///
@@ -1231,6 +1303,181 @@ mod tests {
         let (_dir, world) = world_with_challenges();
         let err = world
             .accept_challenge(424_242)
+            .expect_err("missing id must fail");
+        assert!(
+            matches!(err, ChallengeError::NotFound { id } if id == 424_242),
+            "expected NotFound, got {err:?}"
+        );
+    }
+
+    /// SPEC_v3 §Task 4d acceptance: the canonical happy path. A
+    /// freshly created `open` challenge transitions to `declined` on
+    /// the first decline call. Declined is terminal and there is no
+    /// `declined_at` column, so we additionally pin that
+    /// `accepted_at`, `resolved_at`, and `result` all stay `NULL` —
+    /// a regression that "helpfully" stamped one of those alongside
+    /// the state flip would defeat the audit-view contract on
+    /// [`Challenge::accepted_at`] / [`Challenge::resolved_at`] and
+    /// quietly diverge from the schema's transition timestamps.
+    /// Round-trip through a primary-key SELECT to also prove the
+    /// `RETURNING` row is durable.
+    #[test]
+    fn decline_challenge_transitions_open_to_declined() {
+        let (_dir, world) = world_with_challenges();
+        let alice = world.upsert_player(&ctx("u-a", "alice")).unwrap();
+        let bob = world.upsert_player(&ctx("u-b", "bob")).unwrap();
+        let created = world
+            .create_challenge(alice.id, bob.id, "clue_race", None, None)
+            .expect("create_challenge succeeds");
+
+        let declined = world
+            .decline_challenge(created.id)
+            .expect("decline_challenge succeeds on a fresh open challenge");
+
+        assert_eq!(
+            declined.state,
+            ChallengeState::Declined.as_str(),
+            "open challenge must transition to 'declined'"
+        );
+        assert!(
+            declined.accepted_at.is_none(),
+            "decline_challenge must not stamp accepted_at"
+        );
+        assert!(
+            declined.resolved_at.is_none(),
+            "decline_challenge must not stamp resolved_at"
+        );
+        assert!(
+            declined.result.is_none(),
+            "decline_challenge must not populate result"
+        );
+
+        let stored = world
+            .connection()
+            .query_row(
+                "SELECT id, created_at, challenger_player_id, target_player_id, \
+                        kind, stake, state, accepted_at, resolved_at, expires_at, result \
+                 FROM challenges WHERE id = ?1",
+                rusqlite::params![created.id],
+                row_to_challenge,
+            )
+            .expect("primary-key SELECT decodes the row");
+        assert_eq!(stored, declined, "stored row must equal RETURNING row");
+    }
+
+    /// SPEC §4.2's deadline gate ("Expired challenges cannot be
+    /// accepted") applies only to acceptance. Declining a stale open
+    /// challenge is legitimate — the target sees the lapsed entry in
+    /// their inbox before the sweeper runs and explicitly says "no
+    /// thanks". Pin that contract so a future regression that copy-
+    /// pasted the accept gate onto the decline path (and started
+    /// returning `Expired` here) flunks immediately.
+    #[test]
+    fn decline_challenge_allows_lapsed_deadline() {
+        let (_dir, world) = world_with_challenges();
+        let alice = world.upsert_player(&ctx("u-a", "alice")).unwrap();
+        let bob = world.upsert_player(&ctx("u-b", "bob")).unwrap();
+        let created = world
+            .create_challenge(
+                alice.id,
+                bob.id,
+                "clue_race",
+                None,
+                Some("2000-01-01T00:00:00Z"),
+            )
+            .expect("create_challenge succeeds");
+
+        let declined = world
+            .decline_challenge(created.id)
+            .expect("decline_challenge must accept a lapsed-deadline open challenge");
+        assert_eq!(declined.state, ChallengeState::Declined.as_str());
+    }
+
+    /// SPEC §4.2: only `open -> declined` is a legal decline. Any
+    /// non-open current state must surface as
+    /// [`ChallengeError::InvalidTransition`] carrying the actual
+    /// `from`. Pin the canonical regression — declining an already-
+    /// accepted challenge — and additionally pin the row-unchanged
+    /// invariant so a future helper that flipped state then
+    /// returned an error couldn't slip through. Other terminal
+    /// states ride the same code path; Task 4g's invalid-transition
+    /// matrix covers them exhaustively.
+    #[test]
+    fn decline_challenge_rejects_already_accepted() {
+        let (_dir, world) = world_with_challenges();
+        let alice = world.upsert_player(&ctx("u-a", "alice")).unwrap();
+        let bob = world.upsert_player(&ctx("u-b", "bob")).unwrap();
+        let created = world
+            .create_challenge(alice.id, bob.id, "clue_race", None, None)
+            .unwrap();
+        world.accept_challenge(created.id).expect("accept succeeds");
+
+        let err = world
+            .decline_challenge(created.id)
+            .expect_err("declining an accepted challenge must fail");
+        assert!(
+            matches!(
+                &err,
+                ChallengeError::InvalidTransition { id, from, to }
+                    if *id == created.id && from == "accepted" && *to == ChallengeState::Declined
+            ),
+            "expected InvalidTransition from 'accepted' to Declined, got {err:?}"
+        );
+
+        // Row-unchanged invariant: state still 'accepted', no decline
+        // sneaked in alongside the typed error.
+        let state: String = world
+            .connection()
+            .query_row(
+                "SELECT state FROM challenges WHERE id = ?1",
+                rusqlite::params![created.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "accepted", "rejected decline must not mutate state");
+    }
+
+    /// Decline on a re-decline must surface
+    /// [`ChallengeError::InvalidTransition`] from `'declined'` rather
+    /// than masquerading as a successful no-op. SPEC §4.2 is strict
+    /// here: declined is terminal, and a UI that fires decline twice
+    /// (a double-keypress, an at-least-once retry) needs the typed
+    /// signal to render the right message. Same shape rationale as
+    /// `accept_challenge_rejects_already_accepted`.
+    #[test]
+    fn decline_challenge_rejects_already_declined() {
+        let (_dir, world) = world_with_challenges();
+        let alice = world.upsert_player(&ctx("u-a", "alice")).unwrap();
+        let bob = world.upsert_player(&ctx("u-b", "bob")).unwrap();
+        let created = world
+            .create_challenge(alice.id, bob.id, "clue_race", None, None)
+            .unwrap();
+        world
+            .decline_challenge(created.id)
+            .expect("first decline succeeds");
+
+        let err = world
+            .decline_challenge(created.id)
+            .expect_err("second decline must fail");
+        assert!(
+            matches!(
+                &err,
+                ChallengeError::InvalidTransition { id, from, to }
+                    if *id == created.id && from == "declined" && *to == ChallengeState::Declined
+            ),
+            "expected InvalidTransition from 'declined' to Declined, got {err:?}"
+        );
+    }
+
+    /// A stale id (challenge was deleted, or the caller fabricated
+    /// one) must surface [`ChallengeError::NotFound`] rather than a
+    /// generic SQL error. Same shape as
+    /// `accept_challenge_missing_id_returns_not_found`.
+    #[test]
+    fn decline_challenge_missing_id_returns_not_found() {
+        let (_dir, world) = world_with_challenges();
+        let err = world
+            .decline_challenge(424_242)
             .expect_err("missing id must fail");
         assert!(
             matches!(err, ChallengeError::NotFound { id } if id == 424_242),
