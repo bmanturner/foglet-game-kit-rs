@@ -9,7 +9,9 @@ use thiserror::Error;
 use crate::config::{
     GameConfig, GameSection, ManifestSection, SaveSection, SaveStrategy, WorldSection,
 };
+use crate::events::{EventError, EventRecord, WORLD_EVENTS_MIGRATION};
 use crate::foglet::{ContextSource, FogletContext};
+use crate::players::{PlayerError, PLAYERS_MIGRATION};
 use crate::roles::FogletRole;
 use crate::screen::GameContext;
 use crate::world_db::{WorldDb, WorldDbError};
@@ -40,6 +42,7 @@ struct UserSpec {
 struct HarnessUser {
     foglet: FogletContext,
     save_root: PathBuf,
+    player_id: i64,
 }
 
 /// Errors produced while building or querying a multi-user harness.
@@ -84,6 +87,33 @@ pub enum MultiUserHarnessError {
     UnknownHandle {
         /// Requested handle.
         handle: String,
+    },
+    /// Harness event visibility assertion failed.
+    #[error("no visible event matched for `{handle}`")]
+    EventNotVisible {
+        /// User handle.
+        handle: String,
+    },
+    /// Reading world events failed.
+    #[error("failed to read harness events: {source}")]
+    EventRead {
+        /// Underlying event error.
+        #[source]
+        source: EventError,
+    },
+    /// Applying harness migrations failed.
+    #[error("failed to apply harness migration: {source}")]
+    Migration {
+        /// Underlying world DB error.
+        #[source]
+        source: WorldDbError,
+    },
+    /// Seeding a harness player failed.
+    #[error("failed to seed harness player: {source}")]
+    PlayerSeed {
+        /// Underlying player error.
+        #[source]
+        source: PlayerError,
     },
 }
 
@@ -132,6 +162,12 @@ impl MultiUserHarness {
         self.users.get(handle).map(|user| &user.foglet)
     }
 
+    /// Player id for one harness user.
+    #[must_use]
+    pub fn player_id_for(&self, handle: &str) -> Option<i64> {
+        self.users.get(handle).map(|user| user.player_id)
+    }
+
     /// Build a [`GameContext`] for one registered user.
     pub fn context_for(&self, handle: &str) -> Result<GameContext<'_>, MultiUserHarnessError> {
         let user = self
@@ -151,6 +187,33 @@ impl MultiUserHarness {
     ) -> Result<R, MultiUserHarnessError> {
         let ctx = self.context_for(handle)?;
         Ok(f(&ctx))
+    }
+
+    /// Assert that a visible event exists for one handle.
+    pub fn assert_event_visible_to(
+        &self,
+        handle: &str,
+        predicate: impl Fn(&EventRecord) -> bool,
+    ) -> Result<(), MultiUserHarnessError> {
+        let user = self
+            .users
+            .get(handle)
+            .ok_or_else(|| MultiUserHarnessError::UnknownHandle {
+                handle: handle.to_string(),
+            })?;
+        let events = self
+            .world_db
+            .recent_events(u32::MAX)
+            .map_err(|source| MultiUserHarnessError::EventRead { source })?;
+        let matched = events.into_iter().any(|event| {
+            (event.player_id.is_none() || event.player_id == Some(user.player_id))
+                && predicate(&event)
+        });
+        matched
+            .then_some(())
+            .ok_or_else(|| MultiUserHarnessError::EventNotVisible {
+                handle: handle.to_string(),
+            })
     }
 
     /// Harness temp root. Exposed for cleanup assertions.
@@ -180,8 +243,14 @@ impl MultiUserHarnessBuilder {
         let tempdir =
             tempfile::tempdir().map_err(|source| MultiUserHarnessError::TempDir { source })?;
         let world_db_path = tempdir.path().join("world").join("world.sqlite");
-        let world_db = WorldDb::open(&world_db_path)
+        let mut world_db = WorldDb::open(&world_db_path)
             .map_err(|source| MultiUserHarnessError::WorldDb { source })?;
+        world_db
+            .apply_migration(&PLAYERS_MIGRATION)
+            .map_err(|source| MultiUserHarnessError::Migration { source })?;
+        world_db
+            .apply_migration(&WORLD_EVENTS_MIGRATION)
+            .map_err(|source| MultiUserHarnessError::Migration { source })?;
         let mut users = HashMap::new();
 
         for spec in self.users {
@@ -208,7 +277,17 @@ impl MultiUserHarnessBuilder {
                 terminal_height: 24,
                 source: ContextSource::LocalDev,
             };
-            users.insert(spec.handle, HarnessUser { foglet, save_root });
+            let player = world_db
+                .upsert_player(&foglet)
+                .map_err(|source| MultiUserHarnessError::PlayerSeed { source })?;
+            users.insert(
+                spec.handle,
+                HarnessUser {
+                    foglet,
+                    save_root,
+                    player_id: player.id,
+                },
+            );
         }
 
         Ok(MultiUserHarness {
@@ -334,5 +413,40 @@ mod tests {
             harness.save_root_for("bob"),
             "per-user save roots must be isolated"
         );
+    }
+
+    #[test]
+    fn assert_event_visible_to_distinguishes_player_scoped_and_global_events() {
+        let harness = MultiUserHarness::builder()
+            .add_user("alice", FogletRole::User)
+            .add_user("bob", FogletRole::User)
+            .build()
+            .expect("harness builds");
+        let alice_id = harness.player_id_for("alice").expect("alice player id");
+        let bob_id = harness.player_id_for("bob").expect("bob player id");
+
+        harness
+            .world_db()
+            .append_event("global", None, "all hands", None)
+            .expect("global event appends");
+        harness
+            .world_db()
+            .append_event("private", Some(alice_id), "alice note", None)
+            .expect("alice event appends");
+        harness
+            .world_db()
+            .append_event("private", Some(bob_id), "bob note", None)
+            .expect("bob event appends");
+
+        harness
+            .assert_event_visible_to("alice", |event| event.message == "all hands")
+            .expect("alice sees global event");
+        harness
+            .assert_event_visible_to("alice", |event| event.message == "alice note")
+            .expect("alice sees her own event");
+        assert!(matches!(
+            harness.assert_event_visible_to("alice", |event| event.message == "bob note"),
+            Err(MultiUserHarnessError::EventNotVisible { handle }) if handle == "alice"
+        ));
     }
 }

@@ -88,7 +88,7 @@ One unchecked item per iteration. Dependencies in `[brackets]` must be checked o
 - [x] **10b** — Implement `MultiUserHarness::builder().add_user(handle, role).build()` creating one shared temp world DB and per-user save roots. Test: two users observe the same world DB path. [10a]
 - [x] **10c** — Reject duplicate handles. Test: clear error variant. [10b]
 - [x] **10d** — Implement `context_for(handle)` and `with_user(handle, f)`. Test: each handle returns its own `GameContext` with isolated save roots. [10b]
-- [ ] **10e** — Implement `assert_event_visible_to(handle, predicate)`. Test: distinguishes player-scoped vs. global events. [10b]
+- [x] **10e** — Implement `assert_event_visible_to(handle, predicate)`. Test: distinguishes player-scoped vs. global events. [10b]
 - [ ] **10f** — Implement `assert_notice_for(handle, predicate)` gated on v3 notices. Test: omitted when v3 disabled; functional when enabled. [10b]
 - [ ] **10g** — Drop cleanup removes the temp directory and per-user save roots. Test: post-drop, no harness paths remain under the system temp root. [10b]
 - [ ] **10h** — Self-test demonstrating Alice's transfer affects Bob's view of inventory and that player-scoped recall differs across users. [10d, 10e]
