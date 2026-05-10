@@ -15,6 +15,9 @@
 //! navigation, pagination, and a quit hotkey. Detail modals and
 //! accept/claim callbacks arrive in follow-up tasks.
 
+use std::fmt;
+use std::sync::Arc;
+
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Alignment, Rect};
 use ratatui::style::{Modifier, Style};
@@ -23,6 +26,24 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 use crate::input::Input;
 use crate::job_board::JobBoardEntry;
 use crate::screen::{GameContext, Screen, ScreenCommand};
+use crate::widgets::{centred_rect, render_modal};
+
+/// Callback signature used by [`JobBoardScreen`] to render detail-body
+/// text for one selected [`JobBoardEntry`].
+///
+/// The callback keeps gameplay semantics in game code:
+///
+/// - A **space exploration** game can return a cargo manifest and dock
+///   contact instructions.
+/// - A **dungeon crawler** can return a patron note plus hazard hints.
+type DetailBodyCallback = Arc<dyn Fn(&JobBoardEntry) -> String + 'static>;
+
+/// Captured detail modal snapshot for the currently selected entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DetailModal {
+    title: String,
+    body: String,
+}
 
 /// Screen rendering an aggregated Job Board table.
 ///
@@ -37,13 +58,32 @@ use crate::screen::{GameContext, Screen, ScreenCommand};
 /// This render-only baseline paints a fixed table shape with four
 /// visible columns (`kind_label`, `state_label`, `title`, `expires_at`)
 /// inside a bordered 80×24-safe layout.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct JobBoardScreen {
     title: String,
     entries: Vec<JobBoardEntry>,
     empty_state_text: String,
+    detail_body_callback: Option<DetailBodyCallback>,
+    detail_modal: Option<DetailModal>,
     selected_index: usize,
     page_start: usize,
+}
+
+impl fmt::Debug for JobBoardScreen {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("JobBoardScreen")
+            .field("title", &self.title)
+            .field("entries", &self.entries)
+            .field("empty_state_text", &self.empty_state_text)
+            .field(
+                "detail_body_callback_registered",
+                &self.detail_body_callback.is_some(),
+            )
+            .field("detail_modal", &self.detail_modal)
+            .field("selected_index", &self.selected_index)
+            .field("page_start", &self.page_start)
+            .finish()
+    }
 }
 
 impl JobBoardScreen {
@@ -62,6 +102,14 @@ impl JobBoardScreen {
     /// In the canonical 80x24 frame, border + header + divider leaves
     /// exactly 20 visible rows for entries.
     const CANONICAL_PAGE_SIZE: usize = 20;
+    /// Modal title shown when a detail pane is open.
+    const DETAIL_MODAL_TITLE: &str = "Opportunity Details";
+    /// Preferred modal width; clamped by [`centred_rect`] when the
+    /// frame is smaller than 72 columns.
+    const DETAIL_MODAL_WIDTH: u16 = 72;
+    /// Preferred modal height; clamped by [`centred_rect`] when the
+    /// frame is smaller than 16 rows.
+    const DETAIL_MODAL_HEIGHT: u16 = 16;
 
     /// Build a renderable Job Board list from pre-aggregated entries.
     ///
@@ -74,6 +122,8 @@ impl JobBoardScreen {
             title: Self::DEFAULT_TITLE.to_string(),
             entries,
             empty_state_text: Self::DEFAULT_EMPTY_STATE_TEXT.to_string(),
+            detail_body_callback: None,
+            detail_modal: None,
             selected_index: 0,
             page_start: 0,
         }
@@ -100,12 +150,37 @@ impl JobBoardScreen {
         self
     }
 
+    /// Register a game callback used to build the detail modal body.
+    ///
+    /// The callback is invoked when the player presses `Enter` on the
+    /// selected row.
+    ///
+    /// Genre-neutral examples:
+    ///
+    /// - A **space exploration** board can render cargo tonnage, drop
+    ///   point, and radio channel details for a freight listing.
+    /// - A **town simulation** board can render district notes and
+    ///   bulletin clerk instructions for a municipal work order.
+    ///
+    /// Calling this replaces any previously registered callback.
+    #[must_use]
+    pub fn with_detail_body_callback<F>(mut self, callback: F) -> Self
+    where
+        F: Fn(&JobBoardEntry) -> String + 'static,
+    {
+        self.detail_body_callback = Some(Arc::new(callback));
+        self
+    }
+
     /// Replace the screen's current entry snapshot.
     ///
     /// Callers use this to refresh the rendered list after they re-run
     /// aggregation logic elsewhere.
     pub fn set_entries(&mut self, entries: Vec<JobBoardEntry>) {
         self.entries = entries;
+        // New data invalidates any previously opened modal because its
+        // body snapshot describes a row from the old list.
+        self.detail_modal = None;
         self.normalize_page_state(Self::CANONICAL_PAGE_SIZE);
     }
 
@@ -197,6 +272,26 @@ impl JobBoardScreen {
         self.normalize_page_state(page_size);
     }
 
+    fn open_detail_modal(&mut self) {
+        if self.entries.is_empty() {
+            return;
+        }
+        let Some(callback) = self.detail_body_callback.as_ref() else {
+            return;
+        };
+        let Some(entry) = self.entries.get(self.selected_index) else {
+            return;
+        };
+        self.detail_modal = Some(DetailModal {
+            title: Self::DETAIL_MODAL_TITLE.to_string(),
+            body: callback(entry),
+        });
+    }
+
+    fn close_detail_modal(&mut self) {
+        self.detail_modal = None;
+    }
+
     fn render_inner(&self, frame: &mut ratatui::Frame<'_>, area: Rect) {
         let block = Block::default()
             .borders(Borders::ALL)
@@ -269,6 +364,19 @@ impl JobBoardScreen {
         }
     }
 
+    fn render_detail_modal(&self, frame: &mut ratatui::Frame<'_>, area: Rect) {
+        let Some(detail) = self.detail_modal.as_ref() else {
+            return;
+        };
+        let modal = centred_rect(Self::DETAIL_MODAL_WIDTH, Self::DETAIL_MODAL_HEIGHT, area);
+        render_modal(
+            frame,
+            modal,
+            Some(detail.title.as_str()),
+            detail.body.as_str(),
+        );
+    }
+
     fn write_row(buf: &mut Buffer, area: Rect, row: u16, line: &str, style: Style) {
         if row >= area.height || area.width == 0 {
             return;
@@ -330,13 +438,28 @@ impl Screen for JobBoardScreen {
         let page_size = Self::page_size_for_height(frame.area().height);
         self.normalize_page_state(page_size);
         self.render_inner(frame, frame.area());
+        self.render_detail_modal(frame, frame.area());
     }
 
     fn handle_input(&mut self, ctx: &mut GameContext<'_>, input: Input) -> ScreenCommand {
+        if self.detail_modal.is_some() {
+            return match input {
+                Input::Esc | Input::Char('q') | Input::Enter => {
+                    self.close_detail_modal();
+                    ScreenCommand::None
+                }
+                _ => ScreenCommand::None,
+            };
+        }
+
         let page_size = Self::page_size_for_height(ctx.terminal_size.1);
         self.normalize_page_state(page_size);
 
         match input {
+            Input::Enter => {
+                self.open_detail_modal();
+                ScreenCommand::None
+            }
             Input::Up | Input::Char('k') => {
                 self.move_cursor_up(page_size);
                 ScreenCommand::None
@@ -435,6 +558,14 @@ mod tests {
             out.push_str(buf.cell((x, y)).expect("cell in bounds").symbol());
         }
         out
+    }
+
+    fn all_rows(buf: &Buffer) -> Vec<String> {
+        (0..buf.area.height).map(|y| row_text(buf, y)).collect()
+    }
+
+    fn contains_text(buf: &Buffer, needle: &str) -> bool {
+        all_rows(buf).iter().any(|line| line.contains(needle))
     }
 
     fn entry(kind: &str, state: &str, title: &str, expires_at: Option<&str>) -> JobBoardEntry {
@@ -572,5 +703,46 @@ mod tests {
 
         let cmd = dispatch(&mut screen, Input::Esc);
         assert!(matches!(cmd, ScreenCommand::Pop));
+    }
+
+    #[test]
+    fn detail_modal_opens_and_closes_without_disturbing_list_redraw() {
+        let mut screen = JobBoardScreen::new(vec![entry(
+            "Contract",
+            "available",
+            "Deliver ore to moon dock",
+            Some("2026-05-10T10:00:00Z"),
+        )])
+        .with_detail_body_callback(|selected| {
+            format!(
+                "Manifest details for: {}\nDock relay: channel-7",
+                selected.title
+            )
+        });
+
+        let baseline = draw_screen(&mut screen);
+
+        let cmd = dispatch(&mut screen, Input::Enter);
+        assert!(matches!(cmd, ScreenCommand::None));
+
+        let modal = draw_screen(&mut screen);
+        assert!(
+            contains_text(&modal, "Opportunity Details"),
+            "expected modal title to render after Enter"
+        );
+        assert!(
+            contains_text(&modal, "Manifest details for: Deliver ore to moon dock"),
+            "expected callback-provided detail body to render in modal"
+        );
+
+        let cmd = dispatch(&mut screen, Input::Esc);
+        assert!(matches!(cmd, ScreenCommand::None));
+
+        let after_close = draw_screen(&mut screen);
+        assert_eq!(
+            all_rows(&baseline),
+            all_rows(&after_close),
+            "closing the detail modal must restore the list rendering exactly"
+        );
     }
 }
