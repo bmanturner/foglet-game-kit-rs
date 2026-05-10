@@ -1,8 +1,8 @@
-//! `presence` — current-location tracking schema (SPEC_v4 Task 5a).
+//! `presence` — current-location tracking schema (SPEC_v4 Tasks 5a–5c).
 //!
 //! This module owns the durable schema for per-player current place.
-//! Movement and transactional APIs come in later tasks; this iteration
-//! adds initial placement and read scaffolding.
+//! Movement and transactional APIs are now available for atomic movement
+//! transitions with a callback hook.
 //!
 //! In a **space exploration** game, a row here tracks that a captain is
 //! currently at a specific docking node. In a **dungeon crawler**, it
@@ -57,6 +57,36 @@ pub enum PresenceError {
         /// Player identifier supplied to `set_presence`.
         player_id: i64,
         /// Underlying `rusqlite` error with the true SQLite cause.
+        #[source]
+        source: rusqlite::Error,
+    },
+    /// A move was requested for a player that has no existing row.
+    #[error("player `{player_id}` has no presence row; call `set_presence` before moving")]
+    MissingPresence {
+        /// Player identifier supplied to `move_player`.
+        player_id: i64,
+    },
+    /// SQL or transaction failure while moving the player.
+    #[error("failed to move player `{player_id}` to place `{place_id}`: {source}")]
+    MoveFailed {
+        /// Player identifier supplied to `move_player`.
+        player_id: i64,
+        /// Destination place supplied to `move_player`.
+        place_id: i64,
+        /// Underlying `rusqlite` error from the update or commit.
+        #[source]
+        source: rusqlite::Error,
+    },
+    /// A movement callback rejected or failed.
+    #[error(
+        "movement callback rejected move of player `{player_id}` to place `{place_id}`: {source}"
+    )]
+    MoveRejected {
+        /// Player identifier supplied to `move_player`.
+        player_id: i64,
+        /// Destination place supplied to `move_player`.
+        place_id: i64,
+        /// Underlying callback error surfaced through the `rusqlite::Error` channel.
         #[source]
         source: rusqlite::Error,
     },
@@ -140,6 +170,84 @@ RETURNING player_id, place_id, entered_at, metadata_json";
             )
             .map_err(|source| PresenceError::SetFailed { player_id, source })
     }
+
+    /// Move a player to a new place inside one SQLite transaction.
+    ///
+    /// This is the v4 Task 5c `move_player` primitive. `move_player`
+    /// always updates one presence row and passes the post-move snapshot to
+    /// `on_commit` so game logic can run additional checks inside the same
+    /// transaction.
+    ///
+    /// - The callback receives the active [`rusqlite::Transaction`]
+    ///   plus the canonical post-move presence row.
+    /// - If the callback returns `Err`, the `UPDATE` rolls back and this
+    ///   method returns [`PresenceError::MoveRejected`].
+    /// - The caller gets the committed presence snapshot on success.
+    ///
+    /// This shape stays genre-neutral:
+    ///
+    /// - In a **space exploration** game, a callback can append a
+    ///   transfer-log row or enforce docking restrictions before commit.
+    /// - In a **dungeon crawler** game, the same callback can debit
+    ///   movement stamina or log discovered chambers while keeping the
+    ///   update atomic.
+    pub fn move_player<F>(
+        &mut self,
+        player_id: i64,
+        dest_place_id: i64,
+        on_commit: F,
+    ) -> Result<PresenceRecord, PresenceError>
+    where
+        F: FnOnce(&rusqlite::Transaction<'_>, &PresenceRecord) -> Result<(), rusqlite::Error>,
+    {
+        const SQL: &str = "\
+UPDATE presence\n\
+SET place_id = ?2,\n\
+    entered_at = CURRENT_TIMESTAMP\n\
+WHERE player_id = ?1\n\
+RETURNING player_id, place_id, entered_at, metadata_json";
+
+        let tx =
+            self.connection_mut()
+                .transaction()
+                .map_err(|source| PresenceError::MoveFailed {
+                    player_id,
+                    place_id: dest_place_id,
+                    source,
+                })?;
+
+        let moved = match tx.query_row(
+            SQL,
+            rusqlite::params![player_id, dest_place_id],
+            row_to_presence,
+        ) {
+            Ok(row) => row,
+            Err(rusqlite::Error::QueryReturnedNoRows) => {
+                return Err(PresenceError::MissingPresence { player_id });
+            }
+            Err(source) => {
+                return Err(PresenceError::MoveFailed {
+                    player_id,
+                    place_id: dest_place_id,
+                    source,
+                });
+            }
+        };
+
+        on_commit(&tx, &moved).map_err(|source| PresenceError::MoveRejected {
+            player_id,
+            place_id: dest_place_id,
+            source,
+        })?;
+
+        tx.commit().map_err(|source| PresenceError::MoveFailed {
+            player_id,
+            place_id: dest_place_id,
+            source,
+        })?;
+
+        Ok(moved)
+    }
 }
 
 fn row_to_presence(row: &rusqlite::Row<'_>) -> rusqlite::Result<PresenceRecord> {
@@ -157,6 +265,8 @@ mod tests {
     use crate::players::PLAYERS_MIGRATION;
     use crate::spatial::PLACES_MIGRATION;
     use crate::world_db::WorldDb;
+    use std::thread::sleep;
+    use std::time::Duration;
     use tempfile::tempdir;
 
     /// SPEC_v4 Task 5a requires that the `presence` migration applies
@@ -265,6 +375,76 @@ mod tests {
             "placement must persist a non-empty timestamp"
         );
         assert_eq!(placed, loaded);
+
+        Ok(())
+    }
+
+    /// SPEC_v4 Task 5c requires `move_player` to update the player's
+    /// current location atomically and refresh `entered_at`.
+    ///
+    /// This test also proves the callback receives the committed
+    /// destination row by asserting destination place and metadata inside
+    /// the callback.
+    #[test]
+    fn move_player_updates_presence_and_entered_at() -> Result<(), PresenceError> {
+        let dir = tempdir().expect("tempdir creates");
+        let db_path = dir.path().join("world.sqlite");
+        let mut world = WorldDb::open(&db_path).expect("open succeeds");
+
+        world
+            .apply_migration(&PLAYERS_MIGRATION)
+            .expect("players migration applies");
+        world
+            .apply_migration(&PLACES_MIGRATION)
+            .expect("places migration applies");
+        world
+            .apply_migration(&PRESENCE_MIGRATION)
+            .expect("presence migration applies");
+
+        let player_id: i64 = world
+            .connection()
+            .query_row(
+                "INSERT INTO players (handle) VALUES (?1) RETURNING id",
+                rusqlite::params!["Captain Quill"],
+                |row| row.get(0),
+            )
+            .expect("fixture player insert works");
+
+        let docking_gate = world
+            .insert_place("port-alpha", "Port Alpha", "harbor", None)
+            .expect("fixture place insert works");
+        let market_square = world
+            .insert_place("cargo-hub", "Cargo Hub", "dock", None)
+            .expect("fixture place insert works");
+
+        let initial =
+            world.set_presence(player_id, docking_gate.id, Some(r#"{"zone":"entry"}"#))?;
+        sleep(Duration::from_secs(1));
+
+        let moved = world.move_player(player_id, market_square.id, |_, row| {
+            assert_eq!(row.player_id, player_id);
+            assert_eq!(row.place_id, market_square.id);
+            assert_eq!(row.metadata_json, Some(r#"{"zone":"entry"}"#.to_string()));
+            Ok(())
+        })?;
+
+        let loaded = world
+            .connection()
+            .query_row(
+                "SELECT player_id, place_id, entered_at, metadata_json FROM presence WHERE player_id = ?1",
+                rusqlite::params![player_id],
+                row_to_presence,
+            )
+            .expect("presence row is queryable");
+
+        assert_eq!(moved, loaded);
+        assert_eq!(moved.player_id, player_id);
+        assert_eq!(moved.place_id, market_square.id);
+        assert_eq!(moved.metadata_json, Some(r#"{"zone":"entry"}"#.to_string()));
+        assert_ne!(
+            moved.entered_at, initial.entered_at,
+            "move should refresh entered_at via CURRENT_TIMESTAMP"
+        );
 
         Ok(())
     }
