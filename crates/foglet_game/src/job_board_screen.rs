@@ -304,9 +304,8 @@ impl JobBoardScreen {
         }
 
         if self.entries.is_empty() {
-            // Keeping empty-state rendering in 6a makes the screen
-            // usable in manual smoke tests before 6d adds explicit
-            // behavior assertions around this path.
+            // Empty boards should present intentional guidance text so
+            // players don't infer a broken query path from a blank box.
             let empty = Paragraph::new(self.empty_state_text.as_str())
                 .alignment(Alignment::Center)
                 .style(Style::default().add_modifier(Modifier::DIM));
@@ -647,6 +646,22 @@ mod tests {
         assert!(
             !next_row.contains("ANCIENT-RUINS-DELIVERY-REQUEST"),
             "expected no wrapped overflow into the following row"
+        );
+    }
+
+    #[test]
+    fn empty_entries_render_configured_empty_state_copy() {
+        let empty_copy = "No guild postings yet; check back after dawn bell.";
+        let mut screen = JobBoardScreen::new(Vec::new()).with_empty_state_text(empty_copy);
+
+        let buf = draw_screen(&mut screen);
+        assert!(
+            contains_text(&buf, empty_copy),
+            "expected configured empty-state copy to render for a zero-entry board"
+        );
+        assert!(
+            !contains_text(&buf, "KIND"),
+            "empty boards should not render table headers with no rows"
         );
     }
 
