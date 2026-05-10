@@ -373,6 +373,54 @@ pub enum BountyError {
         #[source]
         source: rusqlite::Error,
     },
+    /// No `bounties` row exists with the given id. Surfaced by the
+    /// transition helpers ([`WorldDb::claim_bounty`] and the upcoming
+    /// `complete_bounty` / `expire_bounties` paths) when the
+    /// caller's id is stale or the row was removed by an operator.
+    /// Same shape as [`crate::challenges::ChallengeError::NotFound`].
+    #[error("bounty {id} does not exist")]
+    NotFound {
+        /// The id the caller looked up. Echoed so log lines and
+        /// operator-facing errors can name the missing row.
+        id: i64,
+    },
+    /// The transition is not legal from the bounty's current state.
+    /// SPEC §4.5 mandates exactly three transitions: `open ->
+    /// claimed`, `claimed -> completed`, and `{open,claimed} ->
+    /// expired`. Every other (from, to) pair fails with this
+    /// variant. Carrying both `from` (the actual state the row was
+    /// found in) and the desired `to` lets the UI render a precise
+    /// message — "this bounty is already claimed" vs "this bounty
+    /// has been completed". Same shape as
+    /// [`crate::challenges::ChallengeError::InvalidTransition`].
+    #[error("cannot transition bounty {id} from {from:?} to {to:?}")]
+    InvalidTransition {
+        /// Bounty id the caller targeted. Echoed so log lines can
+        /// name the offending row.
+        id: i64,
+        /// The state the row was in when the helper read it. Kept
+        /// as a `String` (rather than [`BountyState`]) so a future
+        /// schema state added without a matching enum variant still
+        /// surfaces here verbatim instead of crashing on decode.
+        from: String,
+        /// The state the helper attempted to set.
+        to: BountyState,
+    },
+    /// The bounty was still in `open` but its `expires_at` deadline
+    /// has already passed. SPEC §4.5 makes deadlined bounties
+    /// uncl­aimable past their deadline — the kit refuses to flip
+    /// `open -> claimed` even before the Task 7e sweeper runs, so
+    /// a slow sweeper can't widen the window in which a stale
+    /// bounty looks claimable. A separate variant from
+    /// [`Self::InvalidTransition`] lets the UI distinguish "this
+    /// bounty's deadline lapsed before you got here" from "this
+    /// bounty is in some other terminal state". Same shape as
+    /// [`crate::challenges::ChallengeError::Expired`].
+    #[error("bounty {id} expired before it could be claimed")]
+    Expired {
+        /// Bounty id the caller targeted.
+        id: i64,
+    },
 }
 
 /// In-memory mirror of a `bounties` row — SPEC_v3 §4.5.
@@ -560,6 +608,193 @@ RETURNING id, created_at, posted_by_player_id, title, description, \
                 row_to_bounty,
             )
             .map_err(|source| BountyError::Sqlite { source })
+    }
+
+    /// Transition a bounty from `open` to `claimed` and stamp
+    /// `claimed_by_player_id` + `claimed_at` (SPEC_v3 §4.5 / §Task
+    /// 7c).
+    ///
+    /// The contract is "if and only if the row was still `open` and
+    /// not past its deadline, it is now `claimed` with the named
+    /// claimant and a `claimed_at` timestamp; otherwise the row is
+    /// unchanged and the helper returns a typed error explaining
+    /// why". SPEC §4.5 lists `open -> claimed` as the only legal
+    /// entry into the `claimed` state — every other current state
+    /// (already `claimed`, terminal `completed`/`expired`) surfaces
+    /// as [`BountyError::InvalidTransition`], and that includes the
+    /// "second claimant rejected" acceptance case from the §Task 7c
+    /// brief: the loser of a claim race sees `from = "claimed"`,
+    /// `to = BountyState::Claimed`, with the row already attributed
+    /// to the winner.
+    ///
+    /// # Conditional UPDATE shape
+    ///
+    /// The `WHERE` clause folds three checks into one statement so
+    /// the success path is a single round-trip:
+    ///
+    /// 1. `id = ?1` — addresses the row.
+    /// 2. `state = 'open'` — only the `open -> claimed` transition
+    ///    is legal (SPEC §4.5); any other current state must fall
+    ///    through to the diagnostic SELECT and become an
+    ///    [`BountyError::InvalidTransition`].
+    /// 3. `expires_at IS NULL OR datetime(expires_at) > datetime('now')`
+    ///    — open-ended bounties (`expires_at IS NULL`) are always
+    ///    claimable; deadlined bounties are claimable only while
+    ///    the deadline is still in the future. Wrapping both sides
+    ///    in `datetime(…)` normalises the two ISO forms the kit
+    ///    accepts (`'YYYY-MM-DDTHH:MM:SSZ'` from callers,
+    ///    `'YYYY-MM-DD HH:MM:SS'` from `CURRENT_TIMESTAMP`) so the
+    ///    comparison is chronological rather than lexicographic.
+    ///    Same shape as [`Self::accept_challenge`].
+    ///
+    /// The bookkeeping fields are written in the same statement:
+    /// `state = 'claimed'`, `claimed_by_player_id = ?2`, and
+    /// `claimed_at = CURRENT_TIMESTAMP` (which `RETURNING` echoes
+    /// back as the canonical row).
+    ///
+    /// # Diagnostic SELECT
+    ///
+    /// On `QueryReturnedNoRows` the helper performs one diagnostic
+    /// SELECT to differentiate the failure modes — `NotFound` if no
+    /// row exists, `Expired` if the row is still `open` but past
+    /// its deadline, otherwise `InvalidTransition` carrying the
+    /// row's actual state. The diagnostic is read-only and races
+    /// only on the *error category* surfaced to the caller (a
+    /// concurrent UPDATE could change the row between the failed
+    /// UPDATE and the diagnostic SELECT); the helper never returns
+    /// stale state because it only returns error categories on this
+    /// path. Same convention as the diagnostic helper in
+    /// [`crate::challenges`].
+    ///
+    /// # Race semantics — "second claimant rejected"
+    ///
+    /// Two callers racing on the same `open` bounty hit the same
+    /// conditional `UPDATE … WHERE state = 'open'` in series under
+    /// SQLite's write lock. Exactly one observes a non-zero row
+    /// count and gets the `Ok(Bounty)` echo with their own id in
+    /// `claimed_by_player_id`; the loser sees
+    /// `QueryReturnedNoRows`, the diagnostic SELECT reads the
+    /// just-flipped `'claimed'` state, and the loser surfaces
+    /// `InvalidTransition { from: "claimed", to: Claimed }`. This
+    /// is the §Task 7c "second claimant rejected" acceptance —
+    /// pinned by the `claim_bounty_rejects_second_claimant` test.
+    ///
+    /// # Failure
+    ///
+    /// - [`BountyError::NotFound`] — no row matches `id`.
+    /// - [`BountyError::Expired`] — row is still `open` but its
+    ///   `expires_at` deadline has passed.
+    /// - [`BountyError::InvalidTransition`] — row is in any state
+    ///   other than `open` (already `claimed`, `completed`, or
+    ///   swept to `expired` by Task 7e).
+    /// - [`BountyError::Sqlite`] — any other `rusqlite` error.
+    ///
+    /// # Concurrency
+    ///
+    /// Takes `&self`: a single `UPDATE … RETURNING` plus an
+    /// optional diagnostic `SELECT` under the configured busy
+    /// timeout. SPEC §4.5 requires "Claim/complete transitions MUST
+    /// be transactional"; a single conditional `UPDATE` is natively
+    /// atomic in SQLite, so no explicit `BEGIN`/`COMMIT` wrapper is
+    /// needed here. Same borrow shape as [`Self::post_bounty`].
+    pub fn claim_bounty(
+        &self,
+        bounty_id: i64,
+        claimant_player_id: i64,
+    ) -> Result<Bounty, BountyError> {
+        // Conditional UPDATE: only an `open + still-fresh` row gets
+        // transitioned. SPEC §4.5 transitions are exhaustive — any
+        // non-matching row falls through to the diagnostic SELECT
+        // below for typed-error mapping.
+        const UPDATE_SQL: &str = "\
+UPDATE bounties \
+SET state = 'claimed', \
+    claimed_by_player_id = ?2, \
+    claimed_at = CURRENT_TIMESTAMP \
+WHERE id = ?1 \
+  AND state = 'open' \
+  AND (expires_at IS NULL OR datetime(expires_at) > datetime('now')) \
+RETURNING id, created_at, posted_by_player_id, title, description, \
+          reward, state, claimed_by_player_id, claimed_at, \
+          completed_at, expires_at";
+
+        match self.connection().query_row(
+            UPDATE_SQL,
+            rusqlite::params![bounty_id, claimant_player_id],
+            row_to_bounty,
+        ) {
+            Ok(bounty) => Ok(bounty),
+            Err(rusqlite::Error::QueryReturnedNoRows) => {
+                Err(self.diagnose_failed_bounty_transition(bounty_id, BountyState::Claimed))
+            }
+            Err(source) => Err(BountyError::Sqlite { source }),
+        }
+    }
+
+    /// Map a no-rows response from a bounty-transition `UPDATE` onto
+    /// the right typed [`BountyError`] by reading the row's current
+    /// state.
+    ///
+    /// Pulled out of [`Self::claim_bounty`] so the upcoming
+    /// `complete_bounty` and `expire_bounties` helpers (Tasks
+    /// 7d/7e) can share the same diagnostic. The function does
+    /// exactly one SELECT and returns the most specific error —
+    /// `NotFound` > `Expired` > `InvalidTransition` — without ever
+    /// returning `Ok`. Internal-only; not part of the public API.
+    /// Same shape as [`crate::challenges`]'s diagnostic helper.
+    ///
+    /// `Expired` is scoped to `attempted == Claimed` because that
+    /// is the only transition today that gates on the deadline;
+    /// `complete_bounty` (7d) operates on a row that already passed
+    /// the gate at claim time, and `expire_bounties` (7e) is the
+    /// thing that *creates* the expired state, not a transition
+    /// that gets blocked by it. Pinning the scope here means a
+    /// future caller can't accidentally surface `Expired` on a path
+    /// where it would be misleading.
+    fn diagnose_failed_bounty_transition(
+        &self,
+        bounty_id: i64,
+        attempted: BountyState,
+    ) -> BountyError {
+        // Compute the deadline check in SQL so it uses the same
+        // `datetime()` normalisation as the UPDATE — a mismatch
+        // here would let the diagnostic disagree with the gate that
+        // produced the no-rows in the first place.
+        const DIAG_SQL: &str = "\
+SELECT state, \
+       CASE \
+           WHEN expires_at IS NOT NULL \
+               AND datetime(expires_at) <= datetime('now') \
+           THEN 1 ELSE 0 \
+       END AS deadline_lapsed \
+FROM bounties WHERE id = ?1";
+
+        let row = self
+            .connection()
+            .query_row(DIAG_SQL, rusqlite::params![bounty_id], |row| {
+                let state: String = row.get(0)?;
+                let deadline_lapsed: i64 = row.get(1)?;
+                Ok((state, deadline_lapsed != 0))
+            });
+
+        match row {
+            Err(rusqlite::Error::QueryReturnedNoRows) => BountyError::NotFound { id: bounty_id },
+            Err(source) => BountyError::Sqlite { source },
+            // Row still open but deadline already lapsed — the
+            // sweeper hasn't run, but the helper refused to claim.
+            // Only meaningful when `attempted == Claimed`, the only
+            // transition that gates on the deadline today.
+            Ok((state, true))
+                if state == BountyState::Open.as_str() && attempted == BountyState::Claimed =>
+            {
+                BountyError::Expired { id: bounty_id }
+            }
+            Ok((state, _)) => BountyError::InvalidTransition {
+                id: bounty_id,
+                from: state,
+                to: attempted,
+            },
+        }
     }
 }
 
@@ -1065,6 +1300,281 @@ mod tests {
             first.id,
             second.id
         );
+    }
+
+    /// Variant of [`world_with_bounties`] that pre-creates a poster
+    /// and two distinct claimant players, returning their player ids.
+    /// Used by the §Task 7c claim-bounty tests that need at least
+    /// two attributable claimants (the second-claimant-rejected case).
+    fn world_with_poster_and_two_claimants() -> (tempfile::TempDir, WorldDb, i64, i64, i64) {
+        let (dir, world, poster_id) = world_with_poster();
+        let alice_id: i64 = world
+            .connection()
+            .query_row(
+                "INSERT INTO players (foglet_user_id, handle) \
+                 VALUES ('u-alice', 'alice') RETURNING id",
+                [],
+                |row| row.get(0),
+            )
+            .expect("insert alice");
+        let bob_id: i64 = world
+            .connection()
+            .query_row(
+                "INSERT INTO players (foglet_user_id, handle) \
+                 VALUES ('u-bob', 'bob') RETURNING id",
+                [],
+                |row| row.get(0),
+            )
+            .expect("insert bob");
+        (dir, world, poster_id, alice_id, bob_id)
+    }
+
+    /// SPEC_v3 §Task 7c acceptance, half 1: a fresh `open` bounty
+    /// transitions to `claimed` on a successful claim. Pin the full
+    /// post-conditions in one place so a regression in any of them
+    /// flunks here:
+    ///
+    /// - `state` flips from `'open'` to `'claimed'`.
+    /// - `claimed_by_player_id` is set to the caller's id (not
+    ///   silently NULL or set to the poster).
+    /// - `claimed_at` is stamped (not left NULL).
+    /// - `completed_at` stays `NULL` — claim is a one-step
+    ///   transition, not a "stamp everything" shortcut.
+    /// - The post-claim row is *durable* — re-reading by primary key
+    ///   matches the `RETURNING` echo, guarding against a regression
+    ///   that returned a phantom row from `RETURNING` without
+    ///   committing.
+    #[test]
+    fn claim_bounty_transitions_open_to_claimed() {
+        let (_dir, world, poster_id, alice_id, _bob_id) = world_with_poster_and_two_claimants();
+        let posted = world
+            .post_bounty(
+                Some(poster_id),
+                "Find the missing pocketwatch",
+                "Bring photographic evidence.",
+                r#"{"credits":250}"#,
+                None,
+            )
+            .expect("post_bounty succeeds");
+
+        let claimed = world
+            .claim_bounty(posted.id, alice_id)
+            .expect("claim_bounty succeeds on a fresh open bounty");
+
+        assert_eq!(
+            claimed.state,
+            BountyState::Claimed.as_str(),
+            "open bounty must transition to 'claimed'"
+        );
+        assert_eq!(
+            claimed.claimed_by_player_id,
+            Some(alice_id),
+            "claim_bounty must attribute the claimant"
+        );
+        assert!(
+            claimed.claimed_at.is_some(),
+            "claim_bounty must stamp claimed_at"
+        );
+        assert!(
+            claimed.completed_at.is_none(),
+            "claim_bounty must not stamp completed_at"
+        );
+        // Other fields must be preserved verbatim — the claim
+        // transition only touches state, claimed_by, and
+        // claimed_at; a regression that nulled out title/reward
+        // mid-UPDATE would flunk here.
+        assert_eq!(claimed.id, posted.id);
+        assert_eq!(claimed.title, posted.title);
+        assert_eq!(claimed.description, posted.description);
+        assert_eq!(claimed.reward, posted.reward);
+        assert_eq!(claimed.posted_by_player_id, posted.posted_by_player_id);
+        assert_eq!(claimed.created_at, posted.created_at);
+
+        // Durability: re-read by primary key and confirm the row
+        // matches the `RETURNING` echo. Catches a regression where
+        // `RETURNING` echoed an in-flight UPDATE that never
+        // committed.
+        let stored = world
+            .connection()
+            .query_row(
+                "SELECT id, created_at, posted_by_player_id, title, description, \
+                        reward, state, claimed_by_player_id, claimed_at, \
+                        completed_at, expires_at \
+                 FROM bounties WHERE id = ?1",
+                rusqlite::params![posted.id],
+                row_to_bounty,
+            )
+            .expect("primary-key SELECT decodes the row");
+        assert_eq!(stored, claimed, "stored row must equal RETURNING row");
+    }
+
+    /// SPEC_v3 §Task 7c acceptance, half 2: a second claimant must
+    /// be rejected. The conditional UPDATE with `WHERE state =
+    /// 'open'` ensures only the first caller wins the race; the
+    /// loser surfaces as `InvalidTransition { from: "claimed",
+    /// to: Claimed }`. Pin three things to lock the contract:
+    ///
+    /// - The typed error category (so a future regression that
+    ///   silently swallowed the second claim's loss flunks here).
+    /// - The `from` state shows the *winner's* state ("claimed"),
+    ///   not the loser's intent — proves the diagnostic SELECT
+    ///   reads the post-flip row, not a stale snapshot.
+    /// - The original claimant's id and `claimed_at` are unchanged
+    ///   after the failed second claim — proves the UPDATE failed
+    ///   atomically with no partial overwrite of the winner's
+    ///   attribution.
+    #[test]
+    fn claim_bounty_rejects_second_claimant() {
+        let (_dir, world, poster_id, alice_id, bob_id) = world_with_poster_and_two_claimants();
+        let posted = world
+            .post_bounty(
+                Some(poster_id),
+                "Find the missing pocketwatch",
+                "Bring photographic evidence.",
+                r#"{"credits":250}"#,
+                None,
+            )
+            .expect("post_bounty succeeds");
+
+        let first = world
+            .claim_bounty(posted.id, alice_id)
+            .expect("first claim succeeds");
+        let err = world
+            .claim_bounty(posted.id, bob_id)
+            .expect_err("second claim must fail");
+        assert!(
+            matches!(
+                &err,
+                BountyError::InvalidTransition { id, from, to }
+                    if *id == posted.id && from == "claimed" && *to == BountyState::Claimed
+            ),
+            "expected InvalidTransition from 'claimed' to Claimed, got {err:?}"
+        );
+
+        // The original claimant's attribution and timestamp must
+        // be unchanged after the failed second claim. Catches a
+        // regression where the conditional UPDATE wrote
+        // `claimed_by_player_id = ?2` even though the WHERE clause
+        // matched zero rows (a defensive misread of how RETURNING
+        // interacts with no-rows UPDATEs).
+        let (durable_claimant, durable_claimed_at): (Option<i64>, Option<String>) = world
+            .connection()
+            .query_row(
+                "SELECT claimed_by_player_id, claimed_at \
+                 FROM bounties WHERE id = ?1",
+                rusqlite::params![posted.id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("durable lookup");
+        assert_eq!(
+            durable_claimant,
+            Some(alice_id),
+            "rejected second claim must not overwrite winner's id"
+        );
+        assert_eq!(
+            durable_claimed_at, first.claimed_at,
+            "rejected second claim must not advance claimed_at"
+        );
+    }
+
+    /// SPEC §4.5 makes deadlined bounties uncl­aimable past their
+    /// `expires_at` — even before the Task 7e sweeper runs. An
+    /// `open` row whose deadline is already in the past must
+    /// surface [`BountyError::Expired`] **and** leave the row
+    /// untouched. We pin both halves: the typed error AND the row-
+    /// unchanged invariant. Without the second half, a regression
+    /// that flipped the order of the `WHERE` checks could let a
+    /// stale bounty slip through with a "fail" return value while
+    /// still mutating the row. Same shape as
+    /// `accept_challenge_rejects_expired`.
+    #[test]
+    fn claim_bounty_rejects_expired_bounty() {
+        let (_dir, world, poster_id, alice_id, _bob_id) = world_with_poster_and_two_claimants();
+        // A deadline well in the past so the `datetime()` comparison
+        // in claim_bounty rejects regardless of wall-clock skew.
+        let posted = world
+            .post_bounty(
+                Some(poster_id),
+                "Stale bounty",
+                "Already expired.",
+                r#"{"credits":1}"#,
+                Some("2000-01-01T00:00:00Z"),
+            )
+            .expect("post_bounty succeeds");
+
+        let err = world
+            .claim_bounty(posted.id, alice_id)
+            .expect_err("claiming an expired bounty must fail");
+        assert!(
+            matches!(err, BountyError::Expired { id } if id == posted.id),
+            "expected Expired {{ id: {} }}, got {err:?}",
+            posted.id
+        );
+
+        // Row-unchanged invariant: state still 'open',
+        // claimed_by_player_id still NULL, claimed_at still NULL.
+        // Pinning all three so a regression that wrote claimant
+        // info before checking the deadline flunks here.
+        let (state, claimed_by, claimed_at): (String, Option<i64>, Option<String>) = world
+            .connection()
+            .query_row(
+                "SELECT state, claimed_by_player_id, claimed_at \
+                 FROM bounties WHERE id = ?1",
+                rusqlite::params![posted.id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("durable lookup");
+        assert_eq!(state, "open", "expired-but-unswept row must stay 'open'");
+        assert!(
+            claimed_by.is_none(),
+            "rejected claim must leave claimed_by_player_id NULL"
+        );
+        assert!(
+            claimed_at.is_none(),
+            "rejected claim must leave claimed_at NULL"
+        );
+    }
+
+    /// A stale id (bounty was deleted, or the caller fabricated
+    /// one) must surface [`BountyError::NotFound`] rather than a
+    /// generic SQL error or a misleading `InvalidTransition`. Same
+    /// shape as `accept_challenge_missing_id_returns_not_found`.
+    #[test]
+    fn claim_bounty_missing_id_returns_not_found() {
+        let (_dir, world, _poster_id, alice_id, _bob_id) = world_with_poster_and_two_claimants();
+        let err = world
+            .claim_bounty(424_242, alice_id)
+            .expect_err("claim against a missing id must fail");
+        assert!(
+            matches!(err, BountyError::NotFound { id } if id == 424_242),
+            "expected NotFound {{ id: 424242 }}, got {err:?}"
+        );
+    }
+
+    /// An open-ended bounty (no `expires_at`) is always claimable
+    /// while it remains in `open`. Pin this so a regression that
+    /// inverted the deadline check ("reject when `expires_at IS
+    /// NULL`") flunks at `cargo test` rather than as a confused
+    /// production report.
+    #[test]
+    fn claim_bounty_succeeds_for_open_ended_bounty() {
+        let (_dir, world, poster_id, alice_id, _bob_id) = world_with_poster_and_two_claimants();
+        let posted = world
+            .post_bounty(
+                Some(poster_id),
+                "Open-ended bounty",
+                "No deadline.",
+                r#"{"credits":1}"#,
+                None,
+            )
+            .expect("post_bounty succeeds");
+
+        let claimed = world
+            .claim_bounty(posted.id, alice_id)
+            .expect("open-ended bounty must be claimable");
+        assert_eq!(claimed.state, "claimed");
+        assert_eq!(claimed.claimed_by_player_id, Some(alice_id));
+        assert!(claimed.expires_at.is_none());
     }
 
     /// Read column names from `pragma_table_info` in cid order —
