@@ -374,4 +374,26 @@ mod tests {
 
         Ok(())
     }
+
+    #[test]
+    fn direct_negative_quantity_insert_is_rejected() {
+        let dir = tempdir().expect("tempdir creates");
+        let db_path = dir.path().join("world.sqlite");
+        let mut world = WorldDb::open(&db_path).expect("open succeeds");
+
+        world
+            .apply_migration(&INVENTORY_SLOTS_MIGRATION)
+            .expect("inventory_slots migration applies");
+
+        let direct_insert = world.connection().execute(
+            "INSERT INTO inventory_slots (owner_kind, owner_id, item_key, quantity)\n\
+             VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params!["station", 8, "fuel-cell", -2],
+        );
+
+        assert!(
+            direct_insert.is_err(),
+            "negative quantity must be rejected by the inventory constraint"
+        );
+    }
 }
