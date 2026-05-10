@@ -115,7 +115,7 @@ One unchecked item per iteration. Dependencies in `[brackets]` must be checked o
 ## Acceptance criteria — gate for `<promise>V4_COMPLETE</promise>`
 
 - [x] All Task 1–13 items above are checked
-- [ ] Spatial graph supports unique-keyed places and asymmetric directed routes
+- [x] Spatial graph supports unique-keyed places and asymmetric directed routes
 - [ ] Presence supports transactional move with rollback on rejected `on_commit`
 - [ ] Place recall is per-player, idempotent, and never auto-touched by movement
 - [ ] Inventory supports atomic transfer with `on_commit` rollback and distinct error variants
