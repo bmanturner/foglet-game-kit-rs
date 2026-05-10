@@ -77,12 +77,11 @@ pub struct GameContext<'a> {
     /// untouched.
     ///
     /// Held as a shared borrow rather than `&mut` because every
-    /// `WorldDb` API takes `&self` — the `Connection` is wrapped in
-    /// interior `RefCell`/transaction state inside the type, so screens
-    /// can issue reads and writes through the same `&` they get here.
-    /// The shared borrow also matches the SPEC §8.2 promise that
-    /// `GameContext` is a *view* of runtime data, not a place where
-    /// screens get exclusive ownership of subsystems.
+    /// `WorldDb` API currently takes `&self` for read paths and
+    /// `&mut self` for mutation paths, while `GameContext` only
+    /// expresses *access* to kit subsystems here. Screen-level
+    /// mutation still needs to go through `&mut` at the call site in
+    /// v4-specific handlers.
     ///
     /// **Do not run blocking world queries from `Screen::render`**
     /// (SPEC_v2 §Task 10d). The draw path must stay non-blocking;
@@ -91,6 +90,26 @@ pub struct GameContext<'a> {
     /// [`Screen::render`] docs for the full rationale and the cache
     /// pattern callers should use.
     pub world_db: Option<&'a WorldDb>,
+    /// Optional v4 spatial handle. Present when the runtime opens a
+    /// shared-world DB; this is added in Task 11a so screens can
+    /// locate the handle without rebuilding the runtime surface.
+    pub spatial: Option<&'a WorldDb>,
+    /// Optional v4 presence handle. Present when the runtime opens a
+    /// shared-world DB; this is added in Task 11a so movement
+    /// workflows can share one borrow shape with other v4 handles.
+    pub presence: Option<&'a WorldDb>,
+    /// Optional v4 place-recall handle. Present when the runtime opens
+    /// a shared-world DB; this is added in Task 11a for fog-of-war
+    /// workflows that need discoverable place memory.
+    pub place_recall: Option<&'a WorldDb>,
+    /// Optional v4 inventory handle. Present when the runtime opens a
+    /// shared-world DB; this is added in Task 11a so transfer and
+    /// stockpile workflows can run through one runtime path.
+    pub inventory: Option<&'a WorldDb>,
+    /// Optional v4 world-tick handle. Present when the runtime opens a
+    /// shared-world DB; this is added in Task 11a so cron/login-driven
+    /// tick runners and ad-hoc callbacks share one context field.
+    pub world_ticks: Option<&'a WorldDb>,
 }
 
 impl<'a> GameContext<'a> {
@@ -110,6 +129,11 @@ impl<'a> GameContext<'a> {
             foglet,
             terminal_size,
             world_db: None,
+            spatial: None,
+            presence: None,
+            place_recall: None,
+            inventory: None,
+            world_ticks: None,
         }
     }
 
@@ -126,6 +150,11 @@ impl<'a> GameContext<'a> {
     #[must_use]
     pub fn with_world_db(mut self, world_db: &'a WorldDb) -> Self {
         self.world_db = Some(world_db);
+        self.spatial = Some(world_db);
+        self.presence = Some(world_db);
+        self.place_recall = Some(world_db);
+        self.inventory = Some(world_db);
+        self.world_ticks = Some(world_db);
         self
     }
 }
@@ -478,6 +507,26 @@ mod tests {
             ctx.world_db.is_none(),
             "GameContext::new defaults world_db to None so v1 call sites are unaffected"
         );
+        assert!(
+            ctx.spatial.is_none(),
+            "Task 11a keeps optional handles defaulting to None"
+        );
+        assert!(
+            ctx.presence.is_none(),
+            "Task 11a keeps optional handles defaulting to None"
+        );
+        assert!(
+            ctx.place_recall.is_none(),
+            "Task 11a keeps optional handles defaulting to None"
+        );
+        assert!(
+            ctx.inventory.is_none(),
+            "Task 11a keeps optional handles defaulting to None"
+        );
+        assert!(
+            ctx.world_ticks.is_none(),
+            "Task 11a keeps optional handles defaulting to None"
+        );
     }
 
     #[test]
@@ -495,7 +544,15 @@ mod tests {
         let db = WorldDb::open(tmp.path().join("world.sqlite")).expect("open world db");
 
         let ctx = GameContext::new(&cfg, &fc, (80, 24)).with_world_db(&db);
-        assert!(ctx.world_db.is_some(), "builder attaches the handle");
+        assert!(ctx.world_db.is_some(), "builder attaches world_db");
+        assert!(
+            ctx.spatial.is_some() && ctx.presence.is_some() && ctx.place_recall.is_some(),
+            "Task 11a attaches all v4 handles when world_db is present"
+        );
+        assert!(
+            ctx.inventory.is_some() && ctx.world_ticks.is_some(),
+            "Task 11a attaches all v4 handles when world_db is present"
+        );
         // SQLite reports the connection it gave us, confirming the
         // borrow points at the same `WorldDb` we opened above.
         assert_eq!(
