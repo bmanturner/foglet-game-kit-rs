@@ -830,6 +830,43 @@ mod tests {
         assert!(events.is_empty(), "cost failure must not append events");
     }
 
+    #[test]
+    fn travel_without_route_id_rejects_ambiguous_outbound_routes() {
+        let TravelFixture {
+            mut world,
+            player_id,
+            origin_id,
+            destination_id,
+            route,
+            ..
+        } = setup_travel_fixture();
+        let second_route = world
+            .create_route(origin_id, destination_id, "service-stair", None, None)
+            .expect("second route inserts");
+
+        let rejected = world.travel(TravelRequest::new(player_id, destination_id));
+
+        match rejected {
+            Err(TravelError::AmbiguousRoute {
+                matching_route_ids,
+                from_place_id,
+                to_place_id,
+                ..
+            }) => {
+                assert_eq!(from_place_id, origin_id);
+                assert_eq!(to_place_id, destination_id);
+                assert_eq!(matching_route_ids, vec![route.id, second_route.id]);
+            }
+            other => panic!("expected ambiguous route, got {other:?}"),
+        }
+
+        let loaded_presence = world
+            .get_presence(player_id)
+            .expect("presence reads")
+            .expect("presence row exists");
+        assert_eq!(loaded_presence.place_id, origin_id);
+    }
+
     struct TravelFixture {
         world: WorldDb,
         player_id: i64,

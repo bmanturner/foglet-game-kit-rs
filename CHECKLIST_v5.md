@@ -56,7 +56,7 @@ One unchecked item per iteration. Dependencies in `[brackets]` must be checked o
 - [x] **7b** — Implement `travel(ctx, req)` executing the documented step order inside a single transaction. Test: success path updates presence, touches recall, and appends event. [7a]
 - [x] **7c** — Test `validate` failure rolls back: presence, recall, and events unchanged. [7b]
 - [x] **7d** — Test `charge_cost` failure rolls back: presence, recall, and events unchanged. [7b]
-- [ ] **7e** — Test omitted `route_id` resolves a unique outbound route; ambiguous case returns `AmbiguousRoute`. [7b]
+- [x] **7e** — Test omitted `route_id` resolves a unique outbound route; ambiguous case returns `AmbiguousRoute`. [7b]
 - [ ] **7f** — Test `touch_recall = false` leaves recall unchanged even when `place_recall` is enabled. [7b]
 - [ ] **7g** — Test `append_event` returning `None` produces a `TravelResult` with `event_id = None` and no event row written. [7b]
 - [ ] **7h** — Test the helper functions correctly when `place_recall` and v2 events are independently disabled. [7b]
