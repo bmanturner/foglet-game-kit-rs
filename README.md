@@ -27,6 +27,19 @@ See [`SPEC.md`](SPEC.md) for the full contract.
   [`docs/save-and-state.md`](docs/save-and-state.md) and
   [`docs/dialog-screens.md`](docs/dialog-screens.md) for when to reach
   for each.
+  v3 adds **BBS-native async multiplayer primitives** on top of the v2
+  shared world: durable notices/mail (`Notice`, `WorldDb::send_notice`
+  / `inbox` / `mark_read` / `archive_notice`), challenge lifecycles
+  (`Challenge` with create/accept/decline/resolve/expire transitions),
+  shared market listings (`MarketListing` with atomic, callback-rolled-
+  back `buy_listing`), factions and shared goals (`Faction`,
+  `SharedGoal`, `contribute_to_goal` with auto-completion at target),
+  and bounty boards (`Bounty` with post/claim/complete/expire). Each
+  primitive is opt-in via `[multiplayer]` in `game.toml` and stores
+  state in the v2 SQLite world DB — no live sockets, no background
+  pollers, refresh-on-navigation only. See
+  [`docs/async-multiplayer.md`](docs/async-multiplayer.md) for the
+  mailbox-multiplayer model and the explicit no-real-time scope.
 - **`fgk`** — `new` (scaffolder), `emit-manifest` (Foglet operator
   JSON), and `package` (deployable bundle with a boring auditable
   `run.sh` wrapper).

@@ -115,6 +115,9 @@ One unchecked item per iteration. Dependencies in `[brackets]` must be checked o
 - [ ] **Task 10 — Final v3 verification**
       Run formatting, clippy, tests, docs, and package smoke. Quote results in the final iteration. [all prior tasks]
 
+- [x] **10a** — Mention v3's BBS-native async multiplayer primitives in `README.md` overview/feature list (completion condition #13). [9a]
+      → Added a v3 paragraph to the existing `foglet_game` bullet under "What you get" (rather than inserting a new bullet, which would have desynced the bullet list's "library / CLI / example" cadence). The paragraph names the five primitive families with their public surface in parentheses (`Notice` + `send_notice`/`inbox`/`mark_read`/`archive_notice`; `Challenge` with the five-state lifecycle; `MarketListing` with `buy_listing` and the callback-rollback contract that's load-bearing for atomic buys; `Faction`/`SharedGoal` + `contribute_to_goal` with the auto-completion-at-target hinge; `Bounty` with the four-state lifecycle), opts in via `[multiplayer]` in `game.toml`, pins the "stored in the v2 SQLite world DB — no live sockets, no background pollers, refresh-on-navigation only" guardrail (mirrors `docs/async-multiplayer.md` §10), and links to that doc as the canonical primer. Doc-only change; workspace tests unchanged at 851.
+
 ## Acceptance criteria — gate for `<promise>V3_COMPLETE</promise>`
 
 - [ ] All v2 acceptance criteria remain true
