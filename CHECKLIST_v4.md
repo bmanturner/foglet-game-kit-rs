@@ -24,7 +24,7 @@ One unchecked item per iteration. Dependencies in `[brackets]` must be checked o
 
 ### Task 4 — Route schema and adjacency
 
-- [ ] **4a** — Add `routes` migration with `id`, `from_place_id`, `to_place_id`, `kind`, `requirements_json`, `metadata_json`, `created_at` and FK constraints to `places`. [3a]
+- [x] **4a** — Add `routes` migration with `id`, `from_place_id`, `to_place_id`, `kind`, `requirements_json`, `metadata_json`, `created_at` and FK constraints to `places`. [3a]
 - [ ] **4b** — Implement `create_route`. Test: stored row round-trips. [4a]
 - [ ] **4c** — Implement `outbound_routes(place_id)` adjacency query. Test: returns only outbound routes. [4b]
 - [ ] **4d** — Implement `inbound_routes(place_id)` query. Test: returns only inbound routes. [4b]

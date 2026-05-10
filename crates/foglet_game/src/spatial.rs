@@ -1,6 +1,6 @@
-//! `spatial` — directed location graph primitives (SPEC_v4 Task 3).
+//! `spatial` — directed location graph primitives (SPEC_v4 Tasks 3 and 4).
 //!
-//! The module currently covers the `places` concept only. It stays
+//! The module covers `places` and `routes`, and stays
 //! intentionally genre-neutral:
 //!
 //! - In a **space exploration** game, a row can represent a docking
@@ -99,6 +99,47 @@ CREATE TABLE IF NOT EXISTS places (\n\
     kind            TEXT NOT NULL,\n\
     metadata_json   TEXT,\n\
     created_at      TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP\n\
+);\n\
+",
+};
+
+/// Migration for the shared `routes` table (SPEC_v4 Task 4a).
+///
+/// `routes` encodes directed edges in the graph built from
+/// [`PLACES_MIGRATION`].
+///
+/// - `from_place_id` — origin node.
+/// - `to_place_id` — destination node.
+/// - `kind` — game-defined edge label (e.g. `"airlock"`, `"corridor"`).
+/// - `requirements_json` — optional, opaque requirements payload.
+/// - `metadata_json` — optional, opaque game-defined payload.
+/// - `created_at` — UTC creation timestamp.
+///
+/// This migration keeps graph edges explicit and directional:
+/// a pair of rows can model bidirectionality, and repeated rows with
+/// different `kind` values can model distinct channels between the same
+/// place pair.
+///
+/// In a space game, one edge can model a one-way cargo transfer while
+/// another models a different atmospheric gate between the same docking
+/// nodes.
+///
+/// In a dungeon, one edge can encode a one-way chute while another can
+/// encode a locked stairway in the opposite direction.
+pub const ROUTES_MIGRATION: WorldMigration = WorldMigration {
+    version: 11,
+    name: "create_routes",
+    sql: "\
+CREATE TABLE IF NOT EXISTS routes (\n\
+    id INTEGER PRIMARY KEY,\n\
+    from_place_id      INTEGER NOT NULL,\n\
+    to_place_id        INTEGER NOT NULL,\n\
+    kind               TEXT NOT NULL,\n\
+    requirements_json  TEXT,\n\
+    metadata_json      TEXT,\n\
+    created_at         TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,\n\
+    FOREIGN KEY (from_place_id) REFERENCES places(id),\n\
+    FOREIGN KEY (to_place_id) REFERENCES places(id)\n\
 );\n\
 ",
 };
@@ -237,7 +278,7 @@ fn row_to_place(row: &rusqlite::Row<'_>) -> rusqlite::Result<Place> {
 
 #[cfg(test)]
 mod tests {
-    use super::PLACES_MIGRATION;
+    use super::{PLACES_MIGRATION, ROUTES_MIGRATION};
     use crate::world_db::WorldDb;
     use tempfile::tempdir;
 
@@ -285,6 +326,82 @@ mod tests {
             )
             .expect("recorded migration row is queryable");
         assert_eq!(row_count, PLACES_MIGRATION.version);
+    }
+
+    /// SPEC_v4 Task 4a accepts that `create_routes` applies after
+    /// `create_places` and declares both edge columns plus both place
+    /// foreign keys.
+    ///
+    /// The test asserts:
+    ///
+    /// - Exact schema ordering for predictable SQL introspection.
+    /// - Two foreign-key edges to `places(id)`, proving direct
+    ///   directed-graph representation.
+    #[test]
+    fn applies_routes_migration_with_place_fks() {
+        let dir = tempdir().expect("tempdir creates");
+        let db_path = dir.path().join("world.sqlite");
+        let mut world = WorldDb::open(&db_path).expect("open succeeds");
+
+        world
+            .apply_migration(&PLACES_MIGRATION)
+            .expect("places migration applies");
+        world
+            .apply_migration(&ROUTES_MIGRATION)
+            .expect("routes migration applies");
+
+        let mut stmt = world
+            .connection()
+            .prepare("SELECT name FROM pragma_table_info('routes') ORDER BY cid")
+            .expect("pragma_table_info preparable");
+        let columns: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .expect("query_map runs")
+            .collect::<Result<_, _>>()
+            .expect("rows decode");
+        assert_eq!(
+            columns,
+            vec![
+                "id".to_string(),
+                "from_place_id".to_string(),
+                "to_place_id".to_string(),
+                "kind".to_string(),
+                "requirements_json".to_string(),
+                "metadata_json".to_string(),
+                "created_at".to_string(),
+            ],
+            "routes schema must match SPEC_v4 Task 4a exactly"
+        );
+
+        let mut fk_stmt = world
+            .connection()
+            .prepare("PRAGMA foreign_key_list('routes')")
+            .expect("foreign_key_list preparable");
+        let fk_rows = fk_stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            })
+            .expect("foreign-key rows decode");
+
+        let mut keys = vec![];
+        for result in fk_rows {
+            keys.push(result.expect("query row decodes"));
+        }
+
+        assert!(keys.contains(&(
+            "places".to_string(),
+            "from_place_id".to_string(),
+            "id".to_string()
+        )));
+        assert!(keys.contains(&(
+            "places".to_string(),
+            "to_place_id".to_string(),
+            "id".to_string()
+        )));
     }
 
     /// SPEC_v4 Task 3b requires a typed round-trip surface for a
