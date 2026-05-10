@@ -553,4 +553,35 @@ mod tests {
             Err(MultiUserHarnessError::NoticeNotFound { handle }) if handle == "bob"
         ));
     }
+
+    #[test]
+    fn drop_cleans_up_temp_world_db_and_save_roots() {
+        let harness = MultiUserHarness::builder()
+            .add_user("alice", FogletRole::User)
+            .add_user("bob", FogletRole::User)
+            .build()
+            .expect("harness builds");
+        let temp_root = harness.temp_root().to_path_buf();
+        let world_db_path = harness.world_db_path().to_path_buf();
+        let alice_save_root = harness
+            .save_root_for("alice")
+            .expect("alice save root")
+            .to_path_buf();
+        let bob_save_root = harness
+            .save_root_for("bob")
+            .expect("bob save root")
+            .to_path_buf();
+
+        assert!(temp_root.exists());
+        assert!(world_db_path.exists());
+        assert!(alice_save_root.exists());
+        assert!(bob_save_root.exists());
+
+        drop(harness);
+
+        assert!(!temp_root.exists());
+        assert!(!world_db_path.exists());
+        assert!(!alice_save_root.exists());
+        assert!(!bob_save_root.exists());
+    }
 }
