@@ -305,10 +305,11 @@ impl ChallengeState {
 /// justify the abstraction yet — SPEC tenet "no premature
 /// abstraction").
 ///
-/// Task 4b–4c need: `EmptyKind`, `Sqlite`, `NotFound`,
-/// `InvalidTransition`, and `Expired`. Validation variants for
-/// length caps or self-challenge are deferred to follow-up tasks if
-/// SPEC ever calls for them; SPEC §4.2 does not require either.
+/// Task 4b–4e need: `EmptyKind`, `EmptyResult`, `Sqlite`,
+/// `NotFound`, `InvalidTransition`, and `Expired`. Validation
+/// variants for length caps or self-challenge are deferred to
+/// follow-up tasks if SPEC ever calls for them; SPEC §4.2 does not
+/// require either.
 #[derive(Debug, Error)]
 pub enum ChallengeError {
     /// `kind` was empty. SPEC §4.2 lists `kind` as required; the kit
@@ -318,6 +319,18 @@ pub enum ChallengeError {
     /// every "challenges of kind X" query.
     #[error("challenge kind must not be empty")]
     EmptyKind,
+    /// `result` was empty on a resolve call. SPEC §4.2 lists
+    /// `result JSON` as the resolution payload; the kit additionally
+    /// rejects an empty string at the boundary so a regression that
+    /// dropped the result mid-call (an `unwrap_or_default()` pattern,
+    /// say) surfaces as a typed error rather than as an
+    /// indistinguishable-from-declined `""` payload in the audit
+    /// view. Game code that genuinely has no structured result MUST
+    /// still pass an explicit JSON value (e.g. `"{}"`) so the
+    /// "resolved with no payload" case is intentional, not
+    /// accidental.
+    #[error("challenge result must not be empty")]
+    EmptyResult,
     /// The `INSERT … RETURNING` round-trip (or `UPDATE` on a
     /// transition) failed. Wrapping `rusqlite::Error` keeps the call
     /// site readable while preserving the underlying cause for
@@ -629,6 +642,108 @@ RETURNING id, created_at, challenger_player_id, target_player_id, \
             Ok(challenge) => Ok(challenge),
             Err(rusqlite::Error::QueryReturnedNoRows) => {
                 Err(self.diagnose_failed_transition(challenge_id, ChallengeState::Declined))
+            }
+            Err(source) => Err(ChallengeError::Sqlite { source }),
+        }
+    }
+
+    /// Transition a challenge from `accepted` to `resolved` and stamp
+    /// `resolved_at` + `result` (SPEC_v3 §4.2 / §Task 4e).
+    ///
+    /// The contract is "if and only if the row was in `accepted`, it
+    /// is now `resolved` with a `resolved_at` timestamp and the caller-
+    /// provided `result` payload; otherwise the row is unchanged and
+    /// the helper returns a typed error explaining why". SPEC §4.2
+    /// lists `accepted -> resolved` as the only legal resolve
+    /// transition; any other current state (`open`, `declined`,
+    /// `resolved`, `expired`) must surface as
+    /// [`ChallengeError::InvalidTransition`].
+    ///
+    /// Game code owns result calculation (SPEC §4.2 "Game code owns
+    /// result calculation; the kit owns durable lifecycle
+    /// invariants"). The kit treats `result` as opaque text — same
+    /// contract as `stake` on create — so a future `result` shape
+    /// change is a game-side concern that doesn't require a kit
+    /// migration.
+    ///
+    /// # Conditional UPDATE shape
+    ///
+    /// The `WHERE` clause folds two checks into the UPDATE so the
+    /// success path is one round-trip:
+    ///
+    /// 1. `id = ?1` — addresses the row.
+    /// 2. `state = 'accepted'` — only `accepted -> resolved` is
+    ///    legal. SPEC §4.2 forbids resolving an `open` challenge
+    ///    (the target hasn't agreed) and resolving any terminal
+    ///    state (already resolved/declined/expired).
+    ///
+    /// The bookkeeping fields are written in the same statement:
+    /// `state = 'resolved'`, `resolved_at = CURRENT_TIMESTAMP`, and
+    /// `result = ?2`. `RETURNING` echoes back the canonical row.
+    ///
+    /// Note this path does NOT gate on `expires_at`: an `accepted`
+    /// challenge has already passed the deadline gate via
+    /// [`Self::accept_challenge`], and the deadline is irrelevant
+    /// once the challenge is in flight. SPEC §4.2's "Expired
+    /// challenges cannot be accepted" is scoped to acceptance only,
+    /// and the shared `diagnose_failed_transition` helper restricts
+    /// `Expired` to `attempted == Accepted` so a future caller can't
+    /// accidentally surface it on the resolve path.
+    ///
+    /// # Validation order
+    ///
+    /// The empty-`result` check runs **before** the SQL round-trip,
+    /// same ordering rationale as [`Self::create_challenge`]: a
+    /// rejected resolve never produces a state flip, never burns an
+    /// autoincrement, and never lands a partial row.
+    ///
+    /// # Failure
+    ///
+    /// - [`ChallengeError::EmptyResult`] — caller passed `""`.
+    /// - [`ChallengeError::NotFound`] — no row matches `id`.
+    /// - [`ChallengeError::InvalidTransition`] — row is in any state
+    ///   other than `accepted`.
+    /// - [`ChallengeError::Sqlite`] — any other `rusqlite` error.
+    ///
+    /// # Concurrency
+    ///
+    /// Takes `&self`: a single `UPDATE … RETURNING` plus an optional
+    /// diagnostic `SELECT` under the configured busy timeout. Same
+    /// borrow shape as [`Self::accept_challenge`] and
+    /// [`Self::decline_challenge`].
+    pub fn resolve_challenge(
+        &self,
+        challenge_id: i64,
+        result: &str,
+    ) -> Result<Challenge, ChallengeError> {
+        // Validation runs before the SQL round-trip so a rejected
+        // resolve never produces a state flip — same ordering as
+        // `create_challenge`'s `EmptyKind` check.
+        if result.is_empty() {
+            return Err(ChallengeError::EmptyResult);
+        }
+
+        // Conditional UPDATE: only an `accepted` row gets
+        // transitioned. `result = ?2` is written in the same
+        // statement so the row never exists in a "resolved with NULL
+        // result" intermediate state — SPEC §4.2's `result JSON` is
+        // mandatory on the resolved row.
+        const UPDATE_SQL: &str = "\
+UPDATE challenges \
+SET state = 'resolved', resolved_at = CURRENT_TIMESTAMP, result = ?2 \
+WHERE id = ?1 \
+  AND state = 'accepted' \
+RETURNING id, created_at, challenger_player_id, target_player_id, \
+          kind, stake, state, accepted_at, resolved_at, expires_at, result";
+
+        match self.connection().query_row(
+            UPDATE_SQL,
+            rusqlite::params![challenge_id, result],
+            row_to_challenge,
+        ) {
+            Ok(challenge) => Ok(challenge),
+            Err(rusqlite::Error::QueryReturnedNoRows) => {
+                Err(self.diagnose_failed_transition(challenge_id, ChallengeState::Resolved))
             }
             Err(source) => Err(ChallengeError::Sqlite { source }),
         }
@@ -1478,6 +1593,248 @@ mod tests {
         let (_dir, world) = world_with_challenges();
         let err = world
             .decline_challenge(424_242)
+            .expect_err("missing id must fail");
+        assert!(
+            matches!(err, ChallengeError::NotFound { id } if id == 424_242),
+            "expected NotFound, got {err:?}"
+        );
+    }
+
+    /// SPEC_v3 §Task 4e acceptance: the canonical happy path. An
+    /// `accepted` challenge transitions to `resolved`, the caller-
+    /// provided `result` JSON is stored verbatim, `resolved_at` is
+    /// stamped by SQL, and `accepted_at` from the prior transition
+    /// stays put. Round-trip via primary-key SELECT to prove the
+    /// `RETURNING` row is durable. Same shape as
+    /// `accept_challenge_transitions_open_to_accepted`.
+    #[test]
+    fn resolve_challenge_transitions_accepted_to_resolved() {
+        let (_dir, world) = world_with_challenges();
+        let alice = world.upsert_player(&ctx("u-a", "alice")).unwrap();
+        let bob = world.upsert_player(&ctx("u-b", "bob")).unwrap();
+        let created = world
+            .create_challenge(alice.id, bob.id, "clue_race", None, None)
+            .expect("create_challenge succeeds");
+        let accepted = world
+            .accept_challenge(created.id)
+            .expect("accept_challenge succeeds");
+
+        let payload = r#"{"winner":"alice","xp":100}"#;
+        let resolved = world
+            .resolve_challenge(created.id, payload)
+            .expect("resolve_challenge succeeds on an accepted challenge");
+
+        assert_eq!(
+            resolved.state,
+            ChallengeState::Resolved.as_str(),
+            "accepted challenge must transition to 'resolved'"
+        );
+        assert!(
+            resolved.resolved_at.is_some(),
+            "resolve_challenge must stamp resolved_at"
+        );
+        assert_eq!(
+            resolved.result.as_deref(),
+            Some(payload),
+            "resolve_challenge must store the result JSON verbatim"
+        );
+        assert_eq!(
+            resolved.accepted_at, accepted.accepted_at,
+            "resolve_challenge must preserve the prior accepted_at"
+        );
+
+        let stored = world
+            .connection()
+            .query_row(
+                "SELECT id, created_at, challenger_player_id, target_player_id, \
+                        kind, stake, state, accepted_at, resolved_at, expires_at, result \
+                 FROM challenges WHERE id = ?1",
+                rusqlite::params![created.id],
+                row_to_challenge,
+            )
+            .expect("primary-key SELECT decodes the row");
+        assert_eq!(stored, resolved, "stored row must equal RETURNING row");
+    }
+
+    /// SPEC §4.2: only `accepted -> resolved` is legal. Resolving an
+    /// `open` row (target hasn't accepted yet) must fail with
+    /// [`ChallengeError::InvalidTransition`] from `'open'` and leave
+    /// the row entirely untouched — no state flip, no `resolved_at`,
+    /// no `result`. Pin the row-unchanged invariant so a regression
+    /// that wrote partial state then returned the typed error
+    /// couldn't slip through.
+    #[test]
+    fn resolve_challenge_rejects_open() {
+        let (_dir, world) = world_with_challenges();
+        let alice = world.upsert_player(&ctx("u-a", "alice")).unwrap();
+        let bob = world.upsert_player(&ctx("u-b", "bob")).unwrap();
+        let created = world
+            .create_challenge(alice.id, bob.id, "clue_race", None, None)
+            .unwrap();
+
+        let err = world
+            .resolve_challenge(created.id, r#"{"winner":"alice"}"#)
+            .expect_err("resolving an open challenge must fail");
+        assert!(
+            matches!(
+                &err,
+                ChallengeError::InvalidTransition { id, from, to }
+                    if *id == created.id && from == "open" && *to == ChallengeState::Resolved
+            ),
+            "expected InvalidTransition from 'open' to Resolved, got {err:?}"
+        );
+
+        // Row-unchanged invariant: state still 'open', resolved_at
+        // and result still NULL.
+        let (state, resolved_at, result): (String, Option<String>, Option<String>) = world
+            .connection()
+            .query_row(
+                "SELECT state, resolved_at, result FROM challenges WHERE id = ?1",
+                rusqlite::params![created.id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(state, "open", "rejected resolve must not mutate state");
+        assert!(
+            resolved_at.is_none(),
+            "rejected resolve must leave resolved_at NULL"
+        );
+        assert!(result.is_none(), "rejected resolve must leave result NULL");
+    }
+
+    /// Re-resolving an already-resolved challenge must surface
+    /// [`ChallengeError::InvalidTransition`] from `'resolved'` rather
+    /// than overwriting the original result payload. SPEC §4.2 makes
+    /// `resolved` terminal; a UI that fires resolve twice (a double-
+    /// keypress, an at-least-once retry, two referees racing) needs
+    /// the typed signal to render the right message AND the original
+    /// payload must survive — overwriting it would corrupt the audit
+    /// trail.
+    #[test]
+    fn resolve_challenge_rejects_already_resolved() {
+        let (_dir, world) = world_with_challenges();
+        let alice = world.upsert_player(&ctx("u-a", "alice")).unwrap();
+        let bob = world.upsert_player(&ctx("u-b", "bob")).unwrap();
+        let created = world
+            .create_challenge(alice.id, bob.id, "clue_race", None, None)
+            .unwrap();
+        world.accept_challenge(created.id).unwrap();
+        let first = world
+            .resolve_challenge(created.id, r#"{"winner":"alice"}"#)
+            .expect("first resolve succeeds");
+
+        let err = world
+            .resolve_challenge(created.id, r#"{"winner":"bob"}"#)
+            .expect_err("second resolve must fail");
+        assert!(
+            matches!(
+                &err,
+                ChallengeError::InvalidTransition { id, from, to }
+                    if *id == created.id && from == "resolved" && *to == ChallengeState::Resolved
+            ),
+            "expected InvalidTransition from 'resolved' to Resolved, got {err:?}"
+        );
+
+        // Original payload must survive — second resolve does not
+        // overwrite the audit trail.
+        let post: Option<String> = world
+            .connection()
+            .query_row(
+                "SELECT result FROM challenges WHERE id = ?1",
+                rusqlite::params![created.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            post, first.result,
+            "second resolve must not overwrite the stored result"
+        );
+    }
+
+    /// Resolving a `declined` challenge must surface
+    /// [`ChallengeError::InvalidTransition`] from `'declined'`. SPEC
+    /// §4.2 makes `declined` terminal, and there is no path back to
+    /// `accepted` — covering this case here (alongside the open and
+    /// already-resolved cases) gives Task 4e three of the four
+    /// non-accepted starting states; the fourth (`expired`) lands
+    /// with Task 4f's sweeper. Task 4g's invalid-transition matrix
+    /// covers the full grid.
+    #[test]
+    fn resolve_challenge_rejects_declined() {
+        let (_dir, world) = world_with_challenges();
+        let alice = world.upsert_player(&ctx("u-a", "alice")).unwrap();
+        let bob = world.upsert_player(&ctx("u-b", "bob")).unwrap();
+        let created = world
+            .create_challenge(alice.id, bob.id, "clue_race", None, None)
+            .unwrap();
+        world.decline_challenge(created.id).unwrap();
+
+        let err = world
+            .resolve_challenge(created.id, r#"{"winner":"alice"}"#)
+            .expect_err("resolving a declined challenge must fail");
+        assert!(
+            matches!(
+                &err,
+                ChallengeError::InvalidTransition { id, from, to }
+                    if *id == created.id && from == "declined" && *to == ChallengeState::Resolved
+            ),
+            "expected InvalidTransition from 'declined' to Resolved, got {err:?}"
+        );
+    }
+
+    /// An empty `result` must surface [`ChallengeError::EmptyResult`]
+    /// at the boundary, before any SQL runs. Pin both the typed
+    /// error and the row-unchanged invariant — a regression that
+    /// "helpfully" defaulted `""` to `"{}"` would silently land
+    /// payloads game code never produced. The accepted challenge
+    /// must remain in `accepted` so the next (well-formed) resolve
+    /// call still succeeds.
+    #[test]
+    fn resolve_challenge_rejects_empty_result() {
+        let (_dir, world) = world_with_challenges();
+        let alice = world.upsert_player(&ctx("u-a", "alice")).unwrap();
+        let bob = world.upsert_player(&ctx("u-b", "bob")).unwrap();
+        let created = world
+            .create_challenge(alice.id, bob.id, "clue_race", None, None)
+            .unwrap();
+        world.accept_challenge(created.id).unwrap();
+
+        let err = world
+            .resolve_challenge(created.id, "")
+            .expect_err("empty result must be rejected");
+        assert!(matches!(err, ChallengeError::EmptyResult), "got {err:?}");
+
+        // Row-unchanged invariant: state still 'accepted',
+        // resolved_at still NULL, result still NULL.
+        let (state, resolved_at, result): (String, Option<String>, Option<String>) = world
+            .connection()
+            .query_row(
+                "SELECT state, resolved_at, result FROM challenges WHERE id = ?1",
+                rusqlite::params![created.id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(state, "accepted");
+        assert!(resolved_at.is_none());
+        assert!(result.is_none());
+
+        // The next well-formed resolve must still succeed — the
+        // rejected attempt did not poison the row.
+        let resolved = world
+            .resolve_challenge(created.id, r#"{"ok":true}"#)
+            .expect("subsequent well-formed resolve succeeds");
+        assert_eq!(resolved.state, ChallengeState::Resolved.as_str());
+    }
+
+    /// A stale id (challenge was deleted, or the caller fabricated
+    /// one) must surface [`ChallengeError::NotFound`] rather than a
+    /// generic SQL error. Same shape as
+    /// `accept_challenge_missing_id_returns_not_found`.
+    #[test]
+    fn resolve_challenge_missing_id_returns_not_found() {
+        let (_dir, world) = world_with_challenges();
+        let err = world
+            .resolve_challenge(424_242, r#"{"ok":true}"#)
             .expect_err("missing id must fail");
         assert!(
             matches!(err, ChallengeError::NotFound { id } if id == 424_242),

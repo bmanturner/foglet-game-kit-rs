@@ -33,9 +33,6 @@ Design bias: ambitious BBS-native systems depth; satisfying solo play; async mul
 6. **Multiple careers, no single golden path**  
    Trader, smuggler, salvager, explorer, privateer, faction agent, colony founder, market manipulator, pirate, bounty hunter, and corporate logistics chief should all be viable.
 
-7. **Terminal drama**  
-   The game should feel great in 80x24: compact dashboards, hotkey menus, plain-text reports, ASCII sector maps, modal prompts, clear consequences, and satisfying “press any key” reveals.
-
 ---
 
 ## 3. Inspirations and Non-Clone Boundary
@@ -77,7 +74,6 @@ Drop Dead Nebula is designed specifically for the Foglet game-kit roadmap:
 
 - runs as a packaged `:external_pty` door;
 - uses safe terminal setup/restore;
-- assumes 80x24 baseline readability;
 - uses Foglet context for local player identity;
 - stores per-player private state in per-user save files where appropriate;
 - stores shared world state in a game-owned SQLite world DB;
