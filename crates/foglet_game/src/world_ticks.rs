@@ -786,11 +786,24 @@ mod tests {
     fn run_due_ticks_concurrent_runners_do_not_double_invoke_tasks() {
         let dir = tempdir().expect("tempdir creates");
         let db_path = dir.path().join("world.sqlite");
-        let db_path = db_path.into_os_string();
 
         let alpha_count = Arc::new(AtomicUsize::new(0));
         let beta_count = Arc::new(AtomicUsize::new(0));
         let start = Arc::new(Barrier::new(2));
+
+        // Seed the DB once before the concurrent phase so this test isolates
+        // the run_due_ticks claiming behavior instead of migration/DDL lock
+        // timing during open/register setup.
+        let mut seed_world = WorldDb::open(&db_path).expect("open succeeds");
+        seed_world
+            .apply_migration(&WORLD_TICK_TASKS_MIGRATION)
+            .expect("world_tick_tasks migration applies");
+        seed_world
+            .register_tick("alpha_watch", 120, |_| Ok(()))
+            .expect("register tick alpha");
+        seed_world
+            .register_tick("beta_bay", 120, |_| Ok(()))
+            .expect("register tick beta");
 
         let run_a = {
             let db_path = db_path.clone();
@@ -798,11 +811,7 @@ mod tests {
             let beta_count = Arc::clone(&beta_count);
             let start_a = Arc::clone(&start);
             thread::spawn(move || {
-                let mut world = WorldDb::open(db_path.as_os_str()).expect("open succeeds");
-
-                world
-                    .apply_migration(&WORLD_TICK_TASKS_MIGRATION)
-                    .expect("world_tick_tasks migration applies");
+                let mut world = WorldDb::open(&db_path).expect("open succeeds");
 
                 world
                     .register_tick("alpha_watch", 120, move |_tx| {
@@ -833,11 +842,7 @@ mod tests {
             let beta_count = Arc::clone(&beta_count);
             let start_b = Arc::clone(&start);
             thread::spawn(move || {
-                let mut world = WorldDb::open(db_path.as_os_str()).expect("open succeeds");
-
-                world
-                    .apply_migration(&WORLD_TICK_TASKS_MIGRATION)
-                    .expect("world_tick_tasks migration applies");
+                let mut world = WorldDb::open(&db_path).expect("open succeeds");
 
                 world
                     .register_tick("alpha_watch", 120, move |_tx| {
