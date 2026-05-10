@@ -62,6 +62,18 @@ pub enum TickCommandError {
         source: WorldDbError,
     },
 
+    /// The configured world database does not exist yet.
+    ///
+    /// `fgk tick` is an operator-facing maintenance command; we do not
+    /// auto-create this file because that would blur the distinction
+    /// between "no work to do" and "runtime/world state has not been
+    /// provisioned yet."
+    #[error("world db is missing at `{path}`")]
+    MissingWorldDb {
+        /// Configured path that must already exist.
+        path: String,
+    },
+
     /// The migration install for `world_tick_tasks` failed.
     #[error("failed to ensure `world_tick_tasks` table: {source}")]
     EnsureTickTable {
@@ -131,6 +143,12 @@ pub fn run_tick(project_dir: &Path) -> Result<TickRunSummary, TickCommandError> 
     }
 
     let world_path = project_dir.join(&config.world.path);
+    if !world_path.exists() {
+        return Err(TickCommandError::MissingWorldDb {
+            path: world_path.display().to_string(),
+        });
+    }
+
     let mut world =
         WorldDb::open(world_path.clone()).map_err(|source| TickCommandError::OpenWorldDb {
             path: world_path.display().to_string(),

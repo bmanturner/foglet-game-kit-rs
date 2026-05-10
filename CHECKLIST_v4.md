@@ -83,7 +83,7 @@ One unchecked item per iteration. Dependencies in `[brackets]` must be checked o
 
 - [x] **10a** — Add `fgk tick --project <path>` subcommand that opens the project's world DB and calls `run_due_ticks(now)` once. [9c]
 - [x] **10b** — Print a one-line summary of tasks run and tasks skipped. Test: subcommand returns exit code 0 on success. [10a]
-- [ ] **10c** — Surface DB open errors before invoking `run_due_ticks`. Test: missing world DB produces a clear error and non-zero exit. [10a]
+- [x] **10c** — Surface DB open errors before invoking `run_due_ticks`. Test: missing world DB produces a clear error and non-zero exit. [10a]
 - [ ] **10d** — Add CLI smoke test asserting `fgk tick` is interruption-safe (Ctrl-C during a callback leaves `last_run_at` unchanged for that task). [10a, 9d]
 
 ### Task 11 — Runtime context integration

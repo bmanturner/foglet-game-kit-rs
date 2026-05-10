@@ -87,3 +87,36 @@ fn fgk_tick_executes_due_world_tasks_once() {
         .expect("count query");
     assert_eq!(rows_due, 1, "catch-up bound should leave one task pending");
 }
+
+#[test]
+fn fgk_tick_reports_missing_world_db_and_does_not_create_file() {
+    let td = tempfile::tempdir().expect("tempdir");
+    let project = td.path().join("missing-world");
+    fs::create_dir_all(&project).expect("create project dir");
+    write_fixture_project(&project);
+
+    let world_path = project.join("world").join("world.sqlite");
+    assert!(
+        !world_path.exists(),
+        "fixture should start with no world db"
+    );
+
+    Command::cargo_bin("fgk")
+        .unwrap()
+        .arg("tick")
+        .arg("--project")
+        .arg(&project)
+        .assert()
+        .failure()
+        .stderr(contains("world db is missing at"))
+        .stderr(contains(world_path.to_string_lossy()));
+
+    assert!(
+        !world_path.exists(),
+        "failure should not create missing world db"
+    );
+    assert!(
+        !project.join("world").exists(),
+        "failure should not create world directory"
+    );
+}
