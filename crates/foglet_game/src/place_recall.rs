@@ -306,4 +306,77 @@ mod tests {
 
         assert_eq!(second, loaded);
     }
+
+    /// Task 6c requires `first_seen_at` to stay fixed after the first
+    /// touch, even while `last_seen_at` updates.
+    ///
+    /// This captures the "fog-of-war memory" contract directly: revisiting a
+    /// **dungeon room** should not erase the first-seen breadcrumb, while
+    /// revisits should still refresh the latest-seen time.
+    #[test]
+    fn touch_recall_preserves_first_seen_at_without_merging_metadata() {
+        let dir = tempdir().expect("tempdir creates");
+        let db_path = dir.path().join("world.sqlite");
+        let mut world = WorldDb::open(&db_path).expect("open succeeds");
+
+        world
+            .apply_migration(&PLAYERS_MIGRATION)
+            .expect("players migration applies");
+        world
+            .apply_migration(&PLACES_MIGRATION)
+            .expect("places migration applies");
+        world
+            .apply_migration(&PLACE_RECALL_MIGRATION)
+            .expect("place_recall migration applies");
+
+        let player_id: i64 = world
+            .connection()
+            .query_row(
+                "INSERT INTO players (handle) VALUES (?1) RETURNING id",
+                rusqlite::params!["Helmsman"],
+                |row| row.get(0),
+            )
+            .expect("fixture player inserts");
+
+        let corridor = world
+            .insert_place(
+                "d-05",
+                "Narrow Corridor",
+                "corridor",
+                Some(r#"{"zone":"A"}"#),
+            )
+            .expect("fixture place inserts");
+
+        let first = world
+            .touch_recall(
+                player_id,
+                corridor.id,
+                Some(r#"{"glyph":"◉","note":"cold"}"#),
+            )
+            .expect("initial touch");
+
+        sleep(Duration::from_secs(1));
+
+        let second = world
+            .touch_recall(
+                player_id,
+                corridor.id,
+                Some(r#"{"glyph":"◉","note":"warm"}"#),
+            )
+            .expect("re-touch");
+
+        assert_eq!(
+            first.first_seen_at, second.first_seen_at,
+            "first_seen_at must remain constant across repeated touches"
+        );
+        assert!(
+            second.last_seen_at > first.last_seen_at,
+            "last_seen_at must refresh on repeat touches"
+        );
+        assert_eq!(
+            second.snapshot_json,
+            Some(r#"{"glyph":"◉","note":"warm"}"#.to_string()),
+            "latest snapshot should still replace the previous one"
+        );
+    }
 }
