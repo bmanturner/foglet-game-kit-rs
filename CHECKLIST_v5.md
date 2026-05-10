@@ -80,7 +80,7 @@ One unchecked item per iteration. Dependencies in `[brackets]` must be checked o
 - [x] **9d** — Test player-scoped filter excludes other players' events. [9a]
 - [x] **9e** — Test the per-event formatter callback is invoked once per visible event and its return value drives rendering. [9a]
 - [x] **9f** — Implement embeddable region mode that renders within a caller-supplied rectangle. Test: embedded mode does not redraw outside the region. [9a]
-- [ ] **9g** — Confirm the screen is read-only. Test: rendering does not mutate any event row. [9a]
+- [x] **9g** — Confirm the screen is read-only. Test: rendering does not mutate any event row. [9a]
 
 ### Task 10 — Multi-user local-dev test harness
 

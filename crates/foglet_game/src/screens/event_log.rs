@@ -508,6 +508,34 @@ mod tests {
         );
     }
 
+    #[test]
+    fn event_log_screen_rendering_does_not_mutate_event_rows() {
+        let dir = tempdir().expect("tempdir creates");
+        let db_path = dir.path().join("world.sqlite");
+        let mut world = WorldDb::open(&db_path).expect("open succeeds");
+        world
+            .apply_migration(&PLAYERS_MIGRATION)
+            .expect("players migration applies");
+        world
+            .apply_migration(&WORLD_EVENTS_MIGRATION)
+            .expect("events migration applies");
+        world
+            .append_event("ledger", None, "case note", Some(r#"{"clue":1}"#))
+            .expect("event appends");
+        let before = world.recent_events(10).expect("events read before render");
+        let section = EventLogScreenSection {
+            enabled: true,
+            default_page_size: 20,
+        };
+        let mut screen =
+            EventLogScreen::from_world_db(&world, &section).expect("screen loads events");
+
+        let _buffer = draw_screen(&mut screen);
+
+        let after = world.recent_events(10).expect("events read after render");
+        assert_eq!(after, before);
+    }
+
     fn draw_screen(screen: &mut EventLogScreen) -> Buffer {
         let (config, foglet) = fixture_context();
         let mut ctx = GameContext::new(&config, &foglet, (80, 24));
