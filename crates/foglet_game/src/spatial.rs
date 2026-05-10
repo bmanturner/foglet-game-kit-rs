@@ -152,6 +152,76 @@ RETURNING id, key, display_name, kind, metadata_json, created_at";
                 source,
             })
     }
+
+    /// Load one place by its stable `key`.
+    ///
+    /// This is the primary lookup for game code that stores authored
+    /// identifiers such as:
+    ///
+    /// - In a **space exploration** game, resolving a docking location
+    ///   like `"sector-lima-gate"` when loading a map.
+    /// - In a **dungeon crawler**, resolving a room node such as
+    ///   `"crypt-door-03"` when validating movement targets.
+    ///
+    /// Return `Ok(None)` when the key is unknown; all other SQL errors
+    /// still surface through [`PlaceError`] so callers can preserve the
+    /// same transaction/error handling expectations used by `insert_place`.
+    pub fn get_place_by_key(&self, key: &str) -> Result<Option<Place>, PlaceError> {
+        const SQL: &str = "\
+SELECT id, key, display_name, kind, metadata_json, created_at\n\
+FROM places\n\
+WHERE key = ?1";
+
+        match self
+            .connection()
+            .query_row(SQL, rusqlite::params![key], row_to_place)
+        {
+            Ok(place) => Ok(Some(place)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(source) => Err(PlaceError::Sqlite {
+                key: key.to_string(),
+                source,
+            }),
+        }
+    }
+
+    /// Return all places in deterministic key order.
+    ///
+    /// The API intentionally sorts by `key` so that command/UI code gets
+    /// stable lists suitable for snapshots, auto-complete menus, and
+    /// debug consoles. This is a neutral primitive:
+    ///
+    /// - In a **space exploration** game, the ordering makes route
+    ///   builders render predictable station lists.
+    /// - In a **dungeon crawler**, it keeps room navigation menus
+    ///   deterministic across runs.
+    pub fn list_places(&self) -> Result<Vec<Place>, PlaceError> {
+        const SQL: &str = "\
+SELECT id, key, display_name, kind, metadata_json, created_at\n\
+FROM places\n\
+ORDER BY key ASC, id ASC";
+
+        let mut stmt = self
+            .connection()
+            .prepare(SQL)
+            .map_err(|source| PlaceError::Sqlite {
+                key: "<list_places>".to_string(),
+                source,
+            })?;
+        let places = stmt
+            .query_map([], row_to_place)
+            .map_err(|source| PlaceError::Sqlite {
+                key: "<list_places>".to_string(),
+                source,
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|source| PlaceError::Sqlite {
+                key: "<list_places>".to_string(),
+                source,
+            })?;
+
+        Ok(places)
+    }
 }
 
 fn row_to_place(row: &rusqlite::Row<'_>) -> rusqlite::Result<Place> {
@@ -306,6 +376,76 @@ mod tests {
         assert!(
             rendered.contains("failed to insert place"),
             "error should be emitted from the insert path"
+        );
+    }
+
+    /// SPEC_v4 Task 3d requires deterministic list ordering so game-side
+    /// UIs and tests can depend on stable output.
+    #[test]
+    fn list_places_returns_sorted_rows() {
+        let dir = tempdir().expect("tempdir creates");
+        let db_path = dir.path().join("world.sqlite");
+        let mut world = WorldDb::open(&db_path).expect("open succeeds");
+        world
+            .apply_migration(&PLACES_MIGRATION)
+            .expect("places migration applies");
+
+        let alpha = world
+            .insert_place("zeta-dock", "Zeta Dock", "dock", None)
+            .expect("insert by key works");
+        world
+            .insert_place("alpha-hall", "Alpha Hall", "chamber", None)
+            .expect("insert by key works");
+        world
+            .insert_place("midpoint", "Midpoint Hub", "hub", None)
+            .expect("insert by key works");
+
+        let rows = world.list_places().expect("listing places is queryable");
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].key, "alpha-hall");
+        assert_eq!(rows[1].key, "midpoint");
+        assert_eq!(rows[2].key, "zeta-dock");
+        assert_eq!(rows[0].display_name, "Alpha Hall");
+        assert_eq!(rows[1].display_name, "Midpoint Hub");
+        assert_eq!(rows[2].display_name, "Zeta Dock");
+        let ids = rows.iter().map(|place| place.id).collect::<Vec<_>>();
+        assert!(
+            ids.iter().all(|id| *id > 0),
+            "listed rows should be real rows"
+        );
+        assert!(alpha.id > 0, "inserted fixture row should have concrete id");
+    }
+
+    /// SPEC_v4 Task 3d also requires key lookup semantics.
+    #[test]
+    fn get_place_by_key_returns_match_or_none() {
+        let dir = tempdir().expect("tempdir creates");
+        let db_path = dir.path().join("world.sqlite");
+        let mut world = WorldDb::open(&db_path).expect("open succeeds");
+        world
+            .apply_migration(&PLACES_MIGRATION)
+            .expect("places migration applies");
+
+        let inserted = world
+            .insert_place(
+                "frontier-node",
+                "Frontier Node",
+                "node",
+                Some(r#"{"hazard": 3}"#),
+            )
+            .expect("insert by key works");
+
+        let found = world
+            .get_place_by_key("frontier-node")
+            .expect("place lookup should succeed");
+        assert_eq!(found, Some(inserted.clone()));
+
+        let missing = world
+            .get_place_by_key("missing-node")
+            .expect("missing lookup should be Ok(None)");
+        assert!(
+            missing.is_none(),
+            "unknown keys should return None without SQL error"
         );
     }
 }

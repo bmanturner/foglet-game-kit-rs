@@ -19,7 +19,7 @@ One unchecked item per iteration. Dependencies in `[brackets]` must be checked o
 - [x] **3a** — Add `places` migration with `id`, `key` UNIQUE, `display_name`, `kind`, `metadata_json`, `created_at`. [v2 Task 4]
 - [x] **3b** — Implement `Place` type and `insert_place`. Test: stored row round-trips. [3a]
 - [x] **3c** — Enforce `key` uniqueness. Test: second insert with same key fails clearly. [3b]
-- [ ] **3d** — Implement `get_place_by_key` and `list_places`. Test: deterministic ordering. [3b]
+- [x] **3d** — Implement `get_place_by_key` and `list_places`. Test: deterministic ordering. [3b]
 - [ ] **3e** — Confirm `metadata_json` is stored opaquely. Test: arbitrary JSON object preserved byte-for-byte through round-trip. [3b]
 
 ### Task 4 — Route schema and adjacency
