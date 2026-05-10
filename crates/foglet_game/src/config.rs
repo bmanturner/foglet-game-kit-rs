@@ -120,6 +120,40 @@ pub struct GameConfig {
     /// never on by default.
     #[serde(default)]
     pub world_ticks: WorldTicksSection,
+    /// `[contracts]` section — v5 contract lifecycle primitives
+    /// (Task 3 and Task 4).
+    ///
+    /// Disabled by default so doors that only need shared-world
+    /// storage do not accidentally expose contract APIs.
+    #[serde(default)]
+    pub contracts: ContractsSection,
+    /// `[job_board]` section — v5 opportunity aggregation layer
+    /// (Task 5 and Task 6).
+    ///
+    /// Kept independent from `contracts` so games can opt into pure
+    /// contract APIs without also wiring a built-in board surface.
+    #[serde(default)]
+    pub job_board: JobBoardSection,
+    /// `[travel]` section — v5 movement transaction helper (Task 7).
+    ///
+    /// Default-off keeps movement orchestration explicit for projects
+    /// that prefer hand-rolled travel logic.
+    #[serde(default)]
+    pub travel: TravelSection,
+    /// `[inventory_capacity]` section — v5 capacity-aware transfer
+    /// helper (Task 8).
+    ///
+    /// Disabled by default so v4 stockpiles retain their original
+    /// semantics until a game opts into policy-driven capacity checks.
+    #[serde(default)]
+    pub inventory_capacity: InventoryCapacitySection,
+    /// `[screens]` section — holder for nested v5 screen toggles.
+    ///
+    /// Modeled as a dedicated section now so future v5+ screen
+    /// primitives can live under one namespace without changing the
+    /// top-level config shape again.
+    #[serde(default)]
+    pub screens: ScreensSection,
     /// `[[factions.seed]]` array — game-authored faction definitions
     /// (SPEC v3 §5.2 example).
     ///
@@ -518,6 +552,71 @@ impl Default for WorldTicksSection {
             run_due_ticks_on_login: false,
         }
     }
+}
+
+/// `[contracts]` section: v5 contract lifecycle primitives.
+///
+/// `enabled` is a hard gate: off means contract storage and transition
+/// APIs stay unavailable from runtime handles.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ContractsSection {
+    /// Enable v5 contract CRUD + lifecycle transitions.
+    #[serde(default)]
+    pub enabled: bool,
+}
+
+/// `[job_board]` section: v5 opportunity aggregation primitives.
+///
+/// The toggle controls built-in aggregation helpers only; games remain
+/// free to author their own listing surfaces independently.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct JobBoardSection {
+    /// Enable v5 job-board aggregation helpers.
+    #[serde(default)]
+    pub enabled: bool,
+}
+
+/// `[travel]` section: v5 movement transaction helper.
+///
+/// The helper is additive, so defaulting to `false` preserves existing
+/// game-authored movement code paths unchanged.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct TravelSection {
+    /// Enable v5 travel transaction orchestration APIs.
+    #[serde(default)]
+    pub enabled: bool,
+}
+
+/// `[inventory_capacity]` section: v5 capacity policy helper.
+///
+/// The capacity layer intentionally sits behind its own toggle so
+/// stockpile transfer APIs can be used with or without this policy
+/// mechanism.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct InventoryCapacitySection {
+    /// Enable v5 capacity-aware transfer validation helpers.
+    #[serde(default)]
+    pub enabled: bool,
+}
+
+/// `[screens]` section: namespace for built-in screen primitives.
+///
+/// v5 currently defines only `event_log`, but using a parent section
+/// keeps nested screen toggles cohesive and discoverable.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ScreensSection {
+    /// `[screens.event_log]` subsection controls the v5 read-only
+    /// event log/news screen primitive.
+    #[serde(default)]
+    pub event_log: EventLogScreenSection,
+}
+
+/// `[screens.event_log]` subsection: v5 Event Log / News screen toggle.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct EventLogScreenSection {
+    /// Enable the v5 event log screen helper.
+    #[serde(default)]
+    pub enabled: bool,
 }
 
 /// A single seeded faction definition (SPEC v3 §5.2).
@@ -1030,9 +1129,10 @@ start_y = 0
     }
 
     #[test]
-    fn absent_v4_sections_are_disabled_by_default() {
-        // SPEC_v4 Task 2a: all v4 sections are optional and safe to
-        // omit; every `enabled` flag must default to false.
+    fn absent_v4_and_v5_sections_are_disabled_by_default() {
+        // SPEC_v4 Task 2a + CHECKLIST_v5 Task 2a: all additive
+        // sections are optional and safe to omit; every `enabled`
+        // flag must default to false.
         let config = GameConfig::from_toml_str(
             r#"
 [game]
@@ -1052,6 +1152,11 @@ start_y = 0
         assert!(!config.place_recall.enabled);
         assert!(!config.inventory.enabled);
         assert!(!config.world_ticks.enabled);
+        assert!(!config.contracts.enabled);
+        assert!(!config.job_board.enabled);
+        assert!(!config.travel.enabled);
+        assert!(!config.inventory_capacity.enabled);
+        assert!(!config.screens.event_log.enabled);
         assert_eq!(config.world_ticks.max_catchup_per_call, 100);
         assert!(!config.world_ticks.run_due_ticks_on_login);
     }
@@ -1095,6 +1200,45 @@ enabled = true
         assert!(config.world_ticks.enabled);
         assert_eq!(config.world_ticks.max_catchup_per_call, 100);
         assert!(!config.world_ticks.run_due_ticks_on_login);
+    }
+
+    #[test]
+    fn parses_v5_sections_with_explicit_enabled_flags() {
+        let config = GameConfig::from_toml_str(
+            r#"
+[game]
+title = "V5"
+slug = "v5"
+description = ""
+min_width = 80
+min_height = 24
+start_map = "lobby"
+start_x = 0
+start_y = 0
+
+[contracts]
+enabled = true
+
+[job_board]
+enabled = true
+
+[travel]
+enabled = true
+
+[inventory_capacity]
+enabled = true
+
+[screens.event_log]
+enabled = true
+"#,
+        )
+        .unwrap();
+
+        assert!(config.contracts.enabled);
+        assert!(config.job_board.enabled);
+        assert!(config.travel.enabled);
+        assert!(config.inventory_capacity.enabled);
+        assert!(config.screens.event_log.enabled);
     }
 
     #[test]

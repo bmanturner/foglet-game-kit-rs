@@ -269,6 +269,11 @@ mod tests {
             place_recall: Default::default(),
             inventory: Default::default(),
             world_ticks: Default::default(),
+            contracts: Default::default(),
+            job_board: Default::default(),
+            travel: Default::default(),
+            inventory_capacity: Default::default(),
+            screens: Default::default(),
         }
     }
 
