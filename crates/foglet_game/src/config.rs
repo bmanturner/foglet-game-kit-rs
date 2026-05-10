@@ -486,12 +486,26 @@ pub struct InventorySection {
 /// `[world_ticks]` section: durable scheduler controls (v4 Task 9).
 ///
 /// `enabled` gates registration and execution entrypoints. The
-/// catch-up budget is validated in Task 2b.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+/// catch-up budget defaults to `100` and must be positive.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorldTicksSection {
     /// Enable scheduled world-tick callbacks.
     #[serde(default)]
     pub enabled: bool,
+
+    /// Maximum number of due tasks to process in one `run_due_ticks`
+    /// invocation.
+    #[serde(default = "default_max_catchup_per_call")]
+    pub max_catchup_per_call: u32,
+}
+
+impl Default for WorldTicksSection {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_catchup_per_call: default_max_catchup_per_call(),
+        }
+    }
 }
 
 /// A single seeded faction definition (SPEC v3 §5.2).
@@ -526,6 +540,9 @@ fn default_world_busy_timeout_ms() -> u64 {
 }
 fn default_world_journal_mode() -> String {
     "wal".to_string()
+}
+fn default_max_catchup_per_call() -> u32 {
+    100
 }
 
 fn default_timeout_ms() -> u64 {
@@ -656,6 +673,11 @@ impl GameConfig {
                     "[turns].daily_allowance must be greater than zero".into(),
                 ));
             }
+        }
+        if self.world_ticks.max_catchup_per_call == 0 {
+            return Err(ConfigError::Validate(
+                "[world_ticks].max_catchup_per_call must be greater than zero".into(),
+            ));
         }
         // Leaderboard names must be non-empty and unique. Task 8 will
         // key SQL rows by `name`, so a duplicate would silently merge
@@ -1003,6 +1025,7 @@ start_y = 0
         assert!(!config.place_recall.enabled);
         assert!(!config.inventory.enabled);
         assert!(!config.world_ticks.enabled);
+        assert_eq!(config.world_ticks.max_catchup_per_call, 100);
     }
 
     #[test]
@@ -1042,6 +1065,95 @@ enabled = true
         assert!(config.place_recall.enabled);
         assert!(config.inventory.enabled);
         assert!(config.world_ticks.enabled);
+        assert_eq!(config.world_ticks.max_catchup_per_call, 100);
+    }
+
+    #[test]
+    fn parses_world_ticks_with_default_catchup_bound_when_omitted() {
+        // Task 2b: if the catch-up key is omitted, apply the
+        // documented default so catch-up remains bounded.
+        let config = GameConfig::from_toml_str(
+            r#"
+[game]
+title = "Bounded"
+slug = "bounded"
+description = ""
+min_width = 80
+min_height = 24
+start_map = "lobby"
+start_x = 0
+start_y = 0
+
+[world_ticks]
+enabled = true
+"#,
+        )
+        .unwrap();
+        assert!(config.world_ticks.enabled);
+        assert_eq!(config.world_ticks.max_catchup_per_call, 100);
+    }
+
+    #[test]
+    fn world_ticks_rejects_zero_catchup_bound() {
+        // Zero is explicitly invalid because it guarantees no progress
+        // through the due-task queue.
+        let err = GameConfig::from_toml_str(
+            r#"
+[game]
+title = "Zero Catchup"
+slug = "zero-catchup"
+description = ""
+min_width = 80
+min_height = 24
+start_map = "lobby"
+start_x = 0
+start_y = 0
+
+[world_ticks]
+enabled = true
+max_catchup_per_call = 0
+"#,
+        )
+        .unwrap_err();
+        match err {
+            ConfigError::Validate(msg) => {
+                assert!(
+                    msg.contains("max_catchup_per_call"),
+                    "error should mention field: {msg}"
+                );
+            }
+            other => panic!("expected Validate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn world_ticks_rejects_negative_catchup_bound() {
+        // Negative values must fail during parsing so authors can
+        // correct config before runtime.
+        let err = GameConfig::from_toml_str(
+            r#"
+[game]
+title = "Negative Catchup"
+slug = "negative-catchup"
+description = ""
+min_width = 80
+min_height = 24
+start_map = "lobby"
+start_x = 0
+start_y = 0
+
+[world_ticks]
+enabled = true
+max_catchup_per_call = -1
+"#,
+        )
+        .unwrap_err();
+        assert!(matches!(err, ConfigError::Parse(_)));
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("max_catchup_per_call") || msg.contains("invalid"),
+            "error should be informative: {msg}"
+        );
     }
 
     #[test]
