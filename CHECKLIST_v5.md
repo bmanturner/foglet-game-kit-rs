@@ -59,7 +59,7 @@ One unchecked item per iteration. Dependencies in `[brackets]` must be checked o
 - [x] **7e** — Test omitted `route_id` resolves a unique outbound route; ambiguous case returns `AmbiguousRoute`. [7b]
 - [x] **7f** — Test `touch_recall = false` leaves recall unchanged even when `place_recall` is enabled. [7b]
 - [x] **7g** — Test `append_event` returning `None` produces a `TravelResult` with `event_id = None` and no event row written. [7b]
-- [ ] **7h** — Test the helper functions correctly when `place_recall` and v2 events are independently disabled. [7b]
+- [x] **7h** — Test the helper functions correctly when `place_recall` and v2 events are independently disabled. [7b]
 
 ### Task 8 — Inventory capacity helper
 

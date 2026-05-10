@@ -932,6 +932,70 @@ mod tests {
         assert!(events.is_empty(), "None event payload must not write a row");
     }
 
+    #[test]
+    fn travel_functions_when_place_recall_is_disabled_but_events_are_enabled() {
+        let TravelFixture {
+            mut world,
+            player_id,
+            destination_id,
+            ..
+        } = setup_travel_fixture_with_optional_tables(false, true);
+
+        let result = world
+            .travel(
+                TravelRequest::new(player_id, destination_id).with_append_event(|_, _| {
+                    Some(TravelEventDraft {
+                        kind: "arrived".to_string(),
+                        message: "arrived without recall".to_string(),
+                        metadata_json: None,
+                    })
+                }),
+            )
+            .expect("travel succeeds without place_recall table");
+        let events = world
+            .player_events(player_id, 10)
+            .expect("player events read after travel");
+
+        assert_eq!(result.to_place_id, destination_id);
+        assert_eq!(result.event_id, events.first().map(|event| event.id));
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, "arrived");
+    }
+
+    #[test]
+    fn travel_functions_when_events_are_disabled_but_place_recall_is_enabled() {
+        let TravelFixture {
+            mut world,
+            player_id,
+            destination_id,
+            ..
+        } = setup_travel_fixture_with_optional_tables(true, false);
+
+        let result = world
+            .travel(
+                TravelRequest::new(player_id, destination_id).with_append_event(|_, _| {
+                    Some(TravelEventDraft {
+                        kind: "arrived".to_string(),
+                        message: "arrived without events".to_string(),
+                        metadata_json: None,
+                    })
+                }),
+            )
+            .expect("travel succeeds without world_events table");
+        let recall = world
+            .recall_for_player(player_id)
+            .expect("recall reads after travel");
+
+        assert_eq!(result.to_place_id, destination_id);
+        assert_eq!(result.event_id, None);
+        assert!(
+            recall
+                .iter()
+                .any(|row| row.player_id == player_id && row.place_id == destination_id),
+            "travel should still touch recall when events are disabled"
+        );
+    }
+
     struct TravelFixture {
         world: WorldDb,
         player_id: i64,
@@ -942,10 +1006,27 @@ mod tests {
     }
 
     fn setup_travel_fixture() -> TravelFixture {
+        setup_travel_fixture_with_optional_tables(true, true)
+    }
+
+    fn setup_travel_fixture_with_optional_tables(
+        apply_recall: bool,
+        apply_events: bool,
+    ) -> TravelFixture {
         let tempdir = tempdir().expect("tempdir creates");
         let db_path = tempdir.path().join("world.sqlite");
         let mut world = WorldDb::open(&db_path).expect("open succeeds");
-        apply_travel_migrations(&mut world);
+        apply_core_travel_migrations(&mut world);
+        if apply_recall {
+            world
+                .apply_migration(&PLACE_RECALL_MIGRATION)
+                .expect("recall migration applies");
+        }
+        if apply_events {
+            world
+                .apply_migration(&WORLD_EVENTS_MIGRATION)
+                .expect("events migration applies");
+        }
 
         let player_id: i64 = world
             .connection()
@@ -978,7 +1059,7 @@ mod tests {
         }
     }
 
-    fn apply_travel_migrations(world: &mut WorldDb) {
+    fn apply_core_travel_migrations(world: &mut WorldDb) {
         world
             .apply_migration(&PLAYERS_MIGRATION)
             .expect("players migration applies");
@@ -991,11 +1072,5 @@ mod tests {
         world
             .apply_migration(&PRESENCE_MIGRATION)
             .expect("presence migration applies");
-        world
-            .apply_migration(&PLACE_RECALL_MIGRATION)
-            .expect("recall migration applies");
-        world
-            .apply_migration(&WORLD_EVENTS_MIGRATION)
-            .expect("events migration applies");
     }
 }
