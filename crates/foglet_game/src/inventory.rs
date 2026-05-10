@@ -1318,6 +1318,61 @@ mod tests {
     }
 
     #[test]
+    fn transfer_rejects_missing_source_slot_and_leaves_db_unchanged() {
+        let dir = tempdir().expect("tempdir creates");
+        let db_path = dir.path().join("world.sqlite");
+        let mut world = WorldDb::open(&db_path).expect("open succeeds");
+
+        world
+            .apply_migration(&INVENTORY_SLOTS_MIGRATION)
+            .expect("inventory_slots migration applies");
+
+        let error = world.transfer(
+            ("player", 77),
+            ("outpost", 3),
+            "ore-canister",
+            4,
+            None::<
+                fn(
+                    &rusqlite::Transaction<'_>,
+                    &InventorySlot,
+                    &InventorySlot,
+                ) -> rusqlite::Result<()>,
+            >,
+        );
+
+        let error = error.expect_err("missing source owner should be rejected");
+        match error {
+            InventoryError::MissingSourceSlot {
+                owner_kind,
+                owner_id,
+                item_key,
+            } => {
+                assert_eq!(owner_kind, "player");
+                assert_eq!(owner_id, 77);
+                assert_eq!(item_key, "ore-canister");
+            }
+            other => panic!("expected MissingSourceSlot, got {other:?}"),
+        }
+
+        let missing_source = world
+            .get_slot("player", 77, "ore-canister")
+            .expect("source read should be possible");
+        assert!(
+            missing_source.is_none(),
+            "a rejected transfer should not invent a source slot"
+        );
+
+        let missing_destination = world
+            .get_slot("outpost", 3, "ore-canister")
+            .expect("destination read should be possible");
+        assert!(
+            missing_destination.is_none(),
+            "a rejected transfer should not auto-create destination"
+        );
+    }
+
+    #[test]
     fn transfer_rejects_non_positive_quantity() {
         let dir = tempdir().expect("tempdir creates");
         let db_path = dir.path().join("world.sqlite");
