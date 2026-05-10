@@ -46,6 +46,7 @@ pub mod map;
 pub mod market;
 pub mod notices;
 pub mod players;
+pub mod presence;
 pub mod prompt;
 pub mod prompt_screen;
 pub mod roles;
@@ -98,6 +99,7 @@ pub use market::{
 };
 pub use notices::{Notice, NoticeError, NOTICES_MIGRATION, NOTICE_SUBJECT_MAX_CHARS};
 pub use players::{PlayerError, PlayerRecord, PLAYERS_MIGRATION};
+pub use presence::{PresenceRecord, PRESENCE_MIGRATION};
 pub use prompt::{
     AnyKeyOutcome, AnyKeyPrompt, ChoicePrompt, ConfirmAction, ConfirmOutcome, ConfirmPrompt,
     FeedbackKind, FeedbackLine, PromptAction, PromptChoice, PromptError, PromptKey, StyleRole,
