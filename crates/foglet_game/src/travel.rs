@@ -774,6 +774,62 @@ mod tests {
         );
     }
 
+    #[test]
+    fn travel_cost_failure_rolls_back_presence_recall_and_events() {
+        let TravelFixture {
+            mut world,
+            player_id,
+            origin_id,
+            destination_id,
+            ..
+        } = setup_travel_fixture();
+
+        let rejected = world.travel(
+            TravelRequest::new(player_id, destination_id)
+                .with_charge_cost(|_, route| {
+                    Err(TravelError::CostFailed {
+                        player_id,
+                        route_id: route.id,
+                        reason: "not enough torch oil".to_string(),
+                    })
+                })
+                .with_append_event(|_, _| {
+                    Some(TravelEventDraft {
+                        kind: "arrived".to_string(),
+                        message: "should not persist".to_string(),
+                        metadata_json: None,
+                    })
+                }),
+        );
+
+        match rejected {
+            Err(TravelError::CostFailed { reason, .. }) => {
+                assert_eq!(reason, "not enough torch oil");
+            }
+            other => panic!("expected cost failure, got {other:?}"),
+        }
+
+        let loaded_presence = world
+            .get_presence(player_id)
+            .expect("presence reads")
+            .expect("presence row exists");
+        let recall = world
+            .recall_for_player(player_id)
+            .expect("recall reads after rollback");
+        let events = world
+            .player_events(player_id, 10)
+            .expect("player events read after rollback");
+
+        assert_eq!(loaded_presence.place_id, origin_id);
+        assert!(
+            !recall
+                .iter()
+                .any(|row| row.player_id == player_id && row.place_id == destination_id),
+            "cost failure must not touch destination recall"
+        );
+        assert!(events.is_empty(), "cost failure must not append events");
+    }
+
     struct TravelFixture {
         world: WorldDb,
         player_id: i64,
