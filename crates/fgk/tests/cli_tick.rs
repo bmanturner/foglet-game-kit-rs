@@ -15,6 +15,7 @@ use std::fs;
 
 use assert_cmd::Command;
 use foglet_game::{WorldDb, WORLD_TICK_TASKS_MIGRATION};
+use predicates::str::contains;
 
 const GAME_TOML_V4_TICK_FIXTURE: &str = r#"
 [game]
@@ -33,7 +34,7 @@ path = "world/world.sqlite"
 
 [world_ticks]
 enabled = true
-max_catchup_per_call = 100
+max_catchup_per_call = 1
 "#;
 
 /// Create a minimal, v4-friendly project fixture with `assets/game.toml`.
@@ -73,7 +74,8 @@ fn fgk_tick_executes_due_world_tasks_once() {
         .arg("--project")
         .arg(&project)
         .assert()
-        .success();
+        .success()
+        .stdout(contains("Ran 1 task(s), skipped 1 task(s)"));
 
     let rows_due: i64 = world
         .connection()
@@ -83,5 +85,5 @@ fn fgk_tick_executes_due_world_tasks_once() {
             |row| row.get(0),
         )
         .expect("count query");
-    assert_eq!(rows_due, 2, "all pre-registered tasks should run once");
+    assert_eq!(rows_due, 1, "catch-up bound should leave one task pending");
 }

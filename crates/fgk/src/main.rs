@@ -214,8 +214,12 @@ fn run_package(
 /// This wrapper is intentionally thin so tick scheduling logic stays in
 /// `fgk::tick`, where integration tests can drive it directly.
 fn run_tick(project: &std::path::Path) -> Result<()> {
-    let ran = fgk::tick::run_tick(project)
+    let summary = fgk::tick::run_tick(project)
         .with_context(|| format!("failed to run scheduled tasks for `{}`", project.display()))?;
-    println!("Ran {ran} scheduled task(s)");
+    println!(
+        "Ran {tasks_run} task(s), skipped {tasks_skipped} task(s)",
+        tasks_run = summary.tasks_run,
+        tasks_skipped = summary.tasks_skipped
+    );
     Ok(())
 }

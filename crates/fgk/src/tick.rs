@@ -97,6 +97,15 @@ pub enum TickCommandError {
     },
 }
 
+/// Summary for a single `fgk tick` run.
+#[derive(Debug, Clone, Copy)]
+pub struct TickRunSummary {
+    /// Number of callbacks that reached COMMIT in this run.
+    pub tasks_run: usize,
+    /// Number of due tasks deferred to a later call by the catch-up bound.
+    pub tasks_skipped: usize,
+}
+
 /// Execute one `fgk tick` call against a project.
 ///
 /// This is the library half of the CLI subcommand. It is intentionally
@@ -108,10 +117,9 @@ pub enum TickCommandError {
 ///    always in-process.
 /// 4. Compute `now` and run due tasks once.
 ///
-/// The function returns the number of callbacks that reached `COMMIT`.
-/// A return value of zero is common when no tasks are due; it is still
-/// a successful run for cron operators.
-pub fn run_tick(project_dir: &Path) -> Result<usize, TickCommandError> {
+/// A return value of `tasks_skipped = 0` means every due task ran in this
+/// invocation. A larger skip count means due work is still pending.
+pub fn run_tick(project_dir: &Path) -> Result<TickRunSummary, TickCommandError> {
     let config_path = project_dir.join(GAME_TOML_RELATIVE);
     let config = GameConfig::load(&config_path).map_err(|source| TickCommandError::Config {
         path: config_path.display().to_string(),
@@ -168,7 +176,28 @@ pub fn run_tick(project_dir: &Path) -> Result<usize, TickCommandError> {
             details: source.to_string(),
         })?;
 
-    world
+    let due_count: usize = world
+        .connection()
+        .query_row(
+            &format!(
+                "SELECT COUNT(*) FROM world_tick_tasks \
+             WHERE last_run_at IS NULL \
+             OR datetime(last_run_at, '+' || interval_seconds || ' seconds') <= '{}'",
+                now
+            ),
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|source| TickCommandError::ReadTasks {
+            details: source.to_string(),
+        })? as usize;
+
+    let tasks_run = world
         .run_due_ticks(&now, config.world_ticks.max_catchup_per_call)
-        .map_err(|source| TickCommandError::RunDueTicks { source })
+        .map_err(|source| TickCommandError::RunDueTicks { source })?;
+
+    Ok(TickRunSummary {
+        tasks_run,
+        tasks_skipped: due_count.saturating_sub(tasks_run),
+    })
 }
