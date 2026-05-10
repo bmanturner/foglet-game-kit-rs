@@ -31,6 +31,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs, rust_2018_idioms)]
 
+pub mod bounties;
 pub mod challenges;
 pub mod config;
 pub mod dialog;
@@ -56,6 +57,7 @@ pub mod turns;
 pub mod widgets;
 pub mod world_db;
 
+pub use bounties::BOUNTIES_MIGRATION;
 pub use challenges::{Challenge, ChallengeError, ChallengeState, CHALLENGES_MIGRATION};
 pub use config::{
     ConfigError, FactionSeed, FactionsSection, GameConfig, GameSection, LeaderboardSection,
