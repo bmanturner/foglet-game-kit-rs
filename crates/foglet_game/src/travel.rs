@@ -906,6 +906,32 @@ mod tests {
         );
     }
 
+    #[test]
+    fn travel_append_event_none_returns_no_event_id_and_writes_no_event() {
+        let TravelFixture {
+            mut world,
+            player_id,
+            destination_id,
+            ..
+        } = setup_travel_fixture();
+
+        let result = world
+            .travel(TravelRequest::new(player_id, destination_id).with_append_event(|_, _| None))
+            .expect("travel succeeds without event payload");
+        let events = world
+            .player_events(player_id, 10)
+            .expect("player events read after travel");
+        let loaded_presence = world
+            .get_presence(player_id)
+            .expect("presence reads")
+            .expect("presence row exists");
+
+        assert_eq!(result.to_place_id, destination_id);
+        assert_eq!(loaded_presence.place_id, destination_id);
+        assert_eq!(result.event_id, None);
+        assert!(events.is_empty(), "None event payload must not write a row");
+    }
+
     struct TravelFixture {
         world: WorldDb,
         player_id: i64,
