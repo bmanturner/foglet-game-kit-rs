@@ -118,7 +118,7 @@ One unchecked item per iteration. Dependencies in `[brackets]` must be checked o
 - [x] Spatial graph supports unique-keyed places and asymmetric directed routes
 - [x] Presence supports transactional move with rollback on rejected `on_commit`
 - [x] Place recall is per-player, idempotent, and never auto-touched by movement
-- [ ] Inventory supports atomic transfer with `on_commit` rollback and distinct error variants
+- [x] Inventory supports atomic transfer with `on_commit` rollback and distinct error variants
 - [ ] World ticks are durable, idempotent under concurrency, and bounded by `max_catchup_per_call`
 - [ ] `fgk tick` CLI subcommand exists, exits cleanly, and is documented for cron use
 - [ ] Documentation explains every v4 primitive in genre-neutral terms with at least two distinct game-family examples each
