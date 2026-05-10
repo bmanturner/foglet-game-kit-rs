@@ -204,7 +204,17 @@ impl WorldDb {
     /// replenishment without busy looping after long absences.
     /// In a **dungeon crawler**, trap resets can catch up one
     /// tick-at-a-time when the player returns after disconnection.
-    pub fn run_due_ticks(&mut self, now: &str) -> Result<usize, WorldTickError> {
+    /// `max_catchup_per_call` caps how many due tasks run in one
+    /// invocation so long downtime doesn't execute an unbounded backlog.
+    pub fn run_due_ticks(
+        &mut self,
+        now: &str,
+        max_catchup_per_call: u32,
+    ) -> Result<usize, WorldTickError> {
+        if max_catchup_per_call == 0 {
+            return Ok(0);
+        }
+
         let due_tasks: Vec<WorldTickTask> = {
             let mut statement = self
                 .connection()
@@ -213,12 +223,16 @@ impl WorldDb {
                      FROM world_tick_tasks\n\
                      WHERE last_run_at IS NULL\n\
                         OR datetime(last_run_at, '+' || interval_seconds || ' seconds') <= ?1\n\
-                     ORDER BY key",
+                     ORDER BY key\n\
+                     LIMIT ?2",
                 )
                 .map_err(|source| WorldTickError::DueTasksQueryFailed { source })?;
 
             let rows = statement
-                .query_map(rusqlite::params![now], row_to_world_tick_task)
+                .query_map(
+                    rusqlite::params![now, max_catchup_per_call],
+                    row_to_world_tick_task,
+                )
                 .map_err(|source| WorldTickError::DueTasksQueryFailed { source })?;
 
             rows.collect::<rusqlite::Result<Vec<_>>>()
@@ -492,7 +506,7 @@ mod tests {
             .expect("seed not_due last_run_at");
 
         let ran = world
-            .run_due_ticks("2026-01-01 10:45:00")
+            .run_due_ticks("2026-01-01 10:45:00", 100)
             .expect("run due ticks executes");
 
         assert_eq!(ran, 1, "only one task should have advanced at 10:45");
@@ -576,7 +590,7 @@ mod tests {
             })
             .expect("register_tick persists row");
 
-        let first = world.run_due_ticks("2026-01-01 10:45:00");
+        let first = world.run_due_ticks("2026-01-01 10:45:00", 100);
         assert!(matches!(
             first,
             Err(WorldTickError::CallbackRejected { key, .. }) if key == "retry_tick"
@@ -609,7 +623,7 @@ mod tests {
         );
 
         let second = world
-            .run_due_ticks("2026-01-01 10:45:00")
+            .run_due_ticks("2026-01-01 10:45:00", 100)
             .expect("retry should now succeed");
         assert_eq!(second, 1, "one retrying callback should now succeed");
 
@@ -694,6 +708,55 @@ mod tests {
         assert!(
             sql.contains("CHECK (interval_seconds > 0)"),
             "interval_seconds must be constrained as positive"
+        );
+    }
+
+    /// Task 9e enforces the due-task ceiling on each call so a
+    /// large backlog is chunked across invocations.
+    #[test]
+    fn run_due_ticks_limits_due_tasks_to_max_catchup_per_call() {
+        let dir = tempdir().expect("tempdir creates");
+        let db_path = dir.path().join("world.sqlite");
+        let mut world = WorldDb::open(&db_path).expect("open succeeds");
+
+        world
+            .apply_migration(&WORLD_TICK_TASKS_MIGRATION)
+            .expect("world_tick_tasks migration applies");
+
+        let calls = Rc::new(RefCell::new(Vec::new()));
+
+        for key in ["first_wave", "second_wave"] {
+            world
+                .register_tick(key, 120, {
+                    let calls = Rc::clone(&calls);
+                    move |_tx| {
+                        calls.borrow_mut().push(key.to_string());
+                        Ok(())
+                    }
+                })
+                .expect("register_tick persists row");
+        }
+
+        let first = world
+            .run_due_ticks("2026-01-01 11:00:00", 1)
+            .expect("run with catch-up cap");
+        assert_eq!(
+            first, 1,
+            "only one task should run when max_catchup_per_call is one"
+        );
+        assert_eq!(calls.borrow().len(), 1, "one callback should have executed");
+
+        let second = world
+            .run_due_ticks("2026-01-01 11:00:00", 1)
+            .expect("follow-up run with same cap");
+        assert_eq!(
+            second, 1,
+            "remaining due task should run on the second pass"
+        );
+        assert_eq!(
+            calls.borrow().len(),
+            2,
+            "both callbacks should eventually run"
         );
     }
 }
