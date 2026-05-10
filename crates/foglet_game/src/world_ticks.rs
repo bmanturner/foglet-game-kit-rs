@@ -215,32 +215,29 @@ impl WorldDb {
             return Ok(0);
         }
 
-        let due_tasks: Vec<WorldTickTask> = {
-            let mut statement = self
+        use rusqlite::params;
+        use rusqlite::OptionalExtension;
+
+        let mut ran = 0_usize;
+        while ran < max_catchup_per_call as usize {
+            let Some(task) = self
                 .connection()
-                .prepare(
+                .query_row(
                     "SELECT key, last_run_at, interval_seconds, metadata_json\n\
                      FROM world_tick_tasks\n\
                      WHERE last_run_at IS NULL\n\
                         OR datetime(last_run_at, '+' || interval_seconds || ' seconds') <= ?1\n\
                      ORDER BY key\n\
-                     LIMIT ?2",
-                )
-                .map_err(|source| WorldTickError::DueTasksQueryFailed { source })?;
-
-            let rows = statement
-                .query_map(
-                    rusqlite::params![now, max_catchup_per_call],
+                     LIMIT 1",
+                    params![now],
                     row_to_world_tick_task,
                 )
-                .map_err(|source| WorldTickError::DueTasksQueryFailed { source })?;
-
-            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .optional()
                 .map_err(|source| WorldTickError::DueTasksQueryFailed { source })?
-        };
+            else {
+                break;
+            };
 
-        let mut ran = 0_usize;
-        for task in due_tasks {
             let mut callback = {
                 let mut callbacks = self.tick_callbacks.borrow_mut();
                 callbacks.remove(&task.key).ok_or_else(|| {
@@ -266,7 +263,7 @@ impl WorldDb {
                              last_run_at IS NULL\n\
                              OR datetime(last_run_at, '+' || interval_seconds || ' seconds') <= ?2\n\
                         )",
-                    rusqlite::params![task.key, now],
+                    params![task.key, now],
                 )
                 .map_err(|source| WorldTickError::RunTickFailed {
                     key: task.key.clone(),
@@ -345,6 +342,12 @@ CREATE TABLE IF NOT EXISTS world_tick_tasks (
 mod tests {
     use std::cell::RefCell;
     use std::rc::Rc;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Barrier,
+    };
+    use std::thread;
+    use std::time::Duration;
 
     use super::{row_to_world_tick_task, WorldTickError, WORLD_TICK_TASKS_MIGRATION};
     use crate::world_db::WorldDb;
@@ -757,6 +760,108 @@ mod tests {
             calls.borrow().len(),
             2,
             "both callbacks should eventually run"
+        );
+    }
+
+    /// Task 9f requires concurrent runners to claim and run disjoint
+    /// due-task sets so no task is executed twice.
+    #[test]
+    fn run_due_ticks_concurrent_runners_do_not_double_invoke_tasks() {
+        let dir = tempdir().expect("tempdir creates");
+        let db_path = dir.path().join("world.sqlite");
+        let db_path = db_path.into_os_string();
+
+        let alpha_count = Arc::new(AtomicUsize::new(0));
+        let beta_count = Arc::new(AtomicUsize::new(0));
+        let start = Arc::new(Barrier::new(2));
+
+        let run_a = {
+            let db_path = db_path.clone();
+            let alpha_count = Arc::clone(&alpha_count);
+            let beta_count = Arc::clone(&beta_count);
+            let start_a = Arc::clone(&start);
+            thread::spawn(move || {
+                let mut world = WorldDb::open(db_path.as_os_str()).expect("open succeeds");
+
+                world
+                    .apply_migration(&WORLD_TICK_TASKS_MIGRATION)
+                    .expect("world_tick_tasks migration applies");
+
+                world
+                    .register_tick("alpha_watch", 120, move |_tx| {
+                        alpha_count.fetch_add(1, Ordering::SeqCst);
+                        thread::sleep(Duration::from_millis(75));
+                        Ok(())
+                    })
+                    .expect("register tick alpha");
+
+                world
+                    .register_tick("beta_bay", 120, move |_tx| {
+                        beta_count.fetch_add(1, Ordering::SeqCst);
+                        thread::sleep(Duration::from_millis(75));
+                        Ok(())
+                    })
+                    .expect("register tick beta");
+
+                start_a.wait();
+                world
+                    .run_due_ticks("2026-01-01 11:30:00", 1)
+                    .expect("first runner succeeds")
+            })
+        };
+
+        let run_b = {
+            let db_path = db_path.clone();
+            let alpha_count = Arc::clone(&alpha_count);
+            let beta_count = Arc::clone(&beta_count);
+            let start_b = Arc::clone(&start);
+            thread::spawn(move || {
+                let mut world = WorldDb::open(db_path.as_os_str()).expect("open succeeds");
+
+                world
+                    .apply_migration(&WORLD_TICK_TASKS_MIGRATION)
+                    .expect("world_tick_tasks migration applies");
+
+                world
+                    .register_tick("alpha_watch", 120, move |_tx| {
+                        alpha_count.fetch_add(1, Ordering::SeqCst);
+                        thread::sleep(Duration::from_millis(75));
+                        Ok(())
+                    })
+                    .expect("register tick alpha");
+
+                world
+                    .register_tick("beta_bay", 120, move |_tx| {
+                        beta_count.fetch_add(1, Ordering::SeqCst);
+                        thread::sleep(Duration::from_millis(75));
+                        Ok(())
+                    })
+                    .expect("register tick beta");
+
+                start_b.wait();
+                world
+                    .run_due_ticks("2026-01-01 11:30:00", 1)
+                    .expect("second runner succeeds")
+            })
+        };
+
+        let run_a_count = run_a.join().expect("thread join");
+        let run_b_count = run_b.join().expect("thread join");
+
+        assert_eq!(
+            run_a_count + run_b_count,
+            2,
+            "all due tasks should run once"
+        );
+        assert_eq!(
+            alpha_count.load(Ordering::SeqCst),
+            1,
+            "alpha task should run once"
+        );
+        assert_eq!(
+            beta_count.load(Ordering::SeqCst),
+            1,
+            "beta task should run once"
         );
     }
 }
