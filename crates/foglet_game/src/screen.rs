@@ -569,22 +569,13 @@ mod tests {
             ctx.world_db.is_none(),
             "GameContext::new defaults world_db to None so existing call sites are unaffected"
         );
-        assert!(
-            ctx.spatial.is_none(),
-            "optional handles default to None"
-        );
-        assert!(
-            ctx.presence.is_none(),
-            "optional handles default to None"
-        );
+        assert!(ctx.spatial.is_none(), "optional handles default to None");
+        assert!(ctx.presence.is_none(), "optional handles default to None");
         assert!(
             ctx.place_recall.is_none(),
             "optional handles default to None"
         );
-        assert!(
-            ctx.inventory.is_none(),
-            "optional handles default to None"
-        );
+        assert!(ctx.inventory.is_none(), "optional handles default to None");
         assert!(
             ctx.world_ticks.is_none(),
             "optional handles default to None"
@@ -646,10 +637,7 @@ mod tests {
 
         let ctx = GameContext::new(&cfg, &fc, (80, 24)).with_world_db(&db);
         assert!(ctx.world_db.is_some(), "builder still attaches world_db");
-        assert!(
-            ctx.spatial.is_none(),
-            "disabled `spatial` handle is absent"
-        );
+        assert!(ctx.spatial.is_none(), "disabled `spatial` handle is absent");
         assert!(
             ctx.presence.is_none(),
             "disabled `presence` handle is absent"

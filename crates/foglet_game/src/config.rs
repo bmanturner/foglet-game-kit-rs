@@ -847,7 +847,8 @@ impl GameConfig {
         }
         if self.screens.event_log.enabled && !self.world.enabled {
             return Err(ConfigError::Validate(
-                "[screens.event_log].enabled requires world events via [world].enabled = true".into(),
+                "[screens.event_log].enabled requires world events via [world].enabled = true"
+                    .into(),
             ));
         }
         // Leaderboard names must be non-empty and unique. will

@@ -125,7 +125,7 @@ use thiserror::Error;
 ///   `claimed -> completed` transition. Stays `NULL` for bounties
 ///   that never completed (still open, still claimed, expired).
 /// - `expires_at` — `TEXT`, nullable. ISO timestamp after which the
-///    sweeper may flip an `open` or `claimed` bounty to
+///   sweeper may flip an `open` or `claimed` bounty to
 ///   `expired`. Nullable so a bounty can be open-ended (no
 ///   deadline) without reserving a sentinel value; the partial
 ///   index below filters on `expires_at IS NOT NULL` so the sweeper

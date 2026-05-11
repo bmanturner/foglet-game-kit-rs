@@ -794,7 +794,7 @@ fn migration_recorded(conn: &Connection, version: i64) -> Result<bool, WorldDbEr
 /// - `name` — human-friendly label echoed back in errors and operator
 ///   tooling. `NOT NULL` because every migration ships with one.
 /// - `checksum` — nullable, populated only for file-backed migrations
-///    ("if practical").
+///   ("if practical").
 /// - `applied_at` — UTC timestamp of when the migration was recorded.
 ///   defaulted to `CURRENT_TIMESTAMP` so callers don't have to thread
 ///   a clock through to bookkeeping inserts.

@@ -119,7 +119,7 @@ pub const FACTION_GOAL_COMPLETED_EVENT_KIND: &str = "faction.goal.completed";
 /// game's join screen, not the storage layer.
 ///
 /// - `id` — `INTEGER PRIMARY KEY`. Stable membership handle. Lets
-///    return a struct that can be addressed unambiguously
+///   return a struct that can be addressed unambiguously
 ///   even if the same player rejoins the same faction after
 ///   leaving (a new row, a new id; the old row is preserved as
 ///   audit trail).
@@ -163,7 +163,7 @@ pub const FACTION_GOAL_COMPLETED_EVENT_KIND: &str = "faction.goal.completed";
 ///
 /// - `id` — `INTEGER PRIMARY KEY`.
 /// - `faction_id` — `INTEGER REFERENCES factions(id)`, nullable.
-///    explicitly lists "faction id optional"; world-wide
+///   explicitly lists "faction id optional"; world-wide
 ///   goals (e.g. "the city solves 100 cases") have `NULL` here.
 /// - `key` — `TEXT NOT NULL`. Game-authored stable identifier
 ///   (e.g. `"blue-desk.clue-board"`). Combined with `faction_id`
@@ -205,7 +205,7 @@ pub const FACTION_GOAL_COMPLETED_EVENT_KIND: &str = "faction.goal.completed";
 ///
 /// - `idx_factions_slug` — implicit via the `UNIQUE` constraint
 ///   on `factions.slug`. Backs the idempotent-seed lookup
-///    and the `slug → faction` resolver future screens
+///   and the `slug → faction` resolver future screens
 ///   will use. Materialised by SQLite, not by an explicit
 ///   `CREATE INDEX`.
 /// - `idx_faction_memberships_active` — partial index over
@@ -1308,7 +1308,7 @@ fn row_to_faction(row: &rusqlite::Row<'_>) -> rusqlite::Result<Faction> {
 }
 
 /// Read model for one row of the `faction_memberships` table
-/// 
+///
 ///
 /// Returned by [`WorldDb::join_faction`] (and the upcoming
 /// `leave_faction` helper) so callers receive the canonical row
@@ -1367,7 +1367,7 @@ fn row_to_membership(row: &rusqlite::Row<'_>) -> rusqlite::Result<FactionMembers
 }
 
 /// Read model for one row of the `shared_goals` table
-/// 
+///
 ///
 /// Returned by [`WorldDb::create_shared_goal`] (and the upcoming
 ///  `contribute_to_goal` completion helpers) so
@@ -2546,6 +2546,7 @@ mod tests {
     }
 
     ///  + the schema CHECK forbid `target_amount <= 0`.
+    ///
     /// The helper short-circuits before opening a transaction so
     /// the agency-config UI sees a typed
     /// [`FactionError::InvalidTargetAmount`] with the offending

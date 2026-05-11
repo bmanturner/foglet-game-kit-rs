@@ -32,7 +32,7 @@
 //! 4. **Fallback by [`ContextSource`]**:
 //!    - `ContextFile` `Env` (running under Foglet) →
 //!      `/srv/foglet/doors/<slug>/saves/<user_id>/save.json` per
-//!       Missing `user_id` falls back to a literal
+//!      Missing `user_id` falls back to a literal
 //!      `anonymous` segment so saves still go *somewhere* per-door
 //!      consistent with Foglet supporting anonymous-access doors
 //!      .
@@ -546,7 +546,7 @@ impl<T: Serialize> SaveSlot<T> {
     /// 2. Dirty-flag bookkeeping — once `write_atomic` succeeds the slot
     ///    is by definition in sync with disk, so `is_dirty` returns
     ///    `false` again and the runtime's "save iff dirty" hook
-    ///     won't immediately rewrite the same bytes.
+    ///    won't immediately rewrite the same bytes.
     ///
     /// On failure the dirty flag is **left set** so the next save
     /// attempt still tries to push the unsaved changes — clearing it

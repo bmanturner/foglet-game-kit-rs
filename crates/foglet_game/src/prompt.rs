@@ -66,20 +66,20 @@
 //! #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 //! enum DrawerAction { TakeKey, Leave }
 //!
-//! let prompt = ChoicePrompt::new
+//! let prompt = ChoicePrompt::new()
 //!     .body("A musty drawer holds a tagged room key.")
 //!     .choice('k', DrawerAction::TakeKey, "Take the Room 7 key")
 //!     .choice('l', DrawerAction::Leave, "Leave it");
 //!
 //! // Lowercase and uppercase reach the same arm
 //! assert_eq!(
-//!     prompt.handle(Input::Char('K')).
-//!     PromptAction::Selected(DrawerAction::TakeKey).
+//!     prompt.handle(Input::Char('K')),
+//!     PromptAction::Selected(DrawerAction::TakeKey),
 //! );
 //! // Resize is not a prompt-relevant signal.
 //! assert_eq!(
-//!     prompt.handle(Input::Resize { width: 80, height: 24 }).
-//!     PromptAction::None.
+//!     prompt.handle(Input::Resize { width: 80, height: 24 }),
+//!     PromptAction::None,
 //! );
 //! ```
 //!
@@ -95,7 +95,7 @@
 //! use foglet_game::{ConfirmOutcome, ConfirmPrompt, Input};
 //!
 //! let prompt = ConfirmPrompt::new("Overwrite the existing save?")
-//!     .default_no;
+//!     .default_no();
 //!
 //! // Enter takes the safe default — a stray press will not destroy data.
 //! assert_eq!(prompt.handle(Input::Enter), ConfirmOutcome::No);
@@ -115,14 +115,14 @@
 //! ```
 //! use foglet_game::{AnyKeyOutcome, AnyKeyPrompt, Input};
 //!
-//! let pause = AnyKeyPrompt::new
+//! let pause = AnyKeyPrompt::new()
 //!     .body("The night clerk slides a chipped mug across the counter.")
 //!     .footer("Press any key to continue...");
 //!
 //! // Resize is a layout event, not acknowledgement.
 //! assert_eq!(
-//!     pause.handle(Input::Resize { width: 80, height: 24 }).
-//!     AnyKeyOutcome::None.
+//!     pause.handle(Input::Resize { width: 80, height: 24 }),
+//!     AnyKeyOutcome::None,
 //! );
 //! // Any meaningful key completes the pause.
 //! assert_eq!(pause.handle(Input::Char(' ')), AnyKeyOutcome::Completed);
@@ -629,7 +629,7 @@ pub fn validate_choices<T>(choices: &[PromptChoice<T>]) -> Result<(), PromptErro
 ///  on top of the same struct, and rendering reads
 /// the same fields. Splitting "shape of the prompt" from "what
 /// pressing a key does" keeps the builder testable without a
-/// runtime — `ChoicePrompt::new.body(...).choice(...)` is a pure
+/// runtime — `ChoicePrompt::new().body(...).choice(...)` is a pure
 /// expression that produces an inspectable value.
 ///
 /// # Builder shape
@@ -640,12 +640,12 @@ pub fn validate_choices<T>(choices: &[PromptChoice<T>]) -> Result<(), PromptErro
 /// use foglet_game::prompt::ChoicePrompt;
 /// # #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 /// # enum LootAction { Equip, Take, Pass }
-/// let prompt = ChoicePrompt::new
+/// let prompt = ChoicePrompt::new()
 ///     .body("You found this on the Giant Spider's corpse.")
 ///     .choice('e', LootAction::Equip, "Equip immediately")
 ///     .choice('t', LootAction::Take, "Take to inventory")
 ///     .choice('p', LootAction::Pass, "Pass");
-/// assert_eq!(prompt.choices.len, 3);
+/// assert_eq!(prompt.choices.len(), 3);
 /// ```
 ///
 /// `.disabled_if(cond, reason)` operates on the **most recently added
@@ -1365,7 +1365,7 @@ impl<T> ChoicePrompt<T> {
 ///   uppercased 's display rule.
 /// - **Disabled**: `- [K] Label (reason)`. Leading `- `
 ///   plus square brackets are the *monochrome* visual difference the
-///    requires — the row stays distinguishable from enabled rows
+///   requires — the row stays distinguishable from enabled rows
 ///   even when the renderer is theme-stripped or running on
 ///   a strictly monochrome BBS terminal where the eventual
 ///   `StyleRole::Disabled` dim style is invisible. The trailing
@@ -1532,7 +1532,7 @@ impl<T: Clone> ChoicePrompt<T> {
             // entire comparison — no per-call `to_ascii_lowercase`.
             //
             // : a disabled choice still owns its hotkey
-            // 
+            //
             // so we surface the press as `PromptAction::Disabled`
             // rather than letting it fall through to `None`. That gives
             // the game a chance to render the disabled_reason as

@@ -771,7 +771,10 @@ enabled = true
         )
         .unwrap();
 
-        assert!(outputs.world_dir.is_none(), "world_dir set for game without world enabled");
+        assert!(
+            outputs.world_dir.is_none(),
+            "world_dir set for game without world enabled"
+        );
         assert!(
             !out.join("world").exists(),
             "world/ directory created for game without world enabled"

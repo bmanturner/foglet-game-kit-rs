@@ -77,7 +77,7 @@ use crate::world_db::{WorldDb, WorldMigration};
 ///   (e.g. `"room_7_opened"`, `"clue_found"`). Game authors pick the
 ///   namespace; the kit's only rule is "it must round-trip as text".
 /// - `player_id` — `INTEGER REFERENCES players(id)`, **nullable**.
-///    explicitly types this column as optional so the log can carry
+///   explicitly types this column as optional so the log can carry
 ///   "system" events that aren't attributable to one player (e.g. a
 ///   future "midnight reset" tick the runtime might emit). Foreign-keyed
 ///   for the same reason as the turn ledger: a phantom id should never
