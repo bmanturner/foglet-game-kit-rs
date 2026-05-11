@@ -154,7 +154,8 @@ pub use travel::{
     TravelEventDraft, TravelRequest, TravelResult, TravelValidateCallback,
 };
 pub use turns::{
-    DateProvider, FixedDateProvider, LocalDate, TurnError, TurnLedgerRow, TURN_LEDGER_MIGRATION,
+    spend_turns_on, DateProvider, FixedDateProvider, LocalDate, TurnError, TurnLedgerRow,
+    TURN_LEDGER_MIGRATION,
 };
 pub use widgets::{
     centred_rect, render_hint_line, render_inventory_list, render_menu_list, render_message_line,

@@ -24,9 +24,15 @@ currency or turn cost.
 Use `TravelRequest::with_charge_cost_tx` when charging travel cost needs
 to mutate kit-owned tables in the active travel transaction. The
 callback receives the SQLite connection for that transaction, so it can
-call helpers such as `inventory::transfer_on` or `events::append_event_on`
-without opening a nested transaction or writing raw SQL against
-`presence`, `place_recall`, `inventory_slots`, or `world_events`.
+call helpers such as `spend_turns_on`, `inventory::transfer_on`, or
+`events::append_event_on` without opening a nested transaction or
+writing raw SQL against `presence`, `place_recall`, `turn_ledger`,
+`inventory_slots`, or `world_events`.
+
+For Daily Turn travel costs, call `spend_turns_on` from
+`TravelRequest::with_charge_cost_tx`. The turn spend then rolls back
+with route validation, presence movement, recall touch, and travel event
+append if any later travel step fails.
 
 Travel remains genre-neutral. The kit orchestrates atomic route
 resolution, validation, optional cost charging, presence movement,

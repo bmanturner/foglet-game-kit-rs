@@ -665,15 +665,17 @@ pub(crate) fn ensure_today_turns_on(
 }
 
 /// Free-function form of [`WorldDb::spend_turns`] that operates on any
-/// `&Connection`. Mirrors [`ensure_today_turns_on`]: pulled out so the
-///  `spend_turn_and_emit` helper can compose the spend, the
-/// caller's world mutation, and the event append inside a single
-/// transaction without re-borrowing the [`WorldDb`].
+/// `&Connection`.
+///
+/// Use this helper when a game needs to spend Daily Turns inside an
+/// existing SQLite transaction, such as a [`crate::TravelRequest`]
+/// `with_charge_cost_tx` callback. It accepts `&rusqlite::Connection`,
+/// so `&rusqlite::Transaction` works through deref coercion.
 ///
 /// The behavior — atomic decrement with a `WHERE balance >= ?` guard.
 /// canonical readback for the error payload — is identical to the
 /// method version. See [`WorldDb::spend_turns`] for the full rationale.
-pub(crate) fn spend_turns_on(
+pub fn spend_turns_on(
     conn: &rusqlite::Connection,
     player_id: i64,
     amount: u32,
@@ -1271,6 +1273,64 @@ mod tests {
             )
             .expect("balance readback");
         assert_eq!(persisted, 29, "DB row must reflect the decrement");
+    }
+
+    #[test]
+    fn spend_turns_on_can_spend_inside_existing_transaction() {
+        let dir = tempdir().expect("tempdir creates");
+        let (mut world, player_id) = world_with_player(&dir);
+        let today = LocalDate::parse("2026-05-08").expect("fixture date parses");
+
+        let tx = world
+            .connection_mut()
+            .transaction()
+            .expect("transaction begins");
+        let after = spend_turns_on(&tx, player_id, 3, 30, 0, &today)
+            .expect("transaction-local spend succeeds");
+        assert_eq!(after.balance, 27);
+        tx.commit().expect("transaction commits");
+
+        let persisted: i64 = world
+            .connection()
+            .query_row(
+                "SELECT balance FROM turn_ledger \
+                 WHERE player_id = ?1 AND local_date = ?2",
+                rusqlite::params![player_id, "2026-05-08"],
+                |row| row.get(0),
+            )
+            .expect("balance readback");
+        assert_eq!(persisted, 27);
+    }
+
+    #[test]
+    fn spend_turns_on_rolls_back_with_surrounding_transaction() {
+        let dir = tempdir().expect("tempdir creates");
+        let (mut world, player_id) = world_with_player(&dir);
+        let today = LocalDate::parse("2026-05-08").expect("fixture date parses");
+
+        {
+            let tx = world
+                .connection_mut()
+                .transaction()
+                .expect("transaction begins");
+            spend_turns_on(&tx, player_id, 3, 30, 0, &today)
+                .expect("transaction-local spend succeeds");
+        }
+
+        let row_exists: bool = world
+            .connection()
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM turn_ledger WHERE player_id = ?1 AND local_date = ?2
+                 )",
+                rusqlite::params![player_id, "2026-05-08"],
+                |row| row.get(0),
+            )
+            .expect("existence readback");
+        assert!(
+            !row_exists,
+            "dropped transaction must roll back lazy row creation"
+        );
     }
 
     /// Repeated spends compose: balance after N spends of `amount`

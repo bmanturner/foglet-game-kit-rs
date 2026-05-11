@@ -11,6 +11,8 @@
   costs can mutate kit-owned tables inside the same transaction that
   resolves routes, moves presence, touches recall, and appends travel
   events.
+- Added `spend_turns_on` for spending Daily Turns on an existing SQLite
+  connection or transaction, including from transaction-aware travel
+  cost callbacks.
 - Documented the shared-world table boundary and the preferred public
   APIs for kit-owned tables.
-

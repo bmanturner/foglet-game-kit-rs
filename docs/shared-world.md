@@ -218,7 +218,7 @@ adapters, local migrations, operator repair, or a documented kit gap.
 | Player registry | `players` | `WorldDb::upsert_player` and player lookup helpers |
 | Presence | `presence` | `WorldDb::set_presence`, `WorldDb::get_presence`, `WorldDb::travel` |
 | Place recall | `place_recall` | `WorldDb::touch_recall`, `WorldDb::recall_for_player`, `WorldDb::travel` |
-| Turns | `turn_ledger` | turn ledger helpers in `foglet_game::turns` |
+| Turns | `turn_ledger` | `WorldDb::ensure_today_turns`, `WorldDb::spend_turns`, `spend_turns_on` for existing transactions |
 | Inventory | `inventory_slots` | `WorldDb::create_slot`, `WorldDb::get_slot`, `WorldDb::slots_for_owner`, `WorldDb::transfer`, `inventory::transfer_on` |
 | Contracts | `contracts` | contract lifecycle helpers and transition callbacks |
 | Events | `world_events` | `WorldDb::append_event`, `events::append_event_on`, `WorldDb::recent_events`, `WorldDb::player_events` |
@@ -227,9 +227,9 @@ adapters, local migrations, operator repair, or a documented kit gap.
 For multi-step gameplay that must be atomic, compose kit primitives
 inside one transaction-local path instead of writing kit tables
 directly. For example, a travel request can call
-`TravelRequest::with_charge_cost_tx`, then use `inventory::transfer_on`
-from that callback, while travel itself moves `presence`, touches
-`place_recall`, and appends `world_events`.
+`TravelRequest::with_charge_cost_tx`, then use `spend_turns_on` or
+`inventory::transfer_on` from that callback, while travel itself moves
+`presence`, touches `place_recall`, and appends `world_events`.
 
 The new transaction-local APIs are deliberately genre-neutral: callers
 choose owner kinds, item keys, event names, cost policy, route policy,
