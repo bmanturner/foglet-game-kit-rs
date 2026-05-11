@@ -1,13 +1,10 @@
-# Presence and Recall: separate v4 primitives
+# Presence and Recall
 
-This document explains two related but distinct v4 primitives in
+This document explains two related but distinct primitives in
 `foglet_game`:
 
 - `presence`: a player's current location now
 - `place_recall`: a player's remembered places over time
-
-The contract comes from [`SPEC_v4.md`](../SPEC_v4.md) §2.2, §5, §6, and
-§8. If this page and the SPEC disagree, the SPEC wins.
 
 ## 1. Why they are separate
 
@@ -140,7 +137,7 @@ This ordering supports stable fog-of-war or "recently seen" UI panels.
 
 ## 4. Composition pattern
 
-Typical v4 composition is explicit and policy-driven:
+Typical composition is explicit and policy-driven:
 
 1. Validate adjacency with `routes`
 2. Call `move_player`

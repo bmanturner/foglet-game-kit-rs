@@ -1,15 +1,12 @@
 # Spatial primitives: places and routes
 
-This document explains the v4 spatial layer in `foglet_game`: durable
+This document explains the spatial layer in `foglet_game`: durable
 `places` plus directed `routes` stored in the shared world DB.
-
-The contract comes from [`SPEC_v4.md`](../SPEC_v4.md) §2.2, §3, §4, and
-§8. If this page and the SPEC disagree, the SPEC wins.
 
 ## 1. Why this primitive exists
 
-v4 adds a structural graph so games can represent "where things are"
-without forcing a specific genre or map model.
+The spatial graph lets games represent "where things are" without
+forcing a specific genre or map model.
 
 - A **space exploration** game can treat places as docks, gates, or
   sectors.
@@ -98,7 +95,7 @@ Both are just directed rows. No reverse link is implied.
 - `WorldDb::outbound_routes(place_id)` returns routes that leave a place.
 - `WorldDb::inbound_routes(place_id)` returns routes that arrive at a place.
 
-Two key rules from the v4 contract:
+Two key rules:
 
 - Direction is asymmetric by default: `A -> B` does not create `B -> A`.
 - Bidirectional travel requires two rows.
@@ -123,5 +120,5 @@ model multiple channels between the same two places.
 - No automatic fog-of-war recall updates.
 - No map projection, coordinates, or pathfinding.
 
-Those behaviors are composed by higher-level v4 primitives and game
+Those behaviors are composed by higher-level primitives and game
 logic, not embedded in the shared spatial table contract.

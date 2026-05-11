@@ -147,7 +147,7 @@ Player-facing synonyms may include sector, station, wreck, route marker, gate, o
 
 Implementation source:
 
-- Foglet game-kit v4 spatial primitive.
+- Foglet game-kit spatial primitive.
 
 Fields likely include:
 
@@ -213,7 +213,7 @@ A directed edge from one Place to another.
 
 Implementation source:
 
-- Foglet game-kit v4 route primitive.
+- Foglet game-kit route primitive.
 
 Player-facing examples:
 
@@ -418,7 +418,7 @@ The current Place occupied by a player or NPC.
 
 Implementation source:
 
-- Foglet game-kit v4 presence primitive.
+- Foglet game-kit presence primitive.
 
 Player-facing uses:
 
@@ -438,7 +438,7 @@ A player’s remembered information about previously visited or scanned Places.
 
 Implementation source:
 
-- Foglet game-kit v4 place recall primitive.
+- Foglet game-kit place recall primitive.
 
 Recall may include:
 
@@ -479,7 +479,7 @@ The player’s primary action budget.
 
 Implementation source:
 
-- Foglet game-kit v2 turns primitive.
+- Foglet game-kit turns primitive.
 
 Design purpose:
 
@@ -520,7 +520,7 @@ A simulation advancement pass.
 
 Implementation source:
 
-- Foglet game-kit v4 world tick primitive.
+- Foglet game-kit world tick primitive.
 
 Tick responsibilities:
 
@@ -622,7 +622,7 @@ The implementation-level storage record for an item owned by an entity.
 
 Implementation source:
 
-- Foglet game-kit v4 owner-keyed inventory primitive.
+- Foglet game-kit owner-keyed inventory primitive.
 
 Owners may include:
 
@@ -655,7 +655,7 @@ A place or service where items can be bought or sold.
 
 Implementation source:
 
-- Foglet game-kit v3 market/listing primitive plus v4 inventory transfers.
+- Foglet game-kit market/listing primitive plus inventory transfers.
 
 Market types:
 
@@ -845,7 +845,7 @@ A target-oriented job with claim/complete/expire lifecycle.
 
 Implementation source:
 
-- Foglet game-kit v3 bounty primitive.
+- Foglet game-kit bounty primitive.
 
 Targets:
 
@@ -883,7 +883,7 @@ An asynchronous contest between players or between player and NPC.
 
 Implementation source:
 
-- Foglet game-kit v3 challenge primitive.
+- Foglet game-kit challenge primitive.
 
 Examples:
 
@@ -899,7 +899,7 @@ A persistent faction/corp/world objective advanced by contributions or actions.
 
 Implementation source:
 
-- Foglet game-kit v3 faction/shared-goal primitive.
+- Foglet game-kit faction/shared-goal primitive.
 
 Examples:
 
@@ -930,7 +930,7 @@ A major NPC organization with goals, reputation, territory, services, and confli
 
 Implementation source:
 
-- Foglet game-kit v3 faction primitive.
+- Foglet game-kit faction primitive.
 
 Default factions:
 
@@ -1313,7 +1313,7 @@ A durable in-game message to a player, faction, corp, place, or global audience.
 
 Implementation source:
 
-- Foglet game-kit v3 notices/mail primitive.
+- Foglet game-kit notices/mail primitive.
 
 Notice types:
 
@@ -1336,7 +1336,7 @@ Append-only world-history record.
 
 Implementation source:
 
-- Foglet game-kit v2 event log primitive.
+- Foglet game-kit event log primitive.
 
 Event examples:
 
@@ -1384,7 +1384,7 @@ Examples:
 
 Implementation source:
 
-- Foglet game-kit v1 Screen trait and screen stack.
+- Foglet game-kit Screen trait and screen stack.
 
 ### Modal
 
@@ -1396,7 +1396,7 @@ A text-first interaction with choices and hotkeys.
 
 Implementation source:
 
-- Foglet game-kit v1.1 prompt primitives.
+- Foglet game-kit prompt primitives.
 
 ### Hotkey
 
@@ -1474,7 +1474,7 @@ Private save file for user-specific game state.
 
 Implementation source:
 
-- Foglet game-kit v1/v2.1 save primitives.
+- Foglet game-kit save primitives.
 
 ### Shared World DB
 
@@ -1482,7 +1482,7 @@ Game-owned SQLite database for shared persistent state.
 
 Implementation source:
 
-- Foglet game-kit v2 world DB primitives.
+- Foglet game-kit world DB primitives.
 
 ### Atomic Transfer
 
@@ -1490,7 +1490,7 @@ A transaction that debits one inventory owner and credits another, rolling back 
 
 Implementation source:
 
-- Foglet game-kit v4 inventory transfer primitive.
+- Foglet game-kit inventory transfer primitive.
 
 ### Transaction Boundary
 
@@ -1509,7 +1509,7 @@ Player-authored text with maximum length and terminal-safe sanitization.
 
 Implementation source:
 
-- Foglet game-kit v3 privacy/moderation guidance.
+- Foglet game-kit privacy/moderation guidance.
 
 ### Ralph Loop
 

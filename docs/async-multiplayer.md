@@ -1,32 +1,26 @@
 # BBS-native async multiplayer
 
-This is the operator- and game-author-facing reference for the v3
-async multiplayer layer: mailbox notices, challenges, markets,
+This is the operator- and game-author-facing reference for the async
+multiplayer layer: mailbox notices, challenges, markets,
 factions/shared goals, and bounties. It explains the model, the
 durability story, and the helper surface each primitive ships with.
 
-The contract this document satisfies lives in
-[`SPEC_v3.md`](../SPEC_v3.md) — §3 (system overview), §4 (domain
-model), §7 (operational requirements), §8 (test requirements), and
-§10 (design biases). If anything below conflicts with the SPEC, the
-SPEC wins.
-
 For the underlying SQLite storage (file location, migrations, locking,
-backup), see [`shared-world.md`](shared-world.md) — v3 reuses the
-same per-game world DB and adds migrations starting at version 6.
+backup), see [`shared-world.md`](shared-world.md) — the async
+multiplayer primitives reuse the same per-game world DB and add
+migrations starting at version 6.
 
 ## 1. Why mailbox multiplayer
 
-v2 makes the world shared: events, players, leaderboards. v3 makes
-players *aware of each other* without requiring them to be online at
-the same time.
+The shared world layer makes player actions visible via a shared SQLite
+file. The async multiplayer layer makes players *aware of each other*
+without requiring them to be online at the same time.
 
 That is the BBS sweet spot. Leave a message, set a trap, buy out a
 market, post a bounty, join a faction, challenge another caller —
 and let the world react during the next login.
 
-The design biases ([SPEC_v3 §10](../SPEC_v3.md#10-design-biases))
-that follow from this:
+The design biases that follow from this:
 
 - **Mailbox over live multiplayer.** Players read mail on login; they
   do not chat in real time.
@@ -44,20 +38,19 @@ that follow from this:
   player-typed field has a length cap enforced before the SQL
   round-trip, and rejected drafts never produce autoincrement gaps.
 
-What v3 explicitly does *not* do is covered separately in §10.
+What this layer explicitly does *not* do is covered separately in §10.
 
 ## 2. The five primitives at a glance
 
 | Primitive   | Migration | Module                       | Lifecycle                                      |
 |-------------|-----------|------------------------------|------------------------------------------------|
-| Notices     | v6        | [`notices`](#3-notices)      | unread → read → archived (idempotent edges)    |
-| Challenges  | v7        | [`challenges`](#4-challenges)| open → accepted → resolved \| declined \| expired |
-| Market      | v8        | [`market`](#5-market)        | active → exhausted (atomic buy decrement)      |
-| Factions    | v9        | [`factions`](#6-factions)    | join/leave; goal active → completed            |
-| Bounties    | v10       | [`bounties`](#7-bounties)    | open → claimed → completed; open\|claimed → expired |
+| Notices     | 6         | [`notices`](#3-notices)      | unread → read → archived (idempotent edges)    |
+| Challenges  | 7         | [`challenges`](#4-challenges)| open → accepted → resolved \| declined \| expired |
+| Market      | 8         | [`market`](#5-market)        | active → exhausted (atomic buy decrement)      |
+| Factions    | 9         | [`factions`](#6-factions)    | join/leave; goal active → completed            |
+| Bounties    | 10        | [`bounties`](#7-bounties)    | open → claimed → completed; open\|claimed → expired |
 
-All five are opt-in via `[multiplayer]` in `assets/game.toml`
-([SPEC_v3 §5](../SPEC_v3.md#5-configuration-contract)). A v1 or v2
+All five are opt-in via `[multiplayer]` in `assets/game.toml`. A
 game that omits the block ships with every primitive disabled.
 
 ```toml
@@ -75,10 +68,9 @@ implicitly light up the others.
 
 ## 3. Notices
 
-[`SPEC_v3 §4.1`](../SPEC_v3.md#41-notice). Player-to-player and
-system mail. The default inbox view hides archived notices; the
-`idx_notices_inbox` partial index makes that view a reverse index
-walk over `(recipient_player_id, created_at, id) WHERE archived_at IS NULL`.
+Player-to-player and system mail. The default inbox view hides archived
+notices; the `idx_notices_inbox` partial index makes that view a reverse
+index walk over `(recipient_player_id, created_at, id) WHERE archived_at IS NULL`.
 
 Public surface (re-exported from `foglet_game`):
 
@@ -95,16 +87,14 @@ Public surface (re-exported from `foglet_game`):
 - `WorldDb::archive_notice(notice_id)` — same `COALESCE` shape.
 
 System notices set `sender_player_id = None`. Subject and body are
-length-bounded ([SPEC_v3 §4.1](../SPEC_v3.md#41-notice)) — body cap
-is `max_notice_body_chars` from config, subject cap is the
-kit-internal `NOTICE_SUBJECT_MAX_CHARS = 120`. Counts are Unicode
-scalar values, not bytes.
+length-bounded — body cap is `max_notice_body_chars` from config,
+subject cap is the kit-internal `NOTICE_SUBJECT_MAX_CHARS = 120`.
+Counts are Unicode scalar values, not bytes.
 
 ## 4. Challenges
 
-[`SPEC_v3 §4.2`](../SPEC_v3.md#42-challenge). Async duels. The
-challenger posts an offer; the target sees it on next navigation and
-accepts, declines, or lets it lapse.
+Async duels. The challenger posts an offer; the target sees it on next
+navigation and accepts, declines, or lets it lapse.
 
 ```text
 open ──► accepted ──► resolved
@@ -147,11 +137,10 @@ The kit owns the lifecycle. Game code owns the shape of `stake` and
 
 ## 5. Market
 
-[`SPEC_v3 §4.3`](../SPEC_v3.md#43-marketlisting). Shared listings.
-Sellers post; buyers buy; the partial `idx_market_listings_active`
-index over `(created_at, id) WHERE quantity > 0` means exhausted
-listings fall out of the active view automatically the moment a buy
-commits.
+Shared listings. Sellers post; buyers buy; the partial
+`idx_market_listings_active` index over `(created_at, id) WHERE quantity > 0`
+means exhausted listings fall out of the active view automatically the
+moment a buy commits.
 
 Public surface:
 
@@ -167,24 +156,22 @@ Public surface:
   newest-first with an `id DESC` tiebreak so two listings that post
   in the same SQLite second do not flicker between renders.
 - `WorldDb::buy_listing(listing_id, buyer, on_buyer_debit)` —
-  **the only multi-statement transactional helper in v3**. Wraps a
-  conditional decrement, the buyer-side debit callback, and a
+  **the only multi-statement transactional helper in this layer**.
+  Wraps a conditional decrement, the buyer-side debit callback, and a
   `market.buy` world event in a single `BEGIN … COMMIT`. If the
   callback returns `Err`, the transaction rolls back: listing
   quantity, buyer balance, and the world-event log are all
   unchanged.
 
-Atomicity is the load-bearing contract: SPEC §4.3 mandates that buy
-be atomic across quantity decrement, buyer callback, and event
-append. Tests pin rollback by injecting a callback that returns
-`Err`.
+Atomicity is the load-bearing contract: `buy_listing` is atomic across
+quantity decrement, buyer callback, and event append. Tests pin rollback
+by injecting a callback that returns `Err`.
 
 ## 6. Factions and shared goals
 
-[`SPEC_v3 §4.4`](../SPEC_v3.md#44-faction). Three tables: `factions`
-(slugged definitions, seeded from `[[factions.seed]]`),
-`faction_memberships` (player ↔ faction with role), and
-`shared_goals` (target/current amount, optional faction scope).
+Three tables: `factions` (slugged definitions, seeded from
+`[[factions.seed]]`), `faction_memberships` (player ↔ faction with
+role), and `shared_goals` (target/current amount, optional faction scope).
 
 Public surface:
 
@@ -212,8 +199,7 @@ can render "case closed" banners on next refresh.
 
 ## 7. Bounties
 
-[`SPEC_v3 §4.5`](../SPEC_v3.md#45-bounty). Posted jobs with a
-JSON-shaped reward.
+Posted jobs with a JSON-shaped reward.
 
 ```text
 open ──► claimed ──► completed
@@ -237,7 +223,7 @@ Public surface:
   `claimed_by_player_id`, and `claimed_at` so the audit chain
   ("who held this bounty when it completed, and what was the
   reward") survives untouched. The kit does *not* gate on
-  claimant — game code owns evidence validation per SPEC §4.5.
+  claimant — game code owns evidence validation.
 - `WorldDb::expire_bounties(now)` — sweeper that walks the partial
   `idx_bounties_expiring` index. Both `open` and `claimed` rows are
   eligible: a claimant who never completes their work should not pin
@@ -245,13 +231,12 @@ Public surface:
 
 ## 8. Player-authored text: bounds and sanitization
 
-[`SPEC_v3 §7`](../SPEC_v3.md#7-operational-requirements) requires that
-"player-authored text MUST be bounded and SHOULD be sanitized for
-terminal display." Bounding is enforced by the kit at write time;
-sanitization is enforced by the game at render time. The split is
-deliberate: storage stays a faithful record of what the player typed
-(an operator running `sqlite3` against the world DB sees the truth),
-and rendering owns the responsibility of not corrupting another
+The contract is "player-authored text MUST be bounded and SHOULD be
+sanitized for terminal display." Bounding is enforced by the kit at
+write time; sanitization is enforced by the game at render time. The
+split is deliberate: storage stays a faithful record of what the player
+typed (an operator running `sqlite3` against the world DB sees the
+truth), and rendering owns the responsibility of not corrupting another
 player's terminal.
 
 ### 8.1 What is "player-authored"
@@ -272,7 +257,7 @@ Three things that look player-authored but are *not*:
 
 - **Faction slug, display name, and description.** Seeded from
   `[[factions.seed]]` in `assets/game.toml`, not typed by a player at
-  runtime. Bounded by config-load validation, not by the v3 multiplayer
+  runtime. Bounded by config-load validation, not by the multiplayer
   layer.
 - **Challenge `stake` and `result`, market `metadata`, bounty
   `reward`.** Game-defined JSON payloads. The kit treats them as opaque
@@ -314,7 +299,7 @@ cap is 120" without re-counting in the caller.
 ### 8.3 Why caps live in code, not in `CHECK` constraints
 
 A schema-level `CHECK (length(subject) <= 120)` would be hostile to
-two things v3 wants to preserve:
+two things the multiplayer layer wants to preserve:
 
 - **Per-game tuning of the body cap.** `max_notice_body_chars` is
   configurable per-game; embedding it in a `CHECK` would require a
@@ -337,7 +322,7 @@ debugging.
 
 Rendering is defensive: any TUI screen that draws player-authored text
 to another player's terminal MUST pass the text through a sanitizer
-before handing it to `ratatui`. The recommended sanitizer for v3
+before handing it to `ratatui`. The recommended sanitizer for
 multiplayer screens:
 
 - **Strip ASCII control characters** (`c.is_control()` returning
@@ -357,16 +342,16 @@ multiplayer screens:
   A widget with a 60-cell budget should call its truncator on the
   sanitized string so it never lands mid-escape.
 
-The kit ships this sanitizer with the v3 multiplayer screens it adds
-to Murder Motel (Tasks 10–13); a game that builds its own multiplayer
-screens calls the same helper. Game-defined JSON payloads
-(`stake`, `result`, `metadata`, `reward`) are sanitized by the same
-helper if they include player-typed strings, but the game decides
-which fields qualify because the kit treats those payloads as opaque.
+The kit ships this sanitizer with the multiplayer screens it adds to
+Murder Motel; a game that builds its own multiplayer screens calls the
+same helper. Game-defined JSON payloads (`stake`, `result`, `metadata`,
+`reward`) are sanitized by the same helper if they include
+player-typed strings, but the game decides which fields qualify because
+the kit treats those payloads as opaque.
 
 ### 8.5 What the kit does *not* do
 
-- **No HTML/markdown stripping.** v3 is a terminal kit; player text is
+- **No HTML/markdown stripping.** This is a terminal kit; player text is
   rendered as plain text. There is no markdown layer to escape.
 - **No profanity filtering or content moderation.** That is a game
   policy choice. A game that wants moderation can wrap
@@ -378,9 +363,8 @@ which fields qualify because the kit treats those payloads as opaque.
 
 ## 9. Reading the world without polling
 
-The runtime contract ([SPEC_v3 §7](../SPEC_v3.md#7-operational-requirements))
-is "no polling loops; async multiplayer updates are visible on
-screen refresh/navigation."
+The runtime contract is "no polling loops; async multiplayer updates
+are visible on screen refresh/navigation."
 
 In practice that means:
 
@@ -398,20 +382,19 @@ In practice that means:
   one player's action is visible to the other on next navigation.
 
 If a feature seems to want a daemon, a socket, or a poller — stop.
-v3 is mailbox multiplayer; the contract is refresh-on-navigation.
+This is mailbox multiplayer; the contract is refresh-on-navigation.
 
-## 10. What v3 is not
+## 10. What this layer is not
 
-### 10.1 v3 has no real-time multiplayer — by design
+### 10.1 No real-time multiplayer — by design
 
 This is the load-bearing exclusion the rest of the document is built
 around, so it gets its own subsection rather than a bullet in a
-list. [`SPEC_v3 §2.2`](../SPEC_v3.md#22-non-goals) is the canonical
-contract; this section explains what that means in practice for a
-game author who has just finished reading §§3–7 and is now wondering
+list. This section explains what that means in practice for a game
+author who has just finished reading §§3–7 and is now wondering
 "can I add a chat window?"
 
-**No.** v3 explicitly forbids:
+**No.** The async multiplayer layer explicitly forbids:
 
 - **Live sockets between running door sessions.** Two players running
   `murder_motel` at the same time never share a connection. The
@@ -420,8 +403,8 @@ game author who has just finished reading §§3–7 and is now wondering
 - **Real-time combat, chat, or co-op.** A player's action becomes
   visible to other players when *they* navigate to the screen that
   reads it. There is no push, no notification stream, no "alice is
-  typing…" indicator. The SPEC §10 design bias is *mailbox over
-  live*; everything else follows from that.
+  typing…" indicator. The design bias is *mailbox over live*;
+  everything else follows from that.
 - **Background pollers, daemons, or long-lived threads** to simulate
   the above. The runtime contract from §9 is refresh-on-navigation;
   a 1-second poll loop that updates an inbox badge is still
@@ -443,19 +426,19 @@ game author who has just finished reading §§3–7 and is now wondering
 
 Three reasons, in priority order:
 
-1. **Terminal safety is release-critical.** SPEC §13/§17 (v1) require
+1. **Terminal safety is release-critical.** The terminal guard requires
    that every TUI path exits through the terminal guard, on every
    termination — normal quit, controlled error, panic, Ctrl-C, resize.
    A background socket reader that owns an `&mut Terminal` for stdout
    updates is a second uncoordinated path to the terminal, and that
    is the exact failure mode the guard exists to prevent. Mailbox
    multiplayer keeps the terminal-owning thread the *only* writer.
-2. **Transactional state machines over ad-hoc flags.** Every
-   v3 lifecycle edge is a single conditional `UPDATE … RETURNING`
-   (§§3–7). That works because there is exactly one writer per row at
-   a time, serialised by SQLite's write lock. A real-time layer
-   re-introduces the optimistic-concurrency / merge-conflict problem
-   the mailbox model sidesteps.
+2. **Transactional state machines over ad-hoc flags.** Every lifecycle
+   edge in §§3–7 is a single conditional `UPDATE … RETURNING`. That
+   works because there is exactly one writer per row at a time,
+   serialised by SQLite's write lock. A real-time layer re-introduces
+   the optimistic-concurrency / merge-conflict problem the mailbox
+   model sidesteps.
 3. **BBS sweet spot.** A door game's audience is asynchronous by
    nature — players call in once a day, leave traces, and read what
    other callers left. Building real-time on top of `:external_pty`
@@ -463,8 +446,7 @@ Three reasons, in priority order:
 
 ### 10.3 If you find yourself reaching for real-time
 
-Stop. Append to `DECISIONS.md` § Open Questions describing the
-use-case, and check whether one of these mailbox-shaped alternatives
+Stop, and check whether one of these mailbox-shaped alternatives
 solves it instead:
 
 | Pull toward real-time                  | Mailbox-shaped alternative                                            |
@@ -473,9 +455,9 @@ solves it instead:
 | "Show a live count of bounty claims."  | The bounty board re-reads `state='open'` on screen open; the count is fresh-on-navigation. |
 | "Live chat between agency members."    | Faction-scoped notices with `kind='faction-chat'`; refresh-on-navigation. |
 | "Race two players on the same clue."   | Challenge with a deadline; the second-to-resolve loses on `accept_challenge`'s conditional UPDATE. |
-| "Push leaderboard updates."            | Leaderboard screen reads the v2 events table on entry; the kit already does this. |
+| "Push leaderboard updates."            | Leaderboard screen reads the events table on entry; the kit already does this. |
 
-If none of those fit, the feature is a v4-shaped concern, not a v3
-one. Do not silently add a poller, a socket, or a thread to make it
-work under the v3 contract — those changes break the terminal-safety
-guarantee that the v1/v2/v3 architecture stack rests on.
+If none of those fit, the feature requires real-time semantics. Do not
+silently add a poller, a socket, or a thread to make it work under the
+async multiplayer contract — those changes break the terminal-safety
+guarantee the architecture rests on.

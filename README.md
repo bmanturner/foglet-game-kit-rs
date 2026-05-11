@@ -8,52 +8,52 @@ the Foglet operator manifest.
 The kit targets Foglet's `:external_pty` runtime: each game compiles to
 a single binary that Foglet launches under a PTY, with a documented
 context handed in via `FOGLET_DOOR_CONTEXT` and `FOGLET_*` env vars.
-See [`SPEC.md`](SPEC.md) for the full contract.
 
 ## What you get
 
 - **`foglet_game`** — terminal guard with panic-safe restoration, a
   screen-stack runtime, input normalization, save manager with atomic
   writes, ASCII map and YAML dialog primitives, and ratatui widgets.
-  v2.1 layers on **authoring ergonomics** so games stop hand-rolling
-  the same glue: `SaveSlot<T>` (typed shared save handle with a dirty
-  flag, `load_or_default`, and a `save_handler` closure for runtime
-  persistence), `DialogScreen` (a `Screen` adapter over the YAML
-  dialog runner that mirrors `PromptScreen<T>` and supports
-  modal/compact layouts), modal layout helpers (`centred_rect`,
-  `render_modal`, `render_hint_line`), and `Game::with_save_handler`
-  so persistence runs inside the terminal guard's lifetime instead of
-  a manual tail in `main`. See
+  Includes higher-level authoring ergonomics: `SaveSlot<T>` (typed
+  shared save handle with a dirty flag, `load_or_default`, and a
+  `save_handler` closure for runtime persistence), `DialogScreen` (a
+  `Screen` adapter over the YAML dialog runner that mirrors
+  `PromptScreen<T>` and supports modal/compact layouts), modal layout
+  helpers (`centred_rect`, `render_modal`, `render_hint_line`), and
+  `Game::with_save_handler` so persistence runs inside the terminal
+  guard's lifetime instead of a manual tail in `main`. See
   [`docs/save-and-state.md`](docs/save-and-state.md) and
   [`docs/dialog-screens.md`](docs/dialog-screens.md) for when to reach
   for each.
-  v3 adds **BBS-native async multiplayer primitives** on top of the v2
-  shared world: durable notices/mail (`Notice`, `WorldDb::send_notice`
-  / `inbox` / `mark_read` / `archive_notice`), challenge lifecycles
-  (`Challenge` with create/accept/decline/resolve/expire transitions),
-  shared market listings (`MarketListing` with atomic, callback-rolled-
-  back `buy_listing`), factions and shared goals (`Faction`,
-  `SharedGoal`, `contribute_to_goal` with auto-completion at target),
-  and bounty boards (`Bounty` with post/claim/complete/expire). Each
-  primitive is opt-in via `[multiplayer]` in `game.toml` and stores
-  state in the v2 SQLite world DB — no live sockets, no background
-  pollers, refresh-on-navigation only. See
+
+  The library also ships BBS-native async multiplayer primitives built
+  on a per-game shared SQLite world DB: durable notices/mail (`Notice`,
+  `WorldDb::send_notice` / `inbox` / `mark_read` / `archive_notice`),
+  challenge lifecycles (`Challenge` with create/accept/decline/resolve/expire
+  transitions), shared market listings (`MarketListing` with atomic,
+  callback-rolled-back `buy_listing`), factions and shared goals
+  (`Faction`, `SharedGoal`, `contribute_to_goal` with auto-completion
+  at target), and bounty boards (`Bounty` with post/claim/complete/expire).
+  Each primitive is opt-in via `[multiplayer]` in `game.toml` and stores
+  state in the SQLite world DB — no live sockets, no background pollers,
+  refresh-on-navigation only. See
   [`docs/async-multiplayer.md`](docs/async-multiplayer.md) for the
   mailbox-multiplayer model and the explicit no-real-time scope.
-  v4 adds **spatial-and-stockpiles primitives** on top of v3:
+
+  Spatial graph primitives let games represent durable place graphs:
   directed place graphs (`Place`, `Route`), per-player presence and
   recall (`Presence`, `PlaceRecall`), owner-keyed inventory slots with
   atomic transfer (`InventorySlot`, `transfer`), and durable world
   ticks (`WorldTickTask`, `register_tick`, `run_due_ticks`). See
-  [`docs/spec-v4-overview.md`](docs/spec-v4-overview.md),
   [`docs/spatial.md`](docs/spatial.md),
   [`docs/presence-and-recall.md`](docs/presence-and-recall.md),
   [`docs/inventory.md`](docs/inventory.md), and
   [`docs/world-ticks.md`](docs/world-ticks.md).
-  v5 adds **workflow composition primitives**: generic Contracts,
-  a unified Job Board, transactional Travel, policy-driven Inventory
-  Capacity, an Event Log screen, and a feature-gated Multi-User local
-  test harness. See [`docs/spec-v5-overview.md`](docs/spec-v5-overview.md),
+
+  Workflow composition primitives handle higher-level game mechanics:
+  generic Contracts, a unified Job Board, transactional Travel,
+  policy-driven Inventory Capacity, an Event Log screen, and a
+  feature-gated multi-user local test harness. See
   [`docs/contracts.md`](docs/contracts.md),
   [`docs/job-board.md`](docs/job-board.md),
   [`docs/travel.md`](docs/travel.md),
@@ -91,10 +91,9 @@ cd ~/code/murder-motel-smoke
 ```
 
 The project name (last path segment) becomes both the Cargo crate name
-and the SPEC §9.1 game slug, so it must be lowercase ASCII alphanumeric
-plus `-`. The scaffold includes `Cargo.toml`, `src/main.rs`, an
-`assets/game.toml`, a starter map, `.gitignore`, and a per-project
-README.
+and the game slug, so it must be lowercase ASCII alphanumeric plus `-`.
+The scaffold includes `Cargo.toml`, `src/main.rs`, an `assets/game.toml`,
+a starter map, `.gitignore`, and a per-project README.
 
 ### 3. Run locally
 
@@ -116,8 +115,8 @@ cargo run --example murder_motel
 
 ### 4. Emit the Foglet manifest
 
-`emit-manifest` reads `assets/game.toml` and writes the SPEC §10.3 JSON
-to stdout. Pipe it into Foglet's manifest directory. The
+`emit-manifest` reads `assets/game.toml` and writes the operator manifest
+JSON to stdout. Pipe it into Foglet's manifest directory. The
 `--install-dir` MUST be the absolute path the door will live at on the
 Foglet host.
 
@@ -130,13 +129,13 @@ fgk emit-manifest \
 ### 5. Package the bundle
 
 `fgk package` runs `cargo build --release`, then assembles the
-deployable directory described in SPEC §10.4:
+deployable directory:
 
 ```text
 dist/
   murder-motel-smoke   # release binary
   run.sh               # boring wrapper, executable
-  manifest.json        # operator manifest (SPEC §10.3)
+  manifest.json        # operator manifest
   assets/              # game.toml, maps, dialog, ...
 ```
 
@@ -180,13 +179,13 @@ cargo doc --workspace --no-deps
 
 The library forbids `unwrap()` outside tests and routes every TUI exit
 through the terminal guard (normal quit, error, panic, Ctrl-C, resize).
-Read SPEC §13.1 and [`docs/terminal-safety.md`](docs/terminal-safety.md)
-before touching anything that owns the alternate screen.
+Read [`docs/terminal-safety.md`](docs/terminal-safety.md) before
+touching anything that owns the alternate screen.
 
 ## Limitations and known constraints
 
-Per SPEC §15 these are documented rather than worked around. They
-affect the *verification* surface, not the runtime contract.
+These are documented rather than worked around. They affect the
+*verification* surface, not the runtime contract.
 
 - **Scaffolded projects depend on an unpublished crate.** `fgk new`
   emits a `Cargo.toml` with `foglet_game = "0.1"`, matching the kit's
@@ -212,10 +211,9 @@ affect the *verification* surface, not the runtime contract.
 
   Projects produced by `fgk new` build a regular release binary and
   do not need the `--binary` flag.
-- **TUI smoke is manual.** SPEC §13.1 explicitly accepts manual
-  evidence for the terminal-guard contract (raw mode + alternate
-  screen + panic-hook restoration) because CI cannot drive a real
-  terminal. The recipe and evidence trail live in
+- **TUI smoke is manual.** The terminal-guard contract (raw mode +
+  alternate screen + panic-hook restoration) requires a real TTY that
+  CI cannot drive. The recipe and evidence trail live in
   [`docs/terminal-safety.md`](docs/terminal-safety.md).
 
 ## License

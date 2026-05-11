@@ -1,13 +1,11 @@
 # Inventory primitives: owner-keyed slots and atomic transfer
 
-This document explains the v4 inventory layer in `foglet_game`.
-
-The contract comes from [`SPEC_v4.md`](../SPEC_v4.md) §2.2, §7, and §8.
-If this page and the SPEC disagree, the SPEC wins.
+This document explains the inventory layer in `foglet_game`.
 
 ## 1. Why this primitive exists
 
-v4 adds durable stockpile rows without prescribing one economy model.
+The inventory primitive provides durable stockpile rows without
+prescribing one economy model.
 
 - A **role-playing dungeon game** can track player bags, chests, and vaults.
 - A **trading simulation** can track market stalls, warehouses, and caravans.

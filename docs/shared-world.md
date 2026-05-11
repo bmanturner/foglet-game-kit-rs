@@ -1,15 +1,9 @@
 # Shared-world SQLite contract
 
-This is the operator- and game-author-facing reference for the v2
+This is the operator- and game-author-facing reference for the
 shared-world layer: where the SQLite file lives, how migrations are
 applied, how to back the database up, and how to recover from a lock
 that won't clear.
-
-The contract this document satisfies lives in
-[`SPEC_v2.md`](../SPEC_v2.md) — §3 (system overview), §4 (domain
-model), §5 (configuration), §6 (packaging), and §8 (operational
-requirements). If anything below conflicts with the SPEC, the SPEC
-wins.
 
 For the install-side mechanics (creating `world/`, ownership, and the
 in-context backup commands), see
@@ -18,19 +12,18 @@ focuses on the *why* and on author-facing concerns.
 
 ## 1. Why a per-game SQLite file at all
 
-v1 saves are per-user JSON blobs under `saves/<FOGLET_USER_ID>/`. They
-are perfect for "what does *this* caller see" but cannot represent
-"what did the *previous* caller change." Many BBS door games leaned on
-exactly that asynchronous shared state — a town economy, a rumor
-board, a leaderboard — so v2 adds a per-game shared-world database
-without attempting real-time multiplayer (SPEC_v2 §1, §2.2).
+Per-user JSON save files are perfect for "what does *this* caller see"
+but cannot represent "what did the *previous* caller change." Many BBS
+door games leaned on exactly that asynchronous shared state — a town
+economy, a rumor board, a leaderboard — so the kit adds a per-game
+shared-world database without attempting real-time multiplayer.
 
 The kit deliberately picks SQLite over a network service:
 
 - It is a single file the operator can copy, archive, and inspect with
   `sqlite3` on the host. No extra service to deploy or monitor.
-- It is owned by the game package, not by Foglet's app database
-  (SPEC_v2 §8). The kit never reads or writes Foglet's Postgres.
+- It is owned by the game package, not by Foglet's app database.
+  The kit never reads or writes Foglet's Postgres.
 - It is testable end-to-end without a live terminal — every primitive
   in `crates/foglet_game/src/world_db.rs` is exercised under `cargo
   test` against a `tempfile`-backed DB.
@@ -39,7 +32,7 @@ The kit deliberately picks SQLite over a network service:
   shared-world writes inside a synchronous request handler without a
   background worker.
 
-What v2 explicitly does *not* do:
+What this layer explicitly does *not* do:
 
 - No real-time presence, broadcasts, or push between live sessions.
 - No cross-door shared state. Each game's world DB is its own file.
@@ -50,7 +43,7 @@ What v2 explicitly does *not* do:
 
 ## 2. File locations
 
-A world-enabled package lays out as (SPEC_v2 §6.1):
+A world-enabled package lays out as:
 
 ```text
 /srv/foglet/doors/<slug>/
@@ -58,7 +51,7 @@ A world-enabled package lays out as (SPEC_v2 §6.1):
   run.sh            # boring wrapper
   manifest.json
   assets/
-    world/migrations/  # author-written SQL, optional in v2
+    world/migrations/  # author-written SQL, optional
   world/            # writable runtime data
     .keep
     world.sqlite    # created on first launch
@@ -68,7 +61,7 @@ A world-enabled package lays out as (SPEC_v2 §6.1):
 ```
 
 `[world].path` in `assets/game.toml` selects the file. Resolution
-rules (SPEC_v2 §4.1):
+rules:
 
 - Default is `world/world.sqlite`, relative to the package install
   directory — i.e. the directory the binary lives in. This is what
@@ -77,7 +70,7 @@ rules (SPEC_v2 §4.1):
 - A relative path resolves under the same install directory, *not* the
   shell's current working directory. Game code never opens a path
   derived from inherited environment beyond the documented `FOGLET_*`
-  fallbacks (SPEC §5.6).
+  fallbacks.
 - An absolute path is allowed only when the operator supplies it
   explicitly via CLI or sysop config. The default-on packaging path
   refuses to bake an absolute path into a manifest because it makes
@@ -85,13 +78,13 @@ rules (SPEC_v2 §4.1):
 
 For local development, `fgk run` MAY redirect the world DB to
 `.fgk/world/world.sqlite` so dev iteration does not dirty the assets
-directory (SPEC_v2 §6.2). Treat `.fgk/world/` as throwaway state — the
-file there is not authoritative.
+directory. Treat `.fgk/world/` as throwaway state — the file there is
+not authoritative.
 
-The `world/` directory MUST be writable by the door runtime user
-(SPEC_v2 §6.1). SQLite creates `-wal` and `-shm` siblings next to
-`world.sqlite` while a writer holds the file, so write permission is
-required on the *directory*, not just the file.
+The `world/` directory MUST be writable by the door runtime user.
+SQLite creates `-wal` and `-shm` siblings next to `world.sqlite` while
+a writer holds the file, so write permission is required on the
+*directory*, not just the file.
 
 ## 3. Configuring the world
 
@@ -105,30 +98,30 @@ busy_timeout_ms = 5000
 journal_mode = "wal"
 ```
 
-Field reference (SPEC_v2 §4.1):
+Field reference:
 
 | Field | Default | Notes |
 | --- | --- | --- |
-| `enabled` | `false` | v1 projects without `[world]` keep working. |
+| `enabled` | `false` | Projects without `[world]` keep working. |
 | `path` | `world/world.sqlite` | Relative to the install dir. |
 | `busy_timeout_ms` | `5000` | Applied via `PRAGMA busy_timeout`. |
 | `journal_mode` | `wal` | Or `delete` for environments that forbid WAL siblings. |
 
 Pair `[world]` with `[turns]` and `[[leaderboards]]` if the game uses
-those primitives — see [`SPEC_v2.md`](../SPEC_v2.md) §5 for the full
-schema.
+those primitives.
 
 If `enabled = false` (or `[world]` is missing), the runtime never opens
 a SQLite handle and `GameContext::world_db()` returns `None`. World
 primitives that require a DB return a clear error rather than panicking,
-so a single source tree can ship both v1- and v2-shape projects.
+so a single source tree can ship both world-enabled and world-disabled
+projects.
 
 ## 4. Migration policy
 
 Migrations are game-owned schema steps. The kit owns the framing and
 the recording table; the game owns the SQL.
 
-What the kit guarantees (SPEC_v2 §4.3):
+What the kit guarantees:
 
 - A `world_migrations` table is created on first open and stores
   `(version, name, applied_at)` for every successfully applied
@@ -148,9 +141,9 @@ What the game author owns:
 - Picking version numbers. They MUST be monotonically increasing. The
   conventional pattern is to keep them dense (`1, 2, 3, ...`) and use
   the `name` field for human context.
-- Writing forward-only SQL. v2 does not implement automated rollback —
-  if a migration is destructive and you need to undo it, restore from
-  backup (§5).
+- Writing forward-only SQL. The shared-world layer does not implement
+  automated rollback — if a migration is destructive and you need to
+  undo it, restore from backup (§5).
 - Keeping migrations small and self-contained. A migration that
   depends on application code paths (e.g. a Rust callback that calls
   back into game logic) is allowed but discouraged; future-you reading
@@ -159,8 +152,8 @@ What the game author owns:
 
 `murder_motel` ships its migrations as embedded `WorldMigration`
 values in Rust source — see `examples/murder_motel/src/world.rs` for
-the canonical pattern. v2 keeps the public `WorldMigration` API
-deliberately narrow so a future release can add file-backed
+the canonical pattern. The public `WorldMigration` API is deliberately
+narrow so a future release can add file-backed
 `assets/world/migrations/*.sql` without breaking authors who started
 with embedded SQL.
 
@@ -168,7 +161,7 @@ with embedded SQL.
 
 - **Don't store secrets.** The world DB is a backup target and an
   inspection target. Foglet context, API tokens, and DB URLs do not
-  belong in any column (SPEC_v2 §4.7, SPEC §5.6).
+  belong in any column.
 - **Don't drop tables that hold game-defined player progress.** The
   kit will not stop you, but the data is the only authoritative copy.
   If you must drop, take a backup first (§5).
@@ -177,17 +170,16 @@ with embedded SQL.
   data-fix migration that turns them back on at the end.
 - **Don't SELECT user input back into a log line.** The kit's
   `tracing` policy never logs SQL bind values that may contain player
-  text (SPEC_v2 §4.2). Author-written SQL should follow the same
-  rule — bound parameters only, no string interpolation of player
-  handles into SQL.
+  text. Author-written SQL should follow the same rule — bound
+  parameters only, no string interpolation of player handles into SQL.
 
 ## 5. Backups
 
-The shared-world SQLite file is the *only* place v2 game state like
-the player registry, turn ledger, event log, and leaderboards lives.
+The shared-world SQLite file is the *only* place game state like the
+player registry, turn ledger, event log, and leaderboards lives.
 Saves don't reconstruct it. Back it up.
 
-Two safe strategies (SPEC_v2 §8):
+Two safe strategies:
 
 1. **Stop-the-door copy.** Stop Foglet (or otherwise prevent new door
    launches), copy the whole `world/` directory — including any
@@ -236,24 +228,23 @@ In a single-process door runtime this almost always means one of:
   syslog.
 
 The runtime surfaces every lock/open failure as a controlled error
-*after* terminal restoration (SPEC_v2 §4.1, §8). The operator sees a
-short message on their real shell, the door exits non-zero, and Foglet
-can relaunch it cleanly. The kit does not retry indefinitely — the
-busy timeout is the only retry budget, and beyond it the failure is
-the operator's to triage.
+*after* terminal restoration. The operator sees a short message on
+their real shell, the door exits non-zero, and Foglet can relaunch it
+cleanly. The kit does not retry indefinitely — the busy timeout is the
+only retry budget, and beyond it the failure is the operator's to
+triage.
 
 ## 7. Why no real-time multiplayer
 
-v2 is intentionally an *asynchronous* shared-world layer. SPEC_v2 §2.2
-explicitly forbids real-time multiplayer, networked game servers, and
-cross-door shared state APIs in this slice (see also SPEC_v2 §17, which
-lists "async shared worlds over real-time multiplayer" as a guiding
-principle). This section is the long-form answer to "why not?" so that
-future contributors don't re-litigate the decision in PR review.
+The shared-world layer is intentionally an *asynchronous* shared-world
+layer. Real-time multiplayer, networked game servers, and cross-door
+shared state APIs are explicitly out of scope. This section is the
+long-form answer to "why not?" so that future contributors don't
+re-litigate the decision in PR review.
 
 ### 7.1 What "asynchronous shared world" actually means
 
-The v2 contract is a single SQLite file per game, mutated by whichever
+The contract is a single SQLite file per game, mutated by whichever
 door process happens to be running, observed by the next door process
 that opens it. Concretely:
 
@@ -262,7 +253,7 @@ that opens it. Concretely:
   never broadcasts anything between live sessions.
 - The first caller's commit is durable before the second caller's
   process starts reading; SQLite plus the kit's transaction wrapper
-  (SPEC_v2 §4.6) is the entire concurrency story.
+  is the entire concurrency story.
 - Latency between "Alice did X" and "Bob sees X" is bounded by how
   long Bob takes to launch the door and reach the screen that reads
   the relevant table. In Murder Motel that is seconds-to-minutes —
@@ -270,8 +261,8 @@ that opens it. Concretely:
   enough for cooperative or adversarial real-time play.
 
 If your game's correctness depends on Bob seeing Alice's input *while
-both are connected*, the v2 kit cannot deliver that, and trying to
-bolt it on is out of scope.
+both are connected*, the kit cannot deliver that, and trying to bolt
+it on is out of scope.
 
 ### 7.2 Why we picked async
 
@@ -285,36 +276,36 @@ real-time alternative:
   supervise, a port to firewall, a deploy story to maintain, and a new
   failure mode to page on.
 - **Foglet's process model.** Doors are `:external_pty` children;
-  the adapter owns lifecycle, timeouts, and disconnect handling
-  (SPEC §2, SPEC_v2 §3). A real-time game server would have to
-  coordinate with that — graceful disconnects, zombie-session cleanup,
-  timeouts that don't cross-contaminate Foglet's own — and the kit
-  would have to ship its own networking + auth story. Both are
-  out of scope for v2; both are big enough to be their own product.
+  the adapter owns lifecycle, timeouts, and disconnect handling.
+  A real-time game server would have to coordinate with that —
+  graceful disconnects, zombie-session cleanup, timeouts that don't
+  cross-contaminate Foglet's own — and the kit would have to ship its
+  own networking + auth story. Both are out of scope; both are big
+  enough to be their own product.
 - **Testability.** Every shared-world primitive is exercised under
   `cargo test` against a `tempfile`-backed DB with an injected clock
-  and no live terminal (SPEC_v2 §13). Adding a network would push the
-  test surface toward integration harnesses that are slower and
-  flakier — the exact regression the kit's "no live terminal, no
-  live network" default is designed to prevent.
+  and no live terminal. Adding a network would push the test surface
+  toward integration harnesses that are slower and flakier — the exact
+  regression the kit's "no live terminal, no live network" default is
+  designed to prevent.
 - **Author ergonomics.** Asynchronous shared state is the BBS aesthetic
-  the v2 design targets — one caller changes the town, another caller
-  sees the consequences. That model covers the Murder Motel acceptance
-  fixture (Room 7 first-opener, shared clue ledger, leaderboard) end
-  to end without anyone reasoning about race windows, dropped frames,
-  or partition recovery. Authors get to write game logic, not network
-  logic.
+  the shared-world design targets — one caller changes the town,
+  another caller sees the consequences. That model covers the Murder
+  Motel acceptance fixture (Room 7 first-opener, shared clue ledger,
+  leaderboard) end to end without anyone reasoning about race windows,
+  dropped frames, or partition recovery. Authors get to write game
+  logic, not network logic.
 
 ### 7.3 What to do if you think you need real-time
 
 Most "I need real-time" requests for a BBS-style door collapse into
 one of these async-shaped patterns. Reach for them before reaching
-past the v2 contract:
+past the shared-world contract:
 
 - **"Players need to see each other's actions."** Append a
   `world_events` row on the action and have the other player's screen
-  poll `recent_events` on a turn boundary. Murder Motel's lobby
-  bulletin (Task 13d) does exactly this.
+  read `recent_events` on a turn boundary. Murder Motel's lobby
+  bulletin does exactly this.
 - **"Players need to react to each other within a session."** Don't.
   Two callers on the same door at the same instant is rare on a
   classic BBS; designing for it is usually a sign the game wants to
@@ -328,51 +319,46 @@ past the v2 contract:
   which is plenty.
 
 If after all that you genuinely need synchronous cross-session
-coordination — say, a real-time card game — the v2 kit is the wrong
-foundation, and you should run that game outside the door system or
-wait for a future major version.
+coordination — say, a real-time card game — the shared-world kit is
+the wrong foundation, and you should run that game outside the door
+system.
 
 ### 7.4 Future direction
 
 A future major version MAY revisit real-time semantics if a concrete
 game motivates it and Foglet itself grows the supporting primitives
-(presence channel, push API, broker). v2 explicitly does not paint
-itself into a corner: nothing in the SQLite contract precludes a
-later release adding a separate sidecar service for live coordination
-while keeping the durable state in the same file.
+(presence channel, push API, broker). Nothing in the SQLite contract
+precludes a later release adding a separate sidecar service for live
+coordination while keeping the durable state in the same file.
 
-For now, the v2 contract is, and remains: **shared state, async
-semantics, single SQLite file, no network.**
+The contract is, and remains: **shared state, async semantics, single
+SQLite file, no network.**
 
-## 8. v3 schema namespace notes
+## 8. Kit-owned schema namespace
 
-[`SPEC_v3.md`](../SPEC_v3.md) builds BBS-native async multiplayer
-primitives — notices/mail, challenges, market listings, factions and
-shared goals, bounties — directly on top of the v2 shared-world DB.
-Authors and reviewers landing v3 work need to know what the v2 schema
-namespace already occupies so v3 migrations and tables don't collide
-with anything v2 ships. This section pins that down once.
+The async multiplayer primitives — notices/mail, challenges, market
+listings, factions and shared goals, bounties — are built directly on
+top of the shared-world DB. This section documents what the kit owns
+so game-authored migrations don't collide with kit tables.
 
-### 8.1 v2 occupies migration versions 1–5
+### 8.1 Kit migration versions
 
-The kit-shipped v2 migrations are, in apply order:
+The kit-shipped migrations are, in apply order:
 
-- `1` — reserved for `world_migrations` bootstrap (SPEC_v2 §4.3).
+- `1` — reserved for `world_migrations` bootstrap.
 - `2` — `create_players` (`crates/foglet_game/src/players.rs`).
 - `3` — `create_turn_ledger` (`crates/foglet_game/src/turns.rs`).
 - `4` — `create_world_events` (`crates/foglet_game/src/events.rs`).
 - `5` — `create_leaderboard_scores`
   (`crates/foglet_game/src/leaderboards.rs`).
+- `6`–`10` — async multiplayer primitives (notices, challenges,
+  market, factions, bounties).
 
-v3 primitives MUST therefore claim version numbers `6` and above,
-and SHOULD keep them dense and grouped per primitive (one migration
-per `Notice`, `Challenge`, `MarketListing`, `Faction` family,
-`Bounty`). This matches the v2 convention: one migration per
-top-level concept, named `create_<table>`. Game-authored migrations
-(e.g. Murder Motel's own clue/world tables) keep their existing
-ranges; nothing in v3 forces an author to renumber.
+Game-authored migrations MUST therefore claim version numbers `11` and
+above. Game-specific equivalents of kit tables should pick distinct
+names (e.g. `mm_clue_bounties` rather than `bounties`).
 
-### 8.2 v3 table namespace is reserved for the kit
+### 8.2 Kit-reserved table names
 
 The following table names are owned by `foglet_game` and MUST NOT
 be redefined by game-authored migrations:
@@ -387,30 +373,26 @@ be redefined by game-authored migrations:
 
 If a game already ships a table with one of these names, the migration
 chain will fail loudly at apply time — that is the correct outcome,
-not a bug to work around. Game-specific equivalents should pick a
-different name (e.g. `mm_clue_bounties`).
+not a bug to work around.
 
-### 8.3 v3 inherits every v2 rule
+### 8.3 Kit schema rules apply to game tables too
 
 Every constraint in this document — atomic writes only via the
 transaction wrapper, no Foglet context fields in any column, bounded
 busy timeout, file-locked single-writer model, no cross-door shared
-state — applies unchanged to v3 tables. v3 adds new state machines on
-top of the same primitives; it does not change the contract.
+state — applies to game-authored tables as well as kit tables.
 
 In particular:
 
-- v3 multiplayer state transitions (challenge accept/resolve, market
+- Multiplayer state transitions (challenge accept/resolve, market
   buy, faction contribute, bounty claim/complete) MUST run inside a
   single SQLite transaction so a failed buyer or balance callback
-  leaves no partial debit (SPEC_v3 §7).
+  leaves no partial debit.
 - Player-authored text (notice subject/body, listing display name,
   bounty title/description) MUST be length-bounded per
-  `[multiplayer]` config and sanitized before TUI rendering
-  (SPEC_v3 §7).
-- v3 still has no real-time multiplayer (SPEC_v3 §2.2). Async screens
-  refresh on navigation; no daemon, poller, or background thread is
-  added.
-- Every primitive is opt-in via the new `[multiplayer]` block in
-  `assets/game.toml`. Generated v1/v2 projects keep their existing
-  config and ship no multiplayer screens.
+  `[multiplayer]` config and sanitized before TUI rendering.
+- There is no real-time multiplayer. Async screens refresh on
+  navigation; no daemon, poller, or background thread is added.
+- Every primitive is opt-in via the `[multiplayer]` block in
+  `assets/game.toml`. Projects without `[multiplayer]` keep their
+  existing config and ship no multiplayer screens.

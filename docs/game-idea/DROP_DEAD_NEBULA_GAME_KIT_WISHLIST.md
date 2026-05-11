@@ -220,7 +220,7 @@ Job Board surface:
 
 ### Problem
 
-Many games using the v4 spatial graph will need the same transaction shape:
+Many games using the spatial graph will need the same transaction shape:
 
 1. inspect current Presence;
 2. validate Route;
@@ -290,7 +290,7 @@ Game code owns:
 
 ### Problem
 
-The v4 inventory primitive intentionally avoids game-specific weight, volume, and item semantics. That is correct. But many games still need a reusable capacity-check pattern around atomic transfers.
+The inventory primitive intentionally avoids game-specific weight, volume, and item semantics. That is correct. But many games still need a reusable capacity-check pattern around atomic transfers.
 
 Without a helper, every game will reimplement:
 

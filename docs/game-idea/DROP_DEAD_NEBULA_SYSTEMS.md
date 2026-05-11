@@ -616,7 +616,7 @@ Shared DB:
 
 ### Foglet Kit Dependencies
 
-- v4 presence primitive.
+- presence primitive.
 - players_at query.
 
 ### Game Dependencies
@@ -670,7 +670,7 @@ Shared DB or kit recall:
 
 ### Foglet Kit Dependencies
 
-- v4 place recall primitive.
+- place recall primitive.
 
 ### Game Dependencies
 
@@ -726,7 +726,7 @@ Shared DB:
 
 ### Foglet Kit Dependencies
 
-- v2 turn ledger.
+- turn ledger.
 - Date-provider injection for tests.
 
 ### Game Dependencies
@@ -922,7 +922,7 @@ Shared DB:
 
 ### Foglet Kit Dependencies
 
-- v4 inventory slots.
+- inventory slots.
 - Atomic transfer API.
 
 ### Game Dependencies
@@ -1049,9 +1049,9 @@ Shared DB:
 
 ### Foglet Kit Dependencies
 
-- v3 market listing primitive.
-- v4 owner-keyed inventory and atomic transfers.
-- v2 world DB transactions.
+- market listing primitive.
+- owner-keyed inventory and atomic transfers.
+- world DB transactions.
 
 ### Game Dependencies
 
@@ -1188,7 +1188,7 @@ Shared DB via bounty primitive:
 
 ### Foglet Kit Dependencies
 
-- v3 bounty primitive.
+- bounty primitive.
 - event log.
 - notices.
 - inventory transfer.
@@ -1251,7 +1251,7 @@ Shared DB via notice primitive:
 
 ### Foglet Kit Dependencies
 
-- v3 notices.
+- notices.
 - bounded player-authored text.
 - prompt/text UI.
 
@@ -1313,7 +1313,7 @@ Shared DB via event primitive:
 
 ### Foglet Kit Dependencies
 
-- v2 event log.
+- event log.
 
 ### Game Dependencies
 
@@ -1445,7 +1445,7 @@ Shared DB:
 
 ### Foglet Kit Dependencies
 
-- v4 world ticks.
+- world ticks.
 - `fgk tick` optional CLI.
 - SQLite transactions.
 
@@ -1836,7 +1836,7 @@ Per-user or shared session:
 
 ### Foglet Kit Dependencies
 
-- v1 maps;
+- maps;
 - prompts;
 - inventory transfers;
 - turns;
@@ -1907,7 +1907,7 @@ Shared DB via faction primitives:
 
 ### Foglet Kit Dependencies
 
-- v3 factions/shared goals.
+- factions/shared goals.
 - event log.
 - notices.
 - inventory transfers.
@@ -1964,7 +1964,7 @@ Shared DB via leaderboard primitive:
 
 ### Foglet Kit Dependencies
 
-- v2 leaderboard helpers.
+- leaderboard helpers.
 
 ### Game Dependencies
 
@@ -2407,7 +2407,7 @@ Shared DB via challenge primitive:
 
 ### Foglet Kit Dependencies
 
-- v3 challenges.
+- challenges.
 - notices.
 - event log.
 - leaderboards.
@@ -2631,7 +2631,7 @@ Candidate features:
 
 Why:
 
-- v3 notices are generic; every game needs inbox/read/archive UI.
+- notices are generic; every game needs inbox/read/archive UI.
 
 Candidate features:
 
@@ -2645,7 +2645,7 @@ Candidate features:
 
 Why:
 
-- v2 leaderboards need a standard terminal presentation.
+- leaderboards need a standard terminal presentation.
 
 Candidate features:
 
@@ -2672,7 +2672,7 @@ Candidate features:
 
 Why:
 
-- v4 inventory intentionally avoids weight/volume, but many games need capacity checks.
+- the inventory primitive intentionally avoids weight/volume, but many games need capacity checks.
 
 Candidate features:
 

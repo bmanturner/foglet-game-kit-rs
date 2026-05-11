@@ -1,7 +1,7 @@
 # Travel
 
-The travel helper composes v4 spatial routes, presence, optional recall,
-and optional v2 events into one transaction.
+The travel helper composes spatial routes, presence, optional recall,
+and optional events into one transaction.
 
 Transaction order:
 

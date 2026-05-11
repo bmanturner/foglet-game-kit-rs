@@ -3,19 +3,15 @@
 `DialogScreen` (in `foglet_game::dialog_screen`) is an opt-in
 [`Screen`] adapter that drives a [`Dialog`] / [`DialogState`] pair
 through the standard render and input loop. It is the parallel of
-[`PromptScreen<T>`](./prompt-screens.md) for the dialog primitive
-defined in SPEC §4.6 and SPEC_v2 §3 (`requires`-gated branching), and
-it exists so that screens which are *just* an NPC conversation — talk,
-pick a `requires`-gated branch, pop back when the cursor finishes —
-can be a constructor call rather than ~500 lines of hand-rolled
-`Screen` plumbing.
+[`PromptScreen<T>`](./prompt-screens.md) for the dialog primitive,
+and it exists so that screens which are *just* an NPC conversation —
+talk, pick a `requires`-gated branch, pop back when the cursor
+finishes — can be a constructor call rather than ~500 lines of
+hand-rolled `Screen` plumbing.
 
 This document is the answer to a question that comes up every time a
 new dialog scene lands: **should this be a `DialogScreen`, or should I
-write my own `Screen` that composes `Dialog` directly?** SPEC §4.6
-(dialog primitives), SPEC_v2 §3 (branch flags), and SPEC §5.5
-(`ScreenCommand` vocabulary) are the underlying contracts; this file
-is the authoring rule of thumb.
+write my own `Screen` that composes `Dialog` directly?**
 
 ## TL;DR
 
@@ -31,13 +27,13 @@ is the authoring rule of thumb.
 
 When in doubt, start with `DialogScreen`. The Murder Motel example
 proves the migration: every NPC scene is now a thin wrapper around the
-adapter, and the v2 hand-rolled implementation collapsed from ~562
-lines to ~140 without losing observable behaviour or test coverage.
+adapter, and the hand-rolled implementation collapsed from ~562 lines
+to ~140 without losing observable behaviour or test coverage.
 
 ## Layout default differs from `PromptScreen`
 
-`PromptScreen` defaults to the SPEC §4.3 compact layout because most
-prompts are inline menus. `DialogScreen` defaults to
+`PromptScreen` defaults to the compact layout because most prompts are
+inline menus. `DialogScreen` defaults to
 [`DialogLayout::Modal`] because real Foglet door-game NPC scenes are
 almost always centred, bordered, and titled with the speaker's name.
 Authors who want the unboxed layout opt in with `.compact()`; modal is
@@ -49,9 +45,9 @@ also reachable explicitly via `.modal()` for symmetry.
   beyond the speaker title and any tiny per-game decoration. Every
   Murder Motel NPC scene fits: render the dialog, route the action,
   pop on `Finished` / `Cancelled`. No map, no sidebar, no clock.
-- **Branch gating is just `FlagSet` predicates.** SPEC_v2 §3's
-  `requires` strings (`flag_set`, `!flag_set`, AND/OR groups) are the
-  full vocabulary the adapter understands. If your game's branch
+- **Branch gating is just `FlagSet` predicates.** The `requires`
+  strings (`flag_set`, `!flag_set`, AND/OR groups) are the full
+  vocabulary the adapter understands. If your game's branch
   availability is "set/unset" plus the standard combinators, the
   shared `Rc<RefCell<FlagSet>>` is enough.
 - **You want the standard reducer wiring for free.**
@@ -66,8 +62,8 @@ also reachable explicitly via `.modal()` for symmetry.
   the entire screen-specific logic; everything else is the adapter.
 - **You need `>9`-choice scrolling and you trust the kit to get it
   right.** `DIALOG_PROMPT_MAX_CHOICES` overflow handling is unit-
-  tested at the adapter layer (Task 2f). A custom screen that re-
-  implements scrolling has to re-test it.
+  tested at the adapter layer. A custom screen that re-implements
+  scrolling has to re-test it.
 
 ## Compose `Dialog` inside a custom `Screen` when…
 
@@ -111,8 +107,8 @@ genuinely game-specific decorations:
    The kit deliberately stays out of the global hotkey conversation
    so each game can pick its own; the wrapper translates these into
    `ScreenCommand::Quit` and an `Esc` forwarded to the inner adapter.
-3. **`j` / `k` aliases.** v2 muscle memory. Kit only knows `Up` /
-   `Down`; the wrapper translates.
+3. **`j` / `k` aliases.** Kit only knows `Up` / `Down`; the wrapper
+   translates for players who prefer vim-style navigation.
 4. **Read accessors for tests.** `current_choice_labels()` re-derives
    the visible labels from `state().available_choices(dialog, &flags)`
    so tests can assert "what would the player see right now" without
@@ -205,15 +201,12 @@ If a dialog scene outgrows the adapter, the swap is mechanical:
    resulting `PromptAction` into a `ScreenCommand` exactly as the
    adapter does internally.
 
-No SPEC contract changes during the migration — both shapes call the
-same `Dialog` reducer and the same `requires` evaluator; the adapter
-is a convenience over those primitives, not a separate implementation.
+Both shapes call the same `Dialog` reducer and the same `requires`
+evaluator; the adapter is a convenience over those primitives, not a
+separate implementation.
 
 ## See also
 
 - [`docs/prompt-screens.md`](./prompt-screens.md) — the parallel
   authoring rule of thumb for `PromptScreen<T>`. The decision tree is
   the same shape; only the wrapped primitive differs.
-- SPEC §4.6 — `Dialog` / `DialogState` schema and rendering contract.
-- SPEC_v2 §3 — `requires` predicate vocabulary and `FlagSet` semantics.
-- SPEC_v2_1 §4.2 — `DialogScreen` adapter contract.

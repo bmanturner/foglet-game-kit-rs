@@ -1,13 +1,11 @@
 # World ticks: durable catch-up without daemons
 
-This document explains the v4 world-tick primitive in `foglet_game`.
-
-The contract comes from [`SPEC_v4.md`](../SPEC_v4.md) §2.2, §7, and
-§8. If this page and the SPEC disagree, the SPEC wins.
+This document explains the world-tick primitive in `foglet_game`.
 
 ## 1. Why this primitive exists
 
-v4 adds durable periodic work without forcing one hosting pattern.
+The world-tick primitive provides durable periodic work without forcing
+one hosting pattern.
 
 - A **space exploration** game can restock station depots and rotate
   docking boards.
@@ -51,7 +49,7 @@ The return value is how many tasks committed in that pass.
 
 ## 4. Execution patterns
 
-v4 supports two explicit scheduling patterns. Games can use either, or
+Two explicit scheduling patterns are supported. Games can use either, or
 both:
 
 ### 4.1 Login-time catch-up (in-process)

@@ -5,14 +5,11 @@ leaves the operator's shell in raw mode, stuck inside the alternate
 screen, or echoing nothing is worse than a door that crashes — the
 operator has no obvious recovery beyond `reset` or closing the session.
 This document is the concrete evidence that the kit honours the
-contract from [`SPEC.md`](../SPEC.md) §7.1, §7.3, and §13.1.
-
-If anything below conflicts with the SPEC, the SPEC wins.
+terminal-safety contract.
 
 ## 1. The contract
 
-From SPEC §13.1, the terminal MUST be restored on every termination
-path:
+The terminal MUST be restored on every termination path:
 
 - Normal quit.
 - `Ctrl-C` interrupt.
@@ -27,12 +24,12 @@ the cursor is shown, and any pending output is flushed. After that, the
 shell prompt is usable, typing echoes normally, and panic / error
 messages land on the user's real terminal where they can be read.
 
-## 2. Startup ordering (SPEC §7.1)
+## 2. Startup ordering
 
-`foglet_game::Game::run` performs startup in the order SPEC §7.1
-mandates. The size-check-before-raw-mode rule is the load-bearing
-piece — if the terminal is too small we refuse cleanly, with no
-alt-screen residue to undo:
+`foglet_game::Game::run` performs startup in this order. The
+size-check-before-raw-mode rule is the load-bearing piece — if the
+terminal is too small we refuse cleanly, with no alt-screen residue
+to undo:
 
 1. Parse CLI args.
 2. Load game config.
@@ -55,9 +52,9 @@ alt-screen residue to undo:
 The implementation lives in `crates/foglet_game/src/runtime.rs` and
 `crates/foglet_game/src/terminal.rs`. The contract is enforced by
 `Game::run` itself; per-game code never reaches into raw-mode setup
-directly (see SPEC §17 / `AGENTS.md` tenets).
+directly.
 
-## 3. The guard (Task 5a / 5b)
+## 3. The guard
 
 `TerminalGuard` owns the raw-mode + alt-screen state and runs the
 restoration sequence in two places:
@@ -73,7 +70,7 @@ Idempotency tests cover explicit-cleanup-then-drop and
 drop-without-explicit-cleanup. See
 `crates/foglet_game/src/terminal.rs`.
 
-## 4. The panic hook (Task 5c)
+## 4. The panic hook
 
 `install_panic_hook` captures the previous hook (typically the default
 backtrace printer) and replaces it with one that:
@@ -91,7 +88,7 @@ constructed and *before* dispatching the first event. The `Drop` order
 of locals in `Game::run` ensures the hook is disarmed before the guard
 itself is dropped.
 
-## 5. Logging discipline (SPEC §13.2)
+## 5. Logging discipline
 
 While the TUI owns the terminal, the kit MUST NOT write to stdout.
 Concretely:
@@ -107,10 +104,8 @@ Concretely:
 
 ## 6. Manual smoke recipe
 
-CI cannot drive a real TTY. SPEC §14 explicitly accepts
-"implementation-defined" manual checks for the cases below. The recipe
-lives next to the tests so the maintainer re-running them sees it
-alongside the unit suite:
+CI cannot drive a real TTY. The recipe lives next to the tests so the
+maintainer re-running them sees it alongside the unit suite:
 
 - [`crates/foglet_game/tests/manual-smoke.md`](../crates/foglet_game/tests/manual-smoke.md)
 
@@ -125,8 +120,8 @@ It covers, at minimum:
 - **Scenario 4 — Resize mid-session.** Cramped resize surfaces a
   notice inside the alt screen without exiting raw mode.
 - **Scenario 5 — SSH disconnect.** Best-effort: SIGHUP-without-handler
-  cannot run `Drop`; document any regression in `DECISIONS.md`.
-- **Scenario 6 — Save persistence round trip** (Task 13h).
+  cannot run `Drop`; document any regression in the commit body.
+- **Scenario 6 — Save persistence round trip.**
 
 Re-run the recipe before any release that touches `terminal.rs`,
 `runtime.rs`, or the panic-hook plumbing, and reference this file in
@@ -148,5 +143,5 @@ but it does cover the parts that do not need a real TTY:
   `Resize` — the events the safety contract relies on.
 
 The combination — automated coverage of the orchestration plus the
-manual recipe for the real-TTY paths — is the evidence SPEC §13.1
-asks for.
+manual recipe for the real-TTY paths — is what the terminal-safety
+contract requires.

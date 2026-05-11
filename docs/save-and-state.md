@@ -1,7 +1,7 @@
 # When to use `SaveSlot<T>` vs. a hand-rolled save handle
 
 `SaveSlot<T>` (in `foglet_game::save`) is a typed wrapper around the
-v1 persistence primitives — `read_save`, `write_atomic`, and
+persistence primitives — `read_save`, `write_atomic`, and
 [`SaveStrategy`](../crates/foglet_game/src/save.rs) — that bundles
 the persisted game state, an interior-mutable handle, and a dirty
 flag into one cheaply-cloned struct. It exists so that games which
@@ -12,10 +12,7 @@ call site.
 
 This document is the answer to a question that comes up the moment a
 game grows past a single screen: **should this state live in a
-`SaveSlot<T>`, or should I keep my own `Rc<RefCell<_>>`?** SPEC §6
-(save policy), SPEC §13 (atomic-write reliability bar), and
-SPEC_v2_1 §4.1 (typed save slot) are the underlying contracts; this
-file is the authoring rule of thumb.
+`SaveSlot<T>`, or should I keep my own `Rc<RefCell<_>>`?**
 
 ## TL;DR
 
@@ -25,7 +22,7 @@ file is the authoring rule of thumb.
 | Multiple screens need to mutate the same persisted state | `SaveSlot<T>` |
 | You want `Game::with_save_handler` to call `save` for you on Quit | `SaveSlot<T>` |
 | State is purely ephemeral (toasts, focus rings, animation timers) | Plain `Rc<RefCell<_>>` |
-| State must be coordinated across processes (shared-world SQLite) | `SharedWorld` (SPEC v2 §5) |
+| State must be coordinated across processes (shared-world SQLite) | `SharedWorld` (see [`shared-world.md`](shared-world.md)) |
 | You need to persist *several* unrelated structs to *separate* files | One `SaveSlot<T>` per file |
 | You're prototyping and unsure of the schema yet | Plain `Rc<RefCell<_>>`, promote later |
 
@@ -57,7 +54,7 @@ exactly like `RefCell`'s.
   in `main.rs`.
 - **You want the dirty flag for free.** `borrow_mut` and `apply` flip
   it on; `save` clears it after the rename succeeds; `is_dirty()` is
-  advisory. SPEC_v2_1 §4.1 forbids using `is_dirty` to *gate*
+  advisory. `is_dirty` must not be used to *gate*
   persistence — that decision belongs to the runtime or to the
   author — but it's the right primitive for a "skip the no-op write
   on idle ticks" optimisation later.
@@ -84,7 +81,7 @@ exactly like `RefCell`'s.
   single-process only and makes no synchronisation guarantees. Two
   Foglet doors writing to the same path through their own
   `SaveSlot`s would last-writer-wins each other into the ground.
-  Reach for the v2 [`SharedWorld`](shared-world.md) layer (SQLite
+  Reach for the [`SharedWorld`](shared-world.md) layer (SQLite
   with WAL and explicit transactions) when more than one process
   needs to see the same state.
 - **You have several unrelated structs.** `SaveSlot<T>` is one type
@@ -154,7 +151,7 @@ If a save handle outgrows the raw shape, the swap is mechanical:
    exposes the same two methods with the same `Ref` / `RefMut`
    return types.
 2. Delete any hand-written `snapshot` / `apply` helpers — `SaveSlot`
-   ships them. SPEC_v2_1 §4.1 mandates the names so authors don't
+   ships them. The names `snapshot` and `apply` are fixed — don't
    reinvent them per game.
 3. Replace startup `read_save(&path)?` with
    `SaveSlot::load_or_default(&path)?` (or `SaveSlot::load(&path)?`
@@ -169,9 +166,8 @@ If a save handle outgrows the raw shape, the swap is mechanical:
    slot is one-type-one-file by design — see the "several unrelated
    structs" caveat above.
 
-No SPEC contract changes during the migration — both shapes call the
-same `read_save` / `write_atomic` reliability bar, and the slot adds
-typed bookkeeping on top.
+Both shapes call the same `read_save` / `write_atomic` reliability
+bar. The slot adds typed bookkeeping on top.
 
 ## Common pitfalls
 
@@ -180,11 +176,11 @@ typed bookkeeping on top.
   are reinventing the runtime's save hook badly — the runtime
   already does this once per Save / Quit and adds atomic-write
   guarantees you can't replicate from a screen. Use the handler.
-- **Putting context fields in `T`.** SPEC §6 forbids copying the
-  Foglet context wholesale into a save. The slot doesn't enforce
-  that for you — `T` is author-defined — but a save file with a
-  `door_id` or `username` baked in is a leak. Persist game decisions,
-  not the environment that produced them.
+- **Putting context fields in `T`.** Never copy the Foglet context
+  wholesale into a save. The slot doesn't enforce that for you — `T`
+  is author-defined — but a save file with a `door_id` or `username`
+  baked in is a leak. Persist game decisions, not the environment that
+  produced them.
 - **Re-borrowing across a render boundary.** Holding a
   `slot.borrow_mut()` across a `frame.render_widget` call is a
   `RefCell` panic waiting to happen because a sibling screen's
@@ -198,9 +194,8 @@ typed bookkeeping on top.
 
 `SaveSlot::save` delegates to `write_atomic`, which performs a
 parent-dir `mkdir -p`, writes to a temp file, fsyncs, and renames
-into place. SPEC §13's reliability bar applies unchanged — the slot
-adds typed bookkeeping but does not introduce a second persistence
-path. If a save fails, the dirty flag is left set so the next save
+into place. The slot adds typed bookkeeping but does not introduce a
+second persistence path. If a save fails, the dirty flag is left set so the next save
 attempt actually retries; if it succeeds, the flag is cleared and the
 on-disk bytes are by definition in sync with the slot.
 

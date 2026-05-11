@@ -6,21 +6,15 @@ leaves off: you have a `dist/` bundle from `fgk package` and a manifest
 from `fgk emit-manifest`, and you want Foglet to launch the game as a
 real `:external_pty` door.
 
-The contract this walkthrough satisfies lives in
-[`SPEC.md`](../SPEC.md) — §2 (Foglet adapter grounding), §10 (CLI
-contract), §12 (persistence), §13 (operational requirements), and §14
-(QA standards). If anything below conflicts with the SPEC, the SPEC
-wins.
-
 ## 1. What you are deploying
 
-`fgk package --out dist/` produces this layout (SPEC §10.4):
+`fgk package --out dist/` produces this layout:
 
 ```text
 dist/
   <slug>          # release binary, executable
   run.sh          # boring auditable wrapper, executable
-  manifest.json   # operator manifest (SPEC §10.3)
+  manifest.json   # operator manifest
   assets/         # game.toml, maps, dialog, ...
 ```
 
@@ -28,20 +22,18 @@ dist/
 binary, picks the per-user save directory from `FOGLET_USER_ID` (with
 an `FGK_SAVE_DIR` override for operators), and `exec`s the binary.
 It never interpolates user input into a shell command beyond that
-bounded env-var path selection (SPEC §10.4).
+bounded env-var path selection.
 
 The matching `manifest.json` declares `runtime: "external_pty"`,
 absolute `command` and `working_dir` paths, an explicit non-secret
 `env` map, an `env_allowlist`, `pty: true`, and the timeouts /
-visibility / auth scope from `assets/game.toml`. See the SPEC §10.3
-example for the exact shape.
+visibility / auth scope from `assets/game.toml`.
 
 ## 2. Choose an install directory
 
 Pick the absolute path the door will live at on the Foglet host **before**
 running `fgk emit-manifest`, because that path is baked into the
-manifest's `command` and `working_dir` fields. The convention from
-SPEC §12 is:
+manifest's `command` and `working_dir` fields. The convention is:
 
 ```text
 /srv/foglet/doors/<slug>/
@@ -196,16 +188,14 @@ game-defined state — never the Foglet context (SPEC §5.6, §12).
 ### 5.1 Backing up and maintaining the shared world
 
 The shared-world SQLite file is the *only* place durable world state
-lives. That includes v2 game state like the player registry, turn
-ledger, event log, and leaderboards, plus v4 structural state in
-`places`, `routes`, `presence`, `place_recall`, `inventory_slots`, and
-`world_tick_tasks`. v5 adds `contracts`, which stores accepted work,
-opaque objectives, rewards, deadlines, and lifecycle timestamps. None
-of that is reconstructible from per-player saves. Back it up on a
+lives. That includes the player registry, turn ledger, event log,
+leaderboards, spatial state (`places`, `routes`, `presence`,
+`place_recall`, `inventory_slots`, `world_tick_tasks`), and contracts
+(accepted work, objectives, rewards, deadlines, lifecycle timestamps).
+None of that is reconstructible from per-player saves. Back it up on a
 schedule that matches your tolerance for losing in-game state.
 
-Two safe backup strategies (SPEC_v2 §8 mandates that backups use one
-of these):
+Two safe backup strategies:
 
 1. **Stop-the-door copy.** Stop Foglet (or at least make the door
    un-launchable so no new processes open the DB), then copy the

@@ -6,7 +6,7 @@ It does not own the lifecycle of the work it shows.
 Aggregation model:
 
 - `JobBoard::query` gathers entries from `OpportunityProvider` values.
-- Built-in providers expose available Contracts, and v3 Bounties and
+- Built-in providers expose available Contracts, Bounties, and
   Challenges when their primitives are enabled.
 - Games can add external providers for local goals, rumors, commissions,
   or authored scenario hooks.
@@ -19,7 +19,7 @@ Provider boundaries:
 - `accept_action` is an opaque game token. The kit passes it back to the
   game callback without interpreting it.
 - `title` and `summary` are sanitized at the aggregation boundary using
-  the same bounded text rules as v3 multiplayer surfaces.
+  the same bounded text rules as other multiplayer-facing surfaces.
 
 Examples:
 

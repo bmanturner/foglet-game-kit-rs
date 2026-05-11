@@ -1174,7 +1174,7 @@ Your hold: 16/20
 
 ### Game-Kit Mapping
 
-- v1 maps;
+- maps;
 - prompts;
 - owner-keyed inventory;
 - turns;

@@ -1,6 +1,6 @@
 # Inventory Capacity
 
-Inventory capacity is a v5 helper layered on v4 owner-keyed inventory.
+Inventory capacity is a helper layered on owner-keyed inventory.
 The kit owns the transaction pattern; the game owns the unit and policy.
 
 `CapacityPolicy` supplies two callbacks:
