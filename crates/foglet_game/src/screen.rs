@@ -232,6 +232,12 @@ pub enum ScreenCommand {
     /// Do nothing. The default return for `handle_input` `tick` /
     /// `on_resize` when the screen has no transition to request.
     None,
+    /// Request another draw without changing the screen stack.
+    ///
+    /// Use this from `tick` for lightweight animation, countdowns, or
+    /// other timer-driven visuals. Static screens can keep returning
+    /// [`ScreenCommand::None`]; idle ticks alone do not imply repaint.
+    Redraw,
     /// Push a new screen on top of the current one. The current
     /// screen stays on the stack and resumes when `Pop` is applied.
     Push(Box<dyn Screen>),
@@ -267,6 +273,7 @@ impl std::fmt::Debug for ScreenCommand {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::None => f.write_str("None"),
+            Self::Redraw => f.write_str("Redraw"),
             Self::Push(_) => f.write_str("Push(<dyn Screen>)"),
             Self::Pop => f.write_str("Pop"),
             Self::Replace(_) => f.write_str("Replace(<dyn Screen>)"),
@@ -308,7 +315,7 @@ pub trait Screen {
     /// ## Do not run blocking world queries here
     ///
     /// `ctx.world_db` is reachable from `render` so widgets can format
-    /// data already in scope, but `render` runs on the per-frame draw
+    /// data already in scope, but `render` runs on the terminal draw
     /// path and **must not** issue blocking SQLite reads, writes, or
     /// transactions against the shared world DB. SQLite under load may
     /// stall on `SQLITE_BUSY`/lock contention, and a blocked render
@@ -331,10 +338,13 @@ pub trait Screen {
         ScreenCommand::None
     }
 
-    /// Per-frame tick hook for animation, cooldowns, AI, etc.
+    /// Runtime tick hook for animation, cooldowns, AI, etc.
     ///
-    /// The runtime calls this once per frame *after* `handle_input`
-    /// (decision finalized in 7d). Default: [`ScreenCommand::None`].
+    /// The runtime calls this when the input poll reaches its tick
+    /// deadline. Returning [`ScreenCommand::None`] updates state
+    /// without repainting; return [`ScreenCommand::Redraw`] when a
+    /// timer-driven visual change should draw the next frame. Default:
+    /// [`ScreenCommand::None`].
     fn tick(&mut self, _ctx: &mut GameContext<'_>) -> ScreenCommand {
         ScreenCommand::None
     }
@@ -432,6 +442,7 @@ pub enum SideEffect {
 /// | Command | Stack effect | SideEffect |
 /// |-------------------|------------------------------------------------|-----------------------------|
 /// | `None` | none | `None` |
+/// | `Redraw` | none | `None` |
 /// | `Push(s)` | push `s` on top | `None` |
 /// | `Pop` | pop top; empty afterwards → exit | `None` or `Exit(EmptyStack)`|
 /// | `Replace(s)` | pop top (if any), then push `s` | `None` |
@@ -457,6 +468,7 @@ pub enum SideEffect {
 pub fn apply_command(stack: &mut ScreenStack, command: ScreenCommand) -> SideEffect {
     match command {
         ScreenCommand::None => SideEffect::None,
+        ScreenCommand::Redraw => SideEffect::None,
         ScreenCommand::Push(screen) => {
             stack.push(screen);
             SideEffect::None
@@ -778,6 +790,7 @@ mod tests {
         assert_eq!(format!("{push:?}"), "Push(<dyn Screen>)");
         assert_eq!(format!("{replace:?}"), "Replace(<dyn Screen>)");
         assert_eq!(format!("{:?}", ScreenCommand::None), "None");
+        assert_eq!(format!("{:?}", ScreenCommand::Redraw), "Redraw");
         assert_eq!(format!("{:?}", ScreenCommand::Pop), "Pop");
         assert_eq!(format!("{:?}", ScreenCommand::Quit), "Quit");
         assert_eq!(format!("{:?}", ScreenCommand::Save), "Save");
@@ -866,6 +879,14 @@ mod tests {
     fn apply_none_is_noop() {
         let mut stack: ScreenStack = vec![Box::new(NoopScreen)];
         let effect = apply_command(&mut stack, ScreenCommand::None);
+        assert_eq!(effect, SideEffect::None);
+        assert_eq!(stack.len(), 1);
+    }
+
+    #[test]
+    fn apply_redraw_has_no_stack_side_effect() {
+        let mut stack: ScreenStack = vec![Box::new(NoopScreen)];
+        let effect = apply_command(&mut stack, ScreenCommand::Redraw);
         assert_eq!(effect, SideEffect::None);
         assert_eq!(stack.len(), 1);
     }

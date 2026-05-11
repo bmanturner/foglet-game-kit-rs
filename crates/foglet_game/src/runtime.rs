@@ -3,7 +3,7 @@
 //!  wires the runtime loop on top of the type machinery shipped in
 //! 7a/7b/7c. The loop's responsibilities are:
 //!
-//! 1. Render the top screen.
+//! 1. Render the top screen when the terminal frame is dirty.
 //! 2. Poll a normalized [`Input`] from the event source (timing out at
 //!    the tick interval so [`crate::Screen::tick`] still fires when the
 //!    user is idle).
@@ -11,7 +11,7 @@
 //!    [`crate::ScreenCommand`].
 //! 4. Apply that command via [`crate::apply_command`]; act on the
 //!    returned [`crate::SideEffect`] (save flush, exit).
-//! 5. Loop.
+//! 5. Loop without repainting idle static screens.
 //!
 //! ## Why two entry points
 //!
@@ -32,11 +32,13 @@
 //!
 //! ## Tick policy
 //!
-//! Per the tick interval is "implementation-defined". We hold
-//! it at [`TICK_INTERVAL`] (50 ms, ~20 fps for animation/cooldowns).
-//! Authors who need a different cadence today should override behaviour
-//! inside `tick`; widening this to a builder knob waits for a real
-//! authoring need.
+//! Per the tick interval is "implementation-defined". We hold it at
+//! [`TICK_INTERVAL`] (50 ms) so timers and animation state can keep
+//! advancing while input is idle. A tick is not automatically a paint:
+//! return [`crate::ScreenCommand::Redraw`] when the visible frame has
+//! changed and should be rendered. Authors who need a different cadence
+//! today should override behaviour inside `tick`; widening this to a
+//! builder knob waits for a real authoring need.
 //!
 //! ## Save handler contract
 //!
@@ -93,7 +95,9 @@ use ratatui::Terminal;
 use crate::config::GameConfig;
 use crate::foglet::FogletContext;
 use crate::input::{self, Input};
-use crate::screen::{apply_command, ExitReason, GameContext, Screen, ScreenStack, SideEffect};
+use crate::screen::{
+    apply_command, ExitReason, GameContext, Screen, ScreenCommand, ScreenStack, SideEffect,
+};
 use crate::terminal::{
     arm_panic_hook, install_panic_hook, CrosstermBackend as TermCrosstermBackend, TerminalGuard,
 };
@@ -881,6 +885,26 @@ fn run_due_ticks_on_login_if_enabled(
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DispatchKind {
+    Input,
+    Resize,
+    Tick,
+}
+
+fn command_dirties_frame(command: &ScreenCommand, dispatch_kind: DispatchKind) -> bool {
+    match dispatch_kind {
+        DispatchKind::Input | DispatchKind::Resize => true,
+        DispatchKind::Tick => matches!(
+            command,
+            ScreenCommand::Redraw
+                | ScreenCommand::Push(_)
+                | ScreenCommand::Pop
+                | ScreenCommand::Replace(_)
+        ),
+    }
+}
+
 /// Drive the runtime loop against caller-supplied I/O.
 ///
 /// This is the testable seam. All the orchestration lives here; the
@@ -899,9 +923,11 @@ fn run_due_ticks_on_login_if_enabled(
 /// - **Optional login catch-up**: when
 ///   `[world_ticks].run_due_ticks_on_login = true`, run one bounded
 ///   `WorldDb::run_due_ticks` pass before first render.
-/// - **Render** the top screen each iteration *before* polling for
-///   input. Rendering first means the player sees the new state
-///   immediately after a transition rather than after the next event.
+/// - **Render when dirty**. The loop starts dirty for the initial
+///   frame, then draws again only after input, resize, stack changes,
+///   or an explicit [`crate::ScreenCommand::Redraw`]. Idle ticks that
+///   return [`crate::ScreenCommand::None`] keep running without
+///   repainting static screens.
 /// - **Poll** with a deadline of [`TICK_INTERVAL`] - elapsed-since-tick.
 ///   `Ok(None)` from the source means the deadline elapsed → fire
 ///   `tick` and reset the deadline.
@@ -944,13 +970,15 @@ where
     // keep tick cadence steady when input arrives between ticks.
     let mut next_tick = Instant::now() + TICK_INTERVAL;
 
+    let mut dirty = true;
+
     loop {
         // ---- Render ----
         // Scoped borrow: `top` exclusively borrows `screens` only
         // long enough to draw. Once `terminal.draw` returns, the
         // borrow ends and the next match arm is free to mutate
         // `screens` via `apply_command`.
-        {
+        if dirty {
             let top = built
                 .screens
                 .last_mut()
@@ -962,13 +990,14 @@ where
             terminal
                 .draw(|frame| top.render(&mut ctx, frame))
                 .map_err(|e| GameError::Render(e.to_string()))?;
+            dirty = false;
         }
 
         // ---- Poll ----
         let now = Instant::now();
         let timeout = next_tick.saturating_duration_since(now);
 
-        let cmd = match events
+        let (dispatch_kind, cmd) = match events
             .next_input(timeout)
             .map_err(|e| GameError::EventIo(e.to_string()))?
         {
@@ -983,7 +1012,7 @@ where
                 if let Some(db) = world_db.as_deref() {
                     ctx = ctx.with_world_db(db);
                 }
-                top.on_resize(&mut ctx, width, height)
+                (DispatchKind::Resize, top.on_resize(&mut ctx, width, height))
             }
             Some(other) => {
                 let top = built.screens.last_mut().expect("non-empty");
@@ -991,7 +1020,7 @@ where
                 if let Some(db) = world_db.as_deref() {
                     ctx = ctx.with_world_db(db);
                 }
-                top.handle_input(&mut ctx, other)
+                (DispatchKind::Input, top.handle_input(&mut ctx, other))
             }
             None => {
                 // Tick. Reset the deadline *before* calling tick so a
@@ -1003,9 +1032,11 @@ where
                 if let Some(db) = world_db.as_deref() {
                     ctx = ctx.with_world_db(db);
                 }
-                top.tick(&mut ctx)
+                (DispatchKind::Tick, top.tick(&mut ctx))
             }
         };
+
+        dirty |= command_dirties_frame(&cmd, dispatch_kind);
 
         // ---- Apply ----
         match apply_command(&mut built.screens, cmd) {
@@ -1975,7 +2006,8 @@ mod tests {
         assert_eq!(reason, ExitReason::Quit);
         let log = log.borrow();
         // Sequence: render(40x10) → resize:100x30 → render → tick:100x30
-        // → render → input:Char('q'). Note we don't assert TestBackend
+        // → input:Char('q'). The tick returns None, so the dirty-render
+        // contract deliberately avoids another paint. Note we don't assert TestBackend
         // resize itself — that's ratatui's job — only that the cached
         // GameContext.terminal_size reflects the new dimensions.
         assert_eq!(
@@ -1985,9 +2017,203 @@ mod tests {
                 "only:resize:100x30",
                 "only:render",
                 "only:tick:100x30",
+                "only:input:Char('q')",
+            ]
+        );
+    }
+
+    #[test]
+    fn loop_idle_ticks_do_not_redraw_static_screen() {
+        let cfg = fixture_config();
+        let fc = fixture_context();
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let screen = ScriptedScreen::new(
+            "only",
+            log.clone(),
+            vec![ScreenCommand::Quit],
+            vec![ScreenCommand::None, ScreenCommand::None],
+            vec![],
+        );
+        let built = make_built(Box::new(screen));
+        let mut term = make_terminal();
+        let mut events = VecEventSource::new(vec![None, None, Some(Input::Char('q'))]);
+        let mut on_save: Box<dyn FnMut() -> Result<(), GameError>> = Box::new(|| Ok(()));
+
+        let reason = run_with_io(
+            built,
+            &cfg,
+            &fc,
+            None,
+            (40, 10),
+            &mut term,
+            &mut events,
+            &mut on_save,
+        )
+        .expect("loop ok");
+
+        assert_eq!(reason, ExitReason::Quit);
+        let log = log.borrow();
+        assert_eq!(
+            log.iter().filter(|s| s.as_str() == "only:render").count(),
+            1,
+            "only the initial frame should draw while idle; log was {log:?}"
+        );
+        assert_eq!(
+            *log,
+            vec![
+                "only:render",
+                "only:tick:40x10",
+                "only:tick:40x10",
+                "only:input:Char('q')",
+            ]
+        );
+    }
+
+    #[test]
+    fn loop_input_redraws_even_when_command_is_none() {
+        let cfg = fixture_config();
+        let fc = fixture_context();
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let screen = ScriptedScreen::new(
+            "only",
+            log.clone(),
+            vec![ScreenCommand::None, ScreenCommand::Quit],
+            vec![],
+            vec![],
+        );
+        let built = make_built(Box::new(screen));
+        let mut term = make_terminal();
+        let mut events = VecEventSource::new(vec![Some(Input::Char('j')), Some(Input::Char('q'))]);
+        let mut on_save: Box<dyn FnMut() -> Result<(), GameError>> = Box::new(|| Ok(()));
+
+        let reason = run_with_io(
+            built,
+            &cfg,
+            &fc,
+            None,
+            (40, 10),
+            &mut term,
+            &mut events,
+            &mut on_save,
+        )
+        .expect("loop ok");
+
+        assert_eq!(reason, ExitReason::Quit);
+        assert_eq!(
+            *log.borrow(),
+            vec![
+                "only:render",
+                "only:input:Char('j')",
                 "only:render",
                 "only:input:Char('q')",
             ]
+        );
+    }
+
+    #[test]
+    fn loop_stack_changes_redraw_new_top_screen() {
+        let cfg = fixture_config();
+        let fc = fixture_context();
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let replacement = ScriptedScreen::new(
+            "replacement",
+            log.clone(),
+            vec![ScreenCommand::Quit],
+            vec![],
+            vec![],
+        );
+        let pushed = ScriptedScreen::new(
+            "pushed",
+            log.clone(),
+            vec![ScreenCommand::Pop],
+            vec![],
+            vec![],
+        );
+        let base = ScriptedScreen::new(
+            "base",
+            log.clone(),
+            vec![
+                ScreenCommand::Push(Box::new(pushed)),
+                ScreenCommand::Replace(Box::new(replacement)),
+            ],
+            vec![],
+            vec![],
+        );
+        let built = make_built(Box::new(base));
+        let mut term = make_terminal();
+        let mut events = VecEventSource::new(vec![
+            Some(Input::Char('p')),
+            Some(Input::Char('x')),
+            Some(Input::Char('r')),
+            Some(Input::Char('q')),
+        ]);
+        let mut on_save: Box<dyn FnMut() -> Result<(), GameError>> = Box::new(|| Ok(()));
+
+        let reason = run_with_io(
+            built,
+            &cfg,
+            &fc,
+            None,
+            (40, 10),
+            &mut term,
+            &mut events,
+            &mut on_save,
+        )
+        .expect("loop ok");
+
+        assert_eq!(reason, ExitReason::Quit);
+        assert_eq!(
+            *log.borrow(),
+            vec![
+                "base:render",
+                "base:input:Char('p')",
+                "pushed:render",
+                "pushed:input:Char('x')",
+                "base:render",
+                "base:input:Char('r')",
+                "replacement:render",
+                "replacement:input:Char('q')",
+            ]
+        );
+    }
+
+    #[test]
+    fn loop_tick_redraw_command_opts_into_animation_paints() {
+        let cfg = fixture_config();
+        let fc = fixture_context();
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let screen = ScriptedScreen::new(
+            "only",
+            log.clone(),
+            vec![ScreenCommand::Quit],
+            vec![ScreenCommand::Redraw, ScreenCommand::Redraw],
+            vec![],
+        );
+        let built = make_built(Box::new(screen));
+        let mut term = make_terminal();
+        let mut events = VecEventSource::new(vec![None, None, Some(Input::Char('q'))]);
+        let mut on_save: Box<dyn FnMut() -> Result<(), GameError>> = Box::new(|| Ok(()));
+
+        let reason = run_with_io(
+            built,
+            &cfg,
+            &fc,
+            None,
+            (40, 10),
+            &mut term,
+            &mut events,
+            &mut on_save,
+        )
+        .expect("loop ok");
+
+        assert_eq!(reason, ExitReason::Quit);
+        assert_eq!(
+            log.borrow()
+                .iter()
+                .filter(|s| s.as_str() == "only:render")
+                .count(),
+            3,
+            "initial frame plus two explicit redraw ticks should paint"
         );
     }
 

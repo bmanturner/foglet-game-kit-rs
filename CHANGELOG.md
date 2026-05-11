@@ -2,6 +2,15 @@
 
 ## 0.1.1
 
+- Changed the runtime render loop to draw only when the terminal frame
+  is dirty, avoiding repeated `Terminal::draw` calls while static
+  screens sit idle on tick timeouts.
+- Added `ScreenCommand::Redraw` so animated or countdown screens can
+  explicitly opt into timer-driven paints without forcing all screens
+  to repaint every idle tick.
+- Added runtime-loop coverage for idle no-redraw behavior, redraw after
+  input, redraw after resize, stack-transition redraws, and explicit
+  animated redraws.
 - Added `WorldDb::get_place_by_key` and `WorldDb::get_route_between`
   for typed shared-world spatial lookups without game-local raw SQL.
 - Added `WorldDb::create_and_accept_contract` for atomically creating
