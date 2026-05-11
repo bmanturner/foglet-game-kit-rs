@@ -54,7 +54,7 @@ use thiserror::Error;
 /// TOML edit propagates without code changes.
 ///
 /// `Default` matches the documented defaults — 5 seconds of
-/// retry and WAL journaling — so unit tests and ad-hoc callers
+/// retry, enforced foreign keys, and WAL journaling — so unit tests and ad-hoc callers
 /// ( migration tests, for example) can spell
 /// `WorldDbOptions::default` without rediscovering the 's
 /// numbers.
@@ -203,8 +203,9 @@ impl WorldDb {
 
     /// Open the SQLite database and apply the supplied tunables.
     ///
-    /// Honours both [`WorldDbOptions::busy_timeout_ms`] and
-    /// [`WorldDbOptions::journal_mode`] so the runtime layer
+    /// Honours [`WorldDbOptions::busy_timeout_ms`],
+    /// [`WorldDbOptions::journal_mode`], and the kit's always-on
+    /// SQLite foreign-key enforcement so the runtime layer
     /// only ever calls a single constructor.
     ///
     /// Tunables are applied *after* [`Connection::open`] so a failure
@@ -238,6 +239,8 @@ impl WorldDb {
             path: path_ref.display().to_string(),
             source,
         })?;
+
+        apply_foreign_keys(&conn)?;
 
         // `busy_timeout` calls `sqlite3_busy_timeout`, which installs a
         // retry handler so contended writes (two local-dev sessions on
@@ -810,6 +813,11 @@ fn bootstrap_migrations_table(conn: &Connection) -> Result<(), WorldDbError> {
     .map_err(|source| WorldDbError::BootstrapMigrationsTable { source })
 }
 
+fn apply_foreign_keys(conn: &Connection) -> Result<(), WorldDbError> {
+    conn.execute_batch("PRAGMA foreign_keys = ON")
+        .map_err(|source| WorldDbError::ApplyForeignKeys { source })
+}
+
 /// Errors raised while opening or operating on a [`WorldDb`].
 ///
 /// Library-internal `thiserror` per the architecture tenets: callers
@@ -841,6 +849,19 @@ pub enum WorldDbError {
         /// Value the caller asked us to apply, echoed back so the
         /// operator-facing error names the offending knob.
         busy_timeout_ms: u64,
+        /// Underlying `rusqlite` error.
+        #[source]
+        source: rusqlite::Error,
+    },
+
+    /// `PRAGMA foreign_keys = ON` failed during connection setup.
+    ///
+    /// Shared-world migrations declare foreign keys across kit-owned
+    /// tables (`players`, `presence`, contracts, market listings, etc.).
+    /// Enforcing them at the connection boundary keeps game-local code
+    /// from needing duplicate trigger guards around kit parent rows.
+    #[error("failed to enable world database foreign key enforcement: {source}")]
+    ApplyForeignKeys {
         /// Underlying `rusqlite` error.
         #[source]
         source: rusqlite::Error,
@@ -1023,6 +1044,22 @@ mod tests {
             i64::from(WorldDbOptions::default().busy_timeout_ms as i32),
             "default open path must apply the documented default busy timeout"
         );
+    }
+
+    /// Shared-world migrations declare cross-table foreign keys, so every
+    /// public open path must enable SQLite enforcement before callers run
+    /// game or kit writes.
+    #[test]
+    fn open_enables_foreign_key_enforcement() {
+        let dir = tempdir().expect("tempdir creates");
+        let db_path = dir.path().join("world.sqlite");
+        let world = WorldDb::open(&db_path).expect("default open succeeds");
+
+        let enabled: i64 = world
+            .connection()
+            .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
+            .expect("foreign_keys pragma is queryable");
+        assert_eq!(enabled, 1, "WorldDb opens must enforce foreign keys");
     }
 
     /// `WorldSection` -> `WorldDbOptions` is a thin bridge but it's

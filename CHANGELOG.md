@@ -18,5 +18,8 @@
 - Added `spend_turns_on` for spending Daily Turns on an existing SQLite
   connection or transaction, including from transaction-aware travel
   cost callbacks.
+- Enabled SQLite foreign-key enforcement for every `WorldDb` connection,
+  so kit and game migrations that declare parent rows are enforced without
+  game-local trigger duplicates.
 - Documented the shared-world table boundary and the preferred public
   APIs for kit-owned tables.
