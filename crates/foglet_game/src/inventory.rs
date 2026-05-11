@@ -1,4 +1,4 @@
-//! `inventory` — owner-keyed stockpile schema (SPEC_v4 Task 7a).
+//! `inventory` — owner-keyed stockpile schema.
 //!
 //! This module owns the durable table used to persist durable quantities for
 //! arbitrary owners and item keys. It intentionally stays neutral:
@@ -12,7 +12,7 @@
 //! schema so later movement/transfer tasks can rely on a stable shape.
 //!
 //! All inventory operations are intentionally owner-agnostic. `owner_kind`
-//! is a caller-defined bucket (`"ship"`, `"player"`, `"chest"`, etc.),
+//! is a caller-defined bucket (`"ship"`, `"player"`, `"chest"`, etc.).
 //! and `owner_id` is that bucket's numeric identity.
 
 use thiserror::Error;
@@ -22,7 +22,7 @@ use crate::world_db::WorldMigration;
 
 /// One mutable inventory slot in the shared world DB.
 ///
-/// The shape is deliberately generic and does not encode stack limits,
+/// The shape is deliberately generic and does not encode stack limits.
 /// unit conversions, or ownership semantics. Games model those rules in
 /// callbacks and game logic.
 ///
@@ -174,7 +174,7 @@ pub enum InventoryError {
     },
 }
 
-/// Migration for the `inventory_slots` table (SPEC_v4 Task 7a).
+/// Migration for the `inventory_slots` table.
 ///
 /// The migration uses integer row identity plus a compound owner model:
 ///
@@ -183,7 +183,7 @@ pub enum InventoryError {
 /// - `quantity` is stored as a non-negative integer.
 /// - `equilibrium` is optional advisory target stock.
 /// - `metadata_json` is opaque game-authored JSON payload.
-/// - `created_at` / `updated_at` are SQLite timestamps.
+/// - `created_at` `updated_at` are SQLite timestamps.
 ///
 /// This migration is intentionally minimal and game-agnostic:
 ///
@@ -212,7 +212,7 @@ CREATE TABLE IF NOT EXISTS inventory_slots (\n\
 impl WorldDb {
     /// Create one inventory slot and return the committed row.
     ///
-    /// This is the starting point for v4 stockpile state. The API is
+    /// This is the starting point for stockpile state. The API is
     /// intentionally small:
     ///
     /// - It persists one owner/item pair.
@@ -367,14 +367,14 @@ ORDER BY item_key ASC, id ASC";
     /// Merge one slot into another when metadata and ownership fully match.
     ///
     /// The helper does not invent merge policy; it applies the strict
-    /// v4 contract:
+    /// contract:
     ///
     /// - `(owner_kind, owner_id, item_key, metadata_json)` must match
     ///   exactly across both slots.
     /// - The two row ids must be distinct.
     /// - Quantities are added in a single transaction.
     ///
-    /// This API exists because v4 intentionally keeps stock behavior
+    /// This API exists because intentionally keeps stock behavior
     /// game-agnostic while still allowing explicit consolidation in
     /// shared logic (for example, combining partial loads in a ship cargo
     /// hold or combining duplicate stack rows in a dungeon chest without
@@ -484,8 +484,8 @@ ORDER BY item_key ASC, id ASC";
     /// The helper performs all writes inside one SQLite transaction so
     /// callers can rely on all-or-nothing semantics for:
     ///
-    /// - debiting the source row,
-    /// - crediting the destination row (or creating one if missing),
+    /// - debiting the source row.
+    /// - crediting the destination row (or creating one if missing).
     /// - then invoking the optional `on_commit` callback.
     ///
     /// Why this shape exists:
@@ -502,7 +502,7 @@ ORDER BY item_key ASC, id ASC";
     /// - `on_commit` (when provided) runs after SQL mutations and
     ///   receives the post-mutation snapshots for both source and
     ///   destination rows.
-    /// - If `on_commit` returns an error, the whole transfer rolls back,
+    /// - If `on_commit` returns an error, the whole transfer rolls back.
     ///   including both quantity mutations.
     pub fn transfer<F>(
         &mut self,
@@ -770,7 +770,7 @@ mod tests {
                 "created_at".to_string(),
                 "updated_at".to_string(),
             ],
-            "inventory_slots schema must match SPEC_v4 Task 7a exactly"
+            "inventory_slots schema must match exactly"
         );
 
         let migration_version: i64 = world
@@ -824,7 +824,7 @@ mod tests {
         assert_eq!(recorded_count, 1, "migration record is idempotent");
     }
 
-    /// Task 7b requires that slot creation and lookup round-trip
+    ///  requires that slot creation and lookup round-trip
     /// matching values through the crate API.
     #[test]
     fn create_slot_and_get_slot_round_trip() -> Result<(), InventoryError> {
@@ -953,7 +953,7 @@ mod tests {
         Ok(())
     }
 
-    /// Task 7e requires a deterministic listing for one owner.
+    ///  requires a deterministic listing for one owner.
     ///
     /// The test verifies:
     ///

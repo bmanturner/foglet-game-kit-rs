@@ -1,8 +1,8 @@
 //! Screen trait, screen commands, and the per-frame [`GameContext`]
 //! handed to screens during render/input/tick.
 //!
-//! Task 7a deliberately ships **types only**. The pure stack
-//! reducer (`apply_command`) lives in Task 7b, the `Game` builder in
+//!  deliberately ships **types only**. The pure stack
+//! reducer (`apply_command`) lives in, the `Game` builder in
 //! 7c, and the runtime loop wiring (event poll → render → tick) in
 //! 7d. Splitting it this way keeps each commit small enough
 //! to review and lets the reducer be unit-tested without any terminal
@@ -10,7 +10,7 @@
 //!
 //! ## Why `GameContext` is a borrow-bag, not the runtime
 //!
-//! SPEC §5.3 gives the runtime ownership of `config`,
+//!  gives the runtime ownership of `config`.
 //! `foglet_context`, `terminal_size`, the screen stack, the save
 //! manager, a `running` flag, and `last_tick`. Screens only need a
 //! read view of some of those — passing them the whole `GameRuntime`
@@ -22,7 +22,7 @@
 //! runtime reconstructs each iteration of the loop. It is the *only*
 //! handle screens have on runtime data. Adding a field here is a
 //! deliberate widening of the screen API surface and should be
-//! justified the same way a new SPEC §5.5 command would be.
+//! justified the same way a new command would be.
 //!
 //! ## Why `ScreenCommand::Push` boxes the screen
 //!
@@ -48,18 +48,18 @@ use crate::world_db::WorldDb;
 /// it on `self`.
 ///
 /// **Mutability.** The wrapper is `&mut`-handed to screens (per
-/// SPEC §8.2), but the borrowed sub-values are intentionally `&` for
+/// ), but the borrowed sub-values are intentionally `&` for
 /// the immutable game-wide data (`config`, `foglet`). `terminal_size`
 /// is a `Copy` pair the runtime overwrites on resize before the next
 /// frame; screens may read it but mutating it from a screen has no
 /// effect beyond the current callback.
 #[derive(Debug)]
 pub struct GameContext<'a> {
-    /// Parsed `assets/game.toml`. Title, slug, min size, etc. (SPEC
-    /// §5.2). Immutable for the lifetime of the run.
+    /// Parsed `assets/game.toml`. Title, slug, min size, etc. (
+    /// ). Immutable for the lifetime of the run.
     pub config: &'a GameConfig,
-    /// Foglet door context for this session — door id, user id,
-    /// terminal size hint, and friends (SPEC §5.1). Immutable for the
+    /// Foglet door context for this session — door id, user id.
+    /// terminal size hint, and friends. Immutable for the
     /// lifetime of the run; the runtime is the single source of
     /// truth.
     pub foglet: &'a FogletContext,
@@ -68,7 +68,7 @@ pub struct GameContext<'a> {
     /// against the live size (e.g. centring widgets) should read this
     /// rather than re-querying `crossterm`.
     pub terminal_size: (u16, u16),
-    /// Optional shared-world SQLite handle (SPEC_v2 §Task 3 / §Task 10).
+    /// Optional shared-world SQLite handle.
     ///
     /// `Some` only when the game's `[world].enabled = true` and the
     /// runtime successfully opened the database at startup; `None`
@@ -84,33 +84,33 @@ pub struct GameContext<'a> {
     /// v4-specific handlers.
     ///
     /// **Do not run blocking world queries from `Screen::render`**
-    /// (SPEC_v2 §Task 10d). The draw path must stay non-blocking;
+    /// . The draw path must stay non-blocking;
     /// SQLite reads, writes, and transactions belong in `tick` or
     /// `handle_input`, where the runtime tolerates latency. See the
     /// [`Screen::render`] docs for the full rationale and the cache
     /// pattern callers should use.
     pub world_db: Option<&'a WorldDb>,
-    /// Optional v4 spatial handle. Present when the runtime opens a
-    /// shared-world DB; this is added in Task 11a so screens can
+    /// Optional spatial handle. Present when the runtime opens a
+    /// shared-world DB; this is added in so screens can
     /// locate the handle without rebuilding the runtime surface.
     pub spatial: Option<&'a WorldDb>,
-    /// Optional v4 presence handle. Present when the runtime opens a
-    /// shared-world DB; this is added in Task 11a so movement
-    /// workflows can share one borrow shape with other v4 handles.
+    /// Optional presence handle. Present when the runtime opens a
+    /// shared-world DB; this is added in so movement
+    /// workflows can share one borrow shape with other handles.
     pub presence: Option<&'a WorldDb>,
-    /// Optional v4 place-recall handle. Present when the runtime opens
-    /// a shared-world DB; this is added in Task 11a for fog-of-war
+    /// Optional place-recall handle. Present when the runtime opens
+    /// a shared-world DB; this is added in for fog-of-war
     /// workflows that need discoverable place memory.
     pub place_recall: Option<&'a WorldDb>,
-    /// Optional v4 inventory handle. Present when the runtime opens a
-    /// shared-world DB; this is added in Task 11a so transfer and
+    /// Optional inventory handle. Present when the runtime opens a
+    /// shared-world DB; this is added in so transfer and
     /// stockpile workflows can run through one runtime path.
     pub inventory: Option<&'a WorldDb>,
-    /// Optional v4 world-tick handle. Present when the runtime opens a
-    /// shared-world DB; this is added in Task 11a so cron/login-driven
+    /// Optional world-tick handle. Present when the runtime opens a
+    /// shared-world DB; this is added in so cron/login-driven
     /// tick runners and ad-hoc callbacks share one context field.
     ///
-    /// **Scheduling contract (SPEC_v4 §2.2):** call
+    /// **Scheduling contract:** call
     /// [`WorldDb::run_due_ticks`]
     /// from login flow or screen transitions, never from
     /// `Screen::render`/paint loops. Tick callbacks may perform SQL
@@ -118,15 +118,15 @@ pub struct GameContext<'a> {
     /// violates the "no automatic tick execution in paint loops"
     /// tenet.
     pub world_ticks: Option<&'a WorldDb>,
-    /// Optional v5 contracts handle.
+    /// Optional contracts handle.
     pub contracts: Option<&'a WorldDb>,
-    /// Optional v5 job-board handle.
+    /// Optional job-board handle.
     pub job_board: Option<&'a WorldDb>,
-    /// Optional v5 travel helper handle.
+    /// Optional travel helper handle.
     pub travel: Option<&'a WorldDb>,
-    /// Optional v5 inventory-capacity handle.
+    /// Optional inventory-capacity handle.
     pub inventory_capacity: Option<&'a WorldDb>,
-    /// Optional v5 event-log screen data handle.
+    /// Optional event-log screen data handle.
     ///
     /// Do not query or construct [`crate::EventLogScreen`] from inside
     /// `Screen::render`/paint loops. Loading event rows touches SQLite
@@ -166,7 +166,7 @@ impl<'a> GameContext<'a> {
     }
 
     /// Builder that attaches a shared-world handle to an existing
-    /// [`GameContext`]. Used by the runtime in Task 10b once the world
+    /// [`GameContext`]. Used by the runtime in once the world
     /// DB has been opened, and by tests that need to exercise screens
     /// against a real `WorldDb`.
     ///
@@ -178,7 +178,7 @@ impl<'a> GameContext<'a> {
     /// argument to [`GameContext::new`] so the dozens of existing
     /// `new(&cfg, &fc, size)` call sites in tests and example games
     /// keep compiling without churn — adding `world_db` is purely
-    /// additive for v1 callers.
+    /// additive for callers.
     #[must_use]
     pub fn with_world_db(mut self, world_db: &'a WorldDb) -> Self {
         self.world_db = Some(world_db);
@@ -217,10 +217,10 @@ impl<'a> GameContext<'a> {
 }
 
 /// Command returned by a [`Screen`] callback to instruct the runtime
-/// what to do next. Mirrors SPEC §5.5.
+/// what to do next. Mirrors
 ///
 /// Screens never mutate the screen stack directly; they emit one of
-/// these and the runtime applies it in `apply_command` (Task 7b). This keeps screen logic pure and unit-testable, and
+/// these and the runtime applies it in `apply_command`. This keeps screen logic pure and unit-testable, and
 /// guarantees the runtime gets a chance to (e.g.) flush the save or
 /// drop the terminal guard before exiting.
 ///
@@ -229,7 +229,7 @@ impl<'a> GameContext<'a> {
 /// Tests that need to inspect a returned command should pattern-match
 /// on the variant.
 pub enum ScreenCommand {
-    /// Do nothing. The default return for `handle_input` / `tick` /
+    /// Do nothing. The default return for `handle_input` `tick` /
     /// `on_resize` when the screen has no transition to request.
     None,
     /// Push a new screen on top of the current one. The current
@@ -255,7 +255,7 @@ pub enum ScreenCommand {
     Message(String),
     /// A screen-level error that the runtime should surface to the
     /// player and/or operator log. Plain `String` rather than a typed
-    /// error keeps `ScreenCommand` free of `thiserror` / `anyhow`
+    /// error keeps `ScreenCommand` free of `thiserror` `anyhow`
     /// coupling; richer typing can wait for a real use case.
     Error(String),
 }
@@ -280,7 +280,7 @@ impl std::fmt::Debug for ScreenCommand {
 
 /// A logical game screen — title, menu, map, dialog, inventory, etc.
 ///
-/// Mirrors SPEC §8.2. Screens render themselves into a Ratatui frame,
+/// Mirrors Screens render themselves into a Ratatui frame.
 /// receive normalized [`Input`] events, and respond by emitting a
 /// [`ScreenCommand`] rather than mutating the runtime directly.
 ///
@@ -289,13 +289,13 @@ impl std::fmt::Debug for ScreenCommand {
 /// `handle_input`, `tick`, and `on_resize` default to
 /// [`ScreenCommand::None`] so a render-only screen (splash, credits)
 /// can implement just `render` and ignore the rest. `render` has no
-/// default because every screen must put *something* on the frame —
+/// default because every screen must put *something* on the frame
 /// silently rendering nothing is almost always a bug worth surfacing
 /// at compile time.
 ///
 /// ## Object safety
 ///
-/// All methods take `&mut self` and use only concrete argument types,
+/// All methods take `&mut self` and use only concrete argument types.
 /// so `Box<dyn Screen>` is well-formed. The screen stack and the
 /// `Push`/`Replace` variants of [`ScreenCommand`] both rely on this.
 pub trait Screen {
@@ -305,7 +305,7 @@ pub trait Screen {
     /// no side effects beyond writing widgets. Game-state mutations
     /// belong in `tick` or in response to `handle_input`.
     ///
-    /// ## Do not run blocking world queries here (SPEC_v2 §Task 10d)
+    /// ## Do not run blocking world queries here
     ///
     /// `ctx.world_db` is reachable from `render` so widgets can format
     /// data already in scope, but `render` runs on the per-frame draw
@@ -361,7 +361,7 @@ pub trait Screen {
 /// `Vec<Box<dyn Screen>>` — wrapping it would force callers through an
 /// inherent-method API for trivial pushes/pops the runtime already
 /// drives via [`apply_command`]. Keeping it transparent also lets tests
-/// build a stack with `vec![Box::new(MyScreen)]` and inspect `.len()`
+/// build a stack with `vec![Box::new(MyScreen)]` and inspect `.len`
 /// directly.
 pub type ScreenStack = Vec<Box<dyn Screen>>;
 
@@ -369,7 +369,7 @@ pub type ScreenStack = Vec<Box<dyn Screen>>;
 /// [`apply_command`] when a command transitions the stack into a
 /// terminal state.
 ///
-/// The runtime translates this into the SPEC §7.3 exit path: restore
+/// The runtime translates this into the exit path: restore
 /// terminal, flush dirty saves, return an exit code. Keeping the
 /// reason explicit (rather than collapsing both into a single bool)
 /// lets the runtime distinguish "the player asked to quit" from "the
@@ -379,7 +379,7 @@ pub type ScreenStack = Vec<Box<dyn Screen>>;
 pub enum ExitReason {
     /// A screen returned [`ScreenCommand::Quit`].
     Quit,
-    /// A [`ScreenCommand::Pop`] left the stack empty. SPEC §5.5 says
+    /// A [`ScreenCommand::Pop`] left the stack empty. says
     /// the runtime treats this as a clean exit.
     EmptyStack,
 }
@@ -393,7 +393,7 @@ pub enum ExitReason {
 /// terminal guard, etc. That split is what makes 7b unit-testable
 /// without any `ratatui`/`crossterm` plumbing.
 ///
-/// `Push` / `Replace` are absent on purpose: they only mutate the
+/// `Push` `Replace` are absent on purpose: they only mutate the
 /// stack and have no out-of-band effect for the runtime to perform.
 #[derive(Debug, PartialEq, Eq)]
 pub enum SideEffect {
@@ -407,7 +407,7 @@ pub enum SideEffect {
     /// Runtime should surface an error to the player and/or operator
     /// log. Plain `String` to match [`ScreenCommand::Error`].
     Error(String),
-    /// Runtime should leave the loop and run the SPEC §7.3 shutdown.
+    /// Runtime should leave the loop and run the shutdown.
     Exit(ExitReason),
 }
 
@@ -416,7 +416,7 @@ pub enum SideEffect {
 ///
 /// ## Why a reducer rather than a method on the runtime
 ///
-/// SPEC §7.2 says the runtime "applies returned `ScreenCommand`
+///  says the runtime "applies returned `ScreenCommand`
 /// values" — but that step is entirely about manipulating the stack
 /// and choosing the next action. Pulling it out of the runtime means:
 ///
@@ -429,16 +429,16 @@ pub enum SideEffect {
 ///
 /// ## Behaviour matrix
 ///
-/// | Command           | Stack effect                                   | SideEffect                  |
+/// | Command | Stack effect | SideEffect |
 /// |-------------------|------------------------------------------------|-----------------------------|
-/// | `None`            | none                                           | `None`                      |
-/// | `Push(s)`         | push `s` on top                                | `None`                      |
-/// | `Pop`             | pop top; empty afterwards → exit               | `None` or `Exit(EmptyStack)`|
-/// | `Replace(s)`      | pop top (if any), then push `s`                | `None`                      |
-/// | `Quit`            | clear the stack                                | `Exit(Quit)`                |
-/// | `Save`            | none                                           | `Save`                      |
-/// | `Message(s)`      | none                                           | `Message(s)`                |
-/// | `Error(s)`        | none                                           | `Error(s)`                  |
+/// | `None` | none | `None` |
+/// | `Push(s)` | push `s` on top | `None` |
+/// | `Pop` | pop top; empty afterwards → exit | `None` or `Exit(EmptyStack)`|
+/// | `Replace(s)` | pop top (if any), then push `s` | `None` |
+/// | `Quit` | clear the stack | `Exit(Quit)` |
+/// | `Save` | none | `Save` |
+/// | `Message(s)` | none | `Message(s)` |
+/// | `Error(s)` | none | `Error(s)` |
 ///
 /// Notes:
 ///
@@ -452,7 +452,7 @@ pub enum SideEffect {
 ///   it was the top, and by then the stack is non-empty; the empty
 ///   branch is defined only so the reducer is total.
 /// - `Quit` clears the stack so the runtime sees a consistent "no
-///   more screens" state on its way out, matching the SPEC §5.5
+///   more screens" state on its way out, matching the
 ///   description that `Quit` is "equivalent to popping every screen".
 pub fn apply_command(stack: &mut ScreenStack, command: ScreenCommand) -> SideEffect {
     match command {
@@ -567,27 +567,27 @@ mod tests {
         assert_eq!(ctx.terminal_size, (100, 30));
         assert!(
             ctx.world_db.is_none(),
-            "GameContext::new defaults world_db to None so v1 call sites are unaffected"
+            "GameContext::new defaults world_db to None so existing call sites are unaffected"
         );
         assert!(
             ctx.spatial.is_none(),
-            "Task 11a keeps optional handles defaulting to None"
+            "optional handles default to None"
         );
         assert!(
             ctx.presence.is_none(),
-            "Task 11a keeps optional handles defaulting to None"
+            "optional handles default to None"
         );
         assert!(
             ctx.place_recall.is_none(),
-            "Task 11a keeps optional handles defaulting to None"
+            "optional handles default to None"
         );
         assert!(
             ctx.inventory.is_none(),
-            "Task 11a keeps optional handles defaulting to None"
+            "optional handles default to None"
         );
         assert!(
             ctx.world_ticks.is_none(),
-            "Task 11a keeps optional handles defaulting to None"
+            "optional handles default to None"
         );
         assert!(ctx.contracts.is_none());
         assert!(ctx.job_board.is_none());
@@ -599,7 +599,7 @@ mod tests {
     #[test]
     fn game_context_with_world_db_attaches_enabled_v4_handles_only() {
         // Builder threads a real `WorldDb` borrow into the context so
-        // Task 10b can hand screens a working handle without touching
+        //  can hand screens a working handle without touching
         // any of the existing `GameContext::new(...)` call sites. We
         // drive a query through it to prove the borrow is the same
         // object the test opened, not a copy.
@@ -619,11 +619,11 @@ mod tests {
         assert!(ctx.world_db.is_some(), "builder attaches world_db");
         assert!(
             ctx.spatial.is_some() && ctx.presence.is_some() && ctx.place_recall.is_some(),
-            "Task 11b enables requested v4 handles when sections are on"
+            "enables requested handles when sections are on"
         );
         assert!(
             ctx.inventory.is_some() && ctx.world_ticks.is_some(),
-            "Task 11b enables requested v4 handles when sections are on"
+            "enables requested handles when sections are on"
         );
         // SQLite reports the connection it gave us, confirming the
         // borrow points at the same `WorldDb` we opened above.
@@ -635,7 +635,7 @@ mod tests {
 
     #[test]
     fn game_context_with_world_db_leaves_disabled_v4_handles_none() {
-        // Task 11b: disabling a v4 section leaves its handle as `None`
+        // : disabling a section leaves its handle as `None`
         // even when a shared-world database is present.
         use crate::world_db::WorldDb;
 
@@ -648,23 +648,23 @@ mod tests {
         assert!(ctx.world_db.is_some(), "builder still attaches world_db");
         assert!(
             ctx.spatial.is_none(),
-            "Task 11b keeps disabled `spatial` handle absent"
+            "disabled `spatial` handle is absent"
         );
         assert!(
             ctx.presence.is_none(),
-            "Task 11b keeps disabled `presence` handle absent"
+            "disabled `presence` handle is absent"
         );
         assert!(
             ctx.place_recall.is_none(),
-            "Task 11b keeps disabled `place_recall` handle absent"
+            "disabled `place_recall` handle is absent"
         );
         assert!(
             ctx.inventory.is_none(),
-            "Task 11b keeps disabled `inventory` handle absent"
+            "disabled `inventory` handle is absent"
         );
         assert!(
             ctx.world_ticks.is_none(),
-            "Task 11b keeps disabled `world_ticks` handle absent"
+            "disabled `world_ticks` handle is absent"
         );
     }
 
@@ -742,7 +742,7 @@ mod tests {
 
     #[test]
     fn screen_is_object_safe() {
-        // If `Screen` were not object-safe this would fail to compile,
+        // If `Screen` were not object-safe this would fail to compile.
         // which would in turn break `Box<dyn Screen>` in
         // `ScreenCommand::Push`/`Replace`.
         let _boxed: Box<dyn Screen> = Box::new(NoopScreen);

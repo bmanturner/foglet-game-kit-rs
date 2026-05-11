@@ -3,33 +3,33 @@
 //!
 //! # Why this lives in `foglet_game` (and not just in `fgk`)
 //!
-//! The CLI (`fgk emit-manifest`, Task 11) is the primary writer, but
+//! The CLI (`fgk emit-manifest`) is the primary writer, but
 //! the manifest **shape** is a contract between this kit and Foglet
-//! itself (SPEC §5.7, §10.3). Putting the typed model in the library
+//! itself. Putting the typed model in the library
 //! means:
 //!
-//! - downstream tooling can consume / validate manifests without
-//!   shelling out to `fgk`,
-//! - integration tests can round-trip the SPEC example through the
+//! - downstream tooling can consume validate manifests without
+//!   shelling out to `fgk`.
+//! - integration tests can round-trip the example through the
 //!   same struct the CLI uses, and
 //! - the absolute-path invariants live next to the type that needs
 //!   to enforce them, not scattered across CLI flag parsing.
 //!
 //! # Invariants enforced at construction
 //!
-//! Per SPEC §5.7 and §10.3:
+//! Per and:
 //!
-//! - `runtime` is `"external_pty"` (constant for the v1 slice).
+//! - `runtime` is `"external_pty"` (constant for the slice).
 //! - `command` and `working_dir` are absolute Unix-style paths.
 //!   Foglet only ever runs these on Linux, so we reject anything
 //!   that doesn't start with `/` regardless of the host the manifest
 //!   is generated on.
 //! - `pty` is `true`.
 //! - `env_allowlist` is non-empty when `env` has entries (an
-//!   allowlist of `[]` paired with non-empty `env` is almost always
+//!   allowlist of `` paired with non-empty `env` is almost always
 //!   an authoring bug — Foglet would refuse to forward those vars).
 //!
-//! Field defaults match the SPEC §10.3 example so a typical authoring
+//! Field defaults match the example so a typical authoring
 //! flow (`FogletManifest::new(...)` → tweak → serialize) produces the
 //! canonical shape without ceremony.
 
@@ -39,25 +39,25 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-/// The runtime identifier required for the v1 slice.
+/// The runtime identifier required for the slice.
 ///
-/// SPEC §3.2 / §5.7 forbid `classic_dropfile` and `native_elixir` in
+///  forbid `classic_dropfile` and `native_elixir` in
 /// the first release, so `external_pty` is currently the only legal
 /// value. Exposed as a `pub const` so tests and downstream tooling
 /// can compare against it without stringly-typing the literal.
 pub const RUNTIME_EXTERNAL_PTY: &str = "external_pty";
 
-/// Default per-session timeout (30 minutes), per SPEC §10.3 example.
+/// Default per-session timeout (30 minutes), example.
 pub const DEFAULT_TIMEOUT_MS: u64 = 1_800_000;
 
-/// Default idle timeout (5 minutes), per SPEC §10.3 example.
+/// Default idle timeout (5 minutes), example.
 pub const DEFAULT_IDLE_TIMEOUT_MS: u64 = 300_000;
 
-/// Default visibility — `members` matches the SPEC example and is
+/// Default visibility — `members` matches the example and is
 /// the safer default than `public` for an unaudited door.
 pub const DEFAULT_VISIBILITY: &str = "members";
 
-/// Default auth scope — `site` mirrors the SPEC example.
+/// Default auth scope — `site` mirrors the example.
 pub const DEFAULT_AUTH_SCOPE: &str = "site";
 
 /// Errors raised while building or validating a [`FogletManifest`].
@@ -71,7 +71,7 @@ pub enum ManifestError {
     /// Foglet runs doors as `/path/to/run.sh` from a fixed working
     /// directory; relative paths would be resolved against whatever
     /// CWD the Foglet runtime happens to be in, which is exactly the
-    /// kind of ambient-state coupling SPEC §13.2 warns against.
+    /// kind of ambient-state coupling warns against.
     #[error("{field} must be an absolute path (starts with `/`); got `{value}`")]
     NotAbsolute {
         /// Which field failed validation (e.g. `command`).
@@ -96,12 +96,12 @@ pub enum ManifestError {
 
 /// Typed model of the JSON Foglet expects in its manifest directory.
 ///
-/// Field order in the struct matches the SPEC §10.3 example; serde
+/// Field order in the struct matches the example; serde
 /// preserves struct field order during JSON serialization, so the
 /// output is stable across runs and easy to eyeball-diff.
 ///
 /// Use [`FogletManifest::new`] for the common case (fills in the
-/// SPEC §10.3 defaults); construct the struct directly only when a
+///  defaults); construct the struct directly only when a
 /// test needs to inspect a specific malformed shape.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FogletManifest {
@@ -124,12 +124,12 @@ pub struct FogletManifest {
 
     /// Absolute path Foglet executes to launch the door. For
     /// `fgk`-packaged games this points at the boring `run.sh`
-    /// wrapper from SPEC §10.4.
+    /// wrapper
     pub command: String,
 
     /// Extra args passed to `command`. Usually empty because the
     /// `run.sh` wrapper handles the asset/save-dir flags itself
-    /// (SPEC §10.4).
+    /// .
     pub args: Vec<String>,
 
     /// Absolute working directory Foglet `chdir`s into before
@@ -152,7 +152,7 @@ pub struct FogletManifest {
     pub auth_scope: String,
 
     /// Environment variables Foglet should set when spawning the
-    /// door. Stored in a [`BTreeMap`] for deterministic JSON output,
+    /// door. Stored in a [`BTreeMap`] for deterministic JSON output.
     /// since hash-map ordering would make `cargo test` flake on
     /// snapshot-style assertions.
     pub env: BTreeMap<String, String>,
@@ -165,7 +165,7 @@ pub struct FogletManifest {
 
     /// Whether to allocate a real PTY for the door. Always `true`
     /// for `external_pty`; included as a field rather than a derived
-    /// constant because Foglet's schema (SPEC §5.7) treats it as
+    /// constant because Foglet's schema treats it as
     /// part of the manifest payload and may key behavior off it.
     pub pty: bool,
 }
@@ -174,8 +174,8 @@ pub struct FogletManifest {
 /// it asks for a manifest.
 ///
 /// Held as a struct (rather than a five-arg function) so future
-/// fields (icon path, tags, ...) can be added without breaking
-/// callers. All fields are required because the SPEC §10.3 example
+/// fields (icon path, tags,...) can be added without breaking
+/// callers. All fields are required because the example
 /// does not define defaults for them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ManifestInputs<'a> {
@@ -193,18 +193,18 @@ pub struct ManifestInputs<'a> {
 
 impl FogletManifest {
     /// Build a manifest from the minimum inputs `fgk emit-manifest`
-    /// has access to, filling in the SPEC §10.3 defaults for
+    /// has access to, filling in the defaults for
     /// timeouts, visibility, env, and the PTY flag.
     ///
     /// `command` is derived as `<install_dir>/run.sh` to match the
-    /// SPEC §10.3 example and the wrapper that `fgk package`
-    /// produces (Task 12). Override fields on the returned struct if
+    ///  example and the wrapper that `fgk package`
+    /// produces. Override fields on the returned struct if
     /// a specific game needs to deviate.
     pub fn new(inputs: ManifestInputs<'_>) -> Result<Self, ManifestError> {
         require_absolute("install_dir", inputs.install_dir)?;
 
         // Trim a trailing slash so `command` doesn't end up with a
-        // double-slash like `/srv/foglet/doors/x//run.sh`. Cosmetic,
+        // double-slash like `/srv/foglet/doors/x//run.sh`. Cosmetic.
         // but JSON diffs are easier to read.
         let install_dir = inputs.install_dir.trim_end_matches('/').to_string();
         let command = format!("{install_dir}/run.sh");
@@ -273,12 +273,12 @@ impl FogletManifest {
 /// Validate that `value` looks like an absolute Unix path.
 ///
 /// Implemented manually (rather than via [`Path::is_absolute`])
-/// because `Path::is_absolute` on Windows demands a drive letter,
+/// because `Path::is_absolute` on Windows demands a drive letter.
 /// and we want this check to behave identically regardless of where
 /// `fgk` is run — a developer on macOS generating a manifest for a
 /// Linux Foglet host should get the same answer as CI on Linux.
 fn require_absolute(field: &'static str, value: &str) -> Result<(), ManifestError> {
-    // `Path::new(value).is_absolute()` would also work on Unix hosts,
+    // `Path::new(value).is_absolute` would also work on Unix hosts.
     // but the explicit `/` check makes the intent obvious to readers
     // and avoids platform-conditional behavior in tests.
     if value.starts_with('/') && !value.is_empty() {
@@ -307,7 +307,7 @@ mod tests {
     use super::*;
     use serde_json::Value;
 
-    /// Helper: the canonical inputs from SPEC §10.3.
+    /// Helper: the canonical inputs
     fn murder_motel_inputs() -> ManifestInputs<'static> {
         ManifestInputs {
             slug: "murder-motel",
@@ -397,7 +397,7 @@ mod tests {
         m.validate().expect("empty env + empty allowlist is fine");
     }
 
-    /// Round-trip: serialize → parse → all SPEC §10.3 fields match.
+    /// Round-trip: serialize → parse → all fields match.
     /// We compare via parsed `Value` rather than raw strings so
     /// JSON-object key ordering doesn't make the test brittle.
     #[test]
@@ -433,7 +433,7 @@ mod tests {
         assert_eq!(v["pty"], true);
     }
 
-    /// Deserialize the literal SPEC §10.3 example back into the
+    /// Deserialize the literal example back into the
     /// typed struct. Catches schema drift: if someone reorders or
     /// renames a field on `FogletManifest`, this test fails.
     #[test]
@@ -459,8 +459,8 @@ mod tests {
           "pty": true
         }"#;
 
-        let m: FogletManifest = serde_json::from_str(example).expect("SPEC example parses");
-        m.validate().expect("SPEC example is valid");
+        let m: FogletManifest = serde_json::from_str(example).expect(" example parses");
+        m.validate().expect(" example is valid");
         assert_eq!(m.runtime, RUNTIME_EXTERNAL_PTY);
         assert!(m.pty);
         assert_eq!(m.command, "/srv/foglet/doors/murder-motel/run.sh");

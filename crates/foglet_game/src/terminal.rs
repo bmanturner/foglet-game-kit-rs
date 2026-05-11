@@ -1,15 +1,15 @@
 //! Terminal lifecycle guard.
 //!
-//! SPEC §13.1 declares terminal safety release-critical: every path that
-//! enters raw mode + the alternate screen MUST restore the terminal —
+//!  declares terminal safety release-critical: every path that
+//! enters raw mode + the alternate screen MUST restore the terminal
 //! on normal quit, controlled error, panic, Ctrl-C, and resize. Per
-//! SPEC §7.1 the size check runs *before* the guard engages, so by the
+//!  the size check runs *before* the guard engages, so by the
 //! time we touch raw mode we already know the terminal is large enough
 //! to use safely.
 //!
 //! This module owns the *mechanics* of that contract. Higher layers
-//! (the runtime in Task 7) own the *ordering* — they call the size
-//! check, construct the guard, install the panic hook (Task 5c), and
+//! (the runtime in ) own the *ordering* — they call the size
+//! check, construct the guard, install the panic hook, and
 //! drive the runtime loop. The guard's job is narrow: turn raw-mode +
 //! alt-screen on at construction, turn them back off exactly once at
 //! teardown, and never panic in the cleanup path.
@@ -22,7 +22,7 @@
 //! abstract them behind [`TerminalBackend`] for two reasons:
 //!
 //! 1. **Testability.** The Drop ordering, the `cleaned` idempotency
-//!    flag, and (in Task 5c) the panic-hook integration are pure
+//!    flag, and (in ) the panic-hook integration are pure
 //!    orchestration logic. A test backend that just records calls
 //!    lets us assert that orchestration is correct without owning a
 //!    real terminal — which is the part most likely to regress.
@@ -33,11 +33,11 @@
 //! The production backend is [`CrosstermBackend`] and is what the
 //! runtime constructs in real use; it is intentionally *not*
 //! unit-tested — its correctness rests on `crossterm`'s own coverage
-//! and the manual-smoke recipe documented for SPEC §13.1.
+//! and the manual-smoke recipe documented for
 //!
-//! # Panic-hook integration (Task 5c)
+//! # Panic-hook integration
 //!
-//! SPEC §7.3 / §13.1 require that a panic mid-loop restore the
+//!  require that a panic mid-loop restore the
 //! terminal *before* the default panic handler prints — otherwise the
 //! panic message lands inside the alternate screen and is wiped out
 //! the instant the process exits, leaving the operator with both a
@@ -53,9 +53,9 @@
 //!   hook is set exactly once even if multiple guards are constructed
 //!   over a process's lifetime (e.g. a test binary that constructs
 //!   several).
-//! - [`arm_panic_hook`] / [`disarm_panic_hook`] toggle whether the
+//! - [`arm_panic_hook`] [`disarm_panic_hook`] toggle whether the
 //!   hook actually runs restoration. The guard arms on construction
-//!   (production path only) and disarms on `cleanup()` / Drop, so a
+//!   (production path only) and disarms on `cleanup` Drop, so a
 //!   panic *outside* a TUI session is left to the default hook.
 //! - [`is_panic_hook_armed`] is exposed mainly for tests asserting
 //!   the arm/disarm contract.
@@ -78,12 +78,12 @@ use crossterm::{
 /// Function-pointer signature for the restoration callback the panic
 /// hook invokes when armed.
 ///
-/// We require a `fn()` (not a closure) on purpose: function pointers
+/// We require a `fn` (not a closure) on purpose: function pointers
 /// are `Copy + Send + Sync` and so live inside a `Mutex<Option<_>>`
-/// without any `Box<dyn ...>` ceremony, and they keep the hook path
-/// — which runs while the runtime is already mid-collapse —
+/// without any `Box<dyn...>` ceremony, and they keep the hook path
+/// — which runs while the runtime is already mid-collapse
 /// allocation-free. The production restorer (`default_panic_restore`)
-/// is the only `fn()` the runtime registers; tests register their own
+/// is the only `fn` the runtime registers; tests register their own
 /// to assert the arm/disarm contract without touching a real
 /// terminal.
 pub type PanicRestoreFn = fn();
@@ -124,7 +124,7 @@ static PANIC_RESTORE_FN: Mutex<Option<PanicRestoreFn>> = Mutex::new(None);
 /// armed the hook).
 ///
 /// Call before constructing the guard so the hook is in place even
-/// if `enter()` itself triggers a panic (rare, but the cost of being
+/// if `enter` itself triggers a panic (rare, but the cost of being
 /// defensive here is one `Once` check).
 pub fn install_panic_hook() {
     install_panic_hook_with(default_panic_restore);
@@ -176,7 +176,7 @@ pub fn arm_panic_hook() {
 ///
 /// Called by [`TerminalGuard::cleanup`] and [`TerminalGuard`]'s Drop
 /// impl. After disarming, a subsequent panic runs the chained
-/// previous hook without first invoking the restorer — correct,
+/// previous hook without first invoking the restorer — correct.
 /// because by definition the terminal is no longer in raw mode.
 pub fn disarm_panic_hook() {
     PANIC_HOOK_ARMED.store(false, Ordering::SeqCst);
@@ -194,12 +194,12 @@ pub fn is_panic_hook_armed() -> bool {
 /// down the test binary).
 ///
 /// Performs an atomic disarm (`swap`) so a re-entrant panic during
-/// the restorer cannot run restoration twice — once is the contract,
+/// the restorer cannot run restoration twice — once is the contract.
 /// twice on an already-restored terminal is the regression we are
 /// guarding against.
 pub(crate) fn run_panic_restoration() {
     if PANIC_HOOK_ARMED.swap(false, Ordering::SeqCst) {
-        // Copy the function pointer out before releasing the lock —
+        // Copy the function pointer out before releasing the lock
         // we do not want to hold the mutex across the call, both for
         // panic-during-panic safety and because the production
         // restorer touches stdout which can in pathological cases
@@ -235,7 +235,7 @@ fn default_panic_restore() {
 /// Both variants wrap the underlying [`io::Error`] from `crossterm`.
 /// The two-variant split (rather than a single `Io(io::Error)`) is
 /// intentional: callers handling setup failure typically want to
-/// surface a clear-error message *before* anything has been changed,
+/// surface a clear-error message *before* anything has been changed.
 /// while teardown failures happen during cleanup paths where the only
 /// reasonable response is to log and move on (we are usually already
 /// exiting). Distinguishing them up front keeps both call sites
@@ -244,10 +244,10 @@ fn default_panic_restore() {
 pub enum TerminalError {
     /// Raw mode + alternate screen could not be entered.
     ///
-    /// In practice this means the process is not attached to a TTY,
+    /// In practice this means the process is not attached to a TTY.
     /// or the controlling terminal does not support the requested
     /// mode. The runtime should surface this as a controlled error
-    /// per SPEC §7.3 and exit non-zero — no terminal state has been
+    ///  and exit non-zero — no terminal state has been
     /// changed, so no restoration is required.
     #[error("failed to enter raw mode + alternate screen: {0}")]
     Setup(#[source] io::Error),
@@ -276,7 +276,7 @@ pub trait TerminalBackend {
     ///
     /// Called exactly once, when [`TerminalGuard::new`] succeeds.
     /// Implementations MUST leave the terminal in a "ready for the
-    /// runtime loop" state on `Ok(())` and MUST NOT have changed any
+    /// runtime loop" state on `Ok` and MUST NOT have changed any
     /// terminal state on `Err(...)` (so the caller can surface the
     /// error without first restoring).
     fn enter(&mut self) -> Result<(), TerminalError>;
@@ -285,8 +285,8 @@ pub trait TerminalBackend {
     ///
     /// Called exactly once per successful `enter`, whether through
     /// [`TerminalGuard`]'s Drop impl (the safety net) or — once Task
-    /// 5b lands — an explicit `cleanup()`. Implementations MUST
-    /// attempt every restoration step even if an earlier step fails,
+    /// 5b lands — an explicit `cleanup`. Implementations MUST
+    /// attempt every restoration step even if an earlier step fails.
     /// returning the *first* error observed. Skipping later steps on
     /// the first failure is the path that historically leaves users
     /// staring at a borked shell.
@@ -363,25 +363,25 @@ impl TerminalBackend for CrosstermBackend {
 
 /// Owner of the terminal-mode lifecycle.
 ///
-/// Construct one with [`TerminalGuard::new`] *after* the SPEC §7.1
+/// Construct one with [`TerminalGuard::new`] *after* the
 /// minimum-size check has passed. While the guard is alive the
 /// terminal is in raw mode + alt screen. When it is dropped the
 /// terminal is restored — exactly once, even if Drop runs after an
-/// explicit cleanup (Task 5b) or alongside the panic hook (Task 5c).
+/// explicit cleanup or alongside the panic hook.
 ///
 /// The guard is intentionally `!Send + !Sync` in spirit — there is
 /// one terminal per process and the runtime owns it on a single
 /// thread. We do not impl those traits explicitly because `Stdout`
 /// is already `Send`, but constructing more than one guard at a
 /// time is a logic error the caller is responsible for avoiding;
-/// SPEC §7.1 ordering puts that responsibility on the runtime.
+///  ordering puts that responsibility on the runtime.
 pub struct TerminalGuard<B: TerminalBackend = CrosstermBackend> {
     backend: B,
     /// `true` once the restoration sequence has run successfully.
     ///
-    /// Drop checks this flag and skips `leave` if it is already set,
-    /// so an explicit `cleanup()` (Task 5b) followed by Drop will
-    /// only restore once. For Task 5a the flag has one observable
+    /// Drop checks this flag and skips `leave` if it is already set.
+    /// so an explicit `cleanup` followed by Drop will
+    /// only restore once. For the flag has one observable
     /// consumer — the Drop impl — but it is part of the public
     /// invariant and gets exercised by 5b/5c, hence the early seat.
     cleaned: bool,
@@ -391,17 +391,17 @@ impl TerminalGuard<CrosstermBackend> {
     /// Construct a guard backed by the real `crossterm` adapter.
     ///
     /// This is the production constructor — the runtime wires it up
-    /// in the SPEC §7.1 startup sequence. Tests prefer
+    /// in the startup sequence. Tests prefer
     /// [`TerminalGuard::with_backend`] so they can assert the
     /// orchestration without a TTY.
     ///
     /// Returns `Err(TerminalError::Setup)` if raw mode or the
     /// alternate screen could not be entered; the terminal is left
     /// untouched in that case so the caller can surface a clear
-    /// error per SPEC §7.3.
+    /// error
     pub fn new() -> Result<Self, TerminalError> {
-        // Install the panic hook *before* attempting `enter()`. If
-        // `enter()` itself panics (vanishingly rare — it would mean
+        // Install the panic hook *before* attempting `enter`. If
+        // `enter` itself panics (vanishingly rare — it would mean
         // crossterm panicked rather than returning Err) we still want
         // restoration to fire. Arming happens after the guard is
         // built so a setup failure leaves the hook un-armed.
@@ -417,7 +417,7 @@ impl<B: TerminalBackend> TerminalGuard<B> {
     ///
     /// Primarily a test seam: pair this with a recording backend to
     /// assert that `enter` runs exactly once, that Drop calls `leave`
-    /// exactly once, and (in 5b) that an explicit `cleanup()`
+    /// exactly once, and (in 5b) that an explicit `cleanup`
     /// followed by Drop does not double-restore.
     pub fn with_backend(mut backend: B) -> Result<Self, TerminalError> {
         backend.enter()?;
@@ -432,15 +432,15 @@ impl<B: TerminalBackend> TerminalGuard<B> {
     /// Exposed for tests; the runtime never needs to ask. The bool
     /// is the canonical signal that this guard is "spent" — Drop
     /// uses it to make itself a no-op after an explicit cleanup
-    /// (Task 5b) or after the panic hook has already restored
-    /// (Task 5c).
+    ///  or after the panic hook has already restored
+    /// .
     pub fn is_cleaned(&self) -> bool {
         self.cleaned
     }
 
     /// Explicitly restore the terminal *now* and mark the guard spent.
     ///
-    /// The motivating use case is SPEC §7.3's "controlled error" path:
+    /// The motivating use case is 's "controlled error" path:
     /// the runtime hits a recoverable failure inside the loop and
     /// wants to restore the terminal *before* printing the error
     /// message — otherwise the message lands inside the alternate
@@ -457,7 +457,7 @@ impl<B: TerminalBackend> TerminalGuard<B> {
     /// log it. By the time the error fires the terminal is in an
     /// undefined state and there is no useful recovery beyond
     /// reporting it; the runtime's response should be to log via the
-    /// file appender (SPEC §13.2 — never stdout while we may have
+    /// file appender ( — never stdout while we may have
     /// been in raw mode) and exit.
     pub fn cleanup(&mut self) -> Result<(), TerminalError> {
         if self.cleaned {
@@ -487,7 +487,7 @@ impl<B: TerminalBackend> Drop for TerminalGuard<B> {
         // already restored corrupts state on some hosts. The flag
         // is the one source of truth for "guard is spent."
         if self.cleaned {
-            // Even if `leave` already ran (via `cleanup()` or the
+            // Even if `leave` already ran (via `cleanup` or the
             // panic hook), the armed flag may still be set if the
             // guard skipped its disarm path — defend in depth.
             disarm_panic_hook();
@@ -497,7 +497,7 @@ impl<B: TerminalBackend> Drop for TerminalGuard<B> {
         // gets here. We deliberately discard the error — there is no
         // Result to thread out of Drop, and by definition we are on
         // the way out. The guard's Setup-vs-Teardown error split
-        // exists so explicit `cleanup()` callers in Task 5b can
+        // exists so explicit `cleanup` callers in can
         // observe teardown failures; Drop just does its best.
         let _ = self.backend.leave();
         self.cleaned = true;
@@ -510,8 +510,8 @@ impl<B: TerminalBackend> Drop for TerminalGuard<B> {
 /// soon-to-fail operation.
 ///
 /// Kept here, alongside the guard, because it operates on the same
-/// stdout handle the production backend uses. Logging — per SPEC
-/// §13.2 — must not target stdout while the guard is engaged; this
+/// stdout handle the production backend uses. Logging — per
+///  — must not target stdout while the guard is engaged; this
 /// helper is for *terminal escape sequences* the runtime layer has
 /// already buffered, not for diagnostics.
 pub fn flush_stdout() -> io::Result<()> {
@@ -578,7 +578,7 @@ mod tests {
 
     #[test]
     fn drop_runs_on_early_return() {
-        // Simulates the SPEC §7.3 "controlled error" path: a function
+        // Simulates the "controlled error" path: a function
         // owns the guard, hits an early `?`, and Drop must still
         // restore the terminal. We exercise this by constructing the
         // guard inside a closure that returns Err early.
@@ -634,14 +634,14 @@ mod tests {
 
     #[test]
     fn manual_clean_flag_skips_leave_in_drop() {
-        // Pre-condition for Task 5b: setting `cleaned` from outside
-        // (which `cleanup()` will do) must turn Drop into a no-op so
+        // Pre-condition for: setting `cleaned` from outside
+        // (which `cleanup` will do) must turn Drop into a no-op so
         // the restoration runs exactly once.
         let backend = RecordingBackend::default();
         let log = backend.log.clone();
         {
             let mut guard = TerminalGuard::with_backend(backend).expect("setup ok");
-            // Stand-in for Task 5b's `cleanup()`.
+            // Stand-in for 's `cleanup`.
             guard.backend.leave().expect("manual leave ok");
             guard.cleaned = true;
         }
@@ -651,7 +651,7 @@ mod tests {
 
     #[test]
     fn explicit_cleanup_then_drop_runs_leave_exactly_once() {
-        // SPEC §7.3 controlled-error path: the runtime restores the
+        //  controlled-error path: the runtime restores the
         // terminal *before* printing the error, then the guard is
         // dropped on the way out. Drop must observe `cleaned = true`
         // and skip its own `leave` call.
@@ -668,7 +668,7 @@ mod tests {
     #[test]
     fn drop_without_explicit_cleanup_still_restores() {
         // The dual of the previous test: callers who never reach
-        // `cleanup()` (panic mid-loop, normal Quit path before 5c
+        // `cleanup` (panic mid-loop, normal Quit path before 5c
         // lands, etc.) must still get a one-shot Drop teardown.
         let backend = RecordingBackend::default();
         let log = backend.log.clone();
@@ -695,7 +695,7 @@ mod tests {
 
     #[test]
     fn cleanup_surfaces_teardown_error_and_marks_spent() {
-        // Failed teardown is observable through `cleanup()` — that is
+        // Failed teardown is observable through `cleanup` — that is
         // its whole reason for existing on top of Drop. The guard
         // still ends up marked spent so a subsequent Drop will not
         // re-attempt teardown on a half-restored terminal.
@@ -714,10 +714,10 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // Panic hook tests (Task 5c)
+    // Panic hook tests
     //
     // These touch process-global state (the armed flag and the
-    // registered restorer). Cargo runs tests in parallel by default,
+    // registered restorer). Cargo runs tests in parallel by default.
     // so we serialize the panic-hook tests behind a single mutex.
     // The mutex is `'static` and recovered from poisoning because a
     // failed assertion in one test must not block the rest.
@@ -870,7 +870,7 @@ mod tests {
     #[test]
     fn crossterm_backend_constructs() {
         // Smoke check: constructing the production backend must not
-        // touch the terminal. (`enter()` would; `new()` only
+        // touch the terminal. (`enter` would; `new` only
         // captures the stdout handle.)
         let _ = CrosstermBackend::new();
         let _ = CrosstermBackend::default();

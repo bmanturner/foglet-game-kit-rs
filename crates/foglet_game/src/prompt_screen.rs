@@ -1,12 +1,12 @@
 //! `PromptScreen<T>` — optional [`Screen`] adapter that renders a
 //! [`ChoicePrompt`] and routes its [`PromptAction`] outcomes back to the
-//! runtime as [`ScreenCommand`] values (SPEC_v1_1.md §4 + §5.5).
+//! runtime as [`ScreenCommand`] values (.md ).
 //!
 //! # When to reach for this
 //!
-//! Use `PromptScreen` when the screen is *just* a prompt: a loot drawer,
+//! Use `PromptScreen` when the screen is *just* a prompt: a loot drawer.
 //! a yes/no confirmation, an "are you sure" gate, an any-key pause, the
-//! Murder Motel night-clerk vendor (Task 11). The adapter wires the
+//! Murder Motel night-clerk vendor. The adapter wires the
 //! standard prompt loop — direct-key match, navigation movement, render
 //! into the full frame — so authors don't have to repeat the boilerplate
 //! every time.
@@ -30,16 +30,16 @@
 //! `requires`-gated branches — reach for the sibling adapter
 //! [`crate::dialog_screen::DialogScreen`] instead. `PromptScreen<T>`
 //! handles a single [`ChoicePrompt`]; `DialogScreen` walks a whole
-//! [`crate::dialog::Dialog`] / [`crate::dialog::DialogState`] pair and
+//! [`crate::dialog::Dialog`] [`crate::dialog::DialogState`] pair and
 //! manages flag-gated choice filtering. The two adapters are
-//! deliberately shaped the same way (boxed `FnMut` callback,
-//! `Modal`/`Compact` layout enum, builder-style `modal()` / `compact()`
+//! deliberately shaped the same way (boxed `FnMut` callback.
+//! `Modal`/`Compact` layout enum, builder-style `modal` `compact`
 //! methods) so authors can move between them without re-learning the
-//! ergonomics — see SPEC_v2_1.md §4.2 for the design symmetry.
+//! ergonomics — see.md for the design symmetry.
 //!
 //! # Why a callback, not a return-value-only design
 //!
-//! [`ScreenCommand`] is the SPEC §5.5 vocabulary the runtime understands;
+//! [`ScreenCommand`] is the vocabulary the runtime understands;
 //! [`PromptAction`] is the prompt's narrower vocabulary. The mapping
 //! between them is game-specific (one game's `Selected(LeaveDrawer)`
 //! becomes `Pop`; another's becomes `Replace`), so the adapter must
@@ -56,8 +56,8 @@ use crate::screen::{GameContext, Screen, ScreenCommand};
 /// Layout mode for [`PromptScreen`] rendering.
 ///
 /// Mirrors the two render entry points on [`ChoicePrompt`]:
-/// [`ChoicePrompt::render`] for the SPEC §4.3 compact unboxed shape, and
-/// [`ChoicePrompt::render_modal`] for the SPEC §4.8 bordered modal. The
+/// [`ChoicePrompt::render`] for the compact unboxed shape, and
+/// [`ChoicePrompt::render_modal`] for the bordered modal. The
 /// adapter keeps both available rather than picking one because real
 /// games mix them — title-screen menus tend to be compact, mid-game
 /// confirmations tend to be modal.
@@ -68,10 +68,10 @@ use crate::screen::{GameContext, Screen, ScreenCommand};
 /// surrounding code spells "modal" vs "compact".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PromptLayout {
-    /// SPEC §4.3 compact unboxed layout: no border, body and choices
+    ///  compact unboxed layout: no border, body and choices
     /// flow top-down inside the frame area. Default for `PromptScreen`.
     Compact,
-    /// SPEC §4.8 bordered modal layout: a [`ratatui::widgets::Block`]
+    ///  bordered modal layout: a [`ratatui::widgets::Block`]
     /// frame with the prompt title in the top border and the prompt
     /// content rendered into the inner rect.
     Modal,
@@ -89,7 +89,7 @@ type ActionCallback<T> = Box<dyn FnMut(PromptAction<T>) -> ScreenCommand + 'stat
 /// # Lifecycle
 ///
 /// 1. `render` paints the prompt into the frame using the configured
-///    [`PromptLayout`]. The prompt owns its own state (cursor, body,
+///    [`PromptLayout`]. The prompt owns its own state (cursor, body.
 ///    choices), so `render` is read-only with respect to the screen's
 ///    own fields beyond updating the buffer.
 /// 2. `handle_input` first asks the prompt to consume navigation keys
@@ -145,15 +145,15 @@ impl<T: Clone + 'static> PromptScreen<T> {
         }
     }
 
-    /// Switch the layout to [`PromptLayout::Modal`] (SPEC §4.8 bordered
+    /// Switch the layout to [`PromptLayout::Modal`] ( bordered
     /// modal). Builder-style so the call site reads
-    /// `PromptScreen::new(...).modal()` for the common confirmation case.
+    /// `PromptScreen::new(...).modal` for the common confirmation case.
     pub fn modal(mut self) -> Self {
         self.layout = PromptLayout::Modal;
         self
     }
 
-    /// Switch the layout to [`PromptLayout::Compact`] (SPEC §4.3). The
+    /// Switch the layout to [`PromptLayout::Compact`]. The
     /// adapter starts in compact mode so this method exists primarily
     /// for symmetry with [`PromptScreen::modal`] and for explicit
     /// callers that want to spell out their layout choice.
@@ -211,7 +211,7 @@ impl<T: Clone + 'static> Screen for PromptScreen<T> {
             return ScreenCommand::None;
         }
         let action = self.prompt.handle(input);
-        // Callback drives the SPEC §5.5 mapping. We never inspect
+        // Callback drives the mapping. We never inspect
         // `action` past handing it over: the game owns the policy of
         // "Pop on Selected? Replace on Cancelled? Message on Disabled?"
         // and the adapter exists precisely so it can.
@@ -358,7 +358,7 @@ mod tests {
 
     #[test]
     fn handle_input_uppercase_hotkey_matches_lowercase_choice() {
-        // SPEC §4.1 case-insensitive direct keys: pressing `K` must hit
+        //  case-insensitive direct keys: pressing `K` must hit
         // the same choice the lowercase `k` would. The adapter doesn't
         // do any case work itself; this test pins that we haven't
         // accidentally lost normalization in the routing path.
@@ -452,7 +452,7 @@ mod tests {
     }
 
     /// Minimal in-memory event source mimicking the runtime loop's
-    /// `poll → handle_input` cadence without any terminal I/O. SPEC §13
+    /// `poll → handle_input` cadence without any terminal I/O.
     /// requires runtime tests stay off the live TUI; a `VecDeque` of
     /// `Input` values is the simplest "fake event source" that still
     /// exercises the same code path the production loop uses (one
@@ -480,7 +480,7 @@ mod tests {
         // sequence (an ignored `Resize`, a navigation `Down` on a
         // navigable prompt, a final lowercase hotkey) and assert both
         // the captured `PromptAction`s *and* the `ScreenCommand`
-        // emitted at each step. This is the contract Task 7b is meant
+        // emitted at each step. This is the contract is meant
         // to lock in: a fake event source can drive `PromptScreen`
         // through `Screen::handle_input` and observe the same outcomes
         // the real runtime would.
@@ -540,7 +540,7 @@ mod tests {
     fn fake_event_source_routes_cancellation_through_screen_command() {
         // Pairs with the test above: a fake source can also drive the
         // cancellation arm to a `ScreenCommand`. Using `Esc` here is
-        // the canonical "back out of the prompt" gesture (SPEC §4.4).
+        // the canonical "back out of the prompt" gesture.
         let mut screen = PromptScreen::new(drawer_prompt(), |action| match action {
             PromptAction::Cancelled => ScreenCommand::Pop,
             _ => ScreenCommand::None,

@@ -1,4 +1,4 @@
-//! `world_ticks` — durable scheduled-task schema (SPEC_v4 Task 9a).
+//! `world_ticks` — durable scheduled-task schema.
 //!
 //! The table declared here defines when periodic game logic should run.
 //! The module intentionally remains schema-only in this task so later
@@ -18,7 +18,7 @@
 //! - In a **space exploration** game, tasks can be used to refresh
 //!   docking manifests, rebalance station supply lines, or trigger
 //!   station events.
-//! - In a **dungeon crawler**, tasks can restock room hazards,
+//! - In a **dungeon crawler**, tasks can restock room hazards.
 //!   reset timed puzzle state, or run patrol-wave churn.
 
 use thiserror::Error;
@@ -123,7 +123,7 @@ impl WorldDb {
     /// - on first call, the row is inserted;
     /// - on repeated registration with the same key and interval, the existing
     ///   row is left as-is;
-    /// - on repeated registration with the same key and a different interval,
+    /// - on repeated registration with the same key and a different interval.
     ///   the cadence is updated so one source of truth remains.
     ///
     /// The callback argument is stored on this `WorldDb` handle during
@@ -219,7 +219,7 @@ impl WorldDb {
     /// path. Keep callback SQL idempotent (or protected by application-level
     /// version checks) so retries and concurrent invocations remain safe.
     ///
-    /// **Call-site guidance (SPEC_v4 Task 11c):** do not invoke this from
+    /// **Call-site guidance:** do not invoke this from
     /// paint/render loops. Run it from login boundaries or explicit
     /// screen transitions so callback latency is paid at game-state
     /// boundaries instead of frame time.
@@ -332,7 +332,7 @@ fn row_to_world_tick_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorldTick
     })
 }
 
-/// Migration for the `world_tick_tasks` table (SPEC_v4 Task 9a).
+/// Migration for the `world_tick_tasks` table.
 ///
 /// The table stores durable, game-authored tick definitions:
 ///
@@ -371,7 +371,7 @@ mod tests {
     use rusqlite::params;
     use tempfile::tempdir;
 
-    /// Task 9b registration helper accepts fresh definitions and rounds them
+    ///  registration helper accepts fresh definitions and rounds them
     /// through a typed row so callers can reuse the returned data for scheduling
     /// decisions.
     #[test]
@@ -404,7 +404,7 @@ mod tests {
         assert_eq!(persisted, 1, "one row should be persisted per key");
     }
 
-    /// Task 9b requires idempotent registration when the same task key and
+    ///  requires idempotent registration when the same task key and
     /// interval are re-applied at startup.
     #[test]
     fn register_tick_is_idempotent_for_same_key_and_interval() {
@@ -450,7 +450,7 @@ mod tests {
         assert_eq!(persisted, second);
     }
 
-    /// Task 9b rejects invalid cadence values before touching SQLite and keeps
+    ///  rejects invalid cadence values before touching SQLite and keeps
     /// the registration table unchanged.
     #[test]
     fn register_tick_rejects_non_positive_interval() {
@@ -483,7 +483,7 @@ mod tests {
         assert_eq!(count, 0, "invalid interval should not write rows");
     }
 
-    /// Task 9c runs only ticks whose cadence is due at `now` and skips
+    ///  runs only ticks whose cadence is due at `now` and skips
     /// rows that are still waiting for their next window.
     #[test]
     fn run_due_ticks_executes_only_due_tasks() {
@@ -564,7 +564,7 @@ mod tests {
         );
     }
 
-    /// Task 9d requires failed callbacks to execute atomically with their row
+    ///  requires failed callbacks to execute atomically with their row
     /// updates and be retriable on the next `run_due_ticks` invocation.
     #[test]
     fn run_due_ticks_retries_failed_callback_without_advancing_last_run_at() {
@@ -675,7 +675,7 @@ mod tests {
         );
     }
 
-    /// Task 9a accepts that the migration creates the documented schema.
+    ///  accepts that the migration creates the documented schema.
     #[test]
     fn applies_world_tick_tasks_migration_with_documented_columns() {
         let dir = tempdir().expect("tempdir creates");
@@ -714,7 +714,7 @@ mod tests {
                 ("interval_seconds".to_string(), 1, 0, "INTEGER".to_string()),
                 ("metadata_json".to_string(), 0, 0, "TEXT".to_string()),
             ],
-            "world_tick_tasks schema must match Task 9a contract"
+            "world_tick_tasks schema must match contract"
         );
 
         let sql: String = world
@@ -731,7 +731,7 @@ mod tests {
         );
     }
 
-    /// Task 9e enforces the due-task ceiling on each call so a
+    ///  enforces the due-task ceiling on each call so a
     /// large backlog is chunked across invocations.
     #[test]
     fn run_due_ticks_limits_due_tasks_to_max_catchup_per_call() {
@@ -780,7 +780,7 @@ mod tests {
         );
     }
 
-    /// Task 9f requires concurrent runners to claim and run disjoint
+    ///  requires concurrent runners to claim and run disjoint
     /// due-task sets so no task is executed twice.
     #[test]
     fn run_due_ticks_concurrent_runners_do_not_double_invoke_tasks() {

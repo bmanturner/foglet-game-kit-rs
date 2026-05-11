@@ -1,4 +1,4 @@
-//! `world_db` — shared-world SQLite handle (SPEC_v2 §Task 3).
+//! `world_db` — shared-world SQLite handle.
 //!
 //! This module owns the lifetime of the per-door SQLite database that
 //! powers v2's shared-world features (player registry, daily turn
@@ -9,9 +9,9 @@
 //!
 //! # What lands here, and when
 //!
-//! Task 4a (this commit) extends the open path to bootstrap the
-//! `world_migrations` bookkeeping table. The table itself is empty —
-//! Task 4b records the first row and Task 4c hardens idempotency around
+//!  (this commit) extends the open path to bootstrap the
+//! `world_migrations` bookkeeping table. The table itself is empty
+//!  records the first row and hardens idempotency around
 //! repeat applications.
 //!
 //! Keeping each behavior in its own iteration means the test that
@@ -30,10 +30,10 @@
 //!    Wrapping the connection lets later tasks (3c–3d) tighten the
 //!    open path without touching every call site.
 //! 2. **Error funnelling.** A `thiserror`-derived [`WorldDbError`] at
-//!    the boundary lets the runtime layer (Task 10) decide whether a
+//!    the boundary lets the runtime layer decide whether a
 //!    DB-open failure is a clean-error abort or a fatal panic without
 //!    every caller pattern-matching `rusqlite::Error` variants.
-//! 3. **Testability.** The Task 4+ migration helpers and Task 9
+//! 3. **Testability.** The + migration helpers and
 //!    transaction wrapper hang off this type. Putting the constructor
 //!    behind `WorldDb::open` means tests in those tasks build on the
 //!    same surface authors use in production.
@@ -53,10 +53,10 @@ use thiserror::Error;
 /// [`crate::config::WorldSection`] via [`From`] (below) so a `[world]`
 /// TOML edit propagates without code changes.
 ///
-/// `Default` matches the SPEC v2 §5 documented defaults — 5 seconds of
+/// `Default` matches the documented defaults — 5 seconds of
 /// retry and WAL journaling — so unit tests and ad-hoc callers
-/// (Task 4 migration tests, for example) can spell
-/// `WorldDbOptions::default()` without rediscovering the SPEC's
+/// ( migration tests, for example) can spell
+/// `WorldDbOptions::default` without rediscovering the 's
 /// numbers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorldDbOptions {
@@ -65,7 +65,7 @@ pub struct WorldDbOptions {
     /// `sqlite3_busy_timeout(ms)` via [`Connection::busy_timeout`].
     ///
     /// `0` disables the busy handler entirely (immediate `BUSY`
-    /// errors). v2 ships a non-zero default because contention is
+    /// errors). ships a non-zero default because contention is
     /// expected: a local-dev session running two Murder Motel
     /// instances against the same SQLite file would otherwise see
     /// spurious lock errors on the second writer.
@@ -134,21 +134,21 @@ impl From<&crate::config::WorldSection> for WorldDbOptions {
 ///
 /// One handle per running door process. Authoring code receives this
 /// (eventually wrapped in `Option`) on [`crate::screen::GameContext`]
-/// in Task 10; until then it stands alone so the open/bootstrap path
+/// in ; until then it stands alone so the open/bootstrap path
 /// can be exercised in isolation.
 ///
 /// The handle is **not** `Clone`: SQLite connections are not safe to
-/// share across threads, and v2 explicitly defers real-time
-/// multiplayer (SPEC §3.2). A single owner per door process is the
+/// share across threads, and explicitly defers real-time
+/// multiplayer. A single owner per door process is the
 /// shape every later task assumes.
 pub struct WorldDb {
     /// Underlying `rusqlite` connection. Kept private so future tasks
-    /// (Task 9 transactions, Task 4 migrations) can layer behavior on
+    /// ( transactions, migrations) can layer behavior on
     /// top without breaking callers that grabbed `&mut conn` directly.
     conn: Connection,
     /// Journal mode SQLite reported as active after the open-time
     /// `PRAGMA journal_mode = X` round-trip. Stored so callers (and
-    /// the Task 14 docs) can distinguish "WAL applied" from "WAL
+    /// the docs) can distinguish "WAL applied" from "WAL
     /// requested but the host downgraded to delete" — SQLite signals a
     /// downgrade by returning the old mode rather than raising an
     /// error, so the only way to know is to read what came back.
@@ -174,16 +174,16 @@ impl WorldDb {
     /// does not yet exist.
     ///
     /// Errors are mapped onto [`WorldDbError`] so the runtime layer
-    /// can surface a SPEC §13.1 clean-error message ("could not open
+    /// can surface a clean-error message ("could not open
     /// world database at /srv/foglet/doors/.../world/world.sqlite")
     /// without callers having to match on `rusqlite::Error` directly.
     ///
-    /// # Parent directory handling (Task 3b)
+    /// # Parent directory handling
     ///
     /// If the immediate or any ancestor parent directory of `path`
     /// does not yet exist, [`open`](Self::open) creates the chain via
     /// `fs::create_dir_all` *before* asking SQLite to open the file.
-    /// This matches SPEC §10.4's packaging contract: a fresh install
+    /// This matches 's packaging contract: a fresh install
     /// includes only `world/.keep` (later tasks), and authors should
     /// be able to point at `world/world.sqlite` without an explicit
     /// `mkdir -p` step in `run.sh`.
@@ -196,7 +196,7 @@ impl WorldDb {
     /// Equivalent to [`Self::open_with_options`] using
     /// [`WorldDbOptions::default`]. Kept as a convenience because the
     /// majority of unit-test call sites (and the test fixtures that
-    /// land in Task 4+) don't care about the open-time knobs.
+    /// land in +) don't care about the open-time knobs.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, WorldDbError> {
         Self::open_with_options(path, WorldDbOptions::default())
     }
@@ -204,12 +204,12 @@ impl WorldDb {
     /// Open the SQLite database and apply the supplied tunables.
     ///
     /// Honours both [`WorldDbOptions::busy_timeout_ms`] and
-    /// [`WorldDbOptions::journal_mode`] so the runtime layer (Task 10)
+    /// [`WorldDbOptions::journal_mode`] so the runtime layer
     /// only ever calls a single constructor.
     ///
     /// Tunables are applied *after* [`Connection::open`] so a failure
     /// to set a pragma surfaces with the responsible knob named
-    /// (e.g. [`WorldDbError::ApplyBusyTimeout`],
+    /// (e.g. [`WorldDbError::ApplyBusyTimeout`].
     /// [`WorldDbError::ApplyJournalMode`]) rather than masquerading as a
     /// generic open error — operationally these are very different
     /// conditions (the file is fine, the connection just couldn't be
@@ -265,11 +265,11 @@ impl WorldDb {
     /// Journal mode that SQLite reported as active after open.
     ///
     /// Usually equals the requested value (`"wal"` for the default
-    /// config). May differ when SQLite refuses the requested mode —
+    /// config). May differ when SQLite refuses the requested mode
     /// the canonical case is asking for `wal` on a network filesystem
     /// that doesn't support shared-memory mapping; SQLite silently
     /// keeps the prior mode and returns it from the pragma. Callers
-    /// (operator docs, future Task 14 health checks) inspect this to
+    /// (operator docs, future health checks) inspect this to
     /// surface the downgrade rather than assume WAL took effect.
     pub fn journal_mode(&self) -> &str {
         &self.journal_mode
@@ -278,7 +278,7 @@ impl WorldDb {
     /// Borrow the underlying SQLite [`Connection`] for game-authored
     /// reads and writes against tables the *game* owns (i.e. tables
     /// declared by a game-authored [`WorldMigration`] like Murder
-    /// Motel's `motel_world_state`). SPEC_v2 §Task 12 requires games
+    /// Motel's `motel_world_state`). requires games
     /// to query their own schema to back features like "did anyone
     /// open Room 7 yet?", and the existing curated helpers
     /// (`upsert_player`, `append_event`, leaderboards, turns) only
@@ -286,7 +286,7 @@ impl WorldDb {
     /// hatch for the game half.
     ///
     /// **Use only on tables your own migration created.** Touching
-    /// kit-owned tables (`players`, `turn_ledger`, `world_events`,
+    /// kit-owned tables (`players`, `turn_ledger`, `world_events`.
     /// `leaderboard_scores`, `world_migrations`) through this borrow
     /// is unsupported — kit invariants (e.g. partial unique indexes on
     /// `players`, append-only ordering on `world_events`) live inside
@@ -310,11 +310,11 @@ impl WorldDb {
 
     /// Crate-internal mutable accessor to the underlying [`Connection`].
     ///
-    /// Exposed so v3 multiplayer modules whose transactional helpers
+    /// Exposed so multiplayer modules whose transactional helpers
     /// need to surface their own typed errors (e.g.
     /// [`crate::market::WorldDb::buy_listing`]) can open their own
     /// `rusqlite::Transaction` without funneling failures through
-    /// [`WorldDbError`]. Deliberately `pub(crate)` rather than `pub` —
+    /// [`WorldDbError`]. Deliberately `pub(crate)` rather than `pub`
     /// an external caller that grabs `&mut Connection` could re-apply
     /// migrations, smuggle in schema changes, or roll back the
     /// idempotency bookkeeping. In-tree modules already speak the kit
@@ -326,33 +326,33 @@ impl WorldDb {
     /// Apply a single [`WorldMigration`], recording its version in
     /// `world_migrations` on success.
     ///
-    /// Task 4b implemented the happy path; Task 4c (this iteration) layers
+    ///  implemented the happy path; (this iteration) layers
     /// **idempotency** on top: if the migration's `version` is already
     /// recorded in `world_migrations`, the call is a no-op — the SQL body
     /// is *not* re-run and no second row is written. This matches the
-    /// `external_pty` relaunch dance in SPEC §7: every door re-exec walks
+    /// `external_pty` relaunch dance: every door re-exec walks
     /// the same migration list, so any other contract would either
     /// duplicate rows (PK violation today) or re-run mutating SQL on every
     /// startup (data corruption tomorrow).
     ///
     /// Idempotency is keyed on `version` alone, *not* `(version, name)`.
-    /// SPEC §4.3 makes `version` the unique identity of a migration; the
+    ///  makes `version` the unique identity of a migration; the
     /// `name` is operator-facing prose. Authors are free to rename a
     /// migration ("init" → "v1_init") between releases without the runtime
     /// thinking the renamed migration is a new one to apply.
     ///
-    /// Task 4d (this iteration) pins the **"failed migration leaves no
+    ///  (this iteration) pins the **"failed migration leaves no
     /// row"** guarantee with an explicit test. The mechanism that delivers
     /// it is the wrapping `Connection::transaction`: if `execute_batch` or
     /// the bookkeeping `INSERT` returns an error, the early return drops
-    /// `tx` without `commit()`, and `rusqlite::Transaction`'s `Drop` impl
+    /// `tx` without `commit`, and `rusqlite::Transaction`'s `Drop` impl
     /// rolls the transaction back. The bookkeeping row is therefore never
     /// observable to the next `apply_migration` call — the relaunch path
     /// will retry the migration cleanly rather than silently skip a half-
     /// applied version.
     ///
     /// `&mut self` is required because [`Connection::transaction`] needs
-    /// a unique borrow. The runtime layer (Task 10) wraps the world DB
+    /// a unique borrow. The runtime layer wraps the world DB
     /// in `Option<WorldDb>` on `GameContext`, and authoring code reaches
     /// it through a `&mut` borrow scoped to a single screen tick — so
     /// the mutable signature here matches the call shape that's coming.
@@ -411,17 +411,17 @@ impl WorldDb {
     /// Run `f` inside a SQLite transaction, committing on `Ok` and
     /// rolling back on `Err`.
     ///
-    /// This is the SPEC §3.1 "transaction helper for shared-world
-    /// mutations" exposed for sibling modules (Task 9c will compose it
+    /// This is the "transaction helper for shared-world
+    /// mutations" exposed for sibling modules ( will compose it
     /// for the spend-turn + mutate + append-event flow). The closure
     /// receives a borrowed [`rusqlite::Transaction`] so it can issue
     /// any number of statements that all observe-or-don't as a unit.
     ///
     /// # Why a closure rather than handing back a `Transaction`
     ///
-    /// `rusqlite::Transaction` rolls back on `Drop` *unless* `commit()`
+    /// `rusqlite::Transaction` rolls back on `Drop` *unless* `commit`
     /// has been called. Owning it from a higher-level module makes it
-    /// far too easy to forget the commit and silently drop writes —
+    /// far too easy to forget the commit and silently drop writes
     /// the kind of bug that only shows up after a player notices their
     /// turn-spend "didn't take". By inverting the control flow we
     /// guarantee both branches: a clean `Ok` always commits, an `Err`
@@ -432,7 +432,7 @@ impl WorldDb {
     ///
     /// The closure's error channel is the library-wide
     /// [`WorldDbError`]. Sibling modules that already speak `rusqlite`
-    /// errors at the boundary (Task 4 migrations, Task 9c spend-turn
+    /// errors at the boundary ( migrations, spend-turn
     /// helper) can map their own errors into a `WorldDbError` variant;
     /// callers that need to propagate a non-`WorldDbError` failure can
     /// stash it in [`WorldDbError::Transaction`] via the `source`
@@ -442,7 +442,7 @@ impl WorldDb {
     /// # Borrow shape
     ///
     /// `&mut self` is required because [`Connection::transaction`]
-    /// needs a unique borrow; this matches the call shape Task 10
+    /// needs a unique borrow; this matches the call shape
     /// already plans for, where `GameContext` holds the world DB
     /// behind a `&mut` borrow scoped to a single screen tick.
     pub fn transaction<T, F>(&mut self, f: F) -> Result<T, WorldDbError>
@@ -455,7 +455,7 @@ impl WorldDb {
             .map_err(|source| WorldDbError::Transaction { source })?;
 
         // Run the caller's body. On `Err` we return early; `tx` drops
-        // without `commit()`, and `rusqlite::Transaction`'s `Drop` impl
+        // without `commit`, and `rusqlite::Transaction`'s `Drop` impl
         // rolls the SQLite transaction back. This is the only path
         // that exists for closure failures — there is no "commit on
         // error" branch, intentionally.
@@ -468,14 +468,14 @@ impl WorldDb {
     }
 
     /// Spend a turn, run a caller-supplied world mutation, and append
-    /// an event — all inside a single SQLite transaction. SPEC_v2
-    /// §Task 9c.
+    /// an event — all inside a single SQLite transaction.
+    /// .
     ///
-    /// This is the composed primitive Murder Motel (Task 13) and
-    /// future game code reach for when an action consumes a turn,
+    /// This is the composed primitive Murder Motel and
+    /// future game code reach for when an action consumes a turn.
     /// touches game-specific state, and should be visible in the
     /// lobby bulletin. Pulling the three steps into one helper means
-    /// authoring code never has to remember the begin/commit dance,
+    /// authoring code never has to remember the begin/commit dance.
     /// and — critically — the *atomicity* contract is that all three
     /// steps land or none do:
     ///
@@ -483,7 +483,7 @@ impl WorldDb {
     ///   short-circuits with [`crate::turns::TurnError::InsufficientTurns`] before
     ///   the closure or the event insert runs. The transaction rolls
     ///   back on the way out so the lazy `ensure_today_turns_on`
-    ///   row-materialisation is the only work that touched SQLite —
+    ///   row-materialisation is the only work that touched SQLite
     ///   which is exactly the desired post-condition (a player who
     ///   tried to spend with an empty balance sees no event, no
     ///   game-state change, and no balance change beyond the
@@ -501,14 +501,14 @@ impl WorldDb {
     /// # Closure shape
     ///
     /// The closure receives a borrowed [`rusqlite::Transaction`] and
-    /// must return `Result<(), rusqlite::Error>`. Game code typically
+    /// must return `Result<, rusqlite::Error>`. Game code typically
     /// runs one or more `tx.execute(...)` calls writing to its own
     /// game-state tables. Returning `rusqlite::Error` (rather than a
     /// game-specific error) keeps the helper minimal — game code
     /// that needs richer errors can catch them outside this call by
     /// pre-validating, or by mapping inside the closure into
     /// [`rusqlite::Error::SqliteFailure`] with an explanatory message.
-    /// The Task 13 call sites do not need richer errors today; if
+    /// The call sites do not need richer errors today; if
     /// that changes, the closure error type is the obvious knob to
     /// generalise.
     ///
@@ -566,8 +566,8 @@ impl WorldDb {
 
         // Spend first so an `InsufficientTurns` short-circuit avoids
         // running the closure or appending the event. The early
-        // return drops `tx` without `commit()`, and rusqlite's `Drop`
-        // impl rolls back — which is the SPEC §Task 9c "insufficient
+        // return drops `tx` without `commit`, and rusqlite's `Drop`
+        // impl rolls back — which is the "insufficient
         // turns rolls back" guarantee.
         let ledger = crate::turns::spend_turns_on(
             &tx,
@@ -627,11 +627,11 @@ pub struct SpendAndEmitOutcome {
 
 /// Failure modes for [`WorldDb::spend_turn_and_emit`].
 ///
-/// Wraps the three underlying error types — [`crate::turns::TurnError`],
+/// Wraps the three underlying error types — [`crate::turns::TurnError`].
 /// [`crate::events::EventError`], and a `rusqlite::Error` from the
 /// caller's mutation closure — plus a fourth variant for begin/commit
 /// failures from the SQLite layer itself. Callers that only care
-/// "did the action go through" can `.is_err()`; callers that want to
+/// "did the action go through" can `.is_err`; callers that want to
 /// surface "you only have N turns left" specifically can match on
 /// [`SpendAndEmitError::Turn`] and then on
 /// [`crate::turns::TurnError::InsufficientTurns`].
@@ -683,10 +683,10 @@ pub enum SpendAndEmitError {
 
 /// A schema/bootstrap step authored by a game.
 ///
-/// Mirrors SPEC_v2 §4.3: a monotonically increasing `version`, a
+/// Mirrors: a monotonically increasing `version`, a
 /// human-readable `name`, and a SQL `sql` body. The `checksum` field
-/// the SPEC mentions ("if practical") is intentionally deferred —
-/// Task 4b ships embedded SQL migrations only; file-backed migrations
+/// the mentions ("if practical") is intentionally deferred
+///  ships embedded SQL migrations only; file-backed migrations
 /// (and the checksum that goes with them) are a v2-future extension
 /// and would land alongside the public API surface that loads them.
 ///
@@ -697,8 +697,8 @@ pub enum SpendAndEmitError {
 /// if file-backed migrations need them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WorldMigration {
-    /// Monotonically increasing version. SPEC §4.3 requires uniqueness;
-    /// Task 4c (idempotency) and Task 4d (failure handling) layer the
+    /// Monotonically increasing version. requires uniqueness;
+    ///  (idempotency) and (failure handling) layer the
     /// "applied exactly once" rule on top of this.
     pub version: i64,
     /// Short human-readable label echoed back in errors and operator
@@ -747,7 +747,7 @@ fn apply_journal_mode(conn: &Connection, requested: &str) -> Result<String, Worl
 /// in the `world_migrations` bookkeeping table.
 ///
 /// Pulled out of [`WorldDb::apply_migration`] so the idempotency check
-/// (Task 4c) is named and individually testable. Lookup by primary key
+///  is named and individually testable. Lookup by primary key
 /// is an index seek — cheap enough to do unconditionally on every
 /// `apply_migration` call, which is what the relaunch path requires.
 ///
@@ -756,8 +756,8 @@ fn apply_journal_mode(conn: &Connection, requested: &str) -> Result<String, Worl
 /// the migration apply path; the caller doesn't need to special-case
 /// "the pre-check itself blew up".
 fn migration_recorded(conn: &Connection, version: i64) -> Result<bool, WorldDbError> {
-    // `SELECT 1 ... LIMIT 1` over the PK column is the canonical
-    // existence probe in SQLite. We use `query_row` + `optional()` to
+    // `SELECT 1... LIMIT 1` over the PK column is the canonical
+    // existence probe in SQLite. We use `query_row` + `optional` to
     // distinguish "row exists" (`Some`) from "row missing" (`None`)
     // without paying for an extra round-trip.
     use rusqlite::OptionalExtension;
@@ -780,22 +780,22 @@ fn migration_recorded(conn: &Connection, version: i64) -> Result<bool, WorldDbEr
 /// present.
 ///
 /// Called from every successful open path so a fresh database has the
-/// table ready for Task 4b (recording an applied migration) and a
+/// table ready for (recording an applied migration) and a
 /// previously-bootstrapped database is unaffected — `IF NOT EXISTS`
 /// keeps the call idempotent across the relaunches that happen on every
-/// `external_pty` re-exec (SPEC §7).
+/// `external_pty` re-exec.
 ///
-/// The schema is intentionally minimal for Task 4a: later sub-tasks
+/// The schema is intentionally minimal for: later sub-tasks
 /// (4b–4d) populate `name`/`checksum` and write rows. Columns:
 ///
 /// - `version` — `INTEGER PRIMARY KEY` so rows are unique on the
-///   monotonic version contract from SPEC §4.3 and queries that ask
+///   monotonic version contract and queries that ask
 ///   "what's the highest applied version" are an index lookup.
 /// - `name` — human-friendly label echoed back in errors and operator
 ///   tooling. `NOT NULL` because every migration ships with one.
 /// - `checksum` — nullable, populated only for file-backed migrations
-///   per SPEC §4.3 ("if practical").
-/// - `applied_at` — UTC timestamp of when the migration was recorded,
+///    ("if practical").
+/// - `applied_at` — UTC timestamp of when the migration was recorded.
 ///   defaulted to `CURRENT_TIMESTAMP` so callers don't have to thread
 ///   a clock through to bookkeeping inserts.
 fn bootstrap_migrations_table(conn: &Connection) -> Result<(), WorldDbError> {
@@ -817,7 +817,7 @@ fn bootstrap_migrations_table(conn: &Connection) -> Result<(), WorldDbError> {
 /// `anyhow` so end-user output stays a single sentence.
 #[derive(Debug, Error)]
 pub enum WorldDbError {
-    /// `rusqlite::Connection::open` rejected the path. With Task 3b
+    /// `rusqlite::Connection::open` rejected the path. With
     /// the "parent directory does not exist" failure mode is gone, so
     /// hitting this variant typically means the file exists but is
     /// corrupt, locked by another process, or unreadable.
@@ -888,9 +888,9 @@ pub enum WorldDbError {
 
     /// Applying a [`WorldMigration`] failed at any of its phases:
     /// opening the wrapping transaction, executing the SQL body, or
-    /// recording the bookkeeping row in `world_migrations`. Task 4d
+    /// recording the bookkeeping row in `world_migrations`.
     /// hardens the "no row written on failure" guarantee around this
-    /// variant; Task 4b only needs the variant to exist so the open
+    /// variant; only needs the variant to exist so the open
     /// path's error type can carry it.
     #[error("failed to apply world migration v{version} `{name}`: {source}")]
     ApplyMigration {
@@ -909,8 +909,8 @@ pub enum WorldDbError {
     /// `Connection::transaction` or `Transaction::commit` returned an
     /// error from inside [`WorldDb::transaction`]. Distinct from
     /// [`Self::ApplyMigration`] so the operator-facing error names
-    /// "transaction" rather than implying a migration is in flight —
-    /// Task 9c's spend-turn helper, for example, surfaces here when
+    /// "transaction" rather than implying a migration is in flight
+    /// 's spend-turn helper, for example, surfaces here when
     /// the SQLite layer itself rejects begin/commit.
     #[error("world database transaction failed: {source}")]
     Transaction {
@@ -940,7 +940,7 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
-    /// SPEC_v2 §Task 3a acceptance: opening a SQLite file under a
+    ///   acceptance: opening a SQLite file under a
     /// temp dir succeeds and yields a usable handle.
     #[test]
     fn opens_sqlite_under_temp_dir() {
@@ -950,7 +950,7 @@ mod tests {
         let world = WorldDb::open(&db_path).expect("open succeeds under temp dir");
 
         // The file is created on disk so subsequent runs (and the
-        // `external_pty` re-exec dance described in SPEC §7) reuse
+        // `external_pty` re-exec dance described ) reuse
         // the same database rather than starting fresh.
         assert!(
             db_path.exists(),
@@ -960,7 +960,7 @@ mod tests {
         // Smoke-test the handle by issuing the simplest possible
         // statement. We don't care about the result value — only that
         // the connection is live and the wrapper exposes it to
-        // crate-internal callers (Task 4 migrations build on this).
+        // crate-internal callers ( migrations build on this).
         let conn = world.connection();
         let one: i64 = conn
             .query_row("SELECT 1", [], |row| row.get(0))
@@ -968,7 +968,7 @@ mod tests {
         assert_eq!(one, 1);
     }
 
-    /// SPEC_v2 §Task 3c acceptance: the configured busy timeout is
+    ///   acceptance: the configured busy timeout is
     /// actually applied to the SQLite connection. We verify by
     /// querying `PRAGMA busy_timeout`, which echoes back the current
     /// `sqlite3_busy_timeout` value in milliseconds. Reading it
@@ -1002,10 +1002,10 @@ mod tests {
         );
     }
 
-    /// SPEC_v2 §Task 3c follow-up: the convenience [`WorldDb::open`]
+    ///   follow-up: the convenience [`WorldDb::open`]
     /// must still produce a non-zero busy timeout matching
     /// [`WorldDbOptions::default`]. Without this the most common
-    /// caller (Task 4 migration tests, Task 10 runtime startup) would
+    /// caller ( migration tests, runtime startup) would
     /// inherit rusqlite's bare-`Connection::open` default of "no busy
     /// handler" — exactly the brittle behavior 3c exists to prevent.
     #[test]
@@ -1051,7 +1051,7 @@ mod tests {
         assert_eq!(options.journal_mode, "delete");
     }
 
-    /// SPEC_v2 §Task 3d acceptance: the configured journal mode is
+    ///   acceptance: the configured journal mode is
     /// actually applied. Reading `PRAGMA journal_mode` after open
     /// confirms either the requested mode (the WAL happy path) or the
     /// documented fallback. Test files live on the local filesystem
@@ -1071,7 +1071,7 @@ mod tests {
         );
 
         // Round-trip the pragma directly, not just our cached field, to
-        // catch a future regression where `journal_mode()` lies because
+        // catch a future regression where `journal_mode` lies because
         // the open path forgot to issue the pragma.
         let active: String = world
             .connection()
@@ -1149,8 +1149,8 @@ mod tests {
         }
     }
 
-    /// SPEC_v2 §Task 4a acceptance: a freshly-opened world DB has the
-    /// `world_migrations` bookkeeping table in place. Task 4b builds on
+    ///   acceptance: a freshly-opened world DB has the
+    /// `world_migrations` bookkeeping table in place. builds on
     /// this by recording rows; this test only verifies the table exists
     /// and matches the documented column shape so a future regression
     /// renaming a column flunks here rather than in a higher-level test
@@ -1178,7 +1178,7 @@ mod tests {
         assert_eq!(count, 1, "world_migrations table must exist after open");
 
         // Spot-check the columns so a future schema drift (e.g.
-        // dropping `checksum` because Task 4b/4c forgot it was on the
+        // dropping `checksum` because forgot it was on the
         // contract) flunks here. `pragma_table_info` returns one row per
         // column with `name` in column index 1.
         let mut stmt = world
@@ -1204,7 +1204,7 @@ mod tests {
 
     /// Reopening the same DB file must not error or duplicate the
     /// migrations table — `IF NOT EXISTS` is the only thing standing
-    /// between the relaunch path (SPEC §7 `external_pty` re-exec) and a
+    /// between the relaunch path and a
     /// loud `table already exists` failure on every restart.
     #[test]
     fn reopening_existing_db_keeps_migrations_table_idempotent() {
@@ -1231,11 +1231,11 @@ mod tests {
         );
     }
 
-    /// SPEC_v2 §Task 4b acceptance: applying a [`WorldMigration`]
+    ///   acceptance: applying a [`WorldMigration`]
     /// records its version in `world_migrations` and runs the SQL
     /// body. Two assertions, one test: the row is present *and* the
     /// migration's side effect (a created table) is observable. Either
-    /// failing on its own would mean the apply path is half-broken,
+    /// failing on its own would mean the apply path is half-broken.
     /// so the joint assertion catches both regressions in one place.
     #[test]
     fn apply_migration_records_version_and_runs_sql() {
@@ -1281,7 +1281,7 @@ mod tests {
         );
     }
 
-    /// SPEC_v2 §Task 4c acceptance: applying the same migration twice
+    ///   acceptance: applying the same migration twice
     /// records exactly one row and leaves the schema valid.
     ///
     /// The second call deliberately uses a SQL body that *would* fail
@@ -1380,15 +1380,15 @@ mod tests {
         assert_eq!(recorded_name, "init");
     }
 
-    /// SPEC_v2 §Task 4d acceptance: a migration whose SQL body is
+    ///   acceptance: a migration whose SQL body is
     /// rejected by SQLite surfaces as a [`WorldDbError::ApplyMigration`]
     /// **and** leaves no row in `world_migrations`. Without this guard
-    /// the relaunch path (SPEC §7 `external_pty` re-exec) could record a
+    /// the relaunch path could record a
     /// version that never actually ran, then silently skip it on the
     /// next startup — a half-applied migration that no operator tooling
     /// would ever notice.
     ///
-    /// The body is invalid SQL (`NOT_A_KEYWORD ...`) so the parser fails
+    /// The body is invalid SQL (`NOT_A_KEYWORD...`) so the parser fails
     /// before any side effects; pairing the error assertion with a
     /// `world_migrations` count keeps both halves of the guarantee
     /// (loud failure, clean state) in one place.
@@ -1434,7 +1434,7 @@ mod tests {
             "failed migration must leave the bookkeeping table empty"
         );
 
-        // And a subsequent successful apply at the same version works —
+        // And a subsequent successful apply at the same version works
         // proving the rollback didn't leave SQLite in a state that blocks
         // retry. This is the property the relaunch path actually depends
         // on; without it, a transient SQL error would brick the door.
@@ -1456,12 +1456,12 @@ mod tests {
         assert_eq!(row_count_after, 1, "retry must record exactly one row");
     }
 
-    /// SPEC_v2 §Task 9a acceptance: a successful closure inside
+    ///   acceptance: a successful closure inside
     /// [`WorldDb::transaction`] commits — the writes it issued are
     /// observable to the next read. Pairing the inside-the-closure
     /// `INSERT` with an outside-the-closure `SELECT` proves that the
     /// commit hand-off works: a regression that returned the closure's
-    /// `Ok` without actually calling `tx.commit()` would leave the
+    /// `Ok` without actually calling `tx.commit` would leave the
     /// table empty (rusqlite rolls back on `Drop`) and flunk this test.
     #[test]
     fn transaction_commits_writes_on_ok() {
@@ -1488,13 +1488,13 @@ mod tests {
             .expect("transaction body succeeds and commits");
 
         // The closure's `Ok` value is threaded back through the wrapper
-        // unchanged — callers (Task 9c) rely on this to return the new
+        // unchanged — callers rely on this to return the new
         // turn balance, the appended event id, etc.
         assert_eq!(returned, 42, "transaction must return the closure's value");
 
         // The write is visible after the transaction returns. This is
         // the load-bearing assertion for 9a: a wrapper that forgot to
-        // call `tx.commit()` would see zero rows here.
+        // call `tx.commit` would see zero rows here.
         let row_count: i64 = world
             .connection()
             .query_row("SELECT COUNT(*) FROM demo", [], |row| row.get(0))
@@ -1511,13 +1511,13 @@ mod tests {
         assert_eq!(label, "committed");
     }
 
-    /// SPEC_v2 §Task 9b acceptance: a closure that returns `Err`
+    ///   acceptance: a closure that returns `Err`
     /// rolls back. Any writes the closure issued before failing must
     /// not be observable after [`WorldDb::transaction`] returns, and
     /// the wrapper must propagate the original error verbatim.
     ///
     /// This is the load-bearing safety property of the helper: the
-    /// Task 9c spend-turn flow assumes that a failed event-append
+    ///  spend-turn flow assumes that a failed event-append
     /// undoes the turn deduction. A regression where the wrapper
     /// committed-on-error (or even left the transaction dangling so
     /// rusqlite's `Drop` rolled it back *but* the wrapper still
@@ -1567,7 +1567,7 @@ mod tests {
         }
 
         // The write inside the closure must be gone. This is the
-        // assertion that would fail if the wrapper called `commit()`
+        // assertion that would fail if the wrapper called `commit`
         // on the error path.
         let row_count: i64 = world
             .connection()
@@ -1603,15 +1603,15 @@ mod tests {
         );
     }
 
-    /// SPEC_v2 §Task 3b acceptance: a nested `world/world.sqlite`
+    ///   acceptance: a nested `world/world.sqlite`
     /// path whose parent directory does not yet exist is created on
-    /// open rather than rejected. This is the SPEC §10.4 packaging
+    /// open rather than rejected. This is the packaging
     /// shape — a fresh install ships `world/.keep` (later tasks) and
     /// authors should not need an extra `mkdir -p` step.
     #[test]
     fn open_creates_missing_parent_directories() {
         let dir = tempdir().expect("tempdir creates");
-        // Two levels of missing parents to exercise `create_dir_all`,
+        // Two levels of missing parents to exercise `create_dir_all`.
         // not just a single `mkdir`.
         let nested = dir.path().join("world").join("nested").join("world.sqlite");
 
@@ -1636,7 +1636,7 @@ mod tests {
         assert_eq!(one, 1);
     }
 
-    /// SPEC_v2 §Task 9c acceptance: an `InsufficientTurns` rejection
+    ///   acceptance: an `InsufficientTurns` rejection
     /// rolls back both the caller's world mutation and the would-be
     /// event append. The helper composes spend → mutate → append in a
     /// single transaction; if the very first step short-circuits with
@@ -1690,7 +1690,7 @@ mod tests {
             )
             .expect("create motel_world_state");
 
-        // Insert a player so the FK in turn_ledger / world_events
+        // Insert a player so the FK in turn_ledger world_events
         // resolves. We hand-roll the insert rather than route through
         // `upsert_player` because all this test needs is a stable
         // `id` to key the ledger and event rows by.
@@ -1718,7 +1718,7 @@ mod tests {
         // the helper to materialise a fresh row at the configured
         // allowance and then drain it with a second call, but doing
         // it explicitly here keeps the test focused on 9c — it
-        // doesn't transitively depend on Task 6f's seeding behavior
+        // doesn't transitively depend on 's seeding behavior
         // staying constant.
         let today = LocalDate::parse("2026-05-09").expect("valid local date");
         world
@@ -1735,7 +1735,7 @@ mod tests {
 
         // Track whether the closure ran so the assertion can
         // distinguish "closure ran and was rolled back" from "closure
-        // never ran at all" — the SPEC_v2 contract is the *latter*
+        // never ran at all" — the contract is the *latter*
         // (insufficient short-circuits before the closure), but we
         // still assert the table is empty either way to guarantee
         // rollback even if a future refactor reorders the steps.
@@ -1766,7 +1766,7 @@ mod tests {
             },
         );
 
-        // Helper must surface the SPEC_v2 §Task 6e variant unchanged.
+        // Helper must surface the variant unchanged.
         match result {
             Err(SpendAndEmitError::Turn(TurnError::InsufficientTurns {
                 player_id: pid,
@@ -1822,7 +1822,7 @@ mod tests {
             "rejected spend must roll back the closure's writes"
         );
 
-        // No event row landed. SPEC §Task 7c contract: the bulletin
+        // No event row landed. contract: the bulletin
         // must not show events for actions that didn't happen.
         let event_count: i64 = world
             .connection()
@@ -1849,7 +1849,7 @@ mod tests {
 
     /// Companion to the rollback test above: a successful call commits
     /// all three side-effects atomically. Documents the happy path so
-    /// a regression that, say, dropped the `tx.commit()` (and rolled
+    /// a regression that, say, dropped the `tx.commit` (and rolled
     /// back successful spends) would surface here rather than in a
     /// higher-level Murder Motel integration test where the failure
     /// mode is harder to attribute.
@@ -1952,7 +1952,7 @@ mod tests {
     /// `Err` rolls everything back (including the spend), and a
     /// malformed event message fails before the transaction even
     /// begins. Combined with the rollback test above, these three
-    /// cases pin the SPEC_v2 §Task 9c contract: the helper either
+    /// cases pin the contract: the helper either
     /// commits all three side-effects, or none of them.
     #[test]
     fn spend_turn_and_emit_rolls_back_on_mutation_failure() {
@@ -2020,7 +2020,7 @@ mod tests {
             other => panic!("expected Mutation error, got {other:?}"),
         }
 
-        // Spend was rolled back: today's ledger row never persisted,
+        // Spend was rolled back: today's ledger row never persisted.
         // so the table is empty. (The lazy ensure-row insert that
         // ran inside the transaction is rolled back too.)
         let ledger_count: i64 = world

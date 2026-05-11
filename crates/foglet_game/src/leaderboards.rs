@@ -1,13 +1,13 @@
-//! `leaderboards` — shared-world named score tables (SPEC_v2 §Task 8).
+//! `leaderboards` — shared-world named score tables.
 //!
-//! Task 8a shipped the `leaderboard_scores` migration. Subsequent
+//!  shipped the `leaderboard_scores` migration. Subsequent
 //! sub-tasks layer behavior on top of the schema introduced here:
 //!
 //! - 8b adds [`WorldDb::set_score`] for upserting one
 //!   `(board, player_id)` row to an absolute value.
 //! - 8c adds [`WorldDb::increment_score`] for delta updates that don't
 //!   require the caller to know the prior score.
-//! - 8d adds [`WorldDb::top_scores`] for the leaderboard render —
+//! - 8d adds [`WorldDb::top_scores`] for the leaderboard render
 //!   `Desc`/`Asc` sort with deterministic `(updated_at, player_id)`
 //!   tie ordering.
 //! - 8e (this iteration) adds [`WorldDb::player_rank`] for "you are
@@ -20,15 +20,15 @@
 //! mysterious query failure inside a higher-level helper test.
 //!
 //! The migration is exported as a `pub const` so the runtime startup
-//! path (Task 10) and game-author code can apply one canonical
-//! definition without redeclaring the schema and drifting from it —
-//! same pattern as [`crate::players::PLAYERS_MIGRATION`],
+//! path and game-author code can apply one canonical
+//! definition without redeclaring the schema and drifting from it
+//! same pattern as [`crate::players::PLAYERS_MIGRATION`].
 //! [`crate::turns::TURN_LEDGER_MIGRATION`], and
 //! [`crate::events::WORLD_EVENTS_MIGRATION`].
 //!
 //! # Why a dedicated table per board, keyed by board name
 //!
-//! SPEC_v2 §4.8 mandates four behaviors for any leaderboard:
+//!  mandates four behaviors for any leaderboard:
 //!
 //! 1. Set a player's score on a named board.
 //! 2. Increment a player's score on a named board.
@@ -37,7 +37,7 @@
 //!
 //! All four are "by name" operations. A naive design might create one
 //! SQL table per declared `[[leaderboards]]` entry, but the board set
-//! is game-authored config (SPEC §5) and we don't want to issue
+//! is game-authored config and we don't want to issue
 //! `CREATE TABLE` at runtime every time a game adds a board. Folding
 //! every board into one table keyed by `(board, player_id)` keeps the
 //! migration story stable: adding a board is a config edit, not a
@@ -46,7 +46,7 @@
 //!
 //! # Why `(board, player_id)` is the natural primary key
 //!
-//! A player has at most one score on any given board. SPEC §4.8's
+//! A player has at most one score on any given board. 's
 //! "set score" and "increment score" both target one row per
 //! `(board, player_id)` pair, and a primary key over that pair gives
 //! us:
@@ -63,8 +63,8 @@ use thiserror::Error;
 use crate::config::LeaderboardSort;
 use crate::world_db::{WorldDb, WorldMigration};
 
-/// Schema for the shared-world leaderboard table — SPEC_v2 §4.8 /
-/// §Task 8a.
+/// Schema for the shared-world leaderboard table — /
+/// .
 ///
 /// One row per `(board, player_id)` pair. Rows are mutated in place by
 /// `set_score` (8b) and `increment_score` (8c); unlike `world_events`
@@ -77,18 +77,18 @@ use crate::world_db::{WorldDb, WorldMigration};
 ///   as text so an operator inspecting the file with `sqlite3` reads
 ///   the same identifier the game-author wrote in `game.toml`. The
 ///   kit treats unknown board names as game-author bugs surfaced
-///   through Task 10's runtime validation, not a SQL-layer constraint
+///   through 's runtime validation, not a SQL-layer constraint
 ///   — there is no enum table because the board set is owned by config.
 /// - `player_id` — `INTEGER NOT NULL REFERENCES players(id)`. Same
 ///   foreign-key story as the turn ledger and event log: phantom ids
 ///   should never land here. SQLite enforces FKs only when
-///   `PRAGMA foreign_keys = ON`, which the runtime layer (Task 10) is
+///   `PRAGMA foreign_keys = ON`, which the runtime layer is
 ///   responsible for; until then the constraint is documentation but
 ///   the column shape is already correct.
 /// - `score` — `INTEGER NOT NULL DEFAULT 0`. Score values are
-///   integral by SPEC §4.8 (no fractional scores in v2). The default
+///   integral by (no fractional scores in v2). The default
 ///   matters for `increment_score` (8c) when it lands a new row via
-///   upsert: the conflict-target path updates `score = score + ?`,
+///   upsert: the conflict-target path updates `score = score + ?`.
 ///   while the insert path needs a sane initial value before the
 ///   increment is applied.
 /// - `updated_at` — `TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP`. UTC
@@ -114,12 +114,12 @@ use crate::world_db::{WorldDb, WorldMigration};
 ///
 /// # Indexes
 ///
-/// One secondary index ships with the migration so the Task 8d
+/// One secondary index ships with the migration so the
 /// `top_scores` query is seek-bound from day one:
 ///
 /// - `idx_leaderboard_scores_board_score` over
-///   `(board, score, player_id)`. Matches the §4.8 contract: filter
-///   by `board`, sort by `score` (descending for `desc` boards,
+///   `(board, score, player_id)`. Matches the contract: filter
+///   by `board`, sort by `score` (descending for `desc` boards.
 ///   ascending for `asc` boards), and tie-break by `player_id` for
 ///   determinism. Including `player_id` in the index makes it
 ///   covering for the `top_scores` query — SQLite can answer
@@ -127,14 +127,14 @@ use crate::world_db::{WorldDb, WorldMigration};
 ///   ORDER BY score DESC, player_id LIMIT ?` without touching the
 ///   table heap.
 ///
-/// SPEC §4.8 also requires `player_rank`, which is a count of rows
+///  also requires `player_rank`, which is a count of rows
 /// with a "better" score on the same board. The same index covers
 /// that query without a separate index — the planner can range-scan
 /// `(board, score)` and return a count.
 ///
 /// # Why no `updated_at` index
 ///
-/// `updated_at` is a write-time stamp. No SPEC §4.8 query orders by
+/// `updated_at` is a write-time stamp. No query orders by
 /// it, and adding an index would be dead weight on every write. If a
 /// future task needs "recently active leaderboards" it can land a
 /// follow-up migration; we don't speculatively pay for the index now.
@@ -144,7 +144,7 @@ use crate::world_db::{WorldDb, WorldMigration};
 /// `version = 5`. Versions 1–4 are reserved for prior kit migrations
 /// (1 reserved, 2 = players, 3 = turn_ledger, 4 = world_events).
 /// Game-authored migrations (Murder Motel's `motel_world_state` from
-/// Task 12a) start from a higher band so they don't collide with kit
+/// ) start from a higher band so they don't collide with kit
 /// migrations the runtime applies on every open.
 pub const LEADERBOARD_SCORES_MIGRATION: WorldMigration = WorldMigration {
     version: 5,
@@ -162,11 +162,11 @@ CREATE INDEX IF NOT EXISTS idx_leaderboard_scores_board_score\n\
 ",
 };
 
-/// Decoded `leaderboard_scores` row — SPEC_v2 §4.8 read model.
+/// Decoded `leaderboard_scores` row — read model.
 ///
 /// Mirrors the column shape pinned by [`LEADERBOARD_SCORES_MIGRATION`].
-/// The Task 8b/8c upsert helpers, the Task 8d `top_scores` query, and
-/// the Task 13e/13f Murder Motel screens all consume this struct rather
+/// The upsert helpers, the `top_scores` query, and
+/// the Murder Motel screens all consume this struct rather
 /// than reaching into raw `rusqlite::Row`s — that keeps the
 /// schema-to-Rust mapping in one place and turns a column rename into a
 /// single compile error instead of a fan-out of runtime decode failures.
@@ -199,14 +199,14 @@ pub struct ScoreRecord {
 /// Failure modes for the leaderboard helpers ([`WorldDb::set_score`] in
 /// this iteration; 8c–8e add their own surfaces over the same enum).
 ///
-/// Library-internal `thiserror` shape — Task 10 will wrap these with
+/// Library-internal `thiserror` shape — will wrap these with
 /// `anyhow` at the process boundary so the operator-facing message
 /// stays a single sentence. Mirrors [`crate::events::EventError`] and
 /// [`crate::turns::TurnError`] so all world-DB write paths surface
 /// errors with the same shape.
 #[derive(Debug, Error)]
 pub enum LeaderboardError {
-    /// The supplied board name was empty (or whitespace-only). SPEC §4.8
+    /// The supplied board name was empty (or whitespace-only).
     /// keys every leaderboard query by name; a blank board would be
     /// indistinguishable from "any board" in the index and almost
     /// certainly indicates a caller bug (forgot to substitute a config
@@ -236,7 +236,7 @@ pub enum LeaderboardError {
 /// callers outside the world-DB module shouldn't be inventing their own
 /// validation — they should go through the typed helpers.
 ///
-/// "Empty" is interpreted as `trim().is_empty()`: a board of `" "` or
+/// "Empty" is interpreted as `trim.is_empty`: a board of `" "` or
 /// `"\n"` would render as a blank header in the leaderboard UI, which
 /// is indistinguishable from a missing board and almost always a caller
 /// bug.
@@ -249,14 +249,14 @@ pub(crate) fn validate_board_name(board: &str) -> Result<(), LeaderboardError> {
 
 impl WorldDb {
     /// Set one player's score on a named board to an absolute value and
-    /// return the canonical [`ScoreRecord`] SQLite produced (SPEC_v2
-    /// §4.8 / §Task 8b).
+    /// return the canonical [`ScoreRecord`] SQLite produced (
+    ///  ).
     ///
     /// The contract is "after this call returns, `(board, player_id)`
     /// has exactly the score I asked for, with the timestamp the
     /// database assigned". This is an *upsert* — a missing
     /// `(board, player_id)` row is created, an existing row is
-    /// overwritten. That matches SPEC §4.8's "set score" verb (as
+    /// overwritten. That matches 's "set score" verb (as
     /// distinct from 8c's "increment score"): callers who hold an
     /// authoritative score (e.g. derived from a save snapshot, or a
     /// recomputed total) want to write it without a read-modify-write
@@ -271,7 +271,7 @@ impl WorldDb {
     /// whitespace-only inputs fail fast with
     /// [`LeaderboardError::EmptyBoardName`]. `player_id` and `score`
     /// are intentionally not validated: a non-existent `player_id` is
-    /// caught at the FK layer once Task 10 enables `PRAGMA
+    /// caught at the FK layer once enables `PRAGMA
     /// foreign_keys = ON`, and `score` ranges (including negatives) are
     /// the game-author's domain.
     ///
@@ -280,7 +280,7 @@ impl WorldDb {
     /// Takes `&self`: the upsert is a single statement, so the busy
     /// timeout configured at open time is the only contention story we
     /// need. Same borrow shape as [`Self::append_event`] so the runtime
-    /// layer (Task 10) can hold one shared world-DB handle across
+    /// layer can hold one shared world-DB handle across
     /// screens without a `RefCell` dance.
     pub fn set_score(
         &self,
@@ -288,7 +288,7 @@ impl WorldDb {
         player_id: i64,
         score: i64,
     ) -> Result<ScoreRecord, LeaderboardError> {
-        // Validate before reaching SQL. A bad board is a caller bug,
+        // Validate before reaching SQL. A bad board is a caller bug.
         // not a database problem — surfacing it as `EmptyBoardName` is
         // more actionable than a silent write to an unreachable row, and
         // it avoids paying for a round-trip on input that was always
@@ -325,29 +325,29 @@ RETURNING board, player_id, score, updated_at";
 
     /// Add `delta` to one player's score on a named board, creating the
     /// row at `delta` if it does not yet exist, and return the canonical
-    /// [`ScoreRecord`] SQLite produced (SPEC_v2 §4.8 / §Task 8c).
+    /// [`ScoreRecord`] SQLite produced.
     ///
     /// The contract is "after this call returns, `(board, player_id)`
     /// has its previous score plus `delta` — and if there was no
     /// previous score, the row exists with `delta` as its score". This
-    /// is SPEC §4.8's "increment score" verb: callers who want to
-    /// register +1 for a clue inspection (Murder Motel Task 13e), or
+    /// is 's "increment score" verb: callers who want to
+    /// register +1 for a clue inspection (Murder Motel ), or
     /// any other event-driven score change, shouldn't have to do a
     /// read-modify-write dance from Rust — that would race with another
     /// process touching the same row.
     ///
     /// `delta` is `i64` rather than `u64` so callers can decrement a
     /// score (e.g. a penalty) with the same helper. The score column is
-    /// `INTEGER NOT NULL` and SPEC §4.8 imposes no non-negative
+    /// `INTEGER NOT NULL` and imposes no non-negative
     /// constraint, so a negative result is a valid game-author choice
-    /// rather than a kit-level error. Overflow is not guarded: SPEC
-    /// §4.8 scores are integral and SQLite stores them as 64-bit, which
+    /// rather than a kit-level error. Overflow is not guarded:
+    ///  scores are integral and SQLite stores them as 64-bit, which
     /// is enough headroom for any door game's lifetime; pretending to
     /// guard a 64-bit counter would be theatre.
     ///
     /// We use SQLite's `RETURNING` clause (≥ 3.35) so the caller gets
     /// the canonical row — including the post-increment score and the
-    /// SQL-side `CURRENT_TIMESTAMP` — without a second round-trip,
+    /// SQL-side `CURRENT_TIMESTAMP` — without a second round-trip.
     /// mirroring [`Self::set_score`] and [`Self::append_event`]. The
     /// upsert resolves on the existing `(board, player_id)` primary key
     /// the migration ships with, so no extra index is needed.
@@ -357,7 +357,7 @@ RETURNING board, player_id, score, updated_at";
     /// [`LeaderboardError::EmptyBoardName`], same as [`Self::set_score`]
     /// — so the validator is the single source of truth for the rule.
     /// `player_id` and `delta` are intentionally not validated: a
-    /// non-existent `player_id` is caught at the FK layer once Task 10
+    /// non-existent `player_id` is caught at the FK layer once
     /// enables `PRAGMA foreign_keys = ON`, and `delta` ranges
     /// (including zero, which is a no-op that still bumps `updated_at`)
     /// are the game-author's domain.
@@ -369,7 +369,7 @@ RETURNING board, player_id, score, updated_at";
     /// serialize on the busy-timeout path rather than racing through a
     /// read-modify-write window. That is the whole reason this helper
     /// exists alongside [`Self::set_score`] — a Rust-side
-    /// `set_score(get_score() + 1)` would silently lose increments
+    /// `set_score(get_score + 1)` would silently lose increments
     /// under contention.
     pub fn increment_score(
         &self,
@@ -385,7 +385,7 @@ RETURNING board, player_id, score, updated_at";
         // (matching the schema's `DEFAULT 0` plus a single increment;
         // we encode the addition explicitly rather than relying on the
         // default + a follow-up update so the "first write" case lands
-        // in one statement). Conflict path adds `excluded.score` —
+        // in one statement). Conflict path adds `excluded.score`
         // which is the proposed insert value, i.e. `delta` — to the
         // existing `score` column. The same `?3` parameter is used in
         // both code paths via `excluded`, keeping the "by how much"
@@ -414,7 +414,7 @@ RETURNING board, player_id, score, updated_at";
     }
 
     /// Return the top `limit` rows on a named board in the configured
-    /// sort direction (SPEC_v2 §4.8 / §Task 8d).
+    /// sort direction.
     ///
     /// "Top" means *best first* per the board's [`LeaderboardSort`]:
     /// `Desc` boards (the typical case — investigators, kills, points)
@@ -424,9 +424,9 @@ RETURNING board, player_id, score, updated_at";
     /// straight through; the helper will not invent a default because
     /// "top by score" is ambiguous without a direction.
     ///
-    /// # Tie ordering — deterministic by SPEC §4.8
+    /// # Tie ordering — deterministic by
     ///
-    /// SPEC §4.8 mandates that tie ordering is deterministic. We resolve
+    ///  mandates that tie ordering is deterministic. We resolve
     /// ties in two stages so the order is total even when scores collide:
     ///
     /// 1. `updated_at ASC` — the *earlier* writer wins a score tie. This
@@ -446,8 +446,8 @@ RETURNING board, player_id, score, updated_at";
     ///
     /// # Parameters
     ///
-    /// `board` is validated by the shared `validate_board_name` guard,
-    /// same contract as [`Self::set_score`] / [`Self::increment_score`]:
+    /// `board` is validated by the shared `validate_board_name` guard.
+    /// same contract as [`Self::set_score`] [`Self::increment_score`]:
     /// empty or whitespace-only inputs fail fast with
     /// [`LeaderboardError::EmptyBoardName`].
     ///
@@ -465,8 +465,8 @@ RETURNING board, player_id, score, updated_at";
     ///
     /// Takes `&self`: a single read statement under the configured busy
     /// timeout, same as [`Self::recent_events`]. The runtime layer
-    /// (Task 10) will call this from the leaderboard render path
-    /// (Task 13f); keeping the borrow shared lets `GameContext` share
+    ///  will call this from the leaderboard render path
+    /// ; keeping the borrow shared lets `GameContext` share
     /// one world-DB reference across screens without a `RefCell` dance.
     pub fn top_scores(
         &self,
@@ -523,11 +523,11 @@ LIMIT ?2";
     }
 
     /// Return one player's 1-based rank on a named board, or `None` if
-    /// the player has no score on that board (SPEC_v2 §4.8 / §Task 8e).
+    /// the player has no score on that board.
     ///
     /// The contract is "given the same `sort` direction
     /// [`Self::top_scores`] would use, what position would this
-    /// player's row occupy?". Rank `1` is the head of the leaderboard,
+    /// player's row occupy?". Rank `1` is the head of the leaderboard.
     /// rank `N` is the tail (where `N` is the total row count on the
     /// board). A player with no row on the board returns `Ok(None)`
     /// rather than an error: an unranked player is a normal UI state
@@ -559,7 +559,7 @@ LIMIT ?2";
     /// round-trips and a TOCTOU window where another writer could
     /// shift the rank between calls. We fold both into one statement
     /// using a correlated subquery on `me`, which gives a consistent
-    /// snapshot and halves the wire cost. The `(board, score,
+    /// snapshot and halves the wire cost. The `(board, score.
     /// player_id)` index from the migration covers the inner count.
     ///
     /// # Parameters
@@ -581,8 +581,8 @@ LIMIT ?2";
     ///
     /// Takes `&self`: a single read statement under the configured
     /// busy timeout, same as [`Self::top_scores`]. The runtime layer
-    /// (Task 10) will call this from the leaderboard render path
-    /// (Task 13f) to render "you are #N" alongside the top-scores
+    ///  will call this from the leaderboard render path
+    ///  to render "you are #N" alongside the top-scores
     /// table.
     pub fn player_rank(
         &self,
@@ -673,7 +673,7 @@ WHERE me.board = ?1 AND me.player_id = ?2";
 ///
 /// Pulled out of the upsert call site so the upcoming 8c/8d/8e read
 /// helpers can share one decoder. Column order matches the `RETURNING`
-/// clause in [`WorldDb::set_score`] and the SPEC §4.8 schema; a
+/// clause in [`WorldDb::set_score`] and the schema; a
 /// regression that reorders columns in the migration will surface here
 /// as a `rusqlite` type error rather than a runtime panic in production.
 fn row_to_score_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<ScoreRecord> {
@@ -727,20 +727,20 @@ mod tests {
         world
     }
 
-    /// SPEC_v2 §Task 8a acceptance: applying
+    ///   acceptance: applying
     /// [`LEADERBOARD_SCORES_MIGRATION`] creates the documented
     /// `leaderboard_scores` table with the column shape later sub-tasks
     /// (8b–8e) depend on. Asserts both:
     ///
     /// 1. The table exists in `sqlite_master` (so a regression that
     ///    silently dropped the migration body would flunk).
-    /// 2. The columns and order match the SPEC §4.8 contract (so a
+    /// 2. The columns and order match the contract (so a
     ///    later edit that renames or reorders a column flunks here
     ///    rather than buried in an 8b set-score test).
     ///
     /// We apply the players migration first because
     /// `leaderboard_scores` references it via `FOREIGN KEY`. With FK
-    /// enforcement off (the SQLite default until Task 10 turns it on)
+    /// enforcement off (the SQLite default until turns it on)
     /// the migration would succeed even without the parent table, but
     /// exercising the real dependency order here mirrors how the
     /// runtime startup path will drive migrations on a real door open.
@@ -788,11 +788,11 @@ mod tests {
                 "score".to_string(),
                 "updated_at".to_string(),
             ],
-            "leaderboard_scores column shape must match the SPEC §4.8 contract"
+            "leaderboard_scores column shape must match the contract"
         );
     }
 
-    /// SPEC §4.8's "set score" / "increment score" upserts will rely
+    /// 's "set score" "increment score" upserts will rely
     /// on the composite primary key over `(board, player_id)`. A
     /// regression that flipped the schema to a synthetic `id` PK
     /// (or dropped the composite uniqueness) would silently allow
@@ -838,7 +838,7 @@ mod tests {
         );
     }
 
-    /// The Task 8d `top_scores` and 8e `player_rank` query plans rely
+    /// The `top_scores` and 8e `player_rank` query plans rely
     /// on the secondary index shipped with this migration. Asserting
     /// the index exists by name pins the contract without coupling the
     /// test to the SQL planner's choice of access path (which is
@@ -879,7 +879,7 @@ mod tests {
         );
     }
 
-    /// SPEC §4.8 requires that `score` and `board` always carry a
+    ///  requires that `score` and `board` always carry a
     /// value — a leaderboard row with a NULL board is meaningless and
     /// a NULL score would corrupt every aggregate the kit returns.
     /// Pin both `NOT NULL` constraints explicitly so a future schema
@@ -919,7 +919,7 @@ mod tests {
         );
     }
 
-    /// SPEC_v2 §Task 8b acceptance: the first `set_score` for a fresh
+    ///   acceptance: the first `set_score` for a fresh
     /// `(board, player_id)` pair creates a row with the supplied score
     /// and a SQLite-assigned `updated_at`, and the returned
     /// [`ScoreRecord`] echoes the values that landed in the table.
@@ -982,9 +982,9 @@ mod tests {
 
     /// `set_score` is an *upsert*: a second call against the same
     /// `(board, player_id)` overwrites the score rather than failing on
-    /// the composite primary key. Pinning this here protects the SPEC
-    /// §4.8 "set score" verb — callers who hold an authoritative score
-    /// and write it twice in a row should see the second value win,
+    /// the composite primary key. Pinning this here protects the
+    ///  "set score" verb — callers who hold an authoritative score
+    /// and write it twice in a row should see the second value win.
     /// not a `UNIQUE constraint failed` error. A regression that
     /// dropped the `ON CONFLICT … DO UPDATE` clause would flunk here.
     #[test]
@@ -1020,7 +1020,7 @@ mod tests {
         );
     }
 
-    /// SPEC §4.8 keys every leaderboard query by name; a blank board
+    ///  keys every leaderboard query by name; a blank board
     /// would be indistinguishable from "any board" in the index. The
     /// guard rejects empty and whitespace-only board names at the kit
     /// boundary so unreachable rows can't enter the table. A regression
@@ -1055,7 +1055,7 @@ mod tests {
         assert_eq!(count, 0, "rejected set_score calls must not write any rows");
     }
 
-    /// SPEC_v2 §Task 8c acceptance: incrementing an existing score
+    ///   acceptance: incrementing an existing score
     /// updates the row in place by adding `delta` to the prior value.
     /// A regression that turned the upsert into a `set` (overwriting
     /// rather than adding) would flunk here — the post-increment score
@@ -1115,7 +1115,7 @@ mod tests {
         );
     }
 
-    /// SPEC_v2 §Task 8c acceptance: incrementing a `(board, player_id)`
+    ///   acceptance: incrementing a `(board, player_id)`
     /// pair that has no prior row creates the row with `delta` as the
     /// starting score. A regression that required a prior row (e.g.
     /// dropping the `INSERT … ON CONFLICT` upsert in favor of a plain
@@ -1156,7 +1156,7 @@ mod tests {
     }
 
     /// `delta` is signed: negative deltas decrement, and the result
-    /// can legally be negative or zero. SPEC §4.8 imposes no
+    /// can legally be negative or zero. imposes no
     /// non-negative constraint and the kit shouldn't invent one.
     /// Pinning this here protects callers (e.g. Murder Motel
     /// penalties) who rely on the signed contract.
@@ -1182,9 +1182,9 @@ mod tests {
         );
     }
 
-    /// SPEC_v2 §Task 8d acceptance: `top_scores` on a `Desc` board
+    ///   acceptance: `top_scores` on a `Desc` board
     /// returns rows with the highest score first, capped at `limit`.
-    /// A regression that flipped the sort direction would flunk here —
+    /// A regression that flipped the sort direction would flunk here
     /// the lowest score would appear at the head of the vec.
     #[test]
     fn top_scores_desc_returns_highest_first() {
@@ -1224,7 +1224,7 @@ mod tests {
     }
 
     /// `Asc` boards (time-trial, golf-style) rank lowest score first.
-    /// Pinning this here protects the SPEC §4.8 `Asc` direction so a
+    /// Pinning this here protects the `Asc` direction so a
     /// regression that hard-coded `DESC` in the SQL would flunk.
     #[test]
     fn top_scores_asc_returns_lowest_first() {
@@ -1287,7 +1287,7 @@ mod tests {
         );
     }
 
-    /// SPEC §4.8 mandates deterministic tie ordering. When two players
+    ///  mandates deterministic tie ordering. When two players
     /// share a score *and* the same `updated_at` timestamp (the common
     /// case for back-to-back writes within one SQLite-second), the
     /// helper must break the tie by `player_id ASC`. A regression that
@@ -1470,7 +1470,7 @@ mod tests {
         assert_eq!(top[0].score, 99);
     }
 
-    /// SPEC §4.8's blank-board rule applies to every leaderboard verb,
+    /// 's blank-board rule applies to every leaderboard verb.
     /// including reads. The shared [`validate_board_name`] guard is the
     /// single source of truth; this test pins that `top_scores` uses it.
     #[test]
@@ -1489,7 +1489,7 @@ mod tests {
         }
     }
 
-    /// SPEC §4.8's blank-board rule applies to every leaderboard verb,
+    /// 's blank-board rule applies to every leaderboard verb.
     /// not just `set_score`. The shared [`validate_board_name`] guard
     /// is the single source of truth for the rule; this test pins that
     /// `increment_score` uses it.
@@ -1524,7 +1524,7 @@ mod tests {
         );
     }
 
-    /// SPEC_v2 §Task 8e acceptance: `player_rank` reports the 1-based
+    ///   acceptance: `player_rank` reports the 1-based
     /// position the player would occupy in [`WorldDb::top_scores`] on
     /// a `Desc` board. The single best score is rank 1; the second
     /// best is rank 2; the worst is rank N. A regression that started
@@ -1610,7 +1610,7 @@ mod tests {
         );
     }
 
-    /// SPEC §4.8 mandates that `player_rank`'s tie ordering matches
+    ///  mandates that `player_rank`'s tie ordering matches
     /// `top_scores`. When two players share a score *and* an
     /// `updated_at`, the smaller `player_id` ranks ahead — pinning
     /// this invariant prevents the two helpers from drifting apart
@@ -1681,7 +1681,7 @@ mod tests {
         );
     }
 
-    /// Earlier `updated_at` beats later `updated_at` on a score tie —
+    /// Earlier `updated_at` beats later `updated_at` on a score tie
     /// same primary tiebreaker as `top_scores`. A regression that
     /// swapped the tiebreaker order in the rank query (e.g. running
     /// `player_id` ahead of `updated_at`) would flunk here.
@@ -1798,7 +1798,7 @@ mod tests {
         );
     }
 
-    /// SPEC §4.8's blank-board rule applies to every leaderboard verb.
+    /// 's blank-board rule applies to every leaderboard verb.
     /// Pin that `player_rank` runs through [`validate_board_name`].
     #[test]
     fn player_rank_rejects_empty_board_name() {

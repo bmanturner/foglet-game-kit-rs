@@ -1,4 +1,4 @@
-//! `roles` — typed role normalization for Foglet doors (SPEC_v2 §4.5).
+//! `roles` — typed role normalization for Foglet doors.
 //!
 //! Modern Rust games keep BBS-era "security level" semantics for
 //! flavor, sysop affordances, and dropfile-compatible permission
@@ -9,7 +9,7 @@
 //!
 //! ## Why this is its own module
 //!
-//! SPEC_v2 §3 lists `roles` as a top-level kit module, peer to
+//!  lists `roles` as a top-level kit module, peer to
 //! `world_db`, `players`, `turns`, `events`, and `leaderboards`. The
 //! parsing rule and the integer mapping live in code (rather than in
 //! SQL defaults or in the `players` schema) so that:
@@ -18,12 +18,12 @@
 //!   downstream use picks up the new mapping without a schema migration;
 //! - games that never open a world DB can still call
 //!   [`FogletContext::security_level`] for sysop/debug affordances;
-//! - Task 5f (persisting normalized role/security at upsert time) reads
+//! - (persisting normalized role/security at upsert time) reads
 //!   from this module instead of duplicating the mapping in `players.rs`.
 //!
 //! ## Authority boundary
 //!
-//! SPEC §4.5 is explicit: role/security values are **advisory** game
+//!  is explicit: role/security values are **advisory** game
 //! metadata. They MUST NOT be used as launch authorization. Foglet
 //! remains the single source of truth for whether a user may open a
 //! door; games consult [`FogletRole`] only for in-game flavor, sysop
@@ -35,7 +35,7 @@ use crate::foglet::FogletContext;
 
 /// Normalized Foglet role.
 ///
-/// Mirrors SPEC_v2 §4.5's enum exactly. `Other(String)` preserves the
+/// Mirrors 's enum exactly. `Other(String)` preserves the
 /// original spelling of an unrecognised role so operator-facing UI
 /// can show "you appear to be in role 'beta-tester'" rather than
 /// silently collapsing it to `User`. The mapping in
@@ -47,7 +47,7 @@ use crate::foglet::FogletContext;
 /// `serde` is wired with `rename_all = "snake_case"` so the enum
 /// round-trips through the same lowercase strings Foglet emits
 /// (`"sysop"`, `"mod"`, `"user"`). `Other(String)` carries its payload
-/// verbatim — when serialised it becomes `{"other":"beta-tester"}`,
+/// verbatim — when serialised it becomes `{"other":"beta-tester"}`.
 /// matching the conventional serde untagged-payload shape. This is
 /// deliberate: deserialising back from the same JSON has to be
 /// lossless, and a string-only encoding would conflict with the
@@ -58,10 +58,10 @@ pub enum FogletRole {
     /// Standard user — the default role and the security-level floor.
     User,
     /// Moderator — elevated above users for in-game permission gates
-    /// like clue review or chat moderation. SPEC §4.5 maps to 90.
+    /// like clue review or chat moderation. maps to 90.
     Mod,
     /// Sysop — top-of-stack role for debug menus, world-state
-    /// inspectors, and any "operator-only" affordance. SPEC §4.5
+    /// inspectors, and any "operator-only" affordance.
     /// maps to 100.
     Sysop,
     /// Any role string Foglet supplies that we don't recognise.
@@ -72,7 +72,7 @@ pub enum FogletRole {
 
 /// Security-level integer for a [`FogletRole::User`] (and any unknown
 /// role). Exposed as a `pub const` so downstream code can compare
-/// against it without duplicating the literal — SPEC §4.5 calls this
+/// against it without duplicating the literal — calls this
 /// the "default" mapping and a renumber would land here once.
 pub const USER_SECURITY_LEVEL: i64 = 50;
 
@@ -83,7 +83,7 @@ pub const MOD_SECURITY_LEVEL: i64 = 90;
 pub const SYSOP_SECURITY_LEVEL: i64 = 100;
 
 impl FogletRole {
-    /// Parse a role string per SPEC §4.5: case-insensitive, with
+    /// Parse a role string: case-insensitive, with
     /// surrounding whitespace trimmed (Foglet's contract doesn't
     /// promise tidy strings, and a stray newline shouldn't downgrade
     /// a sysop to "Other").
@@ -91,7 +91,7 @@ impl FogletRole {
     /// Unknown strings land in [`FogletRole::Other`]; the spec says
     /// unknown roles MUST map to the user-level integer, but the
     /// original string is still useful to preserve for diagnostics.
-    /// Empty / whitespace-only strings collapse to [`FogletRole::User`]
+    /// Empty whitespace-only strings collapse to [`FogletRole::User`]
     /// — equivalent to the "absent role" path on
     /// [`FogletContext::role`], which keeps the two entry points
     /// returning the same value for the same logical input.
@@ -101,9 +101,9 @@ impl FogletRole {
             return FogletRole::User;
         }
         // ASCII-lower is sufficient: Foglet's role strings are ASCII
-        // tokens (sysop / mod / user). Going through `to_lowercase`
+        // tokens (sysop mod user). Going through `to_lowercase`
         // would needlessly allocate on the happy path; `eq_ignore_ascii_case`
-        // matches the documented variants without lower-casing the input,
+        // matches the documented variants without lower-casing the input.
         // and we keep the original spelling for the `Other` fallback.
         if trimmed.eq_ignore_ascii_case("sysop") {
             FogletRole::Sysop
@@ -116,7 +116,7 @@ impl FogletRole {
         }
     }
 
-    /// Mapped security-level integer per SPEC §4.5.
+    /// Mapped security-level integer
     ///
     /// `Other` collapses to [`USER_SECURITY_LEVEL`] — the spec says
     /// "user or absent/unknown -> 50" without exception. A future
@@ -134,9 +134,9 @@ impl FogletRole {
 
     /// Canonical lowercase token for the role.
     ///
-    /// Used by Task 5f when persisting the normalized role to the
+    /// Used by when persisting the normalized role to the
     /// `players.role` column so the on-disk value is the same shape a
-    /// SPEC §4.5 reader would expect (`'sysop'` / `'mod'` / `'user'`).
+    ///  reader would expect (`'sysop'` `'mod'` `'user'`).
     /// `Other(s)` returns the trimmed original string verbatim — a
     /// dropfile-compat layer that wants to preserve unknown roles in
     /// the registry can do so without losing fidelity.
@@ -153,9 +153,9 @@ impl FogletRole {
 impl FogletContext {
     /// Normalized [`FogletRole`] for this context.
     ///
-    /// Equivalent to `FogletRole::parse(self.role.as_deref().unwrap_or(""))`.
-    /// An absent `role` field maps to [`FogletRole::User`] (the SPEC
-    /// §4.5 "absent" path), matching the SQL default in
+    /// Equivalent to `FogletRole::parse(self.role.as_deref.unwrap_or(""))`.
+    /// An absent `role` field maps to [`FogletRole::User`] (the
+    ///  "absent" path), matching the SQL default in
     /// `PLAYERS_MIGRATION`.
     pub fn foglet_role(&self) -> FogletRole {
         match self.role.as_deref() {
@@ -164,14 +164,14 @@ impl FogletContext {
         }
     }
 
-    /// Mapped security-level integer per SPEC §4.5.
+    /// Mapped security-level integer
     ///
-    /// Convenience wrapper around `self.foglet_role().security_level()`
+    /// Convenience wrapper around `self.foglet_role.security_level`
     /// — most callers want the integer for a dropfile-compat gate
-    /// (`if ctx.security_level() >= 90 { … }`) and shouldn't have to
+    /// (`if ctx.security_level >= 90 { … }`) and shouldn't have to
     /// import [`FogletRole`] just to bridge to it.
     ///
-    /// SPEC §4.5 leaves a future hook for an explicit
+    ///  leaves a future hook for an explicit
     /// `security_level` field on the wire; when that lands the typed
     /// value will override the role-derived mapping here. For now the
     /// derivation is the single source of truth.
@@ -209,7 +209,7 @@ mod tests {
         assert_eq!(FogletRole::parse("user"), FogletRole::User);
     }
 
-    /// SPEC §4.5: parsing is case-insensitive. A Foglet adapter that
+    /// : parsing is case-insensitive. A Foglet adapter that
     /// emits `"Sysop"` or `"SYSOP"` must still resolve to
     /// [`FogletRole::Sysop`].
     #[test]
@@ -248,7 +248,7 @@ mod tests {
         );
     }
 
-    /// Empty / whitespace-only strings collapse to
+    /// Empty whitespace-only strings collapse to
     /// [`FogletRole::User`], matching the "absent role" path on
     /// [`FogletContext::foglet_role`].
     #[test]
@@ -258,7 +258,7 @@ mod tests {
         assert_eq!(FogletRole::parse("\t\n"), FogletRole::User);
     }
 
-    /// SPEC §4.5 mapping: sysop=100, mod=90, user=50.
+    ///  mapping: sysop=100, mod=90, user=50.
     #[test]
     fn security_level_mapping_matches_spec() {
         assert_eq!(FogletRole::Sysop.security_level(), 100);
@@ -277,7 +277,7 @@ mod tests {
     }
 
     /// `as_token` yields the canonical lowercase spelling for the
-    /// known variants — exactly what Task 5f will write into
+    /// known variants — exactly what will write into
     /// `players.role`.
     #[test]
     fn as_token_returns_canonical_spelling() {
@@ -317,7 +317,7 @@ mod tests {
         );
     }
 
-    /// Round-trip the known variants through serde — Task 5f and any
+    /// Round-trip the known variants through serde — and any
     /// future structured event metadata that embeds a `FogletRole`
     /// rely on the snake_case wire form documented above.
     #[test]

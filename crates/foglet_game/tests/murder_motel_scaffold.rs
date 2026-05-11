@@ -1,22 +1,20 @@
-//! Integration test for the SPEC §13 acceptance fixture's scaffold.
+//! Integration test for the murder motel example scaffold.
 //!
-//! Task 13a stands up `examples/murder_motel/` as a real example target
-//! on `foglet_game`. The example's own `#[cfg(test)] mod tests` covers
-//! the `TitleScreen` keyboard contract, but those run only under
-//! `cargo test --examples` / `--all-targets`. This test sits inside the
-//! library crate's `tests/` directory so it executes under the bare
-//! `cargo test --workspace` gate from PROMPT.md, guaranteeing the
-//! scaffold's on-disk assets stay parseable as later sub-iterations
-//! grow them.
+//! The example's own `#[cfg(test)] mod tests` covers the `TitleScreen`
+//! keyboard contract, but those run only under `cargo test --examples`
+//! / `--all-targets`. This test sits inside the library crate's
+//! `tests/` directory so it executes under the bare
+//! `cargo test --workspace` gate, guaranteeing the scaffold's on-disk
+//! assets stay parseable as the example grows.
 //!
 //! What we assert:
 //! 1. `assets/game.toml` parses through `GameConfig::load` (the same
 //!    code path the example's `main` uses).
-//! 2. The configured slug, title, and minimum size satisfy SPEC §13's
+//! 2. The configured slug, title, and minimum size satisfy the
 //!    acceptance criteria (named "Murder Motel", `min_width >= 80`,
 //!    `min_height >= 24`).
-//! 3. The save strategy is `per_foglet_user` so Task 13h's persistence
-//!    work has the right scaffold to plug into.
+//! 3. The save strategy is `per_foglet_user` so the per-user
+//!    persistence path has the right scaffold from day one.
 //! 4. The example target is registered on this crate so
 //!    `cargo run --example murder_motel` resolves.
 //!
@@ -45,7 +43,7 @@ fn scaffold_game_toml_parses_into_game_config() {
 
     assert_eq!(
         cfg.game.slug, "murder-motel",
-        "slug feeds the Foglet manifest path; SPEC §13 names the door `murder-motel`"
+        "slug feeds the Foglet manifest path; door must be named `murder-motel`"
     );
     assert_eq!(
         cfg.game.title, "Murder Motel",
@@ -53,7 +51,7 @@ fn scaffold_game_toml_parses_into_game_config() {
     );
     assert!(
         cfg.game.min_width >= 80 && cfg.game.min_height >= 24,
-        "SPEC §7.1 requires the size check; scaffold must demand at least 80x24 \
+        "minimum terminal size must be at least 80x24 \
          (got {}x{})",
         cfg.game.min_width,
         cfg.game.min_height
@@ -61,32 +59,30 @@ fn scaffold_game_toml_parses_into_game_config() {
     assert_eq!(
         cfg.save.strategy,
         SaveStrategy::PerFogletUser,
-        "Task 13h plugs persistence into the per-user strategy; the scaffold \
-         must opt in from day one"
+        "save strategy must be per-user; the scaffold must opt in from day one"
     );
 }
 
 #[test]
-fn scaffold_game_toml_enables_v2_shared_world_sections() {
-    // Task 2d: the SPEC §13 fixture must opt into the v2 shared-world
-    // stack so Tasks 3–13 have a real config to drive against. We assert
-    // the *intent* of each section (world enabled, turn ledger present,
-    // `investigators` board registered) rather than every default value
-    // — the config layer's own tests cover defaulting, and re-asserting
-    // them here would just couple the fixture to schema details.
+fn scaffold_game_toml_enables_shared_world_sections() {
+    // We assert the *intent* of each section (world enabled, turn
+    // ledger present, `investigators` board registered) rather than
+    // every default value — the config layer's own tests cover
+    // defaulting, and re-asserting them here would just couple the
+    // fixture to schema details.
     let path = workspace_path("../../examples/murder_motel/assets/game.toml");
     let cfg = GameConfig::load(&path)
         .unwrap_or_else(|err| panic!("scaffold game.toml at {path:?} failed to load: {err}"));
 
     assert!(
         cfg.world.enabled,
-        "[world].enabled must be true so Task 3 onward has a real DB to open"
+        "[world].enabled must be true so the shared-world DB can be opened"
     );
 
     let turns = cfg
         .turns
         .as_ref()
-        .expect("[turns] section is required by Task 2d so the daily ledger has an allowance");
+        .expect("[turns] section is required so the daily ledger has an allowance");
     assert!(
         turns.daily_allowance > 0,
         "[turns].daily_allowance must be > 0; the config validator rejects zero, \
@@ -96,20 +92,20 @@ fn scaffold_game_toml_enables_v2_shared_world_sections() {
     assert_eq!(
         turns.reset,
         TurnReset::LocalMidnight,
-        "v2 ships only `local_midnight`; pinning it here flags any silent reset \
-         change while the closed enum is still narrow"
+        "pinning `local_midnight` here flags any silent reset change while the \
+         closed enum is still narrow"
     );
 
     let investigators = cfg
         .leaderboards
         .iter()
         .find(|board| board.name == "investigators")
-        .expect("Task 13e increments the `investigators` board; the fixture must register it");
+        .expect("the `investigators` leaderboard must be registered in the fixture");
     assert_eq!(
         investigators.sort,
         LeaderboardSort::Desc,
-        "Murder Motel ranks highest score first; `desc` is the SPEC v2 §5 default \
-         but pinning it guards against a future edit flipping the direction"
+        "Murder Motel ranks highest score first; pinning `desc` guards against a \
+         future edit flipping the direction"
     );
 }
 

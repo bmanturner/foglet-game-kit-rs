@@ -1,5 +1,5 @@
 //! `place_recall` — discovered-place memory schema and touch/query primitives
-//! (SPEC_v4 Task 6a, Task 6b, Task 6e).
+//! .
 //!
 //! This module introduces the storage primitive for fog-of-war and
 //! place-memory features. The schema is intentionally minimal and keeps
@@ -10,7 +10,7 @@
 //! - `last_seen_at` tracks the latest observed touch time.
 //! - `snapshot_json` carries any optional game-authored payload.
 //!
-//! By Task 6a, callers can only create the table and run it through the
+//! By, callers can only create the table and run it through the
 //! existing migration pipeline.
 //!
 //! In a **space exploration** game, `place_recall` can retain the last
@@ -75,7 +75,7 @@ pub enum PlaceRecallError {
     },
 }
 
-/// Migration for `place_recall` rows (SPEC_v4 Task 6a).
+/// Migration for `place_recall` rows.
 ///
 /// The table intentionally stores one row per `(player_id, place_id)`:
 ///
@@ -110,7 +110,7 @@ CREATE TABLE IF NOT EXISTS place_recall (\n\
 impl WorldDb {
     /// Record or refresh a player's recall observation of a place.
     ///
-    /// The contract for v4 is idempotent upsert:
+    /// The contract for is idempotent upsert:
     ///
     /// - first call for `(player_id, place_id)` inserts a row with both
     ///   `first_seen_at` and `last_seen_at` seeded from `CURRENT_TIMESTAMP`;
@@ -208,7 +208,7 @@ mod tests {
     use std::time::Duration;
     use tempfile::tempdir;
 
-    /// Task 6a accepts that the recall migration applies and publishes
+    ///  accepts that the recall migration applies and publishes
     /// the documented table shape to SQLite.
     ///
     /// The order matters for later upsert/merge work: both player and
@@ -248,7 +248,7 @@ mod tests {
                 "last_seen_at".to_string(),
                 "snapshot_json".to_string(),
             ],
-            "place_recall schema must match SPEC_v4 Task 6a exactly"
+            "place_recall schema must match exactly"
         );
 
         let row_count: i64 = world
@@ -262,7 +262,7 @@ mod tests {
         assert_eq!(row_count, PLACE_RECALL_MIGRATION.version);
     }
 
-    /// Task 6b requires `touch_recall` to insert a fresh row on first
+    ///  requires `touch_recall` to insert a fresh row on first
     /// call and refresh `last_seen_at` on subsequent calls.
     ///
     /// The test inserts explicit fixture rows first, so foreign keys
@@ -354,7 +354,7 @@ mod tests {
         assert_eq!(second, loaded);
     }
 
-    /// Task 6c requires `first_seen_at` to stay fixed after the first
+    ///  requires `first_seen_at` to stay fixed after the first
     /// touch, even while `last_seen_at` updates.
     ///
     /// This captures the "fog-of-war memory" contract directly: revisiting a
@@ -427,7 +427,7 @@ mod tests {
         );
     }
 
-    /// Task 6d requires each touch call to refresh `snapshot_json`
+    ///  requires each touch call to refresh `snapshot_json`
     /// independently of historical memory.
     ///
     /// Fog-of-war replay in a **space exploration** flow should allow a
@@ -506,7 +506,7 @@ mod tests {
         );
     }
 
-    /// Task 6e requires `recall_for_player` to return records in
+    ///  requires `recall_for_player` to return records in
     /// deterministic newest-first order.
     ///
     /// The contract is intentionally simple: a higher-level game UI can

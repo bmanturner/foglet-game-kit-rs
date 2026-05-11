@@ -1,14 +1,14 @@
-//! `players` — shared-world player registry (SPEC_v2 §Task 5).
+//! `players` — shared-world player registry.
 //!
-//! Task 5a shipped the `players` table migration. Task 5b layered the
+//!  shipped the `players` table migration. layered the
 //! typed [`PlayerRecord`] read model and the [`WorldDb::upsert_player`]
-//! write path on top, scoped to the Foglet-user-id case. Task 5c
+//! write path on top, scoped to the Foglet-user-id case.
 //! extended the upsert path to the local-dev fallback so a
 //! [`FogletContext`] with no `user_id` lands on a stable
-//! `local_dev_key`-keyed row instead of erroring. Task 5d kept
-//! `first_seen_at` stable while refreshing `last_seen_at`. Task 5e
+//! `local_dev_key`-keyed row instead of erroring. kept
+//! `first_seen_at` stable while refreshing `last_seen_at`.
 //! introduced [`FogletRole`](crate::FogletRole) parsing and the
-//! `security_level` mapping. Task 5f (this iteration) plumbs that
+//! `security_level` mapping. (this iteration) plumbs that
 //! mapping into the upsert path so every relaunch persists the
 //! normalized role/security pair from the live context — strictly
 //! advisory metadata for in-game flavour, *not* a launch authorization
@@ -20,8 +20,8 @@
 //! `local_dev_key` column will flunk the schema test in this module
 //! rather than a higher-level upsert assertion that's harder to
 //! attribute. The migration itself is a `pub const` so other modules
-//! (the runtime startup path in Task 10, future Murder Motel
-//! migrations in Task 12) can reference one canonical definition
+//! (the runtime startup path in, future Murder Motel
+//! migrations in ) can reference one canonical definition
 //! instead of redeclaring the schema and drifting from it.
 
 use thiserror::Error;
@@ -30,19 +30,19 @@ use crate::foglet::FogletContext;
 use crate::world_db::{WorldDb, WorldMigration};
 
 /// Default handle written when a [`FogletContext`] arrives without a
-/// `username` / `handle` field.
+/// `username` `handle` field.
 ///
-/// SPEC §4.4 makes `handle` `NOT NULL` because every player needs
+///  makes `handle` `NOT NULL` because every player needs
 /// *something* to render in the lobby/leaderboard UI. Foglet normally
-/// supplies one, but the field is documented as optional in §5.1, so
+/// supplies one, but the field is documented as optional in, so
 /// the upsert path needs a fallback. `"guest"` is intentionally
 /// unremarkable — the on-screen affordance is "we couldn't find a
 /// handle for this session" and the operator can fix it upstream.
 const DEFAULT_HANDLE: &str = "guest";
 
-/// Prefix on every synthesised `local_dev_key` value (Task 5c).
+/// Prefix on every synthesised `local_dev_key` value.
 ///
-/// SPEC §4.4 demands that the local-dev key "does not collide with
+///  demands that the local-dev key "does not collide with
 /// real Foglet users". Foglet-issued user ids are opaque tokens that
 /// the loader writes into the dedicated `foglet_user_id` column, so
 /// the two namespaces are already separated at the schema layer (one
@@ -57,7 +57,7 @@ const LOCAL_DEV_KEY_PREFIX: &str = "local-dev:";
 /// Synthesise the `local_dev_key` for a [`FogletContext`] that has no
 /// `user_id`.
 ///
-/// SPEC §4.4 rule: "If `user_id` is absent, the runtime MUST
+///  rule: "If `user_id` is absent, the runtime MUST
 /// synthesize a local key that does not collide with real Foglet
 /// users." The key has to be **stable** for a given local-dev session
 /// (so a second launch of the same dev user lands on the same
@@ -67,7 +67,7 @@ const LOCAL_DEV_KEY_PREFIX: &str = "local-dev:";
 /// We key on `ctx.username`, normalised by [`str::trim`] and falling
 /// back to [`DEFAULT_HANDLE`] when missing or whitespace-only. Username
 /// is the only identity bit a `--local-dev-user alice` invocation can
-/// influence (Task 9d's CLI flag will set this), so it's the natural
+/// influence ('s CLI flag will set this), so it's the natural
 /// pivot. `door_id` is also stable per launch but identical across the
 /// two-player smoke test (both sessions run the same door binary), so
 /// it cannot disambiguate by itself.
@@ -86,30 +86,30 @@ fn synthesize_local_dev_key(handle: &str) -> String {
     format!("{LOCAL_DEV_KEY_PREFIX}{key_body}")
 }
 
-/// Schema for the shared-world player registry — SPEC_v2 §4.4.
+/// Schema for the shared-world player registry
 ///
 /// One row per stable player identity (Foglet user OR local-dev
-/// fallback). The shape mirrors §4.4 exactly:
+/// fallback). The shape mirrors exactly:
 ///
 /// - `id` — internal autoincrement primary key. Foreign-keyed by
-///   later tables (`turn_ledger` in Task 6a, `world_events` in 7a,
+///   later tables (`turn_ledger` in, `world_events` in 7a.
 ///   `leaderboard_scores` in 8a) so per-player joins stay numeric and
 ///   cheap. `INTEGER PRIMARY KEY` is SQLite's idiom for a stable
 ///   `rowid` alias.
 /// - `foglet_user_id` — nullable string. Populated when
 ///   `FogletContext.user_id` is present; left null on local-dev
 ///   sessions that haven't been issued a Foglet identity yet.
-/// - `handle` — display string. SPEC §4.4 calls out that this is a
+/// - `handle` — display string. calls out that this is a
 ///   **display value, not an authorization key** — kept `NOT NULL`
 ///   because every player needs *something* to render, even a
 ///   default like "guest".
-/// - `role` — normalized `FogletRole` text (`"sysop"`, `"mod"`,
+/// - `role` — normalized `FogletRole` text (`"sysop"`, `"mod"`.
 ///   `"user"`). Stored as text rather than an integer so an operator
 ///   inspecting the SQLite file with the `sqlite3` CLI can read it
 ///   without consulting source. Defaults to `"user"` at the SQL layer
 ///   so 5b (upsert) doesn't have to special-case missing roles.
 /// - `security_level` — integer derived from role unless Foglet
-///   supplies an explicit value (Task 5e mapping: sysop=100, mod=90,
+///   supplies an explicit value ( mapping: sysop=100, mod=90.
 ///   user=50). Stored as an integer for ordering/comparison; the
 ///   mapping itself lives in code so the rules stay in one place.
 /// - `first_seen_at` — UTC timestamp of the player's first upsert.
@@ -120,7 +120,7 @@ fn synthesize_local_dev_key(handle: &str) -> String {
 ///   Defaulted the same way as `first_seen_at` so a freshly-inserted
 ///   row already has a sensible value.
 /// - `local_dev_key` — nullable string identifying local-dev
-///   identities (Task 5c). Distinct from `foglet_user_id` so the two
+///   identities. Distinct from `foglet_user_id` so the two
 ///   identity namespaces never collide: a Foglet user "alice" and a
 ///   local-dev "alice" land on separate rows, both queryable.
 ///
@@ -133,7 +133,7 @@ fn synthesize_local_dev_key(handle: &str) -> String {
 ///   when not null. SQLite treats `NULL` as distinct under a plain
 ///   `UNIQUE` constraint, which would silently allow multiple
 ///   local-dev rows; the partial index (`WHERE foglet_user_id IS NOT
-///   NULL`) makes the intent explicit and matches the SPEC §4.4 rule
+///   NULL`) makes the intent explicit and matches the rule
 ///   that `user_id` "is the stable key" *when present*.
 /// - `idx_players_local_dev_key` — unique over `local_dev_key`
 ///   when not null, for the same reason on the local-dev side.
@@ -162,41 +162,41 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_players_local_dev_key\n\
 ",
 };
 
-/// Typed read of a `players` row — SPEC_v2 §4.4 column-for-column.
+/// Typed read of a `players` row — column-for-column.
 ///
 /// Returned by [`WorldDb::upsert_player`] so authoring code never has
 /// to spell out a `query_row` against the world database to learn its
 /// own player id. Owning every column (rather than borrowing) matches
-/// the rest of the v2 surface: the runtime hands these to screens by
+/// the rest of the surface: the runtime hands these to screens by
 /// value and the lifetime story stays simple.
 ///
 /// # Field semantics
 ///
 /// - `id` — internal autoincrement primary key. Stable across
 ///   relaunches; foreign-keyed by future tables (`turn_ledger` in
-///   Task 6, `world_events` in Task 7, `leaderboard_scores` in Task 8)
+///   , `world_events` in, `leaderboard_scores` in )
 ///   so per-player joins stay numeric.
 /// - `foglet_user_id` — `Some` when the upsert came from a Foglet
 ///   context with a user id; `None` for the local-dev path landing
-///   in Task 5c.
+///   in.
 /// - `handle` — display string. Refreshed on every upsert so a
 ///   user who changes their Foglet handle sees the new value the
 ///   next time they launch.
 /// - `role`, `security_level` — written from the live context's
 ///   [`FogletContext::foglet_role`] /
-///   [`FogletContext::security_level`] on every upsert (Task 5f). The
-///   stored values are advisory metadata for in-game flavour only —
+///   [`FogletContext::security_level`] on every upsert. The
+///   stored values are advisory metadata for in-game flavour only
 ///   never consulted as a launch authorization gate. An absent /
-///   unknown role normalises to `'user'` / `50`, which lines up with
+///   unknown role normalises to `'user'` `50`, which lines up with
 ///   the SQL defaults so the column shape stays consistent whether the
 ///   row was written by the upsert path or a hand-rolled INSERT in
 ///   tests.
 /// - `first_seen_at` — UTC timestamp of the first upsert. Preserved
-///   across repeat upserts (Task 5d's invariant).
+///   across repeat upserts ('s invariant).
 /// - `last_seen_at` — UTC timestamp refreshed to `CURRENT_TIMESTAMP`
-///   on every repeat upsert (Task 5d). Equals `first_seen_at` only on
+///   on every repeat upsert. Equals `first_seen_at` only on
 ///   the very first insert.
-/// - `local_dev_key` — `Some` only on the Task 5c local-dev path;
+/// - `local_dev_key` — `Some` only on the local-dev path;
 ///   `None` for Foglet-user-id rows like the ones 5b creates.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlayerRecord {
@@ -210,18 +210,18 @@ pub struct PlayerRecord {
     pub role: String,
     /// Integer derived from `role` (sysop=100, mod=90, user=50).
     pub security_level: i64,
-    /// UTC timestamp of the first upsert; preserved by Task 5d.
+    /// UTC timestamp of the first upsert; preserved by.
     pub first_seen_at: String,
     /// UTC timestamp refreshed to `CURRENT_TIMESTAMP` on every repeat
-    /// upsert (Task 5d).
+    /// upsert.
     pub last_seen_at: String,
-    /// Synthesised local-dev key (Task 5c) — always `None` here.
+    /// Synthesised local-dev key — always `None` here.
     pub local_dev_key: Option<String>,
 }
 
 /// Failure modes for [`WorldDb::upsert_player`].
 ///
-/// Library-internal `thiserror`: the runtime layer (Task 10) wraps
+/// Library-internal `thiserror`: the runtime layer wraps
 /// these with `anyhow` at the process boundary so the operator-facing
 /// message stays a single sentence.
 #[derive(Debug, Error)]
@@ -242,10 +242,10 @@ impl WorldDb {
     /// Upsert the player identified by `ctx` and return the
     /// resulting [`PlayerRecord`].
     ///
-    /// Stable-key contract (SPEC_v2 §4.4): two calls with the same
+    /// Stable-key contract: two calls with the same
     /// `FogletContext.user_id` resolve to the same `players.id`. The
     /// underlying mechanism is the partial unique index on
-    /// `foglet_user_id` plus an `ON CONFLICT … DO UPDATE` clause —
+    /// `foglet_user_id` plus an `ON CONFLICT … DO UPDATE` clause
     /// the conflict refreshes `handle` so a user who renames in
     /// Foglet sees the new label without us creating a duplicate row.
     ///
@@ -253,11 +253,11 @@ impl WorldDb {
     /// unique index in [`PLAYERS_MIGRATION`]:
     ///
     /// - `ctx.user_id = Some(_)` → upsert keyed on `foglet_user_id`.
-    /// - `ctx.user_id = None`    → upsert keyed on a synthesised
-    ///   `local_dev_key` (Task 5c) derived from `ctx.username`.
+    /// - `ctx.user_id = None` → upsert keyed on a synthesised
+    ///   `local_dev_key` derived from `ctx.username`.
     ///
     /// Repeat upsert refreshes `last_seen_at` to `CURRENT_TIMESTAMP`
-    /// (SPEC §4.4 / Task 5d) while leaving `first_seen_at` alone — the
+    ///  while leaving `first_seen_at` alone — the
     /// "first time we saw this identity" column is an audit anchor and
     /// must survive every relaunch. The normalized `role` /
     /// `security_level` pair is also rewritten on every upsert (Task
@@ -271,17 +271,17 @@ impl WorldDb {
     ///
     /// Takes `&self`: the upsert is a single statement, so the busy
     /// timeout configured at open time is the only contention story
-    /// we need. `&mut self` would fight the runtime layer (Task 10)
+    /// we need. `&mut self` would fight the runtime layer
     /// where `GameContext` borrows the world DB once per tick.
     pub fn upsert_player(&self, ctx: &FogletContext) -> Result<PlayerRecord, PlayerError> {
-        // `username` is optional on the wire (SPEC §5.1). Falling back
+        // `username` is optional on the wire. Falling back
         // to `DEFAULT_HANDLE` keeps the `NOT NULL` `handle` constraint
         // satisfied without burying the choice in the SQL string.
         let handle = ctx.username.as_deref().unwrap_or(DEFAULT_HANDLE);
-        // Resolve the normalized role / security_level pair once per
-        // upsert (Task 5f). Computing here — rather than in each
+        // Resolve the normalized role security_level pair once per
+        // upsert. Computing here — rather than in each
         // identity-branch helper — keeps the "one source of truth for
-        // role normalization" rule from SPEC §4.5 visible at the
+        // role normalization" rule visible at the
         // top-level entry point: both branches receive the exact same
         // tokens, regardless of which partial unique index they target.
         let role = ctx.foglet_role();
@@ -293,7 +293,7 @@ impl WorldDb {
                 self.upsert_by_foglet_user_id(user_id, handle, role_token, security_level)
             }
             None => {
-                // SPEC §4.4 mandates a synthesised local key that does
+                //  mandates a synthesised local key that does
                 // not collide with real Foglet users. The dedicated
                 // `local_dev_key` column + partial unique index gives
                 // us that namespace separation at the schema layer;
@@ -328,15 +328,15 @@ impl WorldDb {
         // first-insert path needs the autoincrement `id` we don't
         // know yet, and the conflict path benefits from echoing the
         // stored timestamps so the caller doesn't get a stale view.
-        // `last_seen_at = CURRENT_TIMESTAMP` is the Task 5d refresh:
+        // `last_seen_at = CURRENT_TIMESTAMP` is the refresh:
         // SQLite evaluates `CURRENT_TIMESTAMP` per-statement, so the
         // conflict path stamps the row with the moment of this upsert
         // without us threading a clock through. `first_seen_at` is
         // *deliberately* not in the SET list — that's the column the
         // audit story depends on, and excluding it from the update
         // preserves the original insert timestamp across every relaunch.
-        // `role` / `security_level` are now part of the SET list
-        // (Task 5f). Rewriting them on every conflict means a player
+        // `role` `security_level` are now part of the SET list
+        // . Rewriting them on every conflict means a player
         // who is promoted/demoted upstream in Foglet between launches
         // sees the change reflected the next time they appear — and
         // the column never ages out of sync with the live context.
@@ -360,13 +360,13 @@ RETURNING id, foglet_user_id, handle, role, security_level, \
             .map_err(|source| PlayerError::Sqlite { source })
     }
 
-    /// Local-dev branch of [`Self::upsert_player`] (Task 5c).
+    /// Local-dev branch of [`Self::upsert_player`].
     ///
     /// Mirrors [`Self::upsert_by_foglet_user_id`] but conflicts on the
     /// `idx_players_local_dev_key` partial index. `foglet_user_id`
     /// stays NULL so the partial index over `foglet_user_id` does not
     /// engage — the two namespaces remain disjoint at the schema
-    /// layer, which is the property SPEC §4.4 calls out.
+    /// layer, which is the property calls out.
     fn upsert_by_local_dev_key(
         &self,
         local_dev_key: &str,
@@ -375,15 +375,15 @@ RETURNING id, foglet_user_id, handle, role, security_level, \
         security_level: i64,
     ) -> Result<PlayerRecord, PlayerError> {
         // See [`Self::upsert_by_foglet_user_id`] for the rationale on
-        // `last_seen_at = CURRENT_TIMESTAMP` (Task 5d). The local-dev
+        // `last_seen_at = CURRENT_TIMESTAMP`. The local-dev
         // branch carries the same first-seen-preserving contract — a
         // dev who relaunches `cargo run --example murder_motel` keeps
         // their original `first_seen_at` even as `last_seen_at` walks
         // forward.
         // See [`Self::upsert_by_foglet_user_id`] for the rationale on
-        // including `role` / `security_level` in the SET list (Task
+        // including `role` `security_level` in the SET list (Task
         // 5f). The local-dev path mirrors the Foglet path so a single
-        // ground-truth contract — "every upsert refreshes role" —
+        // ground-truth contract — "every upsert refreshes role"
         // applies regardless of identity namespace.
         const SQL: &str = "\
 INSERT INTO players (local_dev_key, handle, role, security_level) \
@@ -412,8 +412,8 @@ RETURNING id, foglet_user_id, handle, role, security_level, \
     /// or `"unknown"` rather than soft-locking) and not an error
     /// condition. Errors are reserved for genuine SQLite failures.
     ///
-    /// Added for the SPEC_v2 §Task 13f leaderboard screen, which renders
-    /// `top_scores` results as `<rank>. <handle>  <score>` and therefore
+    /// Added for the leaderboard screen, which renders
+    /// `top_scores` results as `<rank>. <handle> <score>` and therefore
     /// needs to convert each `ScoreRecord.player_id` back into the
     /// display string. Lives next to [`Self::upsert_player`] because the
     /// `players` table is the single source of truth for handles.
@@ -422,7 +422,7 @@ RETURNING id, foglet_user_id, handle, role, security_level, \
     ///
     /// Takes `&self`: a single read statement under the configured busy
     /// timeout, same shape as [`crate::WorldDb::top_scores`]. The runtime
-    /// layer (Task 10) calls this from the leaderboard render path so
+    /// layer calls this from the leaderboard render path so
     /// keeping the borrow shared lets `GameContext` thread one world-DB
     /// reference across screens.
     pub fn player_handle(&self, id: i64) -> Result<Option<String>, PlayerError> {
@@ -443,8 +443,8 @@ RETURNING id, foglet_user_id, handle, role, security_level, \
 
     /// Search the player registry by case-insensitive handle prefix.
     ///
-    /// Added for SPEC_v3 §Task 8a — Murder Motel's async multiplayer
-    /// screens (notice send target picker, challenge-rival selector,
+    /// Added for — Murder Motel's async multiplayer
+    /// screens (notice send target picker, challenge-rival selector.
     /// bounty claim attribution UI) need a way to autocomplete a
     /// handle the local player typed in the box. The kit already owns
     /// the `players` registry, so providing a single typed helper
@@ -456,7 +456,7 @@ RETURNING id, foglet_user_id, handle, role, security_level, \
     /// - The match is **case-insensitive prefix** — `"AL"` matches
     ///   `"alice"` and `"Albert"` but not `"calico"`. Implemented via
     ///   SQLite's `instr(lower(handle), lower(?1)) = 1`, which sidesteps
-    ///   `LIKE`'s `%` / `_` / backslash escaping rules entirely: the
+    ///   `LIKE`'s `%` `_` backslash escaping rules entirely: the
     ///   needle is treated as a literal substring whose only privileged
     ///   property is "starts at column 1". A future regression that
     ///   reaches for `LIKE ?1 || '%'` without escaping would let a
@@ -492,7 +492,7 @@ RETURNING id, foglet_user_id, handle, role, security_level, \
         // letting them flow through to SQLite, which would silently
         // treat `LIMIT -1` as "no limit". Returning the same
         // `PlayerError::Sqlite` variant we already use lets the call
-        // site funnel every search failure through one match arm —
+        // site funnel every search failure through one match arm
         // synthesising a `rusqlite::Error::InvalidParameterCount` would
         // misrepresent the cause, so we use `InvalidQuery` which is the
         // closest fit for "the caller passed a value SQLite would have
@@ -502,9 +502,9 @@ RETURNING id, foglet_user_id, handle, role, security_level, \
                 source: rusqlite::Error::InvalidQuery,
             });
         }
-        // `instr(lower(handle), lower(?1)) = 1` is the prefix match —
+        // `instr(lower(handle), lower(?1)) = 1` is the prefix match
         // see the doc comment for why this beats `LIKE ?1 || '%'`. The
-        // `lower()` wrapper handles the case-insensitive contract; the
+        // `lower` wrapper handles the case-insensitive contract; the
         // `= 1` pins the match to column 1 (SQLite's `instr` is
         // 1-indexed and returns 0 for "no match"). `ORDER BY
         // lower(handle), id` keeps the output deterministic across
@@ -529,8 +529,8 @@ LIMIT ?2";
 
     /// Return the most-recently-active players, newest first.
     ///
-    /// Added for SPEC_v3 §Task 8b — async-multiplayer target-selection
-    /// screens (notice recipient picker, challenge rival selector,
+    /// Added for — async-multiplayer target-selection
+    /// screens (notice recipient picker, challenge rival selector.
     /// bounty claim attribution) need a "who's been around lately"
     /// list to seed the picker before the player has typed anything
     /// into the [`Self::search_players_by_handle_prefix`] box.
@@ -603,10 +603,10 @@ LIMIT ?1";
 
 /// Decode a `players` row into [`PlayerRecord`].
 ///
-/// Pulled out of the upsert call site so Task 5c's local-dev path and
+/// Pulled out of the upsert call site so 's local-dev path and
 /// any future read helpers (a `find_by_user_id` query, for instance)
 /// can share one decoder. Column order matches the `RETURNING` clause
-/// above and the SPEC §4.4 schema; a regression that reorders columns
+/// above and the schema; a regression that reorders columns
 /// in the migration will surface here as a type error rather than as
 /// a runtime panic in production.
 fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<PlayerRecord> {
@@ -638,7 +638,7 @@ mod tests {
     }
 
     /// Variant of [`ctx_with`] that lets a test pin the `role` string.
-    /// Task 5f's persistence test exercises sysop / mod / user / unknown
+    /// 's persistence test exercises sysop mod user unknown
     /// roles — passing the role through this helper keeps each test
     /// body focused on the assertion under test instead of restating
     /// the full struct literal.
@@ -659,9 +659,9 @@ mod tests {
         }
     }
 
-    /// SPEC_v2 §Task 5b acceptance: a Foglet `user_id` is the stable
+    ///   acceptance: a Foglet `user_id` is the stable
     /// key for a player row. Two upserts against the same user_id
-    /// resolve to the same `players.id` and never duplicate the row,
+    /// resolve to the same `players.id` and never duplicate the row.
     /// even if the display handle changes between calls.
     #[test]
     fn upsert_player_with_user_id_is_stable_across_repeats() {
@@ -724,7 +724,7 @@ mod tests {
 
     /// Missing `username` falls back to the documented default rather
     /// than rejecting the upsert. Foglet's contract makes `username`
-    /// optional (SPEC §5.1) — refusing to register a player on that
+    /// optional — refusing to register a player on that
     /// path would lock anonymous-access doors out of the world.
     #[test]
     fn upsert_player_falls_back_to_default_handle_when_username_missing() {
@@ -741,10 +741,10 @@ mod tests {
         assert_eq!(record.handle, DEFAULT_HANDLE);
     }
 
-    /// A context with no `role` field upserts as `'user'` / `50`.
-    /// After Task 5f the upsert path writes the role explicitly rather
+    /// A context with no `role` field upserts as `'user'` `50`.
+    /// After the upsert path writes the role explicitly rather
     /// than relying on the SQL default, but the resulting values must
-    /// still match the documented "absent role" mapping from SPEC §4.5
+    /// still match the documented "absent role" mapping
     /// — that's what keeps the column shape consistent with the
     /// hand-rolled INSERTs in the migration tests below.
     #[test]
@@ -764,9 +764,9 @@ mod tests {
         assert!(record.local_dev_key.is_none());
     }
 
-    /// SPEC_v2 §Task 5f acceptance: distinct sysop / mod / user
+    ///   acceptance: distinct sysop mod user
     /// contexts persist distinct normalized role/security pairs in the
-    /// `players` row. The mapping is the SPEC §4.5 contract — sysop →
+    /// `players` row. The mapping is the contract — sysop →
     /// 100, mod → 90, user → 50, unknown → 50 — and the test pins
     /// each branch explicitly so a regression in
     /// [`FogletRole::security_level`] surfaces here instead of in
@@ -815,7 +815,7 @@ mod tests {
         assert_ne!(sysop.id, moderator.id);
         assert_ne!(moderator.id, user.id);
 
-        // Unknown roles still persist a row, with the SPEC-mandated
+        // Unknown roles still persist a row, with the -mandated
         // user-level fallback. The original token is preserved verbatim
         // (no lowercase-folding for `Other`) so a curious operator
         // dumping the table can still see what the upstream context
@@ -828,11 +828,11 @@ mod tests {
     }
 
     /// A repeat upsert for the same player but with a different role
-    /// rewrites `role` / `security_level` in place — the upstream
+    /// rewrites `role` `security_level` in place — the upstream
     /// Foglet user got promoted/demoted between launches and the
     /// registry must reflect the new value rather than freezing the
     /// first-seen role. Pinning this means a future "preserve role on
-    /// repeat upsert" patch (which would diverge from SPEC §4.5)
+    /// repeat upsert" patch (which would diverge )
     /// flunks here instead of silently freezing live data.
     #[test]
     fn repeat_upsert_refreshes_role_and_security_level() {
@@ -860,11 +860,11 @@ mod tests {
         assert_eq!(after.security_level, 100);
     }
 
-    /// SPEC_v2 §Task 5c acceptance: two local-dev sessions with
+    ///   acceptance: two local-dev sessions with
     /// distinct handles synthesise distinct `local_dev_key` values and
-    /// land on distinct rows — they MUST NOT collide. Without this,
+    /// land on distinct rows — they MUST NOT collide. Without this.
     /// the two-player Murder Motel smoke test (alice + bob) would
-    /// share one player record and fork every per-player ledger,
+    /// share one player record and fork every per-player ledger.
     /// event, and leaderboard entry into a single shared identity.
     #[test]
     fn upsert_player_with_distinct_local_dev_handles_creates_distinct_rows() {
@@ -894,7 +894,7 @@ mod tests {
     }
 
     /// Repeat upserts with the same local-dev handle resolve to the
-    /// same `players.id`. The mirror of the user-id stability test —
+    /// same `players.id`. The mirror of the user-id stability test
     /// without it, a dev relaunching `cargo run --example murder_motel`
     /// would keep forking new player rows on every invocation.
     #[test]
@@ -925,9 +925,9 @@ mod tests {
         assert_eq!(count, 1, "stable local-dev key must not duplicate the row");
     }
 
-    /// Local-dev and Foglet-user-id rows occupy disjoint namespaces —
+    /// Local-dev and Foglet-user-id rows occupy disjoint namespaces
     /// a Foglet user "alice" and a local-dev "alice" must end up on
-    /// separate `players` rows. SPEC §4.4 calls this out explicitly:
+    /// separate `players` rows. calls this out explicitly:
     /// "synthesize a local key that does not collide with real Foglet
     /// users".
     #[test]
@@ -982,7 +982,7 @@ mod tests {
     }
 
     /// Whitespace-only handles trim down to the default. Without this
-    /// guard, two `--local-dev-user "   "` invocations would each pin
+    /// guard, two `--local-dev-user " "` invocations would each pin
     /// a distinct `local_dev_key` byte sequence (one with leading
     /// spaces, one without) and split a single sloppy operator's
     /// history across rows.
@@ -994,7 +994,7 @@ mod tests {
         assert_eq!(synthesize_local_dev_key("   "), "local-dev:guest");
     }
 
-    /// SPEC_v2 §Task 5a acceptance: applying [`PLAYERS_MIGRATION`]
+    ///   acceptance: applying [`PLAYERS_MIGRATION`]
     /// records the version *and* leaves the documented column shape
     /// behind. Pinning both halves in one test means a regression that
     /// renames a column (5d's `last_seen_at` is the most likely
@@ -1035,12 +1035,12 @@ mod tests {
                 "last_seen_at".to_string(),
                 "local_dev_key".to_string(),
             ],
-            "players schema must match SPEC_v2 §4.4 exactly"
+            "players schema must match exactly"
         );
 
         // Bookkeeping row recorded at the migration's declared version
         // — proves the standard apply path was used (vs. a side-channel
-        // `execute_batch`) so the relaunch idempotency test in Task 4c
+        // `execute_batch`) so the relaunch idempotency test in
         // continues to apply.
         let recorded: i64 = world
             .connection()
@@ -1053,8 +1053,8 @@ mod tests {
         assert_eq!(recorded, PLAYERS_MIGRATION.version);
     }
 
-    /// Re-applying [`PLAYERS_MIGRATION`] is a no-op (Task 4c
-    /// idempotency carries forward to the kit's built-in migrations,
+    /// Re-applying [`PLAYERS_MIGRATION`] is a no-op (
+    /// idempotency carries forward to the kit's built-in migrations.
     /// not just author-supplied ones). Without this guard a relaunch
     /// against an already-bootstrapped DB would surface a `table
     /// already exists` error from the second `CREATE TABLE` in the
@@ -1086,7 +1086,7 @@ mod tests {
 
     /// Partial unique index on `foglet_user_id` rejects duplicates
     /// while still allowing multiple local-dev rows where the column
-    /// is null. This is the property Task 5b's upsert path relies on
+    /// is null. This is the property 's upsert path relies on
     /// — without it, two concurrent Foglet sessions for the same user
     /// could create separate registry rows and split a player's
     /// turn ledger and leaderboard score across them.
@@ -1131,7 +1131,7 @@ mod tests {
     }
 
     /// Companion guard to [`foglet_user_id_unique_when_not_null`] for
-    /// the local-dev key namespace. Task 5c will lean on this so two
+    /// the local-dev key namespace. will lean on this so two
     /// local-dev sessions with the same synthesized key resolve to a
     /// single registry row instead of forking the player's history.
     #[test]
@@ -1160,7 +1160,7 @@ mod tests {
         );
     }
 
-    /// SPEC_v2 §Task 5d acceptance: a repeat upsert refreshes
+    ///   acceptance: a repeat upsert refreshes
     /// `last_seen_at` while leaving `first_seen_at` alone. The audit
     /// story depends on `first_seen_at` being a stable "registered at"
     /// anchor — a regression that put it on the SET list of the
@@ -1169,7 +1169,7 @@ mod tests {
     ///
     /// The test fakes the passage of time by stamping the row with a
     /// known-past timestamp directly through SQL after the first
-    /// upsert. `CURRENT_TIMESTAMP` has 1-second granularity in SQLite,
+    /// upsert. `CURRENT_TIMESTAMP` has 1-second granularity in SQLite.
     /// so two back-to-back upserts in the same second would share a
     /// timestamp and prove nothing about whether the column was
     /// rewritten. Manually backdating both columns to a clearly older
@@ -1261,7 +1261,7 @@ mod tests {
         assert!(second.last_seen_at.as_str() > BACKDATED);
     }
 
-    /// Defaults — role and security_level fall back to `'user'` / `50`
+    /// Defaults — role and security_level fall back to `'user'` `50`
     /// when the caller doesn't specify them. 5b's upsert path will
     /// rely on this for any context that arrives without role
     /// information, so the SQL-side default is the load-bearing piece.
@@ -1294,7 +1294,7 @@ mod tests {
         assert_eq!(security_level, 50);
     }
 
-    /// SPEC_v2 §Task 13f: the leaderboard render path needs to look up a
+    ///  : the leaderboard render path needs to look up a
     /// handle from a `players.id`. An upsert followed by `player_handle`
     /// must round-trip the display string verbatim.
     #[test]
@@ -1333,11 +1333,11 @@ mod tests {
             .is_none());
     }
 
-    /// Helper for the §Task 8a search tests: seed a roster of
+    /// Helper for the search tests: seed a roster of
     /// distinct-handle local-dev players so a single test body can
     /// assert on the ordered match set without restating the upsert
     /// boilerplate per row. Handles deliberately span case and
-    /// alphabetical neighbours so prefix / case-folding / ordering
+    /// alphabetical neighbours so prefix case-folding ordering
     /// regressions surface independently.
     fn seed_search_roster(world: &WorldDb) {
         for handle in ["alice", "Albert", "albus", "Bob", "calico", "carol"] {
@@ -1347,7 +1347,7 @@ mod tests {
         }
     }
 
-    /// SPEC_v3 §Task 8a acceptance: the search is **case-insensitive
+    ///   acceptance: the search is **case-insensitive
     /// prefix** match, ordered alphabetically. A query of `"AL"` must
     /// surface `Albert`, `albus`, and `alice` (all three share the
     /// `al` prefix regardless of case) and MUST NOT surface `calico`
@@ -1393,7 +1393,7 @@ mod tests {
     }
 
     /// `limit` caps the returned set. A roster with three matching
-    /// handles and a limit of 2 returns the alphabetically-first two —
+    /// handles and a limit of 2 returns the alphabetically-first two
     /// the order contract from the prefix test pins which two survive.
     #[test]
     fn search_players_by_handle_prefix_respects_limit() {
@@ -1470,7 +1470,7 @@ mod tests {
         assert!(matches!(err, PlayerError::Sqlite { .. }));
     }
 
-    /// A `limit` of zero returns no rows even with matches present —
+    /// A `limit` of zero returns no rows even with matches present
     /// pins the "explicit cap" contract. Without this, a future
     /// regression that special-cased `0` to mean "no limit" would
     /// silently page the entire roster into a screen that asked for
@@ -1490,7 +1490,7 @@ mod tests {
         assert!(hits.is_empty());
     }
 
-    /// Helper for the §Task 8b recent-players tests: stamp a known
+    /// Helper for the recent-players tests: stamp a known
     /// `last_seen_at` on a specific player so the test can pin the
     /// ordering contract without relying on `CURRENT_TIMESTAMP`'s
     /// one-second resolution. SQLite stores the column as `TEXT`, so
@@ -1507,7 +1507,7 @@ mod tests {
             .expect("stamp last_seen_at succeeds");
     }
 
-    /// SPEC_v3 §Task 8b acceptance: results are ordered by
+    ///   acceptance: results are ordered by
     /// `last_seen_at DESC`. Manually stamping distinct timestamps
     /// sidesteps `CURRENT_TIMESTAMP`'s second-precision so this test
     /// pins the chronology contract without sleeping. A regression
@@ -1641,7 +1641,7 @@ mod tests {
         assert!(matches!(err, PlayerError::Sqlite { .. }));
     }
 
-    /// A `limit` of zero returns no rows even with matches present —
+    /// A `limit` of zero returns no rows even with matches present
     /// pins the "explicit cap" contract. A future regression that
     /// special-cased `0` to mean "no limit" would silently page the
     /// entire roster into a screen that asked for nothing.
@@ -1658,7 +1658,7 @@ mod tests {
         assert!(hits.is_empty());
     }
 
-    /// A repeat upsert refreshes `last_seen_at` (Task 5d), so a player
+    /// A repeat upsert refreshes `last_seen_at`, so a player
     /// who relaunches the game bubbles to the top of the picker. Pins
     /// the integration between `upsert_player` and `recent_players`:
     /// the picker reflects activity, not registration order.
@@ -1684,7 +1684,7 @@ mod tests {
         stamp_last_seen(&world, bob.id, "2025-01-02T00:00:00Z");
 
         // alice relaunches and her timestamp jumps ahead of bob's.
-        // Re-upserting via the public path exercises the Task 5d
+        // Re-upserting via the public path exercises the
         // refresh contract end-to-end rather than reaching for raw
         // SQL — the column under test is what `upsert_player` writes.
         stamp_last_seen(&world, alice.id, "2025-01-03T00:00:00Z");

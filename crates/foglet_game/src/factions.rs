@@ -1,18 +1,18 @@
 //! `factions` — shared-world faction, membership, and shared-goal
-//! schema (SPEC_v3 §4.4 / §Task 6a).
+//! schema.
 //!
-//! v3 introduces durable async player factions: detective agencies
+//!  introduces durable async player factions: detective agencies
 //! and equivalent in-game allegiances, the players who belong to
-//! them, and the shared goals (clue-board totals, bounty pools,
+//! them, and the shared goals (clue-board totals, bounty pools.
 //! contribution drives) the membership chips away at together. The
-//! whole feature sits on top of three tightly coupled tables —
+//! whole feature sits on top of three tightly coupled tables
 //! `factions`, `faction_memberships`, `shared_goals` — whose shape
 //! is pinned by [`FACTIONS_MIGRATION`]. This module exists only to
 //! declare that schema and prove it applies; the `Faction` /
-//! `FactionMembership` / `SharedGoal` Rust types and the
-//! `seed_factions` / `join_faction` / `leave_faction` /
-//! `create_shared_goal` / `contribute_to_goal` helpers land in
-//! subsequent §Task 6 sub-items (6b–6g). Splitting the migration
+//! `FactionMembership` `SharedGoal` Rust types and the
+//! `seed_factions` `join_faction` `leave_faction` /
+//! `create_shared_goal` `contribute_to_goal` helpers land in
+//! subsequent sub-items (6b–6g). Splitting the migration
 //! into its own commit keeps the bisect signal sharp — a column
 //! rename, a relaxed `CHECK`, or a missing index flunks the schema
 //! test in this module rather than a higher-level transactional
@@ -31,25 +31,25 @@
 //! 1. A door that comes up with `factions` enabled gets the full
 //!    feature in one atomic version bump — no intermediate state
 //!    where memberships exist but goals do not (or vice versa).
-//! 2. The three tables get one shared rationale block right here,
+//! 2. The three tables get one shared rationale block right here.
 //!    rather than three near-duplicate doc comments across three
 //!    files.
-//! 3. The single bisect signal for "the v3 faction schema is
-//!    wrong" stays one test (`migration_creates_faction_tables`),
+//! 3. The single bisect signal for "the faction schema is
+//!    wrong" stays one test (`migration_creates_faction_tables`).
 //!    not three that all flunk in lockstep.
 //!
 //! Splitting across three migrations would also burn three
 //! versions on a feature that ships as one atomic primitive, which
-//! complicates the kit version → SPEC band mapping documented in
-//! `docs/shared-world.md` §8.1.
+//! complicates the kit version → band mapping documented in
+//! `docs/shared-world.md`
 //!
 //! # Why `version = 9`
 //!
-//! v2 occupies migration versions 1–5 (see `docs/shared-world.md`
-//! §8.1). v3 claims `6` and above, dense and grouped per primitive.
+//!  occupies migration versions 1–5 (see `docs/shared-world.md`
+//! ). claims `6` and above, dense and grouped per primitive.
 //! Notices took 6, challenges took 7, market listings took 8.
-//! Factions are the fourth v3 primitive to land, so they take 9.
-//! The remaining v3 migration (bounties, §Task 7a) takes 10.
+//! Factions are the fourth primitive to land, so they take 9.
+//! The remaining migration (bounties, ) takes 10.
 
 use thiserror::Error;
 
@@ -59,7 +59,7 @@ use crate::world_db::{WorldDb, WorldMigration};
 
 /// `world_events.kind` value the kit emits when a shared goal is
 /// flipped from `'active'` to `'completed'` by
-/// [`WorldDb::complete_goal_if_reached`] (SPEC_v3 §4.4 / §Task 6g).
+/// [`WorldDb::complete_goal_if_reached`].
 ///
 /// Exposed as a `pub const` (rather than a hard-coded string at the
 /// call site) so consuming games can pattern-match against it in a
@@ -69,7 +69,7 @@ use crate::world_db::{WorldDb, WorldMigration};
 pub const FACTION_GOAL_COMPLETED_EVENT_KIND: &str = "faction.goal.completed";
 
 /// Schema for the faction, faction_membership, and shared_goal
-/// tables — SPEC_v3 §4.4 / §Task 6a.
+/// tables —.
 ///
 /// One migration, three tables, four indexes. The tables form a
 /// single conceptual primitive; see the module-level docs for why
@@ -77,21 +77,21 @@ pub const FACTION_GOAL_COMPLETED_EVENT_KIND: &str = "faction.goal.completed";
 ///
 /// # Table: `factions`
 ///
-/// One row per game-defined faction (detective agency, guild,
-/// crew). SPEC §4.4 lists the fields: `faction id`, `slug`,
+/// One row per game-defined faction (detective agency, guild.
+/// crew). lists the fields: `faction id`, `slug`.
 /// `display_name`, `description`, `created_at`. The kit's contract
 /// is "factions are seeded from `[[factions.seed]]` in
-/// `game.toml`, idempotently, by Task 6b — once seeded a faction
+/// `game.toml`, idempotently, by — once seeded a faction
 /// row is write-once".
 ///
 /// - `id` — `INTEGER PRIMARY KEY`. Autoincrement-aliased rowid.
 ///   Stable handle the membership and shared-goal rows reference.
 /// - `slug` — `TEXT NOT NULL UNIQUE`. The game-author-controlled
 ///   stable identifier (e.g. `"blue-desk"`). The `UNIQUE`
-///   constraint is what makes Task 6b's idempotent seed possible:
+///   constraint is what makes 's idempotent seed possible:
 ///   `INSERT … ON CONFLICT(slug) DO NOTHING` round-trips a single
 ///   row regardless of how many times the door starts. The slug
-///   travels in `[[factions.seed]]` config blocks (SPEC §5.2),
+///   travels in `[[factions.seed]]` config blocks.
 ///   not the autoincrement id, because config-file ids would be
 ///   fragile across reseeded worlds.
 /// - `display_name` — `TEXT NOT NULL`. Human-facing label rendered
@@ -111,7 +111,7 @@ pub const FACTION_GOAL_COMPLETED_EVENT_KIND: &str = "faction.goal.completed";
 ///
 /// # Table: `faction_memberships`
 ///
-/// One row per (player, faction) pair. SPEC §4.4 explicitly says
+/// One row per (player, faction) pair. explicitly says
 /// "One player MAY belong to multiple factions unless the game
 /// config restricts it" — the schema therefore does not impose a
 /// "one faction per player" constraint; that policy lives in the
@@ -119,28 +119,28 @@ pub const FACTION_GOAL_COMPLETED_EVENT_KIND: &str = "faction.goal.completed";
 /// game's join screen, not the storage layer.
 ///
 /// - `id` — `INTEGER PRIMARY KEY`. Stable membership handle. Lets
-///   Task 6c/6d return a struct that can be addressed unambiguously
+///    return a struct that can be addressed unambiguously
 ///   even if the same player rejoins the same faction after
 ///   leaving (a new row, a new id; the old row is preserved as
 ///   audit trail).
 /// - `player_id` — `INTEGER NOT NULL REFERENCES players(id)`. FK
-///   to the v2 players table; same enforcement caveat as every
-///   other v2/v3 FK column (active only with `PRAGMA
+///   to the players table; same enforcement caveat as every
+///   other v2/FK column (active only with `PRAGMA
 ///   foreign_keys = ON`).
 /// - `faction_id` — `INTEGER NOT NULL REFERENCES factions(id)`.
 ///   The faction the player belongs to.
-/// - `role` — `TEXT NOT NULL DEFAULT 'member'`. SPEC §4.4 lists
-///   `role` in the membership shape. v3 ships with no enforced
+/// - `role` — `TEXT NOT NULL DEFAULT 'member'`. lists
+///   `role` in the membership shape. ships with no enforced
 ///   vocabulary (no `CHECK` constraint) because the role lexicon
 ///   is game-defined: a noir detective agency might use
 ///   `'rookie'/'sergeant'`, a heist crew `'driver'/'fence'`. The
 ///   default `'member'` is the kit's neutral fallback so
-///   `join_faction` (Task 6c) can stay a one-argument call for
+///   `join_faction` can stay a one-argument call for
 ///   games that don't model roles at all.
 /// - `joined_at` — `TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP`. ISO
 ///   timestamp the player joined.
-/// - `left_at` — `TEXT`, nullable. ISO timestamp the player left,
-///   or `NULL` while the membership is active. Task 6d stamps
+/// - `left_at` — `TEXT`, nullable. ISO timestamp the player left.
+///   or `NULL` while the membership is active. stamps
 ///   this column rather than `DELETE`-ing the row so departures
 ///   are audit-trail visible — the same soft-delete convention as
 ///   `notices.archived_at`. The "active membership" view is
@@ -149,21 +149,21 @@ pub const FACTION_GOAL_COMPLETED_EVENT_KIND: &str = "faction.goal.completed";
 ///
 /// A `UNIQUE (player_id, faction_id, joined_at)` index would be
 /// over-tight (a player who leaves and rejoins on the same second
-/// would clash). Instead, "one *active* membership per (player,
-/// faction)" is enforced by Task 6c's helper inside its
+/// would clash). Instead, "one *active* membership per (player.
+/// faction)" is enforced by 's helper inside its
 /// transaction, and the partial index below guarantees the read
 /// path stays seek-bound.
 ///
 /// # Table: `shared_goals`
 ///
-/// One row per shared goal (clue-board total, contribution drive,
-/// shared bounty pool). SPEC §4.4 fields: `goal id`, `faction_id`
+/// One row per shared goal (clue-board total, contribution drive.
+/// shared bounty pool). fields: `goal id`, `faction_id`
 /// (nullable — a goal may be world-wide rather than scoped to one
 /// faction), `key`, `target_amount`, `current_amount`, `state`.
 ///
 /// - `id` — `INTEGER PRIMARY KEY`.
 /// - `faction_id` — `INTEGER REFERENCES factions(id)`, nullable.
-///   SPEC §4.4 explicitly lists "faction id optional"; world-wide
+///    explicitly lists "faction id optional"; world-wide
 ///   goals (e.g. "the city solves 100 cases") have `NULL` here.
 /// - `key` — `TEXT NOT NULL`. Game-authored stable identifier
 ///   (e.g. `"blue-desk.clue-board"`). Combined with `faction_id`
@@ -173,19 +173,19 @@ pub const FACTION_GOAL_COMPLETED_EVENT_KIND: &str = "faction.goal.completed";
 ///   duplicate goal rows.
 /// - `target_amount` — `INTEGER NOT NULL CHECK (target_amount > 0)`.
 ///   The amount the contribution drive needs to reach. A goal
-///   with target 0 is meaningless (instantly complete on creation),
+///   with target 0 is meaningless (instantly complete on creation).
 ///   so the `CHECK` rejects it at the schema layer rather than
-///   leaving the trap open for Task 6e.
+///   leaving the trap open for.
 /// - `current_amount` — `INTEGER NOT NULL DEFAULT 0
 ///   CHECK (current_amount >= 0)`. Running total. Decrements are
-///   not part of the v3 contract — `contribute_to_goal` only adds
+///   not part of the contract — `contribute_to_goal` only adds
 ///   — so the lower-bound `CHECK` is the safety net for any path
 ///   that bypasses the helper.
 /// - `state` — `TEXT NOT NULL DEFAULT 'active'
 ///   CHECK (state IN ('active','completed'))`. Two-state machine.
 ///   `active` while `current_amount < target_amount`; transitions
 ///   to `completed` exactly once when the helper detects the
-///   target was reached (Task 6g). The `CHECK` constraint pins the
+///   target was reached. The `CHECK` constraint pins the
 ///   vocabulary so a typo in a future helper (`'compelted'`)
 ///   flunks at INSERT time rather than landing a row the UI
 ///   cannot interpret.
@@ -198,14 +198,14 @@ pub const FACTION_GOAL_COMPLETED_EVENT_KIND: &str = "faction.goal.completed";
 /// # Indexes
 ///
 /// Four named indexes are created up-front so the read paths
-/// Task 6b–6g rely on are seek-bound from the moment they land.
-/// Same rationale as the partial indexes on `notices`,
+///  rely on are seek-bound from the moment they land.
+/// Same rationale as the partial indexes on `notices`.
 /// `challenges`, and `market_listings`: pay the index cost at the
 /// same migration that creates the table, never in a follow-up.
 ///
 /// - `idx_factions_slug` — implicit via the `UNIQUE` constraint
 ///   on `factions.slug`. Backs the idempotent-seed lookup
-///   (Task 6b) and the `slug → faction` resolver future screens
+///    and the `slug → faction` resolver future screens
 ///   will use. Materialised by SQLite, not by an explicit
 ///   `CREATE INDEX`.
 /// - `idx_faction_memberships_active` — partial index over
@@ -213,16 +213,16 @@ pub const FACTION_GOAL_COMPLETED_EVENT_KIND: &str = "faction.goal.completed";
 ///   "what factions does this player currently belong to" and
 ///   "is this player a member of this faction" queries. Partial
 ///   predicate keeps the index small (left memberships are
-///   excluded) and matches Task 6c/6d's expected query shape
+///   excluded) and matches 's expected query shape
 ///   exactly.
 /// - `idx_faction_memberships_by_faction` — partial index over
 ///   `(faction_id, joined_at, id)` `WHERE left_at IS NULL`. Backs
 ///   "list active members of this faction" — the agency roster
 ///   screen. The `(joined_at, id)` tail orders members by tenure
 ///   with a deterministic id tiebreaker, mirroring the
-///   `(created_at, id)` convention on the other v3 tables.
+///   `(created_at, id)` convention on the other tables.
 /// - `idx_shared_goals_faction_key` — `UNIQUE (faction_id, key)`.
-///   Pins "one goal per (faction, key)". Required for Task 6e's
+///   Pins "one goal per (faction, key)". Required for 's
 ///   create-or-find helper to be safely idempotent under the same
 ///   `INSERT … ON CONFLICT DO NOTHING` shape as faction seeding.
 ///   `faction_id` participates in the uniqueness so two factions
@@ -231,16 +231,16 @@ pub const FACTION_GOAL_COMPLETED_EVENT_KIND: &str = "faction.goal.completed";
 ///   SQLite's default semantics: NULLs are not equal, so multiple
 ///   world-wide goals with the same key are permitted — game code
 ///   that wants to forbid that resolves it at the helper layer.
-/// - `idx_shared_goals_active` — partial index over `(faction_id,
+/// - `idx_shared_goals_active` — partial index over `(faction_id.
 ///   key)` `WHERE state = 'active'`. Backs "find the open goal
 ///   matching this (faction, key)" without scanning completed
 ///   rows.
 ///
 /// # Version
 ///
-/// `version = 9`. v2 uses 1–5; v3 uses 6+ (notices=6,
+/// `version = 9`. uses 1–5; uses 6+ (notices=6.
 /// challenges=7, market_listings=8). Factions are the fourth v3
-/// primitive to land, so they take 9. Bounties (§Task 7a) take 10.
+/// primitive to land, so they take 9. Bounties take 10.
 pub const FACTIONS_MIGRATION: WorldMigration = WorldMigration {
     version: 9,
     name: "create_factions",
@@ -282,16 +282,16 @@ CREATE INDEX IF NOT EXISTS idx_shared_goals_active\n\
 ",
 };
 
-/// Read model for one row of the `factions` table — SPEC_v3 §4.4.
+/// Read model for one row of the `factions` table
 ///
 /// Returned by [`WorldDb::seed_factions`] so callers receive the
 /// canonical row SQLite produced (autoincrement `id`, SQL-side
 /// `created_at`) rather than echoing back the input config. Future
-/// v3 helpers (`join_faction`, agency selector queries) will read
+/// helpers (`join_faction`, agency selector queries) will read
 /// the same shape.
 ///
 /// `display_name` and `description` are mirrored from the seed row
-/// because v3 treats faction rows as write-once after first seed —
+/// because treats faction rows as write-once after first seed
 /// see [`WorldDb::seed_factions`] for the rationale. If a future
 /// version ever wants editable faction metadata, the change lands
 /// in a new helper, not by mutating this struct's contract.
@@ -319,14 +319,14 @@ pub struct Faction {
 
 /// Errors raised while seeding or otherwise mutating faction state.
 ///
-/// Library-internal `thiserror` per the v3 convention shared with
+/// Library-internal `thiserror` per the convention shared with
 /// [`crate::notices::NoticeError`] and [`crate::market::MarketError`].
 /// Today only the SQL boundary error is needed — config-side
 /// validation (slug shape, non-empty fields, duplicate slugs) is
 /// already enforced by `crate::config::GameConfig::validate` at
 /// load time, so by the time a `&[FactionSeed]` reaches
 /// [`WorldDb::seed_factions`] every entry is structurally sound.
-/// New variants slot in here as later §Task 6 sub-items (membership,
+/// New variants slot in here as later sub-items (membership.
 /// shared goals) ship their own helpers.
 #[derive(Debug, Error)]
 pub enum FactionError {
@@ -340,8 +340,8 @@ pub enum FactionError {
         #[source]
         source: rusqlite::Error,
     },
-    /// [`WorldDb::leave_faction`] was called for a `(player_id,
-    /// faction_id)` pair that has no row in `faction_memberships` —
+    /// [`WorldDb::leave_faction`] was called for a `(player_id.
+    /// faction_id)` pair that has no row in `faction_memberships`
     /// neither active nor historical. The player has never joined
     /// this faction, so there is nothing to leave. Distinct from
     /// "already left" (which the helper handles idempotently and
@@ -369,7 +369,7 @@ pub enum FactionError {
         actual: i64,
     },
     /// [`WorldDb::contribute_to_goal`] was called with a
-    /// non-positive `amount`. SPEC §4.4 frames a contribution as
+    /// non-positive `amount`. frames a contribution as
     /// "current_amount += amount"; an `amount` of zero is a no-op
     /// that would still appear to "succeed" to UI callers, and a
     /// negative amount would silently rewind progress for every
@@ -397,7 +397,7 @@ pub enum FactionError {
         id: i64,
     },
     /// [`WorldDb::contribute_to_goal`] was called against a goal
-    /// whose `state` is already `'completed'`. SPEC §4.4 pins the
+    /// whose `state` is already `'completed'`. pins the
     /// state machine at `active -> completed`; once flipped, further
     /// contributions are rejected so the bulletin can render a stable
     /// "this goal is solved" terminal state without a late-arriving
@@ -414,7 +414,7 @@ pub enum FactionError {
     /// returned `Err`. The wrapping transaction has already rolled
     /// back, so the goal's `current_amount` is unchanged and any side
     /// effects the callback attempted (currency debit, inventory
-    /// burn, evidence row insert) are undone — that's the SPEC §4.4
+    /// burn, evidence row insert) are undone — that's the
     /// "Contributions MUST be transactional" contract. Distinct from
     /// [`Self::Sqlite`] so the agency UI can surface a contributor-
     /// side reason ("you don't have enough clue points") separately
@@ -434,10 +434,10 @@ pub enum FactionError {
     },
     /// The world-event append that fires after a shared goal is
     /// flipped from `'active'` to `'completed'` by
-    /// [`WorldDb::complete_goal_if_reached`] failed (SPEC_v3 §4.4 /
-    /// §Task 6g). The wrapping transaction rolls back as a unit, so
-    /// the goal stays `'active'` and `completed_at` stays `NULL` —
-    /// the SPEC §4.4 "completion MUST be transactional with its
+    /// [`WorldDb::complete_goal_if_reached`] failed ( /
+    /// ). The wrapping transaction rolls back as a unit, so
+    /// the goal stays `'active'` and `completed_at` stays `NULL`
+    /// the "completion MUST be transactional with its
     /// world event" guarantee. Distinct from [`Self::Sqlite`] so the
     /// agency UI can surface the event-append phase explicitly (in
     /// practice this is an operator-fix path: the `world_events`
@@ -455,8 +455,8 @@ pub enum FactionError {
 }
 
 impl WorldDb {
-    /// Idempotently upsert configured factions into the world DB —
-    /// SPEC_v3 §4.4 / §Task 6b.
+    /// Idempotently upsert configured factions into the world DB
+    ///  /.
     ///
     /// The contract is "every slug in `seeds` corresponds to a
     /// `factions` row after this call returns, and calling again
@@ -468,7 +468,7 @@ impl WorldDb {
     ///    safe — a second run sees the existing row and skips the
     ///    insert without raising.
     /// 2. SELECT the canonical row by slug inside the same
-    ///    transaction so the helper returns the same id, display_name,
+    ///    transaction so the helper returns the same id, display_name.
     ///    description, and created_at every call regardless of which
     ///    invocation actually inserted the row.
     /// 3. Commit. If any statement fails the entire batch rolls back
@@ -478,7 +478,7 @@ impl WorldDb {
     /// # Write-once contract
     ///
     /// `display_name` and `description` are deliberately *not*
-    /// updated when a slug already exists. SPEC_v3 §4.4 + the
+    /// updated when a slug already exists. + the
     /// schema doc on [`FACTIONS_MIGRATION`] state that "once seeded
     /// a faction row is write-once". A game author who wants to
     /// rename a detective agency mid-run picks a new slug; an
@@ -490,7 +490,7 @@ impl WorldDb {
     ///
     /// # Empty input is a valid no-op
     ///
-    /// `seeds.is_empty()` returns an empty `Vec` without opening a
+    /// `seeds.is_empty` returns an empty `Vec` without opening a
     /// transaction. Doors that disable factions in `[multiplayer]`
     /// (or simply ship none in `[[factions.seed]]`) call this
     /// helper at startup with an empty slice; paying for a `BEGIN`
@@ -563,16 +563,16 @@ FROM factions WHERE slug = ?1";
         Ok(out)
     }
 
-    /// Add `player_id` to `faction_id` as an active member —
-    /// SPEC_v3 §4.4 / §Task 6c.
+    /// Add `player_id` to `faction_id` as an active member
+    ///  /.
     ///
     /// The contract is "after this call returns, there is exactly
-    /// one row in `faction_memberships` with `(player_id,
+    /// one row in `faction_memberships` with `(player_id.
     /// faction_id, left_at IS NULL)`, and the returned struct
     /// describes it". Calling again with the same arguments while
     /// the membership is still active is a documented no-op: the
     /// helper returns the *existing* row, not a duplicate. This
-    /// matches the kit's broader async-multiplayer convention —
+    /// matches the kit's broader async-multiplayer convention
     /// idempotent helpers free the game UI from defensive "do they
     /// already belong?" queries before offering a join button.
     ///
@@ -589,7 +589,7 @@ FROM factions WHERE slug = ?1";
     /// "no active row", each insert, and leave the agency roster
     /// rendering the player twice. The schema deliberately does
     /// not carry a `UNIQUE (player_id, faction_id)` constraint
-    /// (Task 6d soft-deletes leave the historical row in place,
+    /// ( soft-deletes leave the historical row in place.
     /// which would clash with such a unique key) — that's why the
     /// idempotency MUST live in the helper SQL, not the schema.
     ///
@@ -603,7 +603,7 @@ FROM factions WHERE slug = ?1";
     ///
     /// `role: Option<&str>` — `None` resolves to the schema-side
     /// `DEFAULT 'member'` via `COALESCE(?3, 'member')` in the
-    /// VALUES clause. SPEC §4.4 leaves the role lexicon to the
+    /// VALUES clause. leaves the role lexicon to the
     /// game (rookies/sergeants vs. drivers/fences); games that
     /// don't model roles pass `None` and never see the column.
     ///
@@ -617,7 +617,7 @@ FROM factions WHERE slug = ?1";
     ///
     /// # Multi-faction membership
     ///
-    /// SPEC §4.4 states "One player MAY belong to multiple
+    ///  states "One player MAY belong to multiple
     /// factions unless the game config restricts it" — the schema
     /// and this helper enforce no per-player limit. Cross-faction
     /// exclusivity (the noir convention "you're either Blue Desk
@@ -686,8 +686,8 @@ WHERE player_id = ?1 AND faction_id = ?2 AND left_at IS NULL";
         }
     }
 
-    /// Soft-delete the player's active membership in `faction_id` —
-    /// SPEC_v3 §4.4 / §Task 6d.
+    /// Soft-delete the player's active membership in `faction_id`
+    ///  /.
     ///
     /// The contract is "after this call returns successfully, the
     /// `(player_id, faction_id)` pair has no active membership row
@@ -701,10 +701,10 @@ WHERE player_id = ?1 AND faction_id = ?2 AND left_at IS NULL";
     ///
     /// # Soft-delete, not row removal
     ///
-    /// Per [`FACTIONS_MIGRATION`]'s doc on `faction_memberships`,
-    /// the v3 schema reserves `left_at` for the leave timestamp and
+    /// Per [`FACTIONS_MIGRATION`]'s doc on `faction_memberships`.
+    /// the schema reserves `left_at` for the leave timestamp and
     /// retains the historical row. This mirrors `notices.archived_at`
-    /// — the row stays for audit and replay (Task 6c notes that
+    /// — the row stays for audit and replay ( notes that
     /// "a player who leaves and rejoins" creates a new active row
     /// while the old one is preserved). A `DELETE`-based variant
     /// would also clash with bounty/notice references that captured
@@ -737,7 +737,7 @@ WHERE player_id = ?1 AND faction_id = ?2 AND left_at IS NULL";
     /// Without the `IS NULL` guard the UPDATE would also fire on
     /// historical rows, refreshing their `left_at` to the current
     /// time and violating the "stable timestamp" invariant the
-    /// idempotency test pins. The guard is structurally necessary,
+    /// idempotency test pins. The guard is structurally necessary.
     /// not stylistic.
     ///
     /// # Concurrency
@@ -764,8 +764,8 @@ SET left_at = CURRENT_TIMESTAMP \
 WHERE player_id = ?1 AND faction_id = ?2 AND left_at IS NULL \
 RETURNING id, player_id, faction_id, role, joined_at, left_at";
 
-        // Fallback for the idempotent / never-joined branch. The
-        // `ORDER BY id DESC LIMIT 1` returns the most recent row,
+        // Fallback for the idempotent never-joined branch. The
+        // `ORDER BY id DESC LIMIT 1` returns the most recent row.
         // which under join/leave/rejoin/leave cycles is the row the
         // caller most likely intends to observe. `id` (autoincrement)
         // monotonically increases, so it doubles as a tiebreaker
@@ -798,24 +798,24 @@ ORDER BY id DESC LIMIT 1";
         }
     }
 
-    /// Idempotently create a shared goal for `(faction_id, key)` —
-    /// SPEC_v3 §4.4 / §Task 6e.
+    /// Idempotently create a shared goal for `(faction_id, key)`
+    ///  /.
     ///
     /// The contract is "after this call returns successfully there
     /// is exactly one `shared_goals` row matching the supplied
     /// `(faction_id, key)`, and the returned struct describes it".
     /// Calling again with the same `(faction_id, key)` is a no-op:
     /// the helper returns the *existing* row — same id, same
-    /// `target_amount`, same `current_amount`, same `created_at` —
+    /// `target_amount`, same `current_amount`, same `created_at`
     /// rather than creating a duplicate or overwriting progress.
-    /// This matches the v3 helper convention of leaning on the
+    /// This matches the helper convention of leaning on the
     /// underlying schema's uniqueness so a defensive double-call
     /// from the agency-bootstrap path never accidentally resets a
     /// goal that already has contributions on it.
     ///
     /// # Idempotency primitive
     ///
-    /// `INSERT … SELECT … WHERE NOT EXISTS (…) RETURNING …` —
+    /// `INSERT … SELECT … WHERE NOT EXISTS (…) RETURNING …`
     /// single statement that either inserts a fresh `active` row
     /// (and `RETURNING` echoes it) or inserts nothing (and
     /// `RETURNING` produces zero rows). The same shape used by
@@ -858,7 +858,7 @@ ORDER BY id DESC LIMIT 1";
     ///
     /// # `faction_id` is `Option<i64>`
     ///
-    /// SPEC §4.4 explicitly lists "faction id optional" — a goal
+    ///  explicitly lists "faction id optional" — a goal
     /// MAY be world-wide (e.g. "the city solves 100 cases") rather
     /// than scoped to one faction. `None` lands as SQL `NULL` and
     /// is treated as a distinct goal-scope from any specific
@@ -868,7 +868,7 @@ ORDER BY id DESC LIMIT 1";
     ///
     /// Takes `&self`: a single `INSERT … RETURNING` plus an
     /// optional follow-up `SELECT` under the configured busy
-    /// timeout. Same borrow shape as [`WorldDb::join_faction`] —
+    /// timeout. Same borrow shape as [`WorldDb::join_faction`]
     /// no explicit `BEGIN`/`COMMIT` is needed because the
     /// idempotency check folds into the single INSERT statement.
     pub fn create_shared_goal(
@@ -934,15 +934,15 @@ WHERE faction_id IS ?1 AND key = ?2";
     }
 
     /// Atomically increment a shared goal's `current_amount` and run
-    /// a contributor-side callback inside the same transaction —
-    /// SPEC_v3 §4.4 / §Task 6f.
+    /// a contributor-side callback inside the same transaction
+    ///  /.
     ///
     /// The contract is "either everything happens (the goal's
     /// running total moves up by `amount` *and* every write the
     /// callback performed lands) or nothing does". This is how the
-    /// kit honours SPEC §4.4's "Contributions MUST be transactional"
-    /// rule: a contributor who can't afford to spend the resource,
-    /// or a callback that fails partway through inventory mutation,
+    /// kit honours 's "Contributions MUST be transactional"
+    /// rule: a contributor who can't afford to spend the resource.
+    /// or a callback that fails partway through inventory mutation.
     /// leaves the goal's `current_amount` exactly where it was.
     /// Without that guarantee a flaky network drop mid-contribution
     /// could double-debit a player or, worse, leave the agency goal
@@ -951,9 +951,9 @@ WHERE faction_id IS ?1 AND key = ?2";
     /// # Why a callback (not a separate write path)
     ///
     /// The kit owns the `shared_goals` row but knows nothing about
-    /// the resource the contribution costs the player — clue points,
+    /// the resource the contribution costs the player — clue points.
     /// inventory items, currency, time tokens, all game-defined.
-    /// SPEC §1 / §17 keep the kit out of the game's resource model;
+    ///  keep the kit out of the game's resource model;
     /// the contributor closure is the seam where game code spends
     /// whatever it needs to spend, inside the same `rusqlite::
     /// Transaction` the kit opened, so a failure rolls *both* the
@@ -963,13 +963,13 @@ WHERE faction_id IS ?1 AND key = ?2";
     /// # State-machine guarantees
     ///
     /// - The increment only fires when `state = 'active'`. A goal
-    ///   that has already been flipped to `'completed'` (Task 6g
+    ///   that has already been flipped to `'completed'` (
     ///   handles that flip + the world event) rejects further
     ///   contributions with [`FactionError::GoalAlreadyCompleted`]
     ///   — the bulletin renders a stable terminal state, and a late
     ///   contribute call from a stale UI cannot silently re-open it.
     /// - This helper does *not* itself flip the state when the
-    ///   target is reached; that is Task 6g's job (state flip +
+    ///   target is reached; that is 's job (state flip +
     ///   `shared_goal.completed` world event). 6f's contract is
     ///   strictly "`current_amount` increments transactionally".
     ///   Splitting the responsibilities keeps each helper testable
@@ -977,14 +977,14 @@ WHERE faction_id IS ?1 AND key = ?2";
     /// - There is no schema-side `CHECK` constraint capping
     ///   `current_amount` at `target_amount`, so a final contribute
     ///   that arrives "after" the target is met still succeeds and
-    ///   pushes `current_amount` past `target_amount`. Task 6g will
+    ///   pushes `current_amount` past `target_amount`. will
     ///   read the post-update row and decide whether to flip — that
     ///   model is simpler and race-safer than trying to clamp inside
     ///   the UPDATE here.
     ///
     /// # Errors surfaced
     ///
-    /// - [`FactionError::NonPositiveContribution`] — `amount <= 0`,
+    /// - [`FactionError::NonPositiveContribution`] — `amount <= 0`.
     ///   raised before opening the transaction so a broken UI keypad
     ///   doesn't pay for a `BEGIN` round-trip. A negative `amount`
     ///   would silently rewind progress; a zero is a no-op that
@@ -1080,7 +1080,7 @@ RETURNING id, faction_id, key, target_amount, current_amount, state, created_at,
                     .map_err(|source| FactionError::Sqlite { source })?;
                 // Drop the transaction without commit — rolls back
                 // automatically. The diagnostic SELECT didn't write
-                // anything, so the rollback is observably a no-op,
+                // anything, so the rollback is observably a no-op.
                 // but the explicit drop here documents the intent.
                 drop(tx);
                 return Err(match state {
@@ -1098,7 +1098,7 @@ RETURNING id, faction_id, key, target_amount, current_amount, state, created_at,
         // A callback `Err` propagates as `ContributorCallback` and
         // the transaction drops without commit — every write the
         // callback attempted, plus the kit's own increment, rolls
-        // back as a unit. SPEC §4.4 "Contributions MUST be
+        // back as a unit. "Contributions MUST be
         // transactional".
         if let Err(source) = contributor(&tx, &goal) {
             return Err(FactionError::ContributorCallback { source });
@@ -1113,31 +1113,31 @@ RETURNING id, faction_id, key, target_amount, current_amount, state, created_at,
     /// Flip a shared goal from `'active'` to `'completed'` when its
     /// `current_amount` has reached `target_amount`, atomically
     /// appending a [`FACTION_GOAL_COMPLETED_EVENT_KIND`] world event
-    /// in the same transaction (SPEC_v3 §4.4 / §Task 6g).
+    /// in the same transaction.
     ///
-    /// Task 6f's [`Self::contribute_to_goal`] deliberately does not
+    /// 's [`Self::contribute_to_goal`] deliberately does not
     /// flip state — splitting completion into a second helper keeps
     /// each transactional path testable in isolation and lets games
-    /// decide *when* to evaluate completion (after every contribute,
+    /// decide *when* to evaluate completion (after every contribute.
     /// at end-of-turn, on screen-render). The expected pairing is
     /// `contribute_to_goal(...)?` immediately followed by
     /// `complete_goal_if_reached(goal_id)?`.
     ///
     /// # Behaviour matrix
     ///
-    /// | goal state on entry         | result                                                |
+    /// | goal state on entry | result |
     /// |-----------------------------|-------------------------------------------------------|
-    /// | not found                   | `Err(GoalNotFound)`                                   |
-    /// | active, current < target    | returns the unchanged active row, no event emitted    |
-    /// | active, current ≥ target    | flips state→completed, stamps `completed_at`, emits 1 |
-    /// | completed (already)         | idempotent: returns existing row, no event emitted    |
+    /// | not found | `Err(GoalNotFound)` |
+    /// | active, current < target | returns the unchanged active row, no event emitted |
+    /// | active, current ≥ target | flips state→completed, stamps `completed_at`, emits 1 |
+    /// | completed (already) | idempotent: returns existing row, no event emitted |
     ///
     /// The "already completed" path is idempotent rather than an
     /// error because games are expected to call this helper after
     /// every contribute — a UI race that lands two completions back-
-    /// to-back must not surface as a failure to the second caller,
+    /// to-back must not surface as a failure to the second caller.
     /// and no second event is emitted so the lobby bulletin renders
-    /// exactly one "goal solved" line per goal lifecycle (SPEC §4.4
+    /// exactly one "goal solved" line per goal lifecycle (
     /// "completion is observable exactly once").
     ///
     /// # Atomicity
@@ -1149,7 +1149,7 @@ RETURNING id, faction_id, key, target_amount, current_amount, state, created_at,
     /// `world_events` migration, message exceeds
     /// [`crate::events::MAX_EVENT_MESSAGE_LEN`]) the goal stays
     /// `'active'` and the agency UI's "solved!" toast does not fire
-    /// without a corresponding bulletin entry — SPEC §4.4
+    /// without a corresponding bulletin entry
     /// "completion MUST be transactional with its world event".
     ///
     /// # Attribution
@@ -1162,10 +1162,10 @@ RETURNING id, faction_id, key, target_amount, current_amount, state, created_at,
     /// final tipping contribution. Per-player history surfaces are
     /// powered by `world_events.player_id IS NOT NULL` (the partial
     /// index `idx_world_events_player_recent`), so a NULL row here
-    /// stays out of any single player's "your last N actions" view —
+    /// stays out of any single player's "your last N actions" view
     /// the right shape for a faction-scoped event.
     ///
-    /// # Concurrency / borrow shape
+    /// # Concurrency borrow shape
     ///
     /// `&mut self` because the helper opens a transaction, the same
     /// shape as [`Self::contribute_to_goal`] and
@@ -1177,7 +1177,7 @@ RETURNING id, faction_id, key, target_amount, current_amount, state, created_at,
     pub fn complete_goal_if_reached(&mut self, goal_id: i64) -> Result<SharedGoal, FactionError> {
         // Snapshot the row inside a transaction so the state
         // decision and the (optional) flip see a consistent view.
-        // BEGIN IMMEDIATE (rusqlite default for `transaction()`)
+        // BEGIN IMMEDIATE (rusqlite default for `transaction`)
         // takes a write lock up front; concurrent completers hit
         // the busy timeout and serialise, so the "already
         // completed" idempotent path triggers cleanly for the
@@ -1262,14 +1262,14 @@ RETURNING id, faction_id, key, target_amount, current_amount, state, created_at,
 }
 
 /// Render the human-readable `world_events.message` body the kit
-/// emits when a shared goal flips to `'completed'` (SPEC_v3 §Task
+/// emits when a shared goal flips to `'completed'` (Task
 /// 6g). Pulled into a free function so the
 /// `complete_goal_if_reached` callsite stays focused on
 /// transactional plumbing and tests can assert the exact rendered
 /// shape without re-running the full completion round-trip — same
 /// shape as `format_market_buy_event_message`.
 ///
-/// Format: `shared goal #{id} ({key}) reached its target of {target}` —
+/// Format: `shared goal #{id} ({key}) reached its target of {target}`
 /// or, when the goal is faction-scoped, the message is prefixed with
 /// the faction id so the bulletin can render "faction #3 …" without
 /// a second SQL round-trip to look up the slug. The post-flip
@@ -1307,19 +1307,19 @@ fn row_to_faction(row: &rusqlite::Row<'_>) -> rusqlite::Result<Faction> {
     })
 }
 
-/// Read model for one row of the `faction_memberships` table —
-/// SPEC_v3 §4.4.
+/// Read model for one row of the `faction_memberships` table
+/// 
 ///
-/// Returned by [`WorldDb::join_faction`] (and the upcoming Task 6d
+/// Returned by [`WorldDb::join_faction`] (and the upcoming
 /// `leave_faction` helper) so callers receive the canonical row
-/// SQLite produced — autoincrement `id`, SQL-side `joined_at`,
+/// SQLite produced — autoincrement `id`, SQL-side `joined_at`.
 /// resolved `role` (the input default `'member'` when no override
 /// was supplied) — rather than echoing back the input arguments.
 ///
 /// `left_at` is `Option<String>`: while the membership is active
-/// the column is `NULL` and decodes to `None`; Task 6d soft-deletes
+/// the column is `NULL` and decodes to `None`; soft-deletes
 /// by stamping it with `CURRENT_TIMESTAMP`. Game UI surfaces filter
-/// to active membership by checking `left_at.is_none()` (or by
+/// to active membership by checking `left_at.is_none` (or by
 /// using one of the partial indexes on the schema, which already
 /// scope to `WHERE left_at IS NULL`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1346,7 +1346,7 @@ pub struct FactionMembership {
     /// inserted. Stable for the life of the row.
     pub joined_at: String,
     /// `None` while the membership is active. Stamped with the
-    /// `CURRENT_TIMESTAMP` of the leave event by Task 6d's
+    /// `CURRENT_TIMESTAMP` of the leave event by 's
     /// `leave_faction` helper. Always `None` immediately after a
     /// successful [`WorldDb::join_faction`] return.
     pub left_at: Option<String>,
@@ -1366,19 +1366,19 @@ fn row_to_membership(row: &rusqlite::Row<'_>) -> rusqlite::Result<FactionMembers
     })
 }
 
-/// Read model for one row of the `shared_goals` table —
-/// SPEC_v3 §4.4.
+/// Read model for one row of the `shared_goals` table
+/// 
 ///
 /// Returned by [`WorldDb::create_shared_goal`] (and the upcoming
-/// Task 6f `contribute_to_goal` / Task 6g completion helpers) so
-/// callers receive the canonical row SQLite produced —
+///  `contribute_to_goal` completion helpers) so
+/// callers receive the canonical row SQLite produced
 /// autoincrement `id`, SQL-side `created_at`, schema-default
 /// `current_amount = 0` and `state = 'active'` — rather than
 /// echoing back the input arguments.
 ///
-/// `faction_id` is `Option<i64>` because SPEC §4.4 explicitly
+/// `faction_id` is `Option<i64>` because explicitly
 /// allows world-wide goals (`NULL` faction). `completed_at` is
-/// `Option<String>` and stays `None` until Task 6g flips the
+/// `Option<String>` and stays `None` until flips the
 /// state to `'completed'` and stamps `CURRENT_TIMESTAMP`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SharedGoal {
@@ -1387,18 +1387,18 @@ pub struct SharedGoal {
     /// calls (same id every time for a given `(faction_id, key)`).
     pub id: i64,
     /// Foreign key into `factions(id)`, or `None` for a world-wide
-    /// goal (SPEC §4.4 "faction id optional").
+    /// goal.
     pub faction_id: Option<i64>,
     /// Game-authored stable identifier (e.g. `"blue-desk.clue-board"`).
     /// Combined with `faction_id` it forms the logical lookup key.
     pub key: String,
     /// The amount contributions need to accumulate before the goal
     /// flips to `completed`. Pinned at first creation; the
-    /// idempotent re-create path returns the *existing* target,
+    /// idempotent re-create path returns the *existing* target.
     /// not the freshly-supplied one.
     pub target_amount: i64,
-    /// Running total of contributions. Starts at `0`; Task 6f's
-    /// `contribute_to_goal` increments it; Task 6g flips state to
+    /// Running total of contributions. Starts at `0`; 's
+    /// `contribute_to_goal` increments it; flips state to
     /// `completed` once the target is reached.
     pub current_amount: i64,
     /// Either `"active"` or `"completed"` — the schema CHECK on
@@ -1410,7 +1410,7 @@ pub struct SharedGoal {
     /// idempotent re-create calls.
     pub created_at: String,
     /// `None` while the goal is active. Stamped with the
-    /// `CURRENT_TIMESTAMP` of the completion event by Task 6g.
+    /// `CURRENT_TIMESTAMP` of the completion event by.
     pub completed_at: Option<String>,
 }
 
@@ -1439,15 +1439,15 @@ mod tests {
     use crate::world_db::WorldDb;
     use tempfile::tempdir;
 
-    /// SPEC_v3 §Task 6a acceptance: applying [`FACTIONS_MIGRATION`]
-    /// creates the three documented tables (`factions`,
+    ///   acceptance: applying [`FACTIONS_MIGRATION`]
+    /// creates the three documented tables (`factions`.
     /// `faction_memberships`, `shared_goals`) with the column shape
-    /// SPEC §4.4 pins. Asserts both:
+    ///  pins. Asserts both:
     ///
     /// 1. Each table exists in `sqlite_master` (so a regression
     ///    that silently dropped a `CREATE TABLE` from the migration
     ///    body would flunk).
-    /// 2. The columns and order of each table match the SPEC §4.4
+    /// 2. The columns and order of each table match the
     ///    contract (so a later edit that renames or reorders a
     ///    column flunks here rather than buried in a 6b–6g
     ///    behavioural test).
@@ -1499,7 +1499,7 @@ mod tests {
                 "description".to_string(),
                 "created_at".to_string(),
             ],
-            "factions column shape must match the SPEC_v3 §4.4 contract"
+            "factions column shape must match the contract"
         );
 
         let membership_columns = pragma_columns(&world, "faction_memberships");
@@ -1513,7 +1513,7 @@ mod tests {
                 "joined_at".to_string(),
                 "left_at".to_string(),
             ],
-            "faction_memberships column shape must match the SPEC_v3 §4.4 contract"
+            "faction_memberships column shape must match the contract"
         );
 
         let goal_columns = pragma_columns(&world, "shared_goals");
@@ -1529,12 +1529,12 @@ mod tests {
                 "created_at".to_string(),
                 "completed_at".to_string(),
             ],
-            "shared_goals column shape must match the SPEC_v3 §4.4 contract"
+            "shared_goals column shape must match the contract"
         );
     }
 
-    /// SPEC §4.4 implies the shared-goal state machine is
-    /// `active -> completed` (Task 6g flips it). The migration
+    ///  implies the shared-goal state machine is
+    /// `active -> completed` ( flips it). The migration
     /// encodes that vocabulary via a `CHECK` constraint so a code
     /// path that ever tried to write an out-of-vocabulary state
     /// (e.g. `'closed'`, `'cancelled'`, a typo like `'compelted'`)
@@ -1563,11 +1563,11 @@ mod tests {
         );
         assert!(
             bogus.is_err(),
-            "CHECK constraint must reject states outside the SPEC §4.4 vocabulary"
+            "CHECK constraint must reject states outside the vocabulary"
         );
     }
 
-    /// SPEC §4.4 says contributions accumulate toward a target.
+    ///  says contributions accumulate toward a target.
     /// The schema enforces `target_amount > 0` (a goal with
     /// target 0 would be instantly complete on creation, which
     /// every UI surface would render as "solved" before any work
@@ -1608,7 +1608,7 @@ mod tests {
         );
     }
 
-    /// The Task 6b idempotent-seed helper relies on the `UNIQUE`
+    /// The idempotent-seed helper relies on the `UNIQUE`
     /// constraint on `factions.slug` to upsert a faction without
     /// duplicating rows. Pin the constraint at the schema layer
     /// here so a regression that dropped `UNIQUE` flunks at
@@ -1638,7 +1638,7 @@ mod tests {
         );
     }
 
-    /// The Task 6c–6d/6f helpers walk three partial indexes the
+    /// The helpers walk three partial indexes the
     /// migration creates up-front. If any of them ever stops being
     /// created, the read silently becomes a full table scan in
     /// production. Pin every index name plus its partial predicate
@@ -1684,7 +1684,7 @@ mod tests {
     }
 
     /// The migration is idempotent. v2's relaunch path applies the
-    /// same migration list every open; v3 inherits that contract.
+    /// same migration list every open; inherits that contract.
     /// A second `apply_migration(&FACTIONS_MIGRATION)` MUST be a
     /// no-op (the version is already in `world_migrations`), not
     /// an error from `CREATE TABLE` on an existing table. Same
@@ -1707,7 +1707,7 @@ mod tests {
             .expect("second factions migration applies (idempotent)");
     }
 
-    /// SPEC_v3 §Task 6b acceptance: `seed_factions` materialises one
+    ///   acceptance: `seed_factions` materialises one
     /// row per input seed and returns the canonical `Faction` rows.
     /// Pins the happy path so a regression that swapped the SELECT
     /// to read by id (instead of slug) or that dropped the post-
@@ -1756,7 +1756,7 @@ mod tests {
 
         // Belt-and-braces: confirm rows are durably committed by
         // counting through a fresh statement. A regression that
-        // forgot to call `commit()` would leave the rows visible
+        // forgot to call `commit` would leave the rows visible
         // inside the helper's transaction but absent here.
         let count: i64 = world
             .connection()
@@ -1765,7 +1765,7 @@ mod tests {
         assert_eq!(count, 2, "both seeds committed to the table");
     }
 
-    /// SPEC_v3 §Task 6b acceptance criterion: "second seed call does
+    ///   acceptance criterion: "second seed call does
     /// not duplicate". Doors restart on every player session, so
     /// `seed_factions` runs at every startup; without idempotency
     /// the table would grow a duplicate row every restart and the
@@ -1827,7 +1827,7 @@ mod tests {
 
     /// Write-once contract: when a slug already exists in the
     /// `factions` table, a subsequent `seed_factions` call with the
-    /// same slug but updated `display_name` / `description` MUST
+    /// same slug but updated `display_name` `description` MUST
     /// return the *persisted* values, not the new input. Pins the
     /// `ON CONFLICT(slug) DO NOTHING` clause against a regression
     /// that flipped it to `DO UPDATE` (which would silently rewrite
@@ -1865,7 +1865,7 @@ mod tests {
 
     /// Empty input is a documented no-op: doors that disable
     /// factions in `[multiplayer]` (or simply ship no seeds) call
-    /// `seed_factions(&[])` at startup. The helper MUST short-
+    /// `seed_factions(&)` at startup. The helper MUST short-
     /// circuit before opening a transaction so the cold-path I/O
     /// cost is zero.
     #[test]
@@ -1929,7 +1929,7 @@ mod tests {
         assert_eq!(count, 2, "one new row added, original retained");
     }
 
-    /// SPEC_v3 §Task 6c acceptance: `join_faction` inserts a fresh
+    ///   acceptance: `join_faction` inserts a fresh
     /// `faction_memberships` row for an unaffiliated player and
     /// returns the canonical record. Pins the happy path so a
     /// regression that swapped the `RETURNING` columns or dropped
@@ -1988,8 +1988,8 @@ mod tests {
         assert_eq!(count, 1, "exactly one active membership row exists");
     }
 
-    /// SPEC_v3 §Task 6c acceptance criterion: "membership row is
-    /// created" — and, by the kit's broader idempotency convention,
+    ///   acceptance criterion: "membership row is
+    /// created" — and, by the kit's broader idempotency convention.
     /// not duplicated on a second join. Doors restart on every
     /// player session and game UIs may call `join_faction`
     /// defensively from a "join" button without first checking
@@ -2005,7 +2005,7 @@ mod tests {
     ///    (catches the most direct regression — the `WHERE NOT
     ///    EXISTS` guard removed or inverted).
     /// 3. The second call returns the *same* `joined_at` (catches
-    ///    a regression that wrote a fresh timestamp on each call,
+    ///    a regression that wrote a fresh timestamp on each call.
     ///    which would corrupt tenure-based UI surfaces).
     #[test]
     fn join_faction_is_idempotent_for_active_member() {
@@ -2101,7 +2101,7 @@ mod tests {
         );
     }
 
-    /// A player MAY belong to multiple factions (SPEC §4.4 — the
+    /// A player MAY belong to multiple factions ( — the
     /// schema enforces no per-player cap; cross-faction exclusivity
     /// is a game-config concern, not a storage one). Two separate
     /// joins for the same player into different factions MUST each
@@ -2147,7 +2147,7 @@ mod tests {
         );
     }
 
-    /// SPEC_v3 §Task 6d acceptance: `leave_faction` soft-deletes the
+    ///   acceptance: `leave_faction` soft-deletes the
     /// active membership by stamping `left_at` (per the chosen
     /// schema — see [`FACTIONS_MIGRATION`]'s doc on
     /// `faction_memberships.left_at`). After the call:
@@ -2222,7 +2222,7 @@ mod tests {
     ///    on the UPDATE — that would refresh the timestamp on every
     ///    repeat call).
     /// 3. The second call still succeeds with `Ok` (catches a
-    ///    regression that raised `NotMember` on the idempotent path,
+    ///    regression that raised `NotMember` on the idempotent path.
     ///    which would force every game-UI leave button into a
     ///    defensive "are you still a member?" pre-check).
     #[test]
@@ -2283,7 +2283,7 @@ mod tests {
     }
 
     /// Leaving one faction MUST NOT touch active memberships in
-    /// other factions for the same player. SPEC §4.4 multi-faction
+    /// other factions for the same player. multi-faction
     /// guarantee: a player's two memberships are independent.
     #[test]
     fn leave_faction_does_not_affect_other_faction_memberships() {
@@ -2364,7 +2364,7 @@ mod tests {
         assert_eq!(idempotent.left_at, second_leave.left_at);
     }
 
-    /// SPEC_v3 §Task 6e acceptance happy path: a fresh
+    ///   acceptance happy path: a fresh
     /// `create_shared_goal` call lands a row with the supplied
     /// target, schema defaults for `current_amount = 0` and
     /// `state = 'active'`, the SQL-side `created_at` populated, and
@@ -2415,7 +2415,7 @@ mod tests {
         assert_eq!(count, 1);
     }
 
-    /// SPEC_v3 §Task 6e acceptance — idempotency: a second call for
+    ///   acceptance — idempotency: a second call for
     /// the same `(faction_id, key)` returns the **existing** row
     /// (same id, same `target_amount`, same `current_amount`, same
     /// `created_at`) and does not insert a duplicate. Three
@@ -2511,7 +2511,7 @@ mod tests {
         assert_eq!(count, 1);
     }
 
-    /// Two factions may each carry their own `"clue-board"` —
+    /// Two factions may each carry their own `"clue-board"`
     /// `(faction_id, key)` is the uniqueness scope, not `key`
     /// alone. Pins the schema-side `UNIQUE (faction_id, key)`
     /// against a regression that narrowed the index to `key` only.
@@ -2545,7 +2545,7 @@ mod tests {
         assert_eq!(red.target_amount, 50);
     }
 
-    /// SPEC §4.4 + the schema CHECK forbid `target_amount <= 0`.
+    ///  + the schema CHECK forbid `target_amount <= 0`.
     /// The helper short-circuits before opening a transaction so
     /// the agency-config UI sees a typed
     /// [`FactionError::InvalidTargetAmount`] with the offending
@@ -2573,9 +2573,9 @@ mod tests {
         assert_eq!(count, 0, "rejected calls must not leak rows");
     }
 
-    /// SPEC_v3 §Task 6f acceptance criterion: "current amount
+    ///   acceptance criterion: "current amount
     /// increments". Pins the happy path so a regression that
-    /// reordered the UPDATE / decoder columns or dropped the
+    /// reordered the UPDATE decoder columns or dropped the
     /// `+= ?2` arithmetic flunks here rather than buried in a
     /// downstream agency-screen test. Asserts both the canonical
     /// returned record AND the durably-committed row (a follow-up
@@ -2605,7 +2605,7 @@ mod tests {
         );
         assert_eq!(after.state, "active", "state stays active below target");
 
-        // A second contribution accumulates rather than overwriting,
+        // A second contribution accumulates rather than overwriting.
         // pinning the `+=` arithmetic against a regression to `=`.
         let after2 = world
             .contribute_to_goal(goal.id, 10, |_, _| Ok(()))
@@ -2615,7 +2615,7 @@ mod tests {
         // Belt-and-braces: the row is durably visible to a fresh
         // SELECT — catches a regression that returned the
         // RETURNING row but failed to actually commit (e.g. a
-        // typo'd commit() that dropped the transaction).
+        // typo'd commit that dropped the transaction).
         let durable: i64 = world
             .connection()
             .query_row(
@@ -2627,7 +2627,7 @@ mod tests {
         assert_eq!(durable, 35);
     }
 
-    /// SPEC §4.4 "Contributions MUST be transactional" means the
+    ///  "Contributions MUST be transactional" means the
     /// contributor callback MUST observe the same `rusqlite::
     /// Transaction` the kit's increment ran in — so a callback
     /// write (e.g. a currency debit) commits atomically with the
@@ -2674,7 +2674,7 @@ mod tests {
         assert_eq!(audit, "alice paid 7");
     }
 
-    /// SPEC §4.4 "Contributions MUST be transactional": a callback
+    ///  "Contributions MUST be transactional": a callback
     /// that returns `Err` MUST roll back BOTH the kit's increment
     /// AND every write the callback attempted before failing. Pin
     /// the rollback by:
@@ -2806,13 +2806,13 @@ mod tests {
         }
     }
 
-    /// SPEC §4.4 pins the state machine at `active -> completed`.
+    ///  pins the state machine at `active -> completed`.
     /// A goal whose `state` is already `'completed'` rejects further
     /// contributions with `GoalAlreadyCompleted` — distinct from
     /// `GoalNotFound` so the agency UI can render a "this clue
     /// board is already solved" terminal state rather than the
     /// generic "not found" recovery flow. Manually flips the state
-    /// (Task 6g will land the helper that does this in production)
+    /// ( will land the helper that does this in production)
     /// to exercise the rejection branch in isolation. Also pins the
     /// row-unchanged invariant so a rejected contribute leaves
     /// `current_amount` exactly where the completed-state flip put
@@ -2852,8 +2852,8 @@ mod tests {
         );
     }
 
-    /// SPEC_v3 §Task 6g acceptance: a goal whose `current_amount`
-    /// has reached its `target_amount` flips state to `'completed'`,
+    ///   acceptance: a goal whose `current_amount`
+    /// has reached its `target_amount` flips state to `'completed'`.
     /// stamps `completed_at`, AND appends exactly one
     /// `faction.goal.completed` world event in the same
     /// transaction. Three regression vectors layered into one test
@@ -2903,7 +2903,7 @@ mod tests {
         assert_eq!(state, "completed");
         assert!(completed_at.is_some());
 
-        // Exactly one `faction.goal.completed` event was appended,
+        // Exactly one `faction.goal.completed` event was appended.
         // and it's a system row (player_id IS NULL — see the helper
         // doc-comment on Attribution).
         let events = world.recent_events(10).unwrap();
@@ -2932,7 +2932,7 @@ mod tests {
         );
     }
 
-    /// SPEC §Task 6g idempotency: calling `complete_goal_if_reached`
+    ///   idempotency: calling `complete_goal_if_reached`
     /// a second time on an already-completed goal returns the same
     /// row, does NOT re-flip, and does NOT emit a second event.
     /// Pins the lobby invariant "completion is observable exactly
@@ -2970,7 +2970,7 @@ mod tests {
         );
     }
 
-    /// SPEC §Task 6g: a goal whose `current_amount` is below its
+    ///  : a goal whose `current_amount` is below its
     /// `target_amount` is a no-op — returns the unchanged active
     /// row, no flip, no event. The expected pairing is
     /// `contribute_to_goal` followed by `complete_goal_if_reached`
@@ -3002,7 +3002,7 @@ mod tests {
         assert_eq!(event_count, 0, "no event emitted under target");
     }
 
-    /// SPEC §Task 6g: an over-shoot (current_amount > target_amount)
+    ///  : an over-shoot (current_amount > target_amount)
     /// still triggers completion. The schema deliberately does not
     /// clamp `current_amount` at `target_amount` (see
     /// `contribute_to_goal`'s doc on the no-clamp choice), so games
@@ -3026,7 +3026,7 @@ mod tests {
         );
     }
 
-    /// SPEC §Task 6g: a missing goal id surfaces the typed
+    ///  : a missing goal id surfaces the typed
     /// `GoalNotFound` variant — same diagnostic split as
     /// `contribute_to_goal_returns_not_found_for_missing_goal` so
     /// the agency UI can render "this goal has been removed" rather
@@ -3043,10 +3043,10 @@ mod tests {
         }
     }
 
-    /// SPEC §4.4 "completion MUST be transactional with its world
+    ///  "completion MUST be transactional with its world
     /// event": if the event append fails, the state flip rolls
     /// back. Drive the failure by reaching for an event message
-    /// that exceeds [`crate::events::MAX_EVENT_MESSAGE_LEN`] —
+    /// that exceeds [`crate::events::MAX_EVENT_MESSAGE_LEN`]
     /// achieved here by setting an obscenely long `key` so the
     /// rendered message blows the validator. Asserts that
     /// `Event { source }` surfaces AND the goal is still
@@ -3100,11 +3100,11 @@ mod tests {
         assert_eq!(event_count, 0, "no completion event committed");
     }
 
-    /// SPEC §Task 6g: a faction-scoped goal's completion event
+    ///  : a faction-scoped goal's completion event
     /// includes the faction id in the message so the lobby
     /// bulletin can render "faction #N …" without a second SQL
     /// round-trip to look up the slug. Pins the format-function
-    /// branch on `faction_id.is_some()` against a regression that
+    /// branch on `faction_id.is_some` against a regression that
     /// dropped the prefix.
     #[test]
     fn complete_goal_if_reached_event_message_includes_faction_id() {
@@ -3163,13 +3163,13 @@ mod tests {
         world
             .apply_migration(&PLAYERS_MIGRATION)
             .expect("players migration applies");
-        // §Task 6g's `complete_goal_if_reached` appends a
+        // 's `complete_goal_if_reached` appends a
         // `faction.goal.completed` world event inside its wrapping
         // transaction, so every completion-path test needs
         // `world_events` present. Applying it unconditionally in
         // the helper means the seed/join/leave/create/contribute
         // tests pay a tiny cost (one extra migration on a tempfile)
-        // in exchange for one canonical fixture instead of two —
+        // in exchange for one canonical fixture instead of two
         // same convention as `market::tests::world_with_listings`.
         world
             .apply_migration(&crate::events::WORLD_EVENTS_MIGRATION)
@@ -3180,7 +3180,7 @@ mod tests {
         (dir, world)
     }
 
-    /// Read column names from `pragma_table_info` in cid order —
+    /// Read column names from `pragma_table_info` in cid order
     /// the storage-side column order, which is what the column-
     /// shape assertions pin.
     fn pragma_columns(world: &WorldDb, table: &str) -> Vec<String> {

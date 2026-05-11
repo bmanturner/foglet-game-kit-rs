@@ -1,13 +1,13 @@
-//! `notices` — shared-world player mail/notice schema (SPEC_v3 §4.1 /
-//! §Task 3a).
+//! `notices` — shared-world player mail/notice schema ( /
+//! ).
 //!
-//! v3 introduces durable async player-to-player mail: leave a note for
-//! another investigator, drop a system advisory in a player's inbox,
+//!  introduces durable async player-to-player mail: leave a note for
+//! another investigator, drop a system advisory in a player's inbox.
 //! mark it read, archive it. The whole feature sits on top of one
 //! `notices` table whose shape is pinned by [`NOTICES_MIGRATION`]. This
 //! module exists only to declare that schema and prove it applies; the
-//! `Notice` Rust type and the `send_notice` / `inbox` / `mark_read` /
-//! `archive_notice` helpers land in subsequent §Task 3 sub-items
+//! `Notice` Rust type and the `send_notice` `inbox` `mark_read` /
+//! `archive_notice` helpers land in subsequent sub-items
 //! (3b–3f). Splitting the migration into its own commit keeps the
 //! bisect signal sharp — a column rename or dropped index flunks the
 //! schema test in this module rather than a higher-level behavioural
@@ -15,7 +15,7 @@
 //!
 //! # Why a dedicated table
 //!
-//! SPEC_v3 §3 lists notices alongside challenges, market listings,
+//!  lists notices alongside challenges, market listings.
 //! factions, and bounties as separate primitives. We follow the v2
 //! convention of "one migration per top-level concept, named
 //! `create_<table>`" (see [`crate::events`] for the canonical
@@ -27,10 +27,10 @@
 //!
 //! # Why `version = 6`
 //!
-//! v2 occupies migration versions 1–5 (see
-//! `docs/shared-world.md` §8.1). v3 claims `6` and above, dense and
-//! grouped per primitive. Notices are the first v3 primitive to land,
-//! so they take version 6. Subsequent v3 migrations (challenges,
+//!  occupies migration versions 1–5 (see
+//! `docs/shared-world.md` ). claims `6` and above, dense and
+//! grouped per primitive. Notices are the first primitive to land.
+//! so they take version 6. Subsequent migrations (challenges.
 //! market listings, factions, bounties) MUST pick the next available
 //! kit version — game-authored migrations live in their own higher
 //! band and are not affected.
@@ -39,11 +39,11 @@ use thiserror::Error;
 
 use crate::world_db::{WorldDb, WorldMigration};
 
-/// Schema for the player-mail table — SPEC_v3 §4.1 / §Task 3a.
+/// Schema for the player-mail table —.
 ///
 /// One row per notice. Notices are mutable in the narrow sense that
 /// `read_at` and `archived_at` are flipped from `NULL` to a timestamp
-/// once, by an idempotent helper (Task 3e/3f); the body, subject, and
+/// once, by an idempotent helper ; the body, subject, and
 /// addressing fields are write-once. The kit's contract is "if you only
 /// go through the public API, the only mutations are `mark_read` and
 /// `archive_notice`, both idempotent". An operator with `sqlite3` can
@@ -53,14 +53,14 @@ use crate::world_db::{WorldDb, WorldMigration};
 /// # Column shape
 ///
 /// - `id` — `INTEGER PRIMARY KEY`. Autoincrement-aliased rowid. Doubles
-///   as the deterministic tiebreaker for the inbox query (Task 3d) when
+///   as the deterministic tiebreaker for the inbox query when
 ///   two notices share the same `created_at` second.
 /// - `created_at` — `TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP`. UTC
 ///   timestamp written by SQLite at insert time. Stored as ISO text so
 ///   it sorts lexically the same way it sorts chronologically and
 ///   reads cleanly in the `sqlite3` CLI.
-/// - `sender_player_id` — `INTEGER REFERENCES players(id)`,
-///   **nullable**. SPEC §4.1 explicitly allows system notices with no
+/// - `sender_player_id` — `INTEGER REFERENCES players(id)`.
+///   **nullable**. explicitly allows system notices with no
 ///   sender ("System notices MAY have no sender"). Foreign-keyed for
 ///   the same reason as the turn ledger and event log: a phantom id
 ///   should never land here. SQLite enforces FKs only when `PRAGMA
@@ -75,29 +75,29 @@ use crate::world_db::{WorldDb, WorldMigration};
 /// - `kind` — `TEXT NOT NULL`. Short machine-readable label
 ///   (e.g. `"guestbook_note"`, `"challenge_offer"`). Game authors pick
 ///   the namespace; the kit's only rule is "round-trips as text". Used
-///   by Task 3-consuming screens to filter inbox views by category.
+///   by -consuming screens to filter inbox views by category.
 /// - `subject` — `TEXT NOT NULL`. Player-authored short title. Length
-///   bounds are enforced by Task 3c, not at the schema layer, because
+///   bounds are enforced by, not at the schema layer, because
 ///   the cap lives in `[multiplayer]` config (`max_notice_body_chars`
 ///   covers body; subject gets its own kit-internal cap). A schema-
 ///   level `CHECK` would be hostile to future config tuning.
 /// - `body` — `TEXT NOT NULL`. Player-authored body. Same length-cap
 ///   story as `subject`. Both fields are required at the schema layer
 ///   so the kit can render any inbox row without a fallback string;
-///   "empty body" failures surface at write time (Task 3c) rather than
+///   "empty body" failures surface at write time rather than
 ///   silently producing a blank cell in the UI.
 /// - `read_at` — `TEXT`, nullable. ISO timestamp the player marked the
-///   notice as read, or `NULL` if it's still unread. SPEC §4.1 requires
+///   notice as read, or `NULL` if it's still unread. requires
 ///   "Reading a notice MUST be idempotent"; storing the first-read
 ///   timestamp lets the helper detect "already read" without a
 ///   separate boolean.
 /// - `archived_at` — `TEXT`, nullable. ISO timestamp the notice was
-///   archived. The default inbox query (Task 3d) will exclude rows
+///   archived. The default inbox query will exclude rows
 ///   where this is non-null; the partial index below makes that
 ///   exclusion seek-bound.
-/// - `expires_at` — `TEXT`, nullable. SPEC §4.1 lists optional expiry.
+/// - `expires_at` — `TEXT`, nullable. lists optional expiry.
 ///   The kit does not auto-purge expired notices in v3; expiry is a
-///   filter the inbox query may apply (a future Task 3 sub-item, or
+///   filter the inbox query may apply (a future sub-item, or
 ///   game-author code). Storing it now keeps the schema stable.
 /// - `metadata` — `TEXT`, nullable. Optional opaque JSON. Stored as
 ///   text rather than `BLOB` so an operator can pretty-print it with
@@ -108,7 +108,7 @@ use crate::world_db::{WorldDb, WorldMigration};
 /// # Indexes
 ///
 /// Two covering indexes are created up-front so the inbox query
-/// patterns Task 3d–3f rely on are seek-bound from the moment they
+/// patterns rely on are seek-bound from the moment they
 /// land. Adding them later would require a follow-up migration and a
 /// backfill window where the query path scans the table; pay the index
 /// cost at the same migration that creates the table.
@@ -126,13 +126,13 @@ use crate::world_db::{WorldDb, WorldMigration};
 ///   predicate, for the "show me everything in my mailbox including
 ///   archived" view a future screen might surface (and for operator
 ///   audits via `sqlite3`). Two indexes is cheap on the low-cardinality
-///   data v3 expects, and the partial-vs-full split keeps the default
+///   data expects, and the partial-vs-full split keeps the default
 ///   path's index as small as possible.
 ///
 /// # Version
 ///
-/// `version = 6`. v2 occupies 1–5 (see `docs/shared-world.md` §8.1);
-/// v3 claims 6+. Notices are the first v3 primitive, so they take 6.
+/// `version = 6`. occupies 1–5 (see `docs/shared-world.md` );
+///  claims 6+. Notices are the first primitive, so they take 6.
 pub const NOTICES_MIGRATION: WorldMigration = WorldMigration {
     version: 6,
     name: "create_notices",
@@ -157,9 +157,9 @@ CREATE INDEX IF NOT EXISTS idx_notices_recipient_all\n\
 ",
 };
 
-/// Decoded `notices` row — SPEC_v3 §4.1 read model.
+/// Decoded `notices` row — read model.
 ///
-/// Mirrors the column shape pinned by [`NOTICES_MIGRATION`] one-for-one,
+/// Mirrors the column shape pinned by [`NOTICES_MIGRATION`] one-for-one.
 /// in the same order, so the SQL `RETURNING` clause and the `query_map`
 /// row decoder share a single column list. Authoring code consumes
 /// this struct rather than reaching into raw `rusqlite::Row`s — that
@@ -169,45 +169,45 @@ CREATE INDEX IF NOT EXISTS idx_notices_recipient_all\n\
 ///
 /// All timestamps stay as raw SQLite ISO text, the same contract as
 /// [`crate::events::EventRecord`]: parsing into a richer type would be
-/// a one-way trip that hides corrupt data and forces a chrono / time
-/// dependency on every consumer. `metadata` is likewise opaque text —
+/// a one-way trip that hides corrupt data and forces a chrono time
+/// dependency on every consumer. `metadata` is likewise opaque text
 /// game code that wants structured metadata serialises JSON before
 /// handing it to [`WorldDb::send_notice`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Notice {
     /// Autoincrement primary key. Doubles as the deterministic
-    /// tiebreaker for the inbox query (Task 3d) when two notices share
+    /// tiebreaker for the inbox query when two notices share
     /// a `created_at` value at second resolution.
     pub id: i64,
     /// UTC timestamp written by SQLite at insert time
     /// (`CURRENT_TIMESTAMP`). Kept as ISO text — see struct docs.
     pub created_at: String,
-    /// Sender's `players.id`, or `None` for system notices. SPEC §4.1
+    /// Sender's `players.id`, or `None` for system notices.
     /// explicitly allows "System notices MAY have no sender".
     pub sender_player_id: Option<i64>,
     /// Recipient's `players.id`. Required by the schema — every notice
     /// has exactly one addressee.
     pub recipient_player_id: i64,
-    /// Game-authored kind label (e.g. `"guestbook_note"`,
+    /// Game-authored kind label (e.g. `"guestbook_note"`.
     /// `"challenge_offer"`). Round-tripped verbatim; the kit imposes
     /// no namespace.
     pub kind: String,
     /// Player- or system-authored short title. Length bounds are
-    /// enforced by Task 3c, not at the storage layer.
+    /// enforced by, not at the storage layer.
     pub subject: String,
     /// Player- or system-authored body. Length bounds are enforced by
-    /// Task 3c, not at the storage layer.
+    /// , not at the storage layer.
     pub body: String,
     /// ISO timestamp the recipient first marked the notice as read, or
     /// `None` while it is still unread. Flipped to a timestamp by the
-    /// idempotent Task 3e helper.
+    /// idempotent helper.
     pub read_at: Option<String>,
     /// ISO timestamp the recipient archived the notice, or `None` if
     /// it is still in the active inbox. Flipped to a timestamp by the
-    /// Task 3f helper.
+    ///  helper.
     pub archived_at: Option<String>,
     /// Optional ISO timestamp after which the notice is considered
-    /// expired. The kit does not auto-purge in v3 (see module docs);
+    /// expired. The kit does not auto-purge in (see module docs);
     /// game-authored or future kit code may filter on this.
     pub expires_at: Option<String>,
     /// Optional opaque metadata blob (typically a JSON object). Stored
@@ -218,7 +218,7 @@ pub struct Notice {
 
 /// Kit-internal cap for the subject line of a player-authored notice.
 ///
-/// SPEC_v3 §5.2 ships only `max_notice_body_chars` as configurable; the
+///  ships only `max_notice_body_chars` as configurable; the
 /// subject line is intentionally bounded by the kit instead of by game
 /// authors so every consuming game presents a uniform "short title" UI.
 /// 120 chars fits one 80-column line with room for a recipient prefix
@@ -226,8 +226,8 @@ pub struct Notice {
 /// 1 KB-ish soft limit at which SQLite text scanning stops being
 /// instantaneous on a modern disk.
 ///
-/// Counted in Unicode scalar values (`str::chars().count()`), not bytes
-/// — SPEC §4.1 / §7 talk in *characters*, and a byte cap would let a
+/// Counted in Unicode scalar values (`str::chars.count`), not bytes
+/// — talk in *characters*, and a byte cap would let a
 /// single emoji eat four "chars" of budget. Length checks for the body
 /// (whose cap lives in `[multiplayer].max_notice_body_chars`) use the
 /// same scalar-count rule for consistency.
@@ -239,7 +239,7 @@ pub const NOTICE_SUBJECT_MAX_CHARS: usize = 120;
 /// `anyhow` at the process boundary. Mirrors [`crate::events::EventError`]
 /// so all world-DB write paths surface errors with the same shape.
 ///
-/// Task 3c added the four length-validation variants. They run *before*
+///  added the four length-validation variants. They run *before*
 /// the SQL round-trip so a rejected notice never touches `world.sqlite`
 /// — that keeps `world_events` and the inbox indexes from being
 /// polluted by half-validated drafts and lets the caller re-render the
@@ -247,7 +247,7 @@ pub const NOTICE_SUBJECT_MAX_CHARS: usize = 120;
 #[derive(Debug, Error)]
 pub enum NoticeError {
     /// Subject was empty (or whitespace-only collapsed to empty).
-    /// SPEC §4.1 lists `subject` as `NOT NULL`; the kit additionally
+    ///  lists `subject` as `NOT NULL`; the kit additionally
     /// rejects an empty string here so the inbox never renders a row
     /// with a blank title that the recipient can't tell apart from a
     /// rendering bug.
@@ -262,14 +262,14 @@ pub enum NoticeError {
     EmptyBody,
     /// Subject exceeded [`NOTICE_SUBJECT_MAX_CHARS`]. Surfacing both the
     /// limit and the actual length lets the authoring screen show
-    /// "120 / 137 characters" without re-counting.
+    /// "120 137 characters" without re-counting.
     #[error("notice subject exceeds {max}-character limit (got {actual})")]
     SubjectTooLong {
         /// Cap that was breached — currently always
         /// [`NOTICE_SUBJECT_MAX_CHARS`], named so future per-game caps
         /// (if ever introduced) don't break the error shape.
         max: usize,
-        /// Actual `chars().count()` of the rejected subject. Reported in
+        /// Actual `chars.count` of the rejected subject. Reported in
         /// scalar values, the same unit as `max`.
         actual: usize,
     },
@@ -283,12 +283,12 @@ pub enum NoticeError {
         /// `MultiplayerSection::max_notice_body_chars` and threaded into
         /// [`WorldDb::send_notice`] by the caller.
         max: usize,
-        /// Actual `chars().count()` of the rejected body, in scalar
+        /// Actual `chars.count` of the rejected body, in scalar
         /// values.
         actual: usize,
     },
     /// The `INSERT … RETURNING` round-trip failed. Wrapping
-    /// `rusqlite::Error` keeps the call site readable (one error type,
+    /// `rusqlite::Error` keeps the call site readable (one error type.
     /// one mapping) while preserving the underlying cause for
     /// `tracing` and operator-facing messages.
     #[error("failed to write notice to world database: {source}")]
@@ -299,7 +299,7 @@ pub enum NoticeError {
     },
     /// No `notices` row exists with the given id. Surfaced by helpers
     /// that require an existing notice ([`WorldDb::mark_read`] and the
-    /// upcoming Task 3f `archive_notice`). The call site distinguishes
+    /// upcoming `archive_notice`). The call site distinguishes
     /// "this notice is gone" (a UI-recoverable state — refresh the
     /// inbox) from a generic SQL failure.
     #[error("notice {id} does not exist")]
@@ -312,11 +312,11 @@ pub enum NoticeError {
 
 impl WorldDb {
     /// Insert one row into `notices` and return the canonical
-    /// [`Notice`] SQLite produced (SPEC_v3 §4.1 / §Task 3b).
+    /// [`Notice`] SQLite produced.
     ///
     /// The contract is "the notice I asked you to send is now durably
     /// in the recipient's mailbox, with the id and `created_at` SQLite
-    /// assigned, and `read_at` / `archived_at` both still `NULL`". A
+    /// assigned, and `read_at` `archived_at` both still `NULL`". A
     /// freshly sent notice MUST be unread — the test
     /// `send_notice_stores_unread_notice` pins both fields explicitly
     /// so a future schema or default-value change can't silently flip
@@ -324,14 +324,14 @@ impl WorldDb {
     ///
     /// `kind`, `subject`, and `body` are required by the schema.
     /// `sender_player_id` is `Option<i64>` because system notices have
-    /// no attributable sender (§4.1). `expires_at` is the only optional
+    /// no attributable sender. `expires_at` is the only optional
     /// timestamp on the *write* path: `read_at` and `archived_at` are
     /// always `NULL` at send time and get filled by their dedicated
     /// helpers. `metadata` is opaque text, same contract as
     /// [`crate::events::EventRecord::metadata`].
     ///
     /// `max_body_chars` comes from
-    /// `MultiplayerSection::max_notice_body_chars` — the SPEC v3 §5.2
+    /// `MultiplayerSection::max_notice_body_chars` — the v3
     /// configurable cap. It's threaded as an argument rather than
     /// pulled from a global so the same `WorldDb` can serve a multi-
     /// game door in the future without reaching for a singleton config.
@@ -340,7 +340,7 @@ impl WorldDb {
     ///
     /// # Validation order
     ///
-    /// Length checks (Task 3c) run **before** the SQL round-trip:
+    /// Length checks run **before** the SQL round-trip:
     /// emptiness first, then over-cap, subject before body. A rejected
     /// notice MUST NOT touch `world.sqlite` — that keeps `world_events`
     /// and the inbox indexes free of half-validated drafts and lets the
@@ -356,7 +356,7 @@ impl WorldDb {
     /// Takes `&self`: a single insert statement under the configured
     /// busy timeout. `&mut self` would fight the runtime layer where
     /// `GameContext` borrows the world DB once per tick.
-    #[allow(clippy::too_many_arguments)] // Matches the SPEC §4.1 column shape one-for-one (sender, recipient, kind, subject, body, expires_at, metadata) plus the per-call body cap; bundling into a struct would force every call site through a builder dance without adding type safety, since each parameter is already strongly typed.
+    #[allow(clippy::too_many_arguments)] // Matches the column shape one-for-one (sender, recipient, kind, subject, body, expires_at, metadata) plus the per-call body cap; bundling into a struct would force every call site through a builder dance without adding type safety, since each parameter is already strongly typed.
     pub fn send_notice(
         &self,
         sender_player_id: Option<i64>,
@@ -381,7 +381,7 @@ impl WorldDb {
         if body.is_empty() {
             return Err(NoticeError::EmptyBody);
         }
-        // Count Unicode scalar values, not bytes — SPEC §4.1/§7 talk
+        // Count Unicode scalar values, not bytes — talk
         // in characters, and a byte cap would penalise non-ASCII text.
         let subject_chars = subject.chars().count();
         if subject_chars > NOTICE_SUBJECT_MAX_CHARS {
@@ -400,8 +400,8 @@ impl WorldDb {
         }
         // `RETURNING` echoes the full row back — including the SQL-side
         // `CURRENT_TIMESTAMP` default for `created_at` and the `NULL`
-        // values for `read_at` / `archived_at`. The column order here
-        // matches `row_to_notice` and the inbox query in Task 3d so all
+        // values for `read_at` `archived_at`. The column order here
+        // matches `row_to_notice` and the inbox query in so all
         // three share one decoder.
         const SQL: &str = "\
 INSERT INTO notices \
@@ -428,16 +428,16 @@ RETURNING id, created_at, sender_player_id, recipient_player_id, \
     }
 
     /// Return the recipient's active inbox, newest first
-    /// (SPEC_v3 §4.1 / §Task 3d).
+    /// .
     ///
     /// "Active" means `archived_at IS NULL` — archived notices are
     /// hidden by the default view. A future helper can surface the
-    /// full history (Task 3f's archive UI may want a "show archived"
+    /// full history ('s archive UI may want a "show archived"
     /// toggle); the partial-index split documented on
     /// [`NOTICES_MIGRATION`] already provides the second covering
     /// index for that path. Reading vs. unread is *not* a filter here:
     /// inbox views typically render both, with unread rows styled
-    /// differently. `read_at` is a column on the returned [`Notice`],
+    /// differently. `read_at` is a column on the returned [`Notice`].
     /// so callers can filter or style without a second query.
     ///
     /// # Ordering
@@ -445,7 +445,7 @@ RETURNING id, created_at, sender_player_id, recipient_player_id, \
     /// `ORDER BY created_at DESC, id DESC` — newest first, with the
     /// autoincrement `id` as the deterministic tiebreaker when two
     /// notices land in the same SQLite second. Same shape as
-    /// [`Self::recent_events`] / [`Self::player_events`] so the inbox
+    /// [`Self::recent_events`] [`Self::player_events`] so the inbox
     /// and event log feel consistent in the UI.
     ///
     /// The `idx_notices_inbox` partial index covers
@@ -458,8 +458,8 @@ RETURNING id, created_at, sender_player_id, recipient_player_id, \
     /// `recipient_player_id` is the canonical id from
     /// [`crate::players::PlayerRecord`]. Passing an unknown id is not
     /// an error: it returns an empty vec, the correct UI behaviour for
-    /// "this player has no notices yet". No limit parameter — SPEC §4.1
-    /// scopes notices "to one game world DB" and the v3 mailbox is
+    /// "this player has no notices yet". No limit parameter
+    /// scopes notices "to one game world DB" and the mailbox is
     /// expected to stay small (per-recipient, archive on read); a
     /// future paged variant can be added without breaking this
     /// signature.
@@ -470,7 +470,7 @@ RETURNING id, created_at, sender_player_id, recipient_player_id, \
     /// timeout, same as [`Self::send_notice`].
     pub fn inbox(&self, recipient_player_id: i64) -> Result<Vec<Notice>, NoticeError> {
         // Column order matches `row_to_notice` and the `RETURNING`
-        // clause in `send_notice` — one decoder, one column list,
+        // clause in `send_notice` — one decoder, one column list.
         // surfaced as a type error if a future schema edit ever
         // diverges them.
         const SQL: &str = "\
@@ -491,15 +491,15 @@ ORDER BY created_at DESC, id DESC";
             .map_err(|source| NoticeError::Sqlite { source })
     }
 
-    /// Mark a notice as read; idempotent (SPEC_v3 §4.1 / §Task 3e).
+    /// Mark a notice as read; idempotent.
     ///
-    /// SPEC §4.1 requires "Reading a notice MUST be idempotent". The
+    ///  requires "Reading a notice MUST be idempotent". The
     /// natural interpretation is "calling `mark_read` twice does not
     /// change the timestamp the recipient first read it". We implement
-    /// that with `UPDATE … SET read_at = COALESCE(read_at,
+    /// that with `UPDATE … SET read_at = COALESCE(read_at.
     /// CURRENT_TIMESTAMP)` — the first call flips `NULL` to the
     /// current second; subsequent calls keep the original value
-    /// untouched. The returned [`Notice`] reflects the canonical row,
+    /// untouched. The returned [`Notice`] reflects the canonical row.
     /// so the caller doesn't need a follow-up `SELECT` to discover the
     /// timestamp.
     ///
@@ -514,13 +514,13 @@ ORDER BY created_at DESC, id DESC";
     /// # Scope
     ///
     /// This helper authenticates by `id` only — it does not require a
-    /// `recipient_player_id`. v3 game UIs read the notice from the
+    /// `recipient_player_id`. game UIs read the notice from the
     /// recipient's own inbox before flipping the read flag, so the
     /// caller has already established ownership; layering a second
     /// recipient check here would force every call site through a
     /// duplicate parameter. A future hardening pass can add a
     /// `mark_read_for(recipient_id, notice_id)` overload if a screen
-    /// ever exposes raw ids that didn't come from `inbox()`.
+    /// ever exposes raw ids that didn't come from `inbox`.
     ///
     /// # Failure
     ///
@@ -561,7 +561,7 @@ RETURNING id, created_at, sender_player_id, recipient_player_id, \
         }
     }
 
-    /// Archive a notice; idempotent (SPEC_v3 §4.1 / §Task 3f).
+    /// Archive a notice; idempotent.
     ///
     /// Archiving flips `archived_at` from `NULL` to a timestamp the first
     /// time it's called and is a no-op on every subsequent call — the
@@ -585,11 +585,11 @@ RETURNING id, created_at, sender_player_id, recipient_player_id, \
     /// # Scope
     ///
     /// Authenticates by `id` only — same call-site contract as
-    /// [`Self::mark_read`]: v3 UIs reach `archive_notice` from the
+    /// [`Self::mark_read`]: UIs reach `archive_notice` from the
     /// recipient's own inbox, where ownership is already established.
-    /// A future hardening pass can add an `archive_notice_for(recipient,
+    /// A future hardening pass can add an `archive_notice_for(recipient.
     /// id)` overload if a screen ever exposes raw ids that didn't come
-    /// from `inbox()`.
+    /// from `inbox`.
     ///
     /// # Failure
     ///
@@ -634,7 +634,7 @@ RETURNING id, created_at, sender_player_id, recipient_player_id, \
 
 /// Decode a `notices` row into [`Notice`].
 ///
-/// Pulled out so the Task 3b write path and the upcoming Task 3d
+/// Pulled out so the write path and the upcoming
 /// inbox query can share one decoder. Column order matches the
 /// `RETURNING` clause in [`WorldDb::send_notice`] *and* the inbox
 /// `SELECT` (when it lands); a regression that reorders columns will
@@ -680,7 +680,7 @@ mod tests {
     }
 
     /// Helper: open a fresh world DB with players + notices migrations
-    /// applied. Both Task 3b tests need this setup; pulling it out
+    /// applied. Both tests need this setup; pulling it out
     /// keeps each test body focused on the assertion under test.
     fn world_with_notices() -> (tempfile::TempDir, WorldDb) {
         let dir = tempdir().expect("tempdir creates");
@@ -695,20 +695,20 @@ mod tests {
         (dir, world)
     }
 
-    /// SPEC_v3 §Task 3a acceptance: applying [`NOTICES_MIGRATION`]
+    ///   acceptance: applying [`NOTICES_MIGRATION`]
     /// creates the documented `notices` table with the column shape
-    /// SPEC §4.1 pins. Asserts both:
+    ///  pins. Asserts both:
     ///
     /// 1. The table exists in `sqlite_master` (so a regression that
     ///    silently dropped the migration body would flunk).
-    /// 2. The columns and order match the SPEC §4.1 contract (so a
+    /// 2. The columns and order match the contract (so a
     ///    later edit that renames or reorders a column flunks here
     ///    rather than buried in a 3b/3d behavioural test).
     ///
     /// The players migration is applied first because `notices`
     /// references `players(id)` via two foreign keys. With FK
     /// enforcement off (the SQLite default until the runtime turns it
-    /// on) the migration would succeed even without the parent table,
+    /// on) the migration would succeed even without the parent table.
     /// but exercising the real dependency order here mirrors how the
     /// runtime startup path drives migrations on a real door open.
     #[test]
@@ -759,11 +759,11 @@ mod tests {
                 "expires_at".to_string(),
                 "metadata".to_string(),
             ],
-            "notices column shape must match the SPEC_v3 §4.1 contract"
+            "notices column shape must match the contract"
         );
     }
 
-    /// SPEC §4.1 makes `sender_player_id` optional ("System notices
+    ///  makes `sender_player_id` optional ("System notices
     /// MAY have no sender") and `recipient_player_id` required. A
     /// regression that flipped either nullability would be a silent
     /// behavioural break — system advisories suddenly need a fake
@@ -816,7 +816,7 @@ mod tests {
         );
     }
 
-    /// The default inbox query (Task 3d) walks
+    /// The default inbox query walks
     /// `idx_notices_inbox` — a partial index over
     /// `(recipient_player_id, created_at, id) WHERE archived_at IS
     /// NULL`. If the migration ever stops creating this index, the
@@ -859,7 +859,7 @@ mod tests {
     }
 
     /// The migration is idempotent. v2's relaunch path applies the same
-    /// migration list every open; v3 inherits that contract. A second
+    /// migration list every open; inherits that contract. A second
     /// `apply_migration(&NOTICES_MIGRATION)` MUST be a no-op (the
     /// version is already in `world_migrations`), not an error from
     /// `CREATE TABLE` on an existing table.
@@ -880,11 +880,11 @@ mod tests {
             .expect("second notices migration applies (idempotent)");
     }
 
-    /// SPEC_v3 §Task 3b acceptance: a freshly sent notice is durably
+    ///   acceptance: a freshly sent notice is durably
     /// stored AND is unread. The "stored" half asserts the round-tripped
     /// `Notice` matches what was sent (id assigned, fields preserved);
     /// the "unread" half pins `read_at` and `archived_at` both to
-    /// `None`. SPEC §4.1 implicitly requires this — a notice that was
+    /// `None`. implicitly requires this — a notice that was
     /// born "read" or "archived" would never surface in any inbox query
     /// and the lifecycle would be broken from the start.
     ///
@@ -892,7 +892,7 @@ mod tests {
     /// regression that returned a `Notice` from `RETURNING` without
     /// actually persisting (e.g. a future change that wrapped the
     /// insert in a transaction and forgot to commit) would flunk here
-    /// rather than only at the Task 3d inbox query.
+    /// rather than only at the inbox query.
     #[test]
     fn send_notice_stores_unread_notice() {
         let (_dir, world) = world_with_notices();
@@ -928,7 +928,7 @@ mod tests {
         assert_eq!(sent.subject, "Welcome to the motel");
         assert_eq!(sent.body, "Stop by Room 7. There's a clue under the rug.");
 
-        // The unread / unarchived contract — the central Task 3b claim.
+        // The unread unarchived contract — the central claim.
         assert!(
             sent.read_at.is_none(),
             "freshly sent notice must be unread (read_at IS NULL)"
@@ -957,16 +957,16 @@ mod tests {
         assert_eq!(stored, sent, "stored row must equal RETURNING row");
     }
 
-    /// SPEC §4.1: "System notices MAY have no sender." A `None`
+    /// : "System notices MAY have no sender." A `None`
     /// `sender_player_id` MUST round-trip as `NULL` and produce a
     /// notice that is otherwise indistinguishable from a player-sent
     /// one — same unread/unarchived contract. Pinning this here keeps
     /// the system-advisory pathway honest; without an explicit test, a
     /// future signature change that "helpfully" defaulted the sender to
-    /// some sentinel id would silently break §4.1.
+    /// some sentinel id would silently break
     ///
     /// Also exercises the optional `expires_at` and `metadata`
-    /// parameters — the Task 3b signature accepts them, so a smoke
+    /// parameters — the signature accepts them, so a smoke
     /// that they round-trip belongs here, not in a later 3d/3e test.
     #[test]
     fn send_notice_supports_system_sender_and_optional_fields() {
@@ -990,7 +990,7 @@ mod tests {
 
         assert_eq!(
             sent.sender_player_id, None,
-            "system notices must store NULL sender per SPEC §4.1"
+            "system notices must store NULL sender"
         );
         assert_eq!(sent.recipient_player_id, recipient.id);
         assert_eq!(sent.kind, "system_advisory");
@@ -1002,7 +1002,7 @@ mod tests {
         );
     }
 
-    /// SPEC_v3 §Task 3c: an empty subject is rejected at the kit
+    ///  : an empty subject is rejected at the kit
     /// boundary, before the SQL round-trip. The schema's `NOT NULL`
     /// would accept `""`; the kit refuses so the inbox can never render
     /// a row with a blank title that a recipient can't tell apart from
@@ -1036,7 +1036,7 @@ mod tests {
         assert_eq!(count, 0, "rejected notice must not produce a row");
     }
 
-    /// SPEC_v3 §Task 3c: an empty body is rejected for the same
+    ///  : an empty body is rejected for the same
     /// reason as an empty subject — silent blank rendering would
     /// be a UX hazard. Pinning this independently from
     /// `send_notice_rejects_empty_subject` keeps the two failure
@@ -1089,9 +1089,9 @@ mod tests {
     }
 
     /// Boundary: a subject of [`NOTICE_SUBJECT_MAX_CHARS`] + 1 scalar
-    /// values MUST be rejected with [`NoticeError::SubjectTooLong`],
+    /// values MUST be rejected with [`NoticeError::SubjectTooLong`].
     /// and the error MUST report both the cap and the actual length so
-    /// authoring screens can render "120 / 121 characters" without
+    /// authoring screens can render "120 121 characters" without
     /// re-counting.
     #[test]
     fn send_notice_rejects_subject_over_limit() {
@@ -1146,7 +1146,7 @@ mod tests {
         assert_eq!(sent.body.chars().count(), 8);
     }
 
-    /// SPEC_v3 §Task 3c headline test: an overlong body fails clearly.
+    ///   headline test: an overlong body fails clearly.
     /// Asserts the error names both the cap and the actual length, in
     /// scalar values (Unicode scalars, not bytes — see
     /// [`NOTICE_SUBJECT_MAX_CHARS`] doc comment for why). Uses a
@@ -1201,7 +1201,7 @@ mod tests {
             .expect("4-emoji body must pass a 4-char cap (chars, not bytes)");
     }
 
-    /// SPEC_v3 §Task 3d: an empty inbox returns an empty vec, not an
+    ///  : an empty inbox returns an empty vec, not an
     /// error. A new player with no notices is the dominant first-login
     /// case — surfacing an error there would force every UI consumer
     /// to special-case the empty path.
@@ -1214,7 +1214,7 @@ mod tests {
         assert!(notices.is_empty(), "fresh inbox must be empty");
     }
 
-    /// SPEC_v3 §Task 3d headline: the inbox returns the recipient's
+    ///   headline: the inbox returns the recipient's
     /// notices newest first, with `id` breaking ties when two notices
     /// land in the same SQLite second. Mirrors the
     /// `recent_events_returns_newest_first_with_id_tiebreak` contract
@@ -1291,8 +1291,8 @@ mod tests {
         assert_eq!(alice_inbox[0].subject, "for alice");
     }
 
-    /// SPEC_v3 §Task 3d: the *default* inbox excludes archived
-    /// notices — that's what makes Task 3f's archive button
+    ///  : the *default* inbox excludes archived
+    /// notices — that's what makes 's archive button
     /// meaningful. Pinned here even though `archive_notice` itself
     /// lands in 3f: we exercise the filter by hand-flipping
     /// `archived_at` so the contract is locked before any helper that
@@ -1319,7 +1319,7 @@ mod tests {
             )
             .unwrap();
 
-        // Hand-flip archived_at; Task 3f's helper will replace this.
+        // Hand-flip archived_at; 's helper will replace this.
         world
             .connection()
             .execute(
@@ -1333,7 +1333,7 @@ mod tests {
         assert_eq!(inbox[0].id, kept.id);
     }
 
-    /// SPEC_v3 §Task 3d: read notices stay in the default inbox view.
+    ///  : read notices stay in the default inbox view.
     /// Inbox UIs typically render unread *and* read mail with
     /// different styling; filtering on `read_at` here would force
     /// every consumer through a second query. Pin that an unread+read
@@ -1379,10 +1379,10 @@ mod tests {
         );
     }
 
-    /// SPEC_v3 §Task 3e headline: a freshly sent notice has
+    ///   headline: a freshly sent notice has
     /// `read_at IS NULL`; the first `mark_read` flips it to a
     /// timestamp; the *second* call is a no-op — the timestamp does
-    /// not advance. SPEC §4.1 pins "Reading a notice MUST be
+    /// not advance. pins "Reading a notice MUST be
     /// idempotent" and this is the test that locks it: a regression
     /// from `COALESCE(read_at, CURRENT_TIMESTAMP)` to a plain
     /// `SET read_at = CURRENT_TIMESTAMP` would silently advance the
@@ -1432,7 +1432,7 @@ mod tests {
         assert_eq!(stored.as_deref(), Some(read_at.as_str()));
     }
 
-    /// SPEC_v3 §Task 3e: marking a missing notice returns
+    ///  : marking a missing notice returns
     /// [`NoticeError::NotFound`], not a generic SQL error. The UI
     /// layer needs to distinguish "this notice is gone" (refresh the
     /// inbox) from "the database is broken" (escalate to the operator).
@@ -1446,7 +1446,7 @@ mod tests {
         }
     }
 
-    /// SPEC_v3 §Task 3d (revisited): a marked-read notice stays in
+    ///  (revisited): a marked-read notice stays in
     /// the default inbox. Pinned in `inbox_includes_read_notices` via
     /// a hand-flipped `read_at`; pin it again here through the real
     /// [`WorldDb::mark_read`] helper so the contract is locked
@@ -1466,7 +1466,7 @@ mod tests {
         assert!(inbox[0].read_at.is_some());
     }
 
-    /// SPEC_v3 §Task 3c: rejected notices MUST NOT produce a row.
+    ///  : rejected notices MUST NOT produce a row.
     /// Already covered for the empty-subject case in
     /// `send_notice_rejects_empty_subject`; pin the same invariant for
     /// the overlong-body path so a future change that "validated after
@@ -1497,14 +1497,14 @@ mod tests {
         assert_eq!(count, 0, "rejected notice must not produce a row");
     }
 
-    /// SPEC_v3 §Task 3f headline: archiving a notice removes it from
+    ///   headline: archiving a notice removes it from
     /// the default [`WorldDb::inbox`] view. Pinned via the real helper
     /// (the parallel test `inbox_excludes_archived_notices` exercises
     /// the same filter through a hand-flipped `archived_at`); together
     /// they lock both halves of the contract — the SQL filter AND the
     /// helper that flips the column. The other notice in the inbox
     /// must remain visible so a regression that archived everything
-    /// flunks on the `len() == 1` half.
+    /// flunks on the `len == 1` half.
     #[test]
     fn archive_notice_hides_notice_from_default_inbox() {
         let (_dir, world) = world_with_notices();
@@ -1543,7 +1543,7 @@ mod tests {
         assert_eq!(inbox[0].id, kept.id);
     }
 
-    /// SPEC_v3 §Task 3f: archiving is idempotent — the second call is
+    ///  : archiving is idempotent — the second call is
     /// a no-op and `archived_at` does NOT advance. Same shape as the
     /// `mark_read_is_idempotent` test (sleep ≥1.1 s between calls so a
     /// non-idempotent regression to plain `SET archived_at =
@@ -1595,7 +1595,7 @@ mod tests {
         );
     }
 
-    /// SPEC_v3 §Task 3f: archiving a missing id returns
+    ///  : archiving a missing id returns
     /// [`NoticeError::NotFound`] — same typed-error contract as
     /// [`WorldDb::mark_read`], so the UI layer can recover (refresh
     /// inbox) without escalating to the operator.
@@ -1611,7 +1611,7 @@ mod tests {
         }
     }
 
-    /// SPEC_v3 §Task 3f: archiving a previously-read notice preserves
+    ///  : archiving a previously-read notice preserves
     /// the original `read_at` timestamp (the COALESCE only touches
     /// `archived_at`). A regression that reset `read_at` during archive
     /// would observably flunk the equality check here. Important for

@@ -1,8 +1,8 @@
 //! `GameConfig` — typed view of `assets/game.toml`.
 //!
 //! Game authors describe their door's identity and Foglet manifest
-//! defaults declaratively in `assets/game.toml` (SPEC §9.1). The
-//! runtime, the `fgk` CLI's `emit-manifest` / `package` commands, and
+//! defaults declaratively in `assets/game.toml`. The
+//! runtime, the `fgk` CLI's `emit-manifest` `package` commands, and
 //! the example games all read the same struct so behaviour can't
 //! drift between the library's view and the CLI's view of a project.
 //!
@@ -17,12 +17,12 @@
 //!
 //! # What's required vs. optional
 //!
-//! Per SPEC §5.2, every field listed in the fields block belongs in
+//! Per, every field listed in the fields block belongs in
 //! `GameConfig`. The `[game]` section is fully required — those values
 //! identify the door and seed the player's spawn point, so silently
 //! defaulting them would mask authoring bugs. The `[save]` and
-//! `[manifest]` sections have SPEC-documented defaults
-//! (§5.6 / §10.3); we accept both "section omitted" and "section
+//! `[manifest]` sections have -documented defaults
+//! ; we accept both "section omitted" and "section
 //! present but partial" by defaulting at the field level.
 
 use std::path::Path;
@@ -36,7 +36,7 @@ use crate::manifest::{
 
 /// Parsed `assets/game.toml`.
 ///
-/// The shape mirrors the SPEC §9.1 example one-to-one. `serde` drives
+/// The shape mirrors the example one-to-one. `serde` drives
 /// the actual deserialization; the wrapping [`ConfigError`] just
 /// presents a uniform error surface to the CLI.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -51,103 +51,103 @@ pub struct GameConfig {
     /// the file; defaults applied on load.
     #[serde(default)]
     pub manifest: ManifestSection,
-    /// `[world]` section — shared SQLite world DB settings (SPEC v2 §5).
+    /// `[world]` section — shared SQLite world DB settings.
     /// Optional in the file; absent section defaults to disabled so v1
     /// games keep working unchanged.
     #[serde(default)]
     pub world: WorldSection,
-    /// `[turns]` section — daily turn ledger (SPEC v2 §4.6, §5).
+    /// `[turns]` section — daily turn ledger.
     ///
     /// Modeled as `Option` rather than a defaulted struct because the
-    /// SPEC explicitly says "Missing `[turns]` means no turn system":
+    ///  explicitly says "Missing `[turns]` means no turn system":
     /// fabricating a default allowance for a game that didn't ask for
     /// turns would silently change runtime behavior. `None` is the
     /// "off" signal the runtime checks before opening a ledger.
     #[serde(default)]
     pub turns: Option<TurnsSection>,
-    /// `[[leaderboards]]` array — built-in leaderboards (SPEC v2 §5).
+    /// `[[leaderboards]]` array — built-in leaderboards.
     ///
     /// Modeled as a `Vec` defaulted to empty rather than `Option<Vec>`
     /// because "no leaderboards" and "an empty list of leaderboards"
-    /// are the same SPEC-level statement ("Missing `[[leaderboards]]`
+    /// are the same -level statement ("Missing `[[leaderboards]]`
     /// means no built-in leaderboards"). Downstream consumers iterate
     /// the vec; an empty vec is the natural off signal.
     #[serde(default, rename = "leaderboards")]
     pub leaderboards: Vec<LeaderboardSection>,
-    /// `[multiplayer]` section — v3 BBS-native async multiplayer
-    /// primitives (SPEC v3 §5.2).
+    /// `[multiplayer]` section — BBS-native async multiplayer
+    /// primitives.
     ///
     /// Modeled as `Option` rather than a defaulted struct because
-    /// SPEC v3 §5.2 says "Every primitive is opt-in" and "Generated
-    /// v1/v2 projects are not forced to ship multiplayer screens":
+    ///  says "Every primitive is opt-in" and "Generated
+    /// v1/projects are not forced to ship multiplayer screens":
     /// fabricating a default block for a game that did not request
-    /// multiplayer would silently expose mailbox / market / bounty
+    /// multiplayer would silently expose mailbox market bounty
     /// surface area the author never asked for. `None` is the off
-    /// signal the runtime checks before wiring any v3 primitive.
+    /// signal the runtime checks before wiring any primitive.
     #[serde(default)]
     pub multiplayer: Option<MultiplayerSection>,
-    /// `[spatial]` section — v4 location graph primitives (Task 3).
+    /// `[spatial]` section — location graph primitives.
     ///
     /// `enabled` is default false so omitting this section keeps
     /// existing games unchanged and off the default path.
     #[serde(default)]
     pub spatial: SpatialSection,
-    /// `[presence]` section — v4 player-location tracking primitives
-    /// (Task 5).
+    /// `[presence]` section — player-location tracking primitives
+    /// .
     ///
     /// Absent section and `enabled = false` are treated the same:
     /// movement APIs are not wired until the game opts in.
     #[serde(default)]
     pub presence: PresenceSection,
-    /// `[place_recall]` section — v4 discovered-place memory
-    /// primitives for fog-of-war style UIs (Task 6).
+    /// `[place_recall]` section — discovered-place memory
+    /// primitives for fog-of-war style UIs.
     ///
     /// Keeping this separate from `presence` lets games choose whether
     /// to persist discovered state independently from movement.
     #[serde(default)]
     pub place_recall: PlaceRecallSection,
-    /// `[inventory]` section — v4 owner-keyed stockpile primitives
-    /// (Task 7 and 8).
+    /// `[inventory]` section — owner-keyed stockpile primitives
+    /// ( and 8).
     ///
     /// Explicitly disabled by default so older games are unaffected
     /// until they opt in to stockpile APIs.
     #[serde(default)]
     pub inventory: InventorySection,
-    /// `[world_ticks]` section — v4 durable scheduled callback
-    /// controls (Task 9).
+    /// `[world_ticks]` section — durable scheduled callback
+    /// controls.
     ///
-    /// Defaults to disabled because v4 scheduling is additive and
+    /// Defaults to disabled because scheduling is additive and
     /// never on by default.
     #[serde(default)]
     pub world_ticks: WorldTicksSection,
-    /// `[contracts]` section — v5 contract lifecycle primitives
-    /// (Task 3 and Task 4).
+    /// `[contracts]` section — contract lifecycle primitives
+    /// ( and ).
     ///
     /// Disabled by default so doors that only need shared-world
     /// storage do not accidentally expose contract APIs.
     #[serde(default)]
     pub contracts: ContractsSection,
-    /// `[job_board]` section — v5 opportunity aggregation layer
-    /// (Task 5 and Task 6).
+    /// `[job_board]` section — opportunity aggregation layer
+    /// ( and ).
     ///
     /// Kept independent from `contracts` so games can opt into pure
     /// contract APIs without also wiring a built-in board surface.
     #[serde(default)]
     pub job_board: JobBoardSection,
-    /// `[travel]` section — v5 movement transaction helper (Task 7).
+    /// `[travel]` section — movement transaction helper.
     ///
     /// Default-off keeps movement orchestration explicit for projects
     /// that prefer hand-rolled travel logic.
     #[serde(default)]
     pub travel: TravelSection,
-    /// `[inventory_capacity]` section — v5 capacity-aware transfer
-    /// helper (Task 8).
+    /// `[inventory_capacity]` section — capacity-aware transfer
+    /// helper.
     ///
-    /// Disabled by default so v4 stockpiles retain their original
+    /// Disabled by default so stockpiles retain their original
     /// semantics until a game opts into policy-driven capacity checks.
     #[serde(default)]
     pub inventory_capacity: InventoryCapacitySection,
-    /// `[screens]` section — holder for nested v5 screen toggles.
+    /// `[screens]` section — holder for nested screen toggles.
     ///
     /// Modeled as a dedicated section now so future v5+ screen
     /// primitives can live under one namespace without changing the
@@ -155,12 +155,12 @@ pub struct GameConfig {
     #[serde(default)]
     pub screens: ScreensSection,
     /// `[[factions.seed]]` array — game-authored faction definitions
-    /// (SPEC v3 §5.2 example).
+    /// ( example).
     ///
     /// Modeled as a defaulted `FactionsSection` (whose `seed` field is
     /// itself a `Vec` defaulted to empty) rather than `Option<…>` for
     /// the same reason as `[[leaderboards]]`: "no seeded factions" and
-    /// "an empty seed list" are the same SPEC-level statement, and
+    /// "an empty seed list" are the same -level statement, and
     /// downstream consumers want to iterate. The section sits at the
     /// top level (not inside `[multiplayer]`) because TOML's
     /// `[[factions.seed]]` syntax declares a top-level `factions`
@@ -172,9 +172,9 @@ pub struct GameConfig {
 
 /// `[game]` section: every field is required.
 ///
-/// `min_width` / `min_height` are the *minimum* terminal size the
-/// game expects; the runtime guard (Task 7) compares this against the
-/// live terminal before entering raw mode (SPEC §7.1).
+/// `min_width` `min_height` are the *minimum* terminal size the
+/// game expects; the runtime guard compares this against the
+/// live terminal before entering raw mode.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GameSection {
     /// Human-facing display name (rendered on the title screen).
@@ -192,7 +192,7 @@ pub struct GameSection {
     pub min_height: u16,
     /// Map name the player starts on — must correspond to a map file
     /// the game ships in `assets/`. Cross-referenced by the map
-    /// loader (Task 9), not here.
+    /// loader, not here.
     pub start_map: String,
     /// Player spawn column on `start_map`.
     pub start_x: u16,
@@ -202,13 +202,13 @@ pub struct GameSection {
 
 /// `[save]` section.
 ///
-/// SPEC §5.6 says "Save paths MUST be per-user by default", so the
+///  says "Save paths MUST be per-user by default", so the
 /// default strategy is [`SaveStrategy::PerFogletUser`]. Authors who
 /// want a save-less door (e.g. a kiosk-style demo) opt in explicitly
 /// with `strategy = "none"`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SaveSection {
-    /// Where the save manager (Task 8) writes files, expressed as a
+    /// Where the save manager writes files, expressed as a
     /// strategy rather than a path so the CLI can resolve a path that
     /// matches the deployment environment.
     #[serde(default)]
@@ -223,16 +223,16 @@ pub struct SaveSection {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum SaveStrategy {
-    /// One save file per Foglet user (the SPEC §5.6 default).
+    /// One save file per Foglet user (the default).
     #[default]
     PerFogletUser,
     /// Door explicitly opts out of persistence.
     None,
 }
 
-/// `[manifest]` section: defaults for `fgk emit-manifest` (Task 11).
+/// `[manifest]` section: defaults for `fgk emit-manifest`.
 ///
-/// Authors usually leave this blank and inherit the SPEC §10.3
+/// Authors usually leave this blank and inherit the
 /// defaults; surfacing the fields here is what lets a paranoid door
 /// pin shorter timeouts or restrict visibility without a CLI flag.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -243,11 +243,11 @@ pub struct ManifestSection {
     /// Idle timeout in milliseconds.
     #[serde(default = "default_idle_timeout_ms")]
     pub idle_timeout_ms: u64,
-    /// `members` / `public` / etc. — opaque string at this layer,
+    /// `members` `public` etc. — opaque string at this layer.
     /// validated by Foglet at install time.
     #[serde(default = "default_visibility")]
     pub visibility: String,
-    /// `site` / `none` / etc. — opaque string at this layer.
+    /// `site` `none` etc. — opaque string at this layer.
     #[serde(default = "default_auth_scope")]
     pub auth_scope: String,
 }
@@ -263,39 +263,39 @@ impl Default for ManifestSection {
     }
 }
 
-/// `[world]` section: shared SQLite world DB settings (SPEC v2 §5).
+/// `[world]` section: shared SQLite world DB settings.
 ///
-/// Every field is field-level optional with a SPEC-documented default
+/// Every field is field-level optional with a -documented default
 /// so an author can write the section as `[world]\nenabled = true` and
 /// inherit safe values for path, busy timeout, and journal mode. The
-/// section as a whole is also optional: a v1 game with no `[world]`
+/// section as a whole is also optional: a game with no `[world]`
 /// block parses cleanly and behaves as if `enabled = false`.
 ///
 /// We do not validate `path` against the filesystem here — that's the
-/// world DB layer's job (Task 3). Storing it as a `String` rather than
+/// world DB layer's job. Storing it as a `String` rather than
 /// a `PathBuf` keeps cross-platform packaging predictable: a config
 /// authored on macOS deploys cleanly to a Linux Foglet host.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorldSection {
     /// Whether the runtime should open a shared-world SQLite DB. The
-    /// safe default is `false` so v1 projects without a `[world]`
+    /// safe default is `false` so projects without a `[world]`
     /// section continue to behave exactly as they did pre-v2.
     #[serde(default)]
     pub enabled: bool,
     /// Path to the SQLite file relative to the package root. The
-    /// default matches the SPEC v2 §5 example so an operator who
+    /// default matches the example so an operator who
     /// inspects a packaged door knows where to look without consulting
     /// the config.
     #[serde(default = "default_world_path")]
     pub path: String,
     /// SQLite `busy_timeout` in milliseconds. Applied during DB open
-    /// (Task 3c) so contention from a parallel local-dev session
+    ///  so contention from a parallel local-dev session
     /// retries instead of erroring out immediately.
     #[serde(default = "default_world_busy_timeout_ms")]
     pub busy_timeout_ms: u64,
-    /// Journal mode applied during DB open (Task 3d). Stored as a
+    /// Journal mode applied during DB open. Stored as a
     /// `String` rather than a closed enum because SQLite has more
-    /// journal modes than v2 currently uses; the world DB layer
+    /// journal modes than currently uses; the world DB layer
     /// validates the value at apply time and falls back if a host
     /// rejects WAL.
     #[serde(default = "default_world_journal_mode")]
@@ -313,7 +313,7 @@ impl Default for WorldSection {
     }
 }
 
-/// `[turns]` section: daily turn allowance settings (SPEC v2 §4.6, §5).
+/// `[turns]` section: daily turn allowance settings.
 ///
 /// `daily_allowance` is required because there's no defensible default
 /// value — a game that opts into turns is making a design statement
@@ -321,8 +321,8 @@ impl Default for WorldSection {
 /// bugs (the same reason `[game]` fields aren't defaulted).
 ///
 /// `reset` and `carryover_max` are field-level optional. The only
-/// documented reset cadence in v2 is local midnight (SPEC §5 example),
-/// so it has a default. `carryover_max = 0` is the SPEC-implied
+/// documented reset cadence in is local midnight.
+/// so it has a default. `carryover_max = 0` is the -implied
 /// "no carryover" behavior: a player who doesn't spend today does not
 /// bank turns for tomorrow.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -330,7 +330,7 @@ pub struct TurnsSection {
     /// Number of turns granted at the start of each reset cycle.
     /// Required; rejected at validation time if zero.
     pub daily_allowance: u32,
-    /// When the ledger rolls over. v2 ships only `LocalMidnight`; the
+    /// When the ledger rolls over. ships only `LocalMidnight`; the
     /// closed enum means an unknown reset string surfaces as a parse
     /// error rather than silently disabling resets.
     #[serde(default)]
@@ -343,10 +343,10 @@ pub struct TurnsSection {
     pub carryover_max: u32,
 }
 
-/// `[[leaderboards]]` entry: one named scoreboard (SPEC v2 §5).
+/// `[[leaderboards]]` entry: one named scoreboard.
 ///
 /// `name` is the stable identifier used by the eventual leaderboard
-/// helpers (Task 8) to scope writes and reads — duplicates would make
+/// helpers to scope writes and reads — duplicates would make
 /// "increment score on board X" ambiguous, so they're rejected at
 /// load time rather than silently coalescing entries.
 ///
@@ -357,7 +357,7 @@ pub struct TurnsSection {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LeaderboardSection {
     /// Stable identifier used to scope reads/writes. Validated as
-    /// non-empty at load time; the helpers in Task 8 will further key
+    /// non-empty at load time; the helpers in will further key
     /// SQL rows by this string, so a typo here would silently shard
     /// the scoreboard.
     pub name: String,
@@ -385,7 +385,7 @@ pub enum LeaderboardSort {
 /// Reset cadences understood by the turn ledger.
 ///
 /// Closed enum: an unrecognised value in `assets/game.toml` is a
-/// load-time error, not a silent fallback to "never reset". v2 only
+/// load-time error, not a silent fallback to "never reset". only
 /// ships `local_midnight`; later versions will extend this.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -395,8 +395,8 @@ pub enum TurnReset {
     LocalMidnight,
 }
 
-/// `[multiplayer]` section: v3 BBS-native async multiplayer toggles
-/// (SPEC v3 §5.2).
+/// `[multiplayer]` section: BBS-native async multiplayer toggles
+/// .
 ///
 /// Each `bool` controls whether the corresponding primitive is wired
 /// up at runtime. They default to `false` so that an author who writes
@@ -404,36 +404,36 @@ pub enum TurnReset {
 /// challenges, the market, factions, and bounties as well — opting
 /// into one primitive should not opt the door into all of them.
 ///
-/// `max_notice_body_chars` is field-level optional with a SPEC-derived
-/// default. SPEC v3 §7 requires player-authored text to be bounded;
-/// 1000 chars matches the example in SPEC v3 §5.2 and is small enough
+/// `max_notice_body_chars` is field-level optional with a -derived
+/// default. requires player-authored text to be bounded;
+/// 1000 chars matches the example in and is small enough
 /// to render safely in an 80×24 terminal without sanitization
 /// surprises. We keep it on this section (rather than a dedicated
 /// `[limits]` block) so the cap travels alongside the toggle that
 /// enables the surface where it applies.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MultiplayerSection {
-    /// Enable v3 notices/mail (Task 3). When `false`, the runtime
+    /// Enable notices/mail. When `false`, the runtime
     /// MUST NOT expose notice send/inbox APIs to game code; the kit
     /// still creates the schema migration to keep the on-disk DB
     /// shape predictable across operator-driven config changes.
     #[serde(default)]
     pub notices: bool,
-    /// Enable v3 challenge lifecycle (Task 4).
+    /// Enable challenge lifecycle.
     #[serde(default)]
     pub challenges: bool,
-    /// Enable v3 shared market listings (Task 5).
+    /// Enable shared market listings.
     #[serde(default)]
     pub market: bool,
-    /// Enable v3 factions and shared goals (Task 6).
+    /// Enable factions and shared goals.
     #[serde(default)]
     pub factions: bool,
-    /// Enable v3 bounty board (Task 7).
+    /// Enable bounty board.
     #[serde(default)]
     pub bounties: bool,
     /// Maximum subject+body length for player-authored notices, in
-    /// characters. SPEC v3 §7 requires bounded text; the default
-    /// (1000) matches the SPEC v3 §5.2 example. Stored as `u32` so a
+    /// characters. requires bounded text; the default
+    /// (1000) matches the example. Stored as `u32` so a
     /// negative number is rejected at parse time.
     #[serde(default = "default_max_notice_body_chars")]
     pub max_notice_body_chars: u32,
@@ -457,11 +457,11 @@ fn default_max_notice_body_chars() -> u32 {
 }
 
 /// `[factions]` section: holder for the `[[factions.seed]]` array
-/// (SPEC v3 §5.2). The section itself carries no other knobs today;
+/// . The section itself carries no other knobs today;
 /// it exists so `serde` has a stable parent for the array of seeds.
 ///
 /// Defaults to an empty `seed` list so games that never declare a
-/// faction (and v1/v2 games that predate the section entirely) parse
+/// faction (and v1/ games that predate the section entirely) parse
 /// without ceremony.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct FactionsSection {
@@ -473,7 +473,7 @@ pub struct FactionsSection {
     pub seed: Vec<FactionSeed>,
 }
 
-/// `[spatial]` section: location graph primitives (v4 Task 3).
+/// `[spatial]` section: location graph primitives.
 ///
 /// `enabled` is the contract-safe off-switch for place/route APIs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -483,7 +483,7 @@ pub struct SpatialSection {
     pub enabled: bool,
 }
 
-/// `[presence]` section: player location tracking (v4 Task 5).
+/// `[presence]` section: player location tracking.
 ///
 /// This section stays focused on whether movement APIs are
 /// exposed; movement rules and gating remain game-defined and happen
@@ -495,9 +495,9 @@ pub struct PresenceSection {
     pub enabled: bool,
 }
 
-/// `[place_recall]` section: per-player visited-place history (v4 Task 6).
+/// `[place_recall]` section: per-player visited-place history.
 ///
-/// `enabled` gates storage and helper APIs for fog-of-war / map
+/// `enabled` gates storage and helper APIs for fog-of-war map
 /// memory. The schema and payload shape remain game-defined.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct PlaceRecallSection {
@@ -506,7 +506,7 @@ pub struct PlaceRecallSection {
     pub enabled: bool,
 }
 
-/// `[inventory]` section: owner-keyed stockpile primitives (v4 Task 7/8).
+/// `[inventory]` section: owner-keyed stockpile primitives.
 ///
 /// This toggle enables stockpile persistence and transfer helpers;
 /// it intentionally does not add economics, caps, or pricing policy.
@@ -517,7 +517,7 @@ pub struct InventorySection {
     pub enabled: bool,
 }
 
-/// `[world_ticks]` section: durable scheduler controls (v4 Task 9).
+/// `[world_ticks]` section: durable scheduler controls.
 ///
 /// `enabled` gates registration and execution entrypoints. The
 /// catch-up budget defaults to `100` and must be positive. The
@@ -554,74 +554,74 @@ impl Default for WorldTicksSection {
     }
 }
 
-/// `[contracts]` section: v5 contract lifecycle primitives.
+/// `[contracts]` section: contract lifecycle primitives.
 ///
 /// `enabled` is a hard gate: off means contract storage and transition
 /// APIs stay unavailable from runtime handles.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct ContractsSection {
-    /// Enable v5 contract CRUD + lifecycle transitions.
+    /// Enable contract CRUD + lifecycle transitions.
     #[serde(default)]
     pub enabled: bool,
 }
 
-/// `[job_board]` section: v5 opportunity aggregation primitives.
+/// `[job_board]` section: opportunity aggregation primitives.
 ///
 /// The toggle controls built-in aggregation helpers only; games remain
 /// free to author their own listing surfaces independently.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct JobBoardSection {
-    /// Enable v5 job-board aggregation helpers.
+    /// Enable job-board aggregation helpers.
     #[serde(default)]
     pub enabled: bool,
 }
 
-/// `[travel]` section: v5 movement transaction helper.
+/// `[travel]` section: movement transaction helper.
 ///
 /// The helper is additive, so defaulting to `false` preserves existing
 /// game-authored movement code paths unchanged.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct TravelSection {
-    /// Enable v5 travel transaction orchestration APIs.
+    /// Enable travel transaction orchestration APIs.
     #[serde(default)]
     pub enabled: bool,
 }
 
-/// `[inventory_capacity]` section: v5 capacity policy helper.
+/// `[inventory_capacity]` section: capacity policy helper.
 ///
 /// The capacity layer intentionally sits behind its own toggle so
 /// stockpile transfer APIs can be used with or without this policy
 /// mechanism.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct InventoryCapacitySection {
-    /// Enable v5 capacity-aware transfer validation helpers.
+    /// Enable capacity-aware transfer validation helpers.
     #[serde(default)]
     pub enabled: bool,
 }
 
 /// `[screens]` section: namespace for built-in screen primitives.
 ///
-/// v5 currently defines only `event_log`, but using a parent section
+/// currently defines only `event_log`, but using a parent section
 /// keeps nested screen toggles cohesive and discoverable.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct ScreensSection {
-    /// `[screens.event_log]` subsection controls the v5 read-only
+    /// `[screens.event_log]` subsection controls the read-only
     /// event log/news screen primitive.
     #[serde(default)]
     pub event_log: EventLogScreenSection,
 }
 
-/// `[screens.event_log]` subsection: v5 Event Log / News screen toggle.
+/// `[screens.event_log]` subsection: Event Log News screen toggle.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EventLogScreenSection {
-    /// Enable the v5 event log screen helper.
+    /// Enable the event log screen helper.
     #[serde(default)]
     pub enabled: bool,
-    /// Default number of events shown per page in the v5 event-log
+    /// Default number of events shown per page in the event-log
     /// screen.
     ///
     /// We default to `20` to keep pagination deterministic across
-    /// game families (space station bulletins, dungeon death logs,
+    /// game families (space station bulletins, dungeon death logs.
     /// town council notices) without forcing every project to set an
     /// explicit value in `game.toml`.
     #[serde(
@@ -640,27 +640,27 @@ impl Default for EventLogScreenSection {
     }
 }
 
-/// A single seeded faction definition (SPEC v3 §5.2).
+/// A single seeded faction definition.
 ///
 /// Seeds are pure data: the runtime upserts them into the
-/// `factions` table at startup (Task 6b) so game authors can edit
+/// `factions` table at startup so game authors can edit
 /// `assets/game.toml` without writing migrations. The fields mirror
-/// the SPEC v3 §5.2 example one-to-one.
+/// the example one-to-one.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FactionSeed {
     /// URL-safe identifier; validated against the same slug rule as
     /// `[game].slug` so the value is safe to use as a primary key in
-    /// the v3 `factions` table and stable across renames of the
+    /// the `factions` table and stable across renames of the
     /// human-facing `display_name`.
     pub slug: String,
     /// Human-facing name shown on screens and in notices. Required
     /// (non-empty after trim) because every UI surface we plan to
-    /// build for v3 renders it; an empty value would produce a
+    /// build for renders it; an empty value would produce a
     /// blank menu entry.
     pub display_name: String,
     /// One-sentence flavour text shown on faction selection screens.
     /// Required for the same reason as `display_name`: the agency
-    /// selector in `murder_motel` (Task 12) reads this verbatim.
+    /// selector in `murder_motel` reads this verbatim.
     pub description: String,
 }
 
@@ -718,7 +718,7 @@ pub enum ConfigError {
     /// A field was structurally valid but semantically rejected
     /// (e.g. empty slug, zero `min_width`). Separate from `Parse` so
     /// CLI callers can distinguish "your TOML is malformed" from
-    /// "your values violate the SPEC".
+    /// "your values violate the ".
     #[error("invalid game config: {0}")]
     Validate(String),
 }
@@ -798,7 +798,7 @@ impl GameConfig {
             ));
         }
         if let Some(turns) = &self.turns {
-            // SPEC v2 §4.6 says "Initialize a player with today's
+            //  says "Initialize a player with today's
             // allowance" — an allowance of zero would create a game
             // where every action is rejected on day one, which is
             // almost certainly an authoring mistake. Negative values
@@ -847,10 +847,10 @@ impl GameConfig {
         }
         if self.screens.event_log.enabled && !self.world.enabled {
             return Err(ConfigError::Validate(
-                "[screens.event_log].enabled requires v2 events via [world].enabled = true".into(),
+                "[screens.event_log].enabled requires world events via [world].enabled = true".into(),
             ));
         }
-        // Leaderboard names must be non-empty and unique. Task 8 will
+        // Leaderboard names must be non-empty and unique. will
         // key SQL rows by `name`, so a duplicate would silently merge
         // two boards that the author intended to keep separate, and an
         // empty name would produce ambiguous error messages downstream.
@@ -941,8 +941,8 @@ where
 mod tests {
     use super::*;
 
-    /// The exact TOML from SPEC §9.1. Kept verbatim so a future
-    /// SPEC tweak that breaks compatibility shows up as a failing
+    /// The exact TOML Kept verbatim so a future
+    ///  tweak that breaks compatibility shows up as a failing
     /// test, not a silent shift in field semantics.
     const SPEC_EXAMPLE: &str = r#"
 [game]
@@ -967,7 +967,7 @@ auth_scope = "site"
 
     #[test]
     fn parses_spec_example() {
-        let config = GameConfig::from_toml_str(SPEC_EXAMPLE).expect("SPEC §9.1 example parses");
+        let config = GameConfig::from_toml_str(SPEC_EXAMPLE).expect("example parses");
         assert_eq!(config.game.title, "Murder Motel");
         assert_eq!(config.game.slug, "murder-motel");
         assert_eq!(config.game.min_width, 80);
@@ -1012,7 +1012,7 @@ start_y = 0
     #[test]
     fn applies_field_level_defaults_in_partial_manifest_section() {
         // An author overrides only `timeout_ms` — the rest of
-        // `[manifest]` should still come from SPEC §10.3 defaults.
+        // `[manifest]` should still come defaults.
         let partial = r#"
 [game]
 title = "Partial"
@@ -1167,7 +1167,7 @@ start_y = 0
 
     #[test]
     fn absent_world_section_defaults_to_disabled() {
-        // SPEC v2 §5: a v1 project without `[world]` MUST continue to
+        //  v2: a project without `[world]` MUST continue to
         // work, with the world layer effectively off.
         let v1_style = r#"
 [game]
@@ -1191,7 +1191,7 @@ start_y = 0
 
     #[test]
     fn absent_v4_and_v5_sections_are_disabled_by_default() {
-        // SPEC_v4 Task 2a + CHECKLIST_v5 Task 2a: all additive
+        //  + : all additive
         // sections are optional and safe to omit; every `enabled`
         // flag must default to false.
         let config = GameConfig::from_toml_str(
@@ -1402,7 +1402,7 @@ default_page_size = -5
 
     #[test]
     fn parses_world_ticks_login_hook_when_enabled() {
-        // Task 11d: login-driven catch-up is opt-in and explicit.
+        // : login-driven catch-up is opt-in and explicit.
         let config = GameConfig::from_toml_str(
             r#"
 [game]
@@ -1457,7 +1457,7 @@ run_due_ticks_on_login = true
 
     #[test]
     fn place_recall_requires_spatial_be_enabled() {
-        // Task 2c: recall is only meaningful when the place graph is
+        // : recall is only meaningful when the place graph is
         // enabled, so we reject configurations that enable
         // `[place_recall]` alone.
         let err = GameConfig::from_toml_str(
@@ -1490,7 +1490,7 @@ enabled = true
 
     #[test]
     fn presence_requires_spatial_be_enabled() {
-        // Task 2d: presence is only meaningful when the place graph is
+        // : presence is only meaningful when the place graph is
         // enabled, so we reject configurations that enable `[presence]`
         // alone.
         let err = GameConfig::from_toml_str(
@@ -1523,7 +1523,7 @@ enabled = true
 
     #[test]
     fn job_board_requires_contracts_be_enabled() {
-        // CHECKLIST_v5 Task 2c: the built-in v5 job board aggregates
+        // : the built-in job board aggregates
         // contract rows, so enabling `[job_board]` without
         // `[contracts]` is a config authoring error.
         let err = GameConfig::from_toml_str(
@@ -1556,7 +1556,7 @@ enabled = true
 
     #[test]
     fn travel_requires_spatial_and_presence_be_enabled() {
-        // CHECKLIST_v5 Task 2d: the travel helper depends on route
+        // : the travel helper depends on route
         // adjacency (`[spatial]`) and a concrete player location
         // (`[presence]`), so both toggles are mandatory.
         let err = GameConfig::from_toml_str(
@@ -1591,7 +1591,7 @@ enabled = true
 
     #[test]
     fn inventory_capacity_requires_inventory_be_enabled() {
-        // CHECKLIST_v5 Task 2e: capacity enforcement sits on top of
+        // : capacity enforcement sits on top of
         // inventory slots, so enabling `[inventory_capacity]` without
         // `[inventory]` would expose a helper with no backing rows.
         let err = GameConfig::from_toml_str(
@@ -1624,7 +1624,7 @@ enabled = true
 
     #[test]
     fn event_log_screen_requires_world_events_be_enabled() {
-        // CHECKLIST_v5 Task 2f: the v5 Event Log screen reads the v2
+        // : the Event Log screen reads the v2
         // shared-world event table, so `[screens.event_log]` must not
         // be enabled unless `[world]` is enabled.
         let err = GameConfig::from_toml_str(
@@ -1657,7 +1657,7 @@ enabled = true
 
     #[test]
     fn parses_world_ticks_with_default_catchup_bound_when_omitted() {
-        // Task 2b: if the catch-up key is omitted, apply the
+        // : if the catch-up key is omitted, apply the
         // documented default so catch-up remains bounded.
         let config = GameConfig::from_toml_str(
             r#"
@@ -1745,7 +1745,7 @@ max_catchup_per_call = -1
 
     #[test]
     fn parses_full_world_section_from_spec_example() {
-        // Verbatim from SPEC v2 §5 so a future SPEC tweak surfaces as
+        // Verbatim from so a future tweak surfaces as
         // a failing test rather than silent drift.
         let v2 = r#"
 [game]
@@ -1774,7 +1774,7 @@ journal_mode = "wal"
     #[test]
     fn world_section_applies_field_level_defaults() {
         // Author opts in but only sets `enabled` — every other field
-        // should fall back to the SPEC-documented default.
+        // should fall back to the -documented default.
         let partial = r#"
 [game]
 title = "Partial World"
@@ -1826,7 +1826,7 @@ journal_mode = "delete"
 
     #[test]
     fn absent_turns_section_means_no_turn_system() {
-        // SPEC v2 §5: "Missing `[turns]` means no turn system." We
+        //  v2: "Missing `[turns]` means no turn system." We
         // must not synthesize a default — `None` is the off signal the
         // runtime checks before opening a ledger.
         let v1_style = r#"
@@ -1846,7 +1846,7 @@ start_y = 0
 
     #[test]
     fn parses_full_turns_section_from_spec_example() {
-        // Verbatim from SPEC v2 §5 so a future SPEC tweak surfaces as
+        // Verbatim from so a future tweak surfaces as
         // a failing test rather than silent drift.
         let v2 = r#"
 [game]
@@ -1900,7 +1900,7 @@ daily_allowance = 5
     fn turns_section_rejects_zero_allowance_with_validate() {
         // Zero would create a game where every action is rejected on
         // day one. We surface this as `Validate` so the author sees
-        // a SPEC-level message, not a generic parse error.
+        // a -level message, not a generic parse error.
         let bad = r#"
 [game]
 title = "Zero Turns"
@@ -2004,7 +2004,7 @@ carryover_max = 7
 
     #[test]
     fn absent_leaderboards_means_no_built_in_boards() {
-        // SPEC v2 §5: "Missing `[[leaderboards]]` means no built-in
+        //  v2: "Missing `[[leaderboards]]` means no built-in
         // leaderboards." We model that as an empty vec rather than an
         // `Option`, so consumers iterate uniformly.
         let v1_style = r#"
@@ -2024,7 +2024,7 @@ start_y = 0
 
     #[test]
     fn parses_full_leaderboards_section_from_spec_example() {
-        // Verbatim from SPEC v2 §5 so a future SPEC tweak surfaces as
+        // Verbatim from so a future tweak surfaces as
         // a failing test rather than silent drift.
         let v2 = r#"
 [game]
@@ -2098,7 +2098,7 @@ sort = "asc"
 
     #[test]
     fn duplicate_leaderboard_names_are_rejected() {
-        // Task 8 will key SQL rows by `name` — a duplicate would
+        //  will key SQL rows by `name` — a duplicate would
         // silently merge boards the author meant to keep separate.
         let bad = r#"
 [game]
@@ -2202,10 +2202,10 @@ sort = "asc"
 
     #[test]
     fn absent_multiplayer_section_disables_all_primitives() {
-        // SPEC v3 §5.2: "Every primitive is opt-in" and v1/v2 projects
+        //  v3: "Every primitive is opt-in" and v1/projects
         // must not be forced into multiplayer. We model that as
         // `None` — the off signal the runtime checks before wiring any
-        // v3 primitive.
+        //  primitive.
         let v1_style = r#"
 [game]
 title = "No Multiplayer"
@@ -2223,8 +2223,8 @@ start_y = 0
 
     #[test]
     fn parses_full_multiplayer_section_from_spec_example() {
-        // Verbatim from SPEC v3 §5.2 (minus the [[factions.seed]]
-        // block, which lands in Task 2b). A future SPEC tweak that
+        // Verbatim from (minus the [[factions.seed]]
+        // block, which lands in ). A future tweak that
         // breaks compatibility shows up as a failing test.
         let v3 = r#"
 [game]
@@ -2340,7 +2340,7 @@ max_notice_body_chars = -1
 
     #[test]
     fn absent_factions_section_yields_empty_seed_list() {
-        // SPEC v3 §5.2: seeded factions are opt-in. v1/v2 games and v3
+        //  v3: seeded factions are opt-in. v1/ games and v3
         // games that ship with no agencies must parse without ceremony.
         let v1_style = r#"
 [game]
@@ -2359,7 +2359,7 @@ start_y = 0
 
     #[test]
     fn parses_factions_seed_array_from_spec_example() {
-        // Verbatim shape from SPEC v3 §5.2; pinned so a SPEC tweak that
+        // Verbatim shape from ; pinned so a tweak that
         // breaks compatibility surfaces here.
         let v3 = r#"
 [game]
@@ -2423,7 +2423,7 @@ description = "Counterpoint."
 
     #[test]
     fn duplicate_faction_slug_is_rejected() {
-        // Task 2b's named acceptance: two seeds with the same slug
+        // 's named acceptance: two seeds with the same slug
         // would silently merge into a single row at upsert time, so we
         // catch it at config load with a clearly-attributed error.
         let bad = r#"

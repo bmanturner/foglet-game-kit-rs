@@ -119,7 +119,7 @@ pub enum MultiUserHarnessError {
         #[source]
         source: PlayerError,
     },
-    /// Notice assertions are unavailable because v3 notices are disabled.
+    /// Notice assertions are unavailable because notices are disabled.
     #[error("harness notices are disabled")]
     NoticesDisabled,
     /// Reading notices failed.
@@ -285,7 +285,7 @@ impl MultiUserHarnessBuilder {
         self
     }
 
-    /// Enable v3 notice helpers for the harness.
+    /// Enable notice helpers for the harness.
     #[must_use]
     pub fn with_notices_enabled(mut self) -> Self {
         self.notices_enabled = true;

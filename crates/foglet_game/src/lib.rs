@@ -3,29 +3,29 @@
 //!
 //! This crate's role, in one sentence: provide the runtime, terminal
 //! safety guarantees, and primitives a game author needs so their
-//! `main.rs` is "wire up screens, hand control to `Game::run()`".
+//! `main.rs` is "wire up screens, hand control to `Game::run`".
 //!
 //! # Module map (target — populated across the implementation tasks)
 //!
-//! The eventual module layout follows SPEC §6:
+//! The eventual module layout follows:
 //!
-//! - `terminal` — raw-mode/alt-screen guard (Task 5)
-//! - `foglet`  — `FogletContext` loader (Task 2)
-//! - `input`   — `crossterm` event → `Input` normalization (Task 6, done)
-//! - `screen`  — `Screen` trait + `ScreenCommand` (Task 7)
-//! - `runtime` — top-level `Game` builder + loop (Task 7)
-//! - `save`    — atomic save manager (Task 8)
+//! - `terminal` — raw-mode/alt-screen guard
+//! - `foglet` — `FogletContext` loader
+//! - `input` — `crossterm` event → `Input` normalization ( done)
+//! - `screen` — `Screen` trait + `ScreenCommand`
+//! - `runtime` — top-level `Game` builder + loop
+//! - `save` — atomic save manager
 //! - `world`, `map`, `entity`, `dialog`, `widgets` — primitives
-//!   (Task 9)
-//! - `error`   — library-internal `thiserror` types
+//!   
+//! - `error` — library-internal `thiserror` types
 //!
-//! Task 1 only stands up the crate so the workspace builds. Modules
+//!  only stands up the crate so the workspace builds. Modules
 //! land alongside the tasks that exercise them.
 //!
 //! # Stability
 //!
 //! Pre-1.0. The public API is allowed to break between minor versions
-//! while we converge on the SPEC §8 contract. Breaking changes will
+//! while we converge on the contract. Breaking changes will
 //! be called out in commit messages and (eventually) `CHANGELOG.md`.
 
 #![forbid(unsafe_code)]

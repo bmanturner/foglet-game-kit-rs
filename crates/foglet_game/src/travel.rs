@@ -43,7 +43,7 @@ pub type TravelAppendEventCallback<'a> =
 
 /// Event payload shape emitted by an optional travel `append_event` callback.
 ///
-/// The structure intentionally mirrors v2 event append fields without
+/// The structure intentionally mirrors event append fields without
 /// prescribing message text:
 ///
 /// - A **space exploration** game can emit `"dock_arrival"` events.
@@ -60,7 +60,7 @@ pub struct TravelEventDraft {
 
 /// Input payload for one travel attempt.
 ///
-/// `TravelRequest` bundles identity, destination, route resolution hints,
+/// `TravelRequest` bundles identity, destination, route resolution hints.
 /// and caller-owned callbacks into one explicit unit so travel orchestration
 /// can execute the documented step order atomically.
 pub struct TravelRequest<'a> {
@@ -86,8 +86,8 @@ impl<'a> TravelRequest<'a> {
     ///
     /// Defaults:
     ///
-    /// - `route_id = None` (resolve uniquely by adjacency),
-    /// - `touch_recall = true`,
+    /// - `route_id = None` (resolve uniquely by adjacency).
+    /// - `touch_recall = true`.
     /// - `append_event = None`.
     #[must_use]
     pub fn new(player_id: i64, dest_place_id: i64) -> Self {
@@ -241,7 +241,7 @@ pub enum TravelError {
         /// Game-authored explanation surfaced to callers.
         reason: String,
     },
-    /// Underlying v4 inventory transfer/debit call failed.
+    /// Underlying inventory transfer/debit call failed.
     #[error("travel inventory mutation failed: {source}")]
     InventoryError {
         /// Wrapped inventory error source.
@@ -293,8 +293,8 @@ impl From<InventoryError> for TravelError {
 impl WorldDb {
     /// Execute one travel request as a single SQLite transaction.
     ///
-    /// The helper follows the v5 order exactly: read current presence,
-    /// resolve the route, run validation, charge cost, move presence,
+    /// The helper follows the order exactly: read current presence.
+    /// resolve the route, run validation, charge cost, move presence.
     /// optionally touch recall, and optionally append a world event.
     /// Any error returns before commit, so SQLite rolls back every
     /// mutation performed earlier in the helper.

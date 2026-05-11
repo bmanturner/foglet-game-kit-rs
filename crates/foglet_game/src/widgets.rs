@@ -1,26 +1,26 @@
-//! Simple shared widgets (SPEC §9 — Game Primitives).
+//! Simple shared widgets.
 //!
 //! Three widgets every door game ends up needing — pulled into the
 //! library so authors don't reinvent them and so the visual baseline
 //! stays consistent across games shipped with the kit:
 //!
-//! - [`MenuList`]   — vertical list of choices with a single selection
+//! - [`MenuList`] — vertical list of choices with a single selection
 //!   marker. Used for title menus, dialog choices, and any "pick one"
 //!   prompt.
 //! - [`InventoryList`] — vertical list of player-held items, with an
 //!   explicit empty-state hint so an empty inventory doesn't render as
 //!   a blank box.
-//! - [`MessageLine`] — single-line status / hint / error display,
+//! - [`MessageLine`] — single-line status hint error display.
 //!   styled by [`MessageKind`].
 //!
 //! # Why widgets, not screens
 //!
-//! Per SPEC §8.2 a `Screen` owns input handling. These widgets are the
+//! Per a `Screen` owns input handling. These widgets are the
 //! opposite: pure render helpers that take a `ratatui::Frame` and a
 //! state struct, write into a `Rect`, and return. They never read
 //! input, never push or pop screens, and never mutate game state.
-//! Authors compose them inside their own `Screen::render` methods,
-//! drive selection / contents from their screen state, and dispatch
+//! Authors compose them inside their own `Screen::render` methods.
+//! drive selection contents from their screen state, and dispatch
 //! input through the screen trait.
 //!
 //! # Why no internal state
@@ -53,14 +53,14 @@ use crate::prompt::{StyleRole, Theme};
 ///
 /// Pulled into the kit from `examples/murder_motel/src/layout.rs` so
 /// every game's modal lays out the same way without each example
-/// re-implementing the constraint-split dance. SPEC §7.1 already
+/// re-implementing the constraint-split dance. already
 /// guarantees an 80×24 floor, so the clamping path only matters for
 /// unit tests that hand in tiny `TestBackend` frames — but it MUST
 /// stay correct there because the v2.1 modal helpers and the
 /// `DialogScreen` snapshot tests depend on it.
 ///
 /// The implementation is byte-equivalent to the original example
-/// helper: same `Constraint::Length` / `Min(0)` ordering, same
+/// helper: same `Constraint::Length` `Min(0)` ordering, same
 /// `saturating_sub` math, so swapping example callers from
 /// `crate::layout::centred_rect` to `foglet_game::centred_rect`
 /// cannot shift any pixel.
@@ -97,13 +97,13 @@ const SELECTION_MARKER: &str = "> ";
 const SELECTION_GUTTER: &str = "  ";
 
 /// A vertical list of selectable options, e.g. the title-screen
-/// "New game / Continue / Quit" menu.
+/// "New game Continue Quit" menu.
 ///
 /// State is owned by the caller — typically a `Screen` storing the
 /// items vector and a `selected: usize` cursor. Render is pure: pass
 /// the borrowed state to [`render_menu_list`] each frame.
 ///
-/// `selected` is clamped to `items.len().saturating_sub(1)` at render
+/// `selected` is clamped to `items.len.saturating_sub(1)` at render
 /// time, so callers don't need to defensively bounds-check before
 /// rendering. An empty `items` vector is allowed and renders to just
 /// the bordered title.
@@ -159,7 +159,7 @@ pub enum MessageKind {
     Error,
 }
 
-/// Single-line status / hint / error rendered into a one-row area.
+/// Single-line status hint error rendered into a one-row area.
 ///
 /// The widget intentionally does not wrap or scroll — the caller picks
 /// a one-row `Rect` and the widget truncates if the message overflows.
@@ -179,9 +179,9 @@ pub struct MessageLine<'a> {
 /// Pulled into the kit because every game's "press a key to dismiss"
 /// modal — help screens, win screens, role/profile read-outs, the
 /// `murder_motel` Lost & Found and Night Clerk panes — all reach for
-/// the same construction: `Block::default().borders(Borders::ALL)`,
-/// optional `.title(...)`, and a left-aligned `Paragraph` body. SPEC
-/// §4.3 pins the contract: single bordered block, title in the top
+/// the same construction: `Block::default.borders(Borders::ALL)`.
+/// optional `.title(...)`, and a left-aligned `Paragraph` body.
+///  pins the contract: single bordered block, title in the top
 /// border, body left-aligned with one cell of padding.
 ///
 /// `body` is `&str` so the helper handles the common case (a static
@@ -195,7 +195,7 @@ pub struct MessageLine<'a> {
 /// inner area from `Block::inner` (which already accounts for the
 /// border) and then horizontally indenting one column on each side
 /// before rendering the paragraph. Vertical padding is **not** added:
-/// callers tend to size `area` exactly to `body.lines().count() + 2`
+/// callers tend to size `area` exactly to `body.lines.count + 2`
 /// (border rows), so trimming the first and last inner rows would
 /// drop body content. Vertical centring is the caller's job via
 /// [`centred_rect`].
@@ -226,7 +226,7 @@ pub fn render_modal(frame: &mut Frame<'_>, area: Rect, title: Option<&str>, body
 /// Render a single-line hint footer styled with the kit's
 /// [`StyleRole::Hint`] under the default [`Theme`].
 ///
-/// SPEC_v2_1 §4.3 fixes the contract: hint lines are one row, centred,
+///  fixes the contract: hint lines are one row, centred.
 /// styled by the kit's standard hint role rather than by whatever
 /// `Theme` the calling screen happens to hold. That keeps the helper
 /// composable from any screen — including ones that never plumb a
@@ -238,13 +238,13 @@ pub fn render_modal(frame: &mut Frame<'_>, area: Rect, title: Option<&str>, body
 /// horizontally centred within `area.width` and right-truncated by
 /// `Paragraph` if the hint overflows. No prefix is added: the helper
 /// renders the author's literal string so the example's existing
-/// `"[Enter] continue"` / `"[Esc] leave"` conventions survive the move
+/// `"[Enter] continue"` `"[Esc] leave"` conventions survive the move
 /// from hand-rolled `Paragraph` calls into the shared widget.
 ///
-/// The style is resolved through `Theme::default().style(StyleRole::Hint)`
-/// rather than a hard-coded `Style::default().add_modifier(Modifier::DIM)`
+/// The style is resolved through `Theme::default.style(StyleRole::Hint)`
+/// rather than a hard-coded `Style::default.add_modifier(Modifier::DIM)`
 /// so the helper automatically tracks any future change to the
-/// SPEC-defined default theme without each caller re-deriving the
+/// -defined default theme without each caller re-deriving the
 /// styling.
 pub fn render_hint_line(frame: &mut Frame<'_>, area: Rect, hint: &str) {
     if area.width == 0 || area.height == 0 {
@@ -266,11 +266,11 @@ pub fn render_hint_line(frame: &mut Frame<'_>, area: Rect, hint: &str) {
     frame.render_widget(para, band);
 }
 
-/// Render a [`MenuList`] into `area`. Pure: state is borrowed,
+/// Render a [`MenuList`] into `area`. Pure: state is borrowed.
 /// nothing is mutated.
 ///
 /// Rows that don't fit are dropped silently — callers must size
-/// `area` to at least `2 + items.len()` rows (top + bottom border +
+/// `area` to at least `2 + items.len` rows (top + bottom border +
 /// one row per item) to guarantee no truncation. Width is similarly
 /// the caller's responsibility; long labels are right-truncated.
 pub fn render_menu_list(frame: &mut Frame<'_>, area: Rect, menu: &MenuList<'_>) {
@@ -355,7 +355,7 @@ fn bordered_block(title: Option<&str>) -> Block<'_> {
 
 /// Draw a selectable list directly into the buffer.
 ///
-/// Inlines the marker / gutter rendering instead of using
+/// Inlines the marker gutter rendering instead of using
 /// `ratatui::widgets::List` so:
 ///
 /// - The selection marker is plain ASCII (`> `), readable on any
@@ -648,7 +648,7 @@ mod tests {
         let inner = centred_rect(40, 10, outer);
         assert_eq!(inner.width, 40);
         assert_eq!(inner.height, 10);
-        // (80 - 40) / 2 = 20, (24 - 10) / 2 = 7.
+        // (80 - 40) 2 = 20, (24 - 10) 2 = 7.
         assert_eq!(inner.x, 20);
         assert_eq!(inner.y, 7);
     }
@@ -661,7 +661,7 @@ mod tests {
             width: 10,
             height: 4,
         };
-        // Requested width / height exceed `outer`; expect clamped to outer.
+        // Requested width height exceed `outer`; expect clamped to outer.
         let inner = centred_rect(40, 10, outer);
         assert_eq!(inner.width, 10);
         assert_eq!(inner.height, 4);
@@ -682,8 +682,8 @@ mod tests {
         let inner = centred_rect(10, 4, outer);
         assert_eq!(inner.width, 10);
         assert_eq!(inner.height, 4);
-        // (20 - 10) / 2 = 5 → x = 5 + 5 = 10.
-        // (10 - 4) / 2 = 3 → y = 3 + 3 = 6.
+        // (20 - 10) 2 = 5 → x = 5 + 5 = 10.
+        // (10 - 4) 2 = 3 → y = 3 + 3 = 6.
         assert_eq!(inner.x, 10);
         assert_eq!(inner.y, 6);
     }
@@ -820,7 +820,7 @@ mod tests {
         let buf = draw(20, 1, |f| {
             render_hint_line(f, full_area(20, 1), "[Enter] continue")
         });
-        // 16-char hint inside a 20-wide area → 2 cells of left padding,
+        // 16-char hint inside a 20-wide area → 2 cells of left padding.
         // 2 cells of right padding for `Alignment::Center`.
         assert_eq!(row_text(&buf, 0), "  [Enter] continue");
     }

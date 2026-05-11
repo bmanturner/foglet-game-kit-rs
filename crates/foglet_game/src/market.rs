@@ -1,25 +1,25 @@
-//! `market` — shared-world market-listing schema (SPEC_v3 §4.3 /
-//! §Task 5a).
+//! `market` — shared-world market-listing schema ( /
+//! ).
 //!
-//! v3 introduces durable async player-to-player marketplaces: a
+//!  introduces durable async player-to-player marketplaces: a
 //! seller posts a listing (price, quantity, item key), a buyer
 //! atomically decrements the quantity, the game's inventory and
 //! balance callbacks settle the transaction. The whole feature sits
 //! on top of one `market_listings` table whose shape is pinned by
 //! [`MARKET_LISTINGS_MIGRATION`]. This module exists only to declare
 //! that schema and prove it applies; the `MarketListing` Rust type
-//! and the `create_listing` / `active_listings` / `buy_listing`
-//! helpers land in subsequent §Task 5 sub-items (5b–5f). Splitting
-//! the migration into its own commit keeps the bisect signal sharp —
+//! and the `create_listing` `active_listings` `buy_listing`
+//! helpers land in subsequent sub-items (5b–5f). Splitting
+//! the migration into its own commit keeps the bisect signal sharp
 //! a column rename, a relaxed `CHECK`, or a dropped partial index
 //! flunks the schema test in this module rather than a higher-level
 //! transactional test that's harder to attribute.
 //!
 //! # Why a dedicated table
 //!
-//! SPEC_v3 §3 lists the market alongside notices, challenges,
+//!  lists the market alongside notices, challenges.
 //! factions, and bounties as separate primitives. We follow the same
-//! v2/v3 convention as [`crate::notices`] and [`crate::challenges`]:
+//! v2/convention as [`crate::notices`] and [`crate::challenges`]:
 //! one table, one migration, one named index family. Folding
 //! listings onto the `world_events` log would conflate the
 //! append-only event stream with mutable inventory state (`quantity`
@@ -28,10 +28,10 @@
 //!
 //! # Why `version = 8`
 //!
-//! v2 occupies migration versions 1–5 (see `docs/shared-world.md`
-//! §8.1). v3 claims `6` and above, dense and grouped per primitive.
+//!  occupies migration versions 1–5 (see `docs/shared-world.md`
+//! ). claims `6` and above, dense and grouped per primitive.
 //! Notices took version 6, challenges took 7. Market listings are the
-//! third v3 primitive to land, so they take 8. Subsequent v3
+//! third primitive to land, so they take 8. Subsequent v3
 //! migrations (factions, bounties) MUST pick the next available kit
 //! version — game-authored migrations live in their own higher band
 //! and are not affected.
@@ -41,16 +41,16 @@ use thiserror::Error;
 use crate::events::EventError;
 use crate::world_db::{WorldDb, WorldMigration};
 
-/// Schema for the shared marketplace table — SPEC_v3 §4.3 / §Task 5a.
+/// Schema for the shared marketplace table —.
 ///
 /// One row per listing. Listings are mutable in the narrow sense that
 /// `quantity` is decremented by the typed helpers landing in Tasks
-/// 5d/5e (atomic buy with rollback); the addressing, `item_key`,
+/// 5d/5e (atomic buy with rollback); the addressing, `item_key`.
 /// `display_name`, `price`, and creation timestamp are write-once.
 /// The kit's contract is "if you only go through the public API, the
 /// only state changes are the documented quantity decrements, and
 /// every decrement runs inside a SQLite transaction with the buyer
-/// callback" (SPEC_v3 §4.3 / §7). An operator with `sqlite3` can of
+/// callback". An operator with `sqlite3` can of
 /// course rewrite anything; that's the same caveat as
 /// [`crate::events::WORLD_EVENTS_MIGRATION`] and
 /// [`crate::challenges::CHALLENGES_MIGRATION`].
@@ -59,16 +59,16 @@ use crate::world_db::{WorldDb, WorldMigration};
 ///
 /// - `id` — `INTEGER PRIMARY KEY`. Autoincrement-aliased rowid.
 ///   Doubles as the deterministic tiebreaker for the
-///   `active_listings` query (Task 5c) when two listings share a
+///   `active_listings` query when two listings share a
 ///   `created_at` value at second resolution. Same role as `id` on
 ///   notices and challenges.
 /// - `created_at` — `TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP`. UTC
 ///   timestamp written by SQLite at insert time. ISO text so it
 ///   sorts lexically the same way it sorts chronologically and reads
 ///   cleanly in the `sqlite3` CLI — the same contract as every other
-///   v2/v3 timestamp column.
-/// - `seller_player_id` — `INTEGER REFERENCES players(id)`,
-///   **nullable**. SPEC §4.3 explicitly allows NPC/system listings
+///   v2/timestamp column.
+/// - `seller_player_id` — `INTEGER REFERENCES players(id)`.
+///   **nullable**. explicitly allows NPC/system listings
 ///   ("seller player id optional for NPC/system listings"). Foreign-
 ///   keyed for the same reason as the turn ledger and notices: a
 ///   phantom id should never land here. SQLite enforces FKs only
@@ -76,22 +76,22 @@ use crate::world_db::{WorldDb, WorldMigration};
 ///   responsible for; until then the constraint is documentation but
 ///   the column shape is correct.
 /// - `item_key` — `TEXT NOT NULL`. Game-authored stable identifier
-///   for the item being sold (e.g. `"clue.fingerprint"`,
+///   for the item being sold (e.g. `"clue.fingerprint"`.
 ///   `"item.lockpick"`). Game code owns the namespace; the kit's
 ///   only rule is "round-trips as text". Used by `active_listings`
 ///   to filter "show me only X listings" and by buy callbacks to
 ///   route the inventory grant.
 /// - `display_name` — `TEXT NOT NULL`. Player- or game-authored
 ///   short title rendered in the marketplace UI. Length bounds for
-///   player-authored display names are enforced by Task 5b's helper,
+///   player-authored display names are enforced by 's helper.
 ///   not at the schema layer, because the cap lives alongside other
 ///   `[multiplayer]` config — the same rationale as
 ///   `notices.subject` and `notices.body`.
 /// - `price` — `INTEGER NOT NULL CHECK (price >= 0)`. Game-defined
-///   currency unit, expressed as a non-negative integer. SPEC §4.3
+///   currency unit, expressed as a non-negative integer.
 ///   requires "The kit MUST reject negative prices"; the schema-
 ///   level `CHECK` is the safety net so a regression that bypassed
-///   the Task 5b validator (e.g. raw SQL in a test fixture, or a
+///   the validator (e.g. raw SQL in a test fixture, or a
 ///   future helper that forgot to validate) fails at INSERT time
 ///   rather than landing a corrupt row that crashes the marketplace
 ///   UI on read. Stored as `INTEGER` rather than `REAL` because
@@ -100,23 +100,23 @@ use crate::world_db::{WorldDb, WorldMigration};
 ///   minor units (cents, mils) at the boundary.
 /// - `quantity` — `INTEGER NOT NULL CHECK (quantity >= 0)`. Number
 ///   of units still available in the listing. Decrements atomically
-///   on `buy_listing` (Task 5d). SPEC §4.3 requires "The kit MUST
+///   on `buy_listing`. requires "The kit MUST
 ///   reject negative quantities"; the `CHECK` is the schema-side
 ///   safety net for the same reason as `price`. A listing whose
 ///   quantity reaches `0` stays in the table (audit trail; future
 ///   reactivation by the seller) but falls out of the partial
 ///   `idx_market_listings_active` index below.
 /// - `expires_at` — `TEXT`, nullable. ISO timestamp after which an
-///   active listing should fall out of the marketplace UI. SPEC §4.3
+///   active listing should fall out of the marketplace UI.
 ///   lists `expires_at` in the field set but does not specify
 ///   automatic expiry semantics; the kit follows the same policy
 ///   as `notices.expires_at` — store the column, let the
-///   `active_listings` query (Task 5c) filter on it, do not run a
+///   `active_listings` query filter on it, do not run a
 ///   sweeper. Nullable so a listing can be open-ended (no deadline)
 ///   without reserving a sentinel value.
 /// - `metadata` — `TEXT`, nullable. Optional opaque JSON. Stored as
 ///   text rather than `BLOB` so an operator can pretty-print it
-///   with `sqlite3 -json`; the kit treats this column as opaque,
+///   with `sqlite3 -json`; the kit treats this column as opaque.
 ///   the same contract as `notices.metadata` and `challenges.stake`.
 ///   Game code that wants structured metadata (item rarity, lore
 ///   blurb, etched serial number) serialises JSON before handing it
@@ -125,7 +125,7 @@ use crate::world_db::{WorldDb, WorldMigration};
 /// # Indexes
 ///
 /// One partial index is created up-front so the `active_listings`
-/// query pattern Task 5c relies on is seek-bound from the moment it
+/// query pattern relies on is seek-bound from the moment it
 /// lands. Adding it later would require a follow-up migration and a
 /// backfill window where the query path scans the table; pay the
 /// index cost at the same migration that creates the table — the
@@ -137,12 +137,12 @@ use crate::world_db::{WorldDb, WorldMigration};
 ///   keeps the index small — exhausted listings (quantity = 0) fall
 ///   out automatically the moment the buy transaction commits, so
 ///   the active-marketplace view never has to filter them out at
-///   query time. The leading `created_at` column matches Task 5c's
-///   expected default ordering ("newest first" / "oldest first" —
+///   query time. The leading `created_at` column matches 's
+///   expected default ordering ("newest first" "oldest first"
 ///   either direction is a one-line query change against this
 ///   index). The `id` tiebreaker keeps the order deterministic when
 ///   two listings post in the same second, mirroring the
-///   `notices` / `challenges` partial-index strategy.
+///   `notices` `challenges` partial-index strategy.
 ///
 /// # Why no `kind` column
 ///
@@ -158,7 +158,7 @@ use crate::world_db::{WorldDb, WorldMigration};
 /// `version = 8`. Notices claim 6, challenges claim 7 (see
 /// [`crate::notices::NOTICES_MIGRATION`] and
 /// [`crate::challenges::CHALLENGES_MIGRATION`]); market listings are
-/// the third v3 primitive to land, so they take 8. Subsequent v3
+/// the third primitive to land, so they take 8. Subsequent v3
 /// migrations (factions, bounties) take 9 and onward.
 pub const MARKET_LISTINGS_MIGRATION: WorldMigration = WorldMigration {
     version: 8,
@@ -180,7 +180,7 @@ CREATE INDEX IF NOT EXISTS idx_market_listings_active\n\
 ",
 };
 
-/// Decoded `market_listings` row — SPEC_v3 §4.3 read model.
+/// Decoded `market_listings` row — read model.
 ///
 /// Mirrors the column shape pinned by [`MARKET_LISTINGS_MIGRATION`]
 /// one-for-one, in the same order, so the SQL `RETURNING` clause and
@@ -192,23 +192,23 @@ CREATE INDEX IF NOT EXISTS idx_market_listings_active\n\
 /// [`crate::notices::Notice`] and [`crate::challenges::Challenge`].
 ///
 /// All timestamps stay as raw SQLite ISO text, the same contract as
-/// every other v2/v3 read model: parsing into a richer type would be
-/// a one-way trip that hides corrupt data and forces a chrono / time
-/// dependency on every consumer. `metadata` is likewise opaque text —
+/// every other v2/read model: parsing into a richer type would be
+/// a one-way trip that hides corrupt data and forces a chrono time
+/// dependency on every consumer. `metadata` is likewise opaque text
 /// game code that wants structured metadata serialises JSON before
 /// handing it to [`WorldDb::create_listing`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MarketListing {
     /// Autoincrement primary key. Doubles as the deterministic
-    /// tiebreaker for the `active_listings` query (Task 5c) when two
+    /// tiebreaker for the `active_listings` query when two
     /// listings share a `created_at` value at second resolution. Same
     /// role as `notices.id` and `challenges.id`.
     pub id: i64,
     /// UTC timestamp written by SQLite at insert time
     /// (`CURRENT_TIMESTAMP`). Kept as ISO text — see struct docs.
     pub created_at: String,
-    /// Seller's `players.id`, or `None` for NPC/system listings. SPEC
-    /// §4.3 explicitly allows "seller player id optional for
+    /// Seller's `players.id`, or `None` for NPC/system listings.
+    ///  explicitly allows "seller player id optional for
     /// NPC/system listings".
     pub seller_player_id: Option<i64>,
     /// Game-authored stable identifier for the item being sold
@@ -225,7 +225,7 @@ pub struct MarketListing {
     /// Rust-side validator on the write path.
     pub price: i64,
     /// Units still available in the listing. Decrements atomically on
-    /// `buy_listing` (Task 5d). Always non-negative — the schema-level
+    /// `buy_listing`. Always non-negative — the schema-level
     /// `CHECK (quantity >= 0)` is the safety net behind the Rust-side
     /// validator on the write path. A listing whose quantity reaches
     /// zero stays in the table for audit but falls out of the
@@ -233,7 +233,7 @@ pub struct MarketListing {
     pub quantity: i64,
     /// Optional ISO timestamp after which an active listing should
     /// fall out of the marketplace UI. The kit does not auto-expire
-    /// listings in v3 (see module docs).
+    /// listings in (see module docs).
     pub expires_at: Option<String>,
     /// Optional opaque metadata blob (typically a JSON object). Stored
     /// as text so `sqlite3 -json` can pretty-print it; the kit does
@@ -244,7 +244,7 @@ pub struct MarketListing {
 /// Kit-internal cap for a listing's player- or game-authored
 /// `display_name`.
 ///
-/// SPEC_v3 §5.2 ships only `max_notice_body_chars` as configurable;
+///  ships only `max_notice_body_chars` as configurable;
 /// listing display names follow the same convention as the notice
 /// subject line ([`crate::notices::NOTICE_SUBJECT_MAX_CHARS`]) — bound
 /// by the kit, not by game authors, so every consuming game presents
@@ -252,17 +252,17 @@ pub struct MarketListing {
 /// the notice-subject cap and fits one 80-column line with room for a
 /// price/quantity suffix in marketplace list views.
 ///
-/// Counted in Unicode scalar values (`str::chars().count()`), not
-/// bytes — SPEC §4.3 / §7 talk in *characters*, and a byte cap would
+/// Counted in Unicode scalar values (`str::chars.count`), not
+/// bytes — talk in *characters*, and a byte cap would
 /// let a single emoji eat four "chars" of budget. Same rule as the
 /// notice-subject and (eventually) bounty-title caps.
 pub const MARKET_DISPLAY_NAME_MAX_CHARS: usize = 120;
 
 /// World-event `kind` written by [`WorldDb::buy_listing`] when a
-/// purchase commits successfully (SPEC_v3 §4.3 / §Task 5f).
+/// purchase commits successfully.
 ///
 /// Pinned as a `pub const` rather than a string literal so consuming
-/// games can pattern-match the bulletin / per-player-event stream
+/// games can pattern-match the bulletin per-player-event stream
 /// against the same canonical value the kit emits — and so a regression
 /// that changed the kind silently would flunk a string-equality test in
 /// this module rather than leaking past Murder Motel's bulletin filter.
@@ -276,27 +276,27 @@ pub const MARKET_BUY_EVENT_KIND: &str = "market.buy";
 /// Library-internal `thiserror` shape — the runtime wraps these with
 /// `anyhow` at the process boundary. Mirrors
 /// [`crate::notices::NoticeError`] and
-/// [`crate::challenges::ChallengeError`] so all v3 multiplayer write
+/// [`crate::challenges::ChallengeError`] so all multiplayer write
 /// paths surface errors with the same shape (a future code review
 /// pass can fold these into a single multiplayer-error trait if a
 /// fourth primitive needs the same variants, but three primitives
-/// still doesn't justify the abstraction yet — SPEC tenet "no
+/// still doesn't justify the abstraction yet — tenet "no
 /// premature abstraction").
 ///
-/// Task 5b needs: `EmptyItemKey`, `EmptyDisplayName`,
+///  needs: `EmptyItemKey`, `EmptyDisplayName`.
 /// `DisplayNameTooLong`, `NegativePrice`, `NegativeQuantity`, and
 /// `Sqlite`. `NotFound` and the buy-time rollback variants land with
-/// Tasks 5d–5f.
+/// .
 #[derive(Debug, Error)]
 pub enum MarketError {
-    /// `item_key` was empty. SPEC §4.3 lists `item_key` as required;
+    /// `item_key` was empty. lists `item_key` as required;
     /// the kit additionally rejects the empty string here so a listing
     /// can always be filtered/dispatched by item. A regression that
     /// silently accepted `""` would surface as a phantom row in every
     /// `WHERE item_key = ?` query.
     #[error("market listing item_key must not be empty")]
     EmptyItemKey,
-    /// `display_name` was empty. SPEC §4.3 lists `display_name` as
+    /// `display_name` was empty. lists `display_name` as
     /// required; the kit additionally rejects the empty string so the
     /// marketplace UI never renders a row with a blank title that the
     /// browser can't tell apart from a rendering bug. Same rationale
@@ -305,7 +305,7 @@ pub enum MarketError {
     EmptyDisplayName,
     /// `display_name` exceeded [`MARKET_DISPLAY_NAME_MAX_CHARS`].
     /// Surfacing both the limit and the actual length lets the
-    /// authoring screen show "120 / 137 characters" without
+    /// authoring screen show "120 137 characters" without
     /// re-counting. Same shape as
     /// [`crate::notices::NoticeError::SubjectTooLong`].
     #[error("market listing display_name exceeds {max}-character limit (got {actual})")]
@@ -314,11 +314,11 @@ pub enum MarketError {
         /// [`MARKET_DISPLAY_NAME_MAX_CHARS`], named so future per-game
         /// caps (if ever introduced) don't break the error shape.
         max: usize,
-        /// Actual `chars().count()` of the rejected display name, in
+        /// Actual `chars.count` of the rejected display name, in
         /// scalar values.
         actual: usize,
     },
-    /// `price` was negative. SPEC §4.3 mandates "The kit MUST reject
+    /// `price` was negative. mandates "The kit MUST reject
     /// negative prices". The schema-level `CHECK (price >= 0)` is the
     /// safety net; this variant is the typed surface so authoring
     /// screens can render "price must be zero or higher" without
@@ -329,9 +329,9 @@ pub enum MarketError {
         /// screen can re-render the offending input.
         actual: i64,
     },
-    /// `quantity` was negative. SPEC §4.3 mandates "The kit MUST
+    /// `quantity` was negative. mandates "The kit MUST
     /// reject negative quantities". Same rationale as
-    /// [`Self::NegativePrice`]: the schema CHECK is the safety net,
+    /// [`Self::NegativePrice`]: the schema CHECK is the safety net.
     /// this variant is the typed UI surface.
     #[error("market listing quantity must be non-negative (got {actual})")]
     NegativeQuantity {
@@ -339,7 +339,7 @@ pub enum MarketError {
         /// screen can re-render the offending input.
         actual: i64,
     },
-    /// `buy_listing` was called with a non-positive quantity. SPEC §4.3
+    /// `buy_listing` was called with a non-positive quantity.
     /// frames the buy as "decrement quantity by N"; N must be strictly
     /// positive — buying zero or a negative number is meaningless and
     /// would leave the listing unchanged while still appearing to
@@ -389,7 +389,7 @@ pub enum MarketError {
     /// returned `Err`. The wrapping transaction has already rolled
     /// back, so the listing's `quantity` is unchanged and any side
     /// effects the callback attempted (inventory grant, balance
-    /// debit, seller credit) are undone — that's the SPEC §4.3
+    /// debit, seller credit) are undone — that's the
     /// "Buying MUST be atomic" contract. Distinct from
     /// [`Self::Sqlite`] so the marketplace UI can surface a buyer-
     /// side reason ("you can't afford this") separately from a
@@ -416,10 +416,10 @@ pub enum MarketError {
         source: rusqlite::Error,
     },
     /// The world-event append that fires after a successful buy-and-
-    /// callback transaction (SPEC_v3 §4.3 / §Task 5f) failed. The
+    /// callback transaction failed. The
     /// wrapping transaction rolls back as a unit, so the listing's
-    /// quantity decrement and any callback writes are also undone —
-    /// the SPEC §4.3 "Buying MUST be atomic … event append" guarantee.
+    /// quantity decrement and any callback writes are also undone
+    /// the "Buying MUST be atomic … event append" guarantee.
     /// Distinct from [`Self::Sqlite`] and [`Self::BuyerCallback`] so
     /// the marketplace UI can surface the event-append phase
     /// explicitly (in practice this is an operator-fix path: the
@@ -437,19 +437,19 @@ pub enum MarketError {
 
 impl WorldDb {
     /// Insert one row into `market_listings` and return the canonical
-    /// [`MarketListing`] SQLite produced (SPEC_v3 §4.3 / §Task 5b).
+    /// [`MarketListing`] SQLite produced.
     ///
     /// The contract is "the listing I asked you to create is now
     /// durably in the marketplace, with the id and `created_at`
     /// SQLite assigned, and the price/quantity/display_name/item_key
-    /// I supplied". `seller_player_id` is `Option<i64>` because SPEC
-    /// §4.3 explicitly allows NPC/system listings with no
+    /// I supplied". `seller_player_id` is `Option<i64>` because
+    ///  explicitly allows NPC/system listings with no
     /// attributable seller. `expires_at` and `metadata` are likewise
-    /// optional — `None` means "open-ended" / "no metadata".
+    /// optional — `None` means "open-ended" "no metadata".
     ///
     /// `price` and `quantity` are `i64` so this helper can validate
     /// negatives at the boundary and return a typed
-    /// [`MarketError::NegativePrice`] / [`MarketError::NegativeQuantity`]
+    /// [`MarketError::NegativePrice`] [`MarketError::NegativeQuantity`]
     /// rather than letting the caller hit the schema `CHECK` and
     /// surface a stringly-typed SQL error. The schema CHECKs remain
     /// the safety net for any path that bypasses this helper.
@@ -474,11 +474,11 @@ impl WorldDb {
     /// # Concurrency
     ///
     /// Takes `&self`: a single insert statement under the configured
-    /// busy timeout. The buy path (Task 5d) will need an explicit
+    /// busy timeout. The buy path will need an explicit
     /// transaction because it reads quantity, decrements, and
     /// dispatches buyer/seller callbacks; *creating* a listing is one
     /// `INSERT` and is already atomic.
-    #[allow(clippy::too_many_arguments)] // Matches the SPEC §4.3 column shape one-for-one (seller, item_key, display_name, price, quantity, expires_at, metadata); bundling into a struct would force every call site through a builder dance without adding type safety, since each parameter is already strongly typed. Same rationale as `WorldDb::send_notice`.
+    #[allow(clippy::too_many_arguments)] // Matches the column shape one-for-one (seller, item_key, display_name, price, quantity, expires_at, metadata); bundling into a struct would force every call site through a builder dance without adding type safety, since each parameter is already strongly typed. Same rationale as `WorldDb::send_notice`.
     pub fn create_listing(
         &self,
         seller_player_id: Option<i64>,
@@ -490,7 +490,7 @@ impl WorldDb {
         metadata: Option<&str>,
     ) -> Result<MarketListing, MarketError> {
         // Validation runs before the SQL round-trip so a rejected
-        // listing never produces a row. Emptiness first (cheapest),
+        // listing never produces a row. Emptiness first (cheapest).
         // then length, then signedness — same ordering as the notice
         // path, so a UI that re-renders the authoring screen on
         // failure shows a consistent surface across primitives.
@@ -500,7 +500,7 @@ impl WorldDb {
         if display_name.is_empty() {
             return Err(MarketError::EmptyDisplayName);
         }
-        // Count Unicode scalar values, not bytes — SPEC §4.3/§7 talk
+        // Count Unicode scalar values, not bytes — talk
         // in characters, and a byte cap would penalise non-ASCII
         // listing names.
         let display_chars = display_name.chars().count();
@@ -546,7 +546,7 @@ RETURNING id, created_at, seller_player_id, item_key, display_name, \
     }
 
     /// Return every currently-active market listing, sorted
-    /// deterministically (SPEC_v3 §4.3 / §Task 5c).
+    /// deterministically.
     ///
     /// "Active" means two things:
     ///
@@ -558,13 +558,13 @@ RETURNING id, created_at, seller_player_id, item_key, display_name, \
     ///    query with an index walk and no residual scan.
     /// 2. `expires_at` is either NULL (open-ended listing) or strictly
     ///    in the future. The kit deliberately does **not** run a
-    ///    sweeper on listings — same policy as `notices.expires_at`,
+    ///    sweeper on listings — same policy as `notices.expires_at`.
     ///    documented on [`MARKET_LISTINGS_MIGRATION`]. Filtering at
     ///    read time keeps the schema simple (no background jobs, no
     ///    "expired" state column to maintain) at the cost of a tiny
-    ///    `datetime()` comparison per row in the active set. The
-    ///    `datetime()` wrapping handles both ISO forms the kit accepts
-    ///    (`'YYYY-MM-DDTHH:MM:SSZ'` from callers,
+    ///    `datetime` comparison per row in the active set. The
+    ///    `datetime` wrapping handles both ISO forms the kit accepts
+    ///    (`'YYYY-MM-DDTHH:MM:SSZ'` from callers.
     ///    `'YYYY-MM-DD HH:MM:SS'` from `CURRENT_TIMESTAMP`) so the
     ///    comparison is chronological rather than lexicographic — same
     ///    rationale as [`Self::accept_challenge`] and
@@ -578,7 +578,7 @@ RETURNING id, created_at, seller_player_id, item_key, display_name, \
     /// index column order so the planner satisfies the sort with a
     /// reverse index walk. Same shape as [`Self::inbox`] and
     /// [`Self::recent_events`] so the marketplace UI feels consistent
-    /// with the rest of the v3 mailbox surface.
+    /// with the rest of the mailbox surface.
     ///
     /// # Now-clock
     ///
@@ -589,13 +589,13 @@ RETURNING id, created_at, seller_player_id, item_key, display_name, \
     /// cutoff on the boundary, but `active_listings` is observation-
     /// only and the SQL clock is what production callers want anyway.
     /// Tests express expiry windows relative to "now" using
-    /// `datetime('now', '-1 hour')` / `'+1 hour'` modifiers.
+    /// `datetime('now', '-1 hour')` `'+1 hour'` modifiers.
     ///
     /// # No filters
     ///
     /// No `item_key` filter, no `seller_player_id` filter, no
-    /// pagination. SPEC §4.3 doesn't ask for any, and the v3
-    /// marketplace is expected to stay small enough (per-game world,
+    /// pagination. doesn't ask for any, and the v3
+    /// marketplace is expected to stay small enough (per-game world.
     /// short-lived listings) that the UI can filter client-side. A
     /// future paged or item-filtered variant can be added without
     /// breaking this signature.
@@ -606,7 +606,7 @@ RETURNING id, created_at, seller_player_id, item_key, display_name, \
     /// busy timeout, same as [`Self::inbox`].
     pub fn active_listings(&self) -> Result<Vec<MarketListing>, MarketError> {
         // Column order matches `row_to_listing` and the `RETURNING`
-        // clause in `create_listing` — one decoder, one column list,
+        // clause in `create_listing` — one decoder, one column list.
         // surfaced as a type error if a future schema edit diverges
         // them.
         const SQL: &str = "\
@@ -629,12 +629,12 @@ ORDER BY created_at DESC, id DESC";
     }
 
     /// Atomically decrement a listing's `quantity` and run a buyer
-    /// callback inside the same SQLite transaction (SPEC_v3 §4.3 /
-    /// §Task 5d).
+    /// callback inside the same SQLite transaction ( /
+    /// ).
     ///
-    /// The contract is the SPEC §4.3 invariant verbatim: "Buying MUST
-    /// be atomic: quantity decrement, buyer inventory/balance callback,
-    /// seller credit callback if used, event append." Tasks 5d–5f land
+    /// The contract is the invariant verbatim: "Buying MUST
+    /// be atomic: quantity decrement, buyer inventory/balance callback.
+    /// seller credit callback if used, event append." land
     /// the three observable phases incrementally — 5d here lays down
     /// the kit-owned quantity decrement plus the buyer callback hook;
     /// 5e adds the rollback test when the callback fails (no signature
@@ -654,8 +654,8 @@ ORDER BY created_at DESC, id DESC";
     /// `Connection::transaction` so the callback's writes (inventory
     /// grant, balance debit, future event append) commit atomically
     /// with the decrement; if any of them returns `Err`, dropping the
-    /// transaction without `commit()` rolls every write back, which is
-    /// the SPEC §7 "A failed transaction MUST NOT partially debit
+    /// transaction without `commit` rolls every write back, which is
+    /// the "A failed transaction MUST NOT partially debit
     /// turns, consume inventory, or change challenge state" guarantee
     /// — extended here to listings.
     ///
@@ -785,21 +785,21 @@ RETURNING id, created_at, seller_player_id, item_key, display_name, \
         // callback `Err` propagates as `BuyerCallback` and the
         // transaction drops without commit — every write the callback
         // attempted, plus the kit's own decrement, rolls back as a
-        // unit. SPEC §7's "no partial debit" guarantee.
+        // unit. 's "no partial debit" guarantee.
         if let Err(source) = buyer(&tx, &listing) {
             return Err(MarketError::BuyerCallback { source });
         }
 
-        // SPEC §4.3 / §Task 5f: append a `market.buy` world event last,
+        //  : append a `market.buy` world event last.
         // inside the same transaction as the decrement and the callback
         // writes. Appending *after* the callback (not before) means a
         // callback rollback also rolls back the event row, so the
-        // bulletin invariant "every event corresponds to a real,
+        // bulletin invariant "every event corresponds to a real.
         // persisted purchase" holds — the same ordering rule
         // [`WorldDb::spend_turn_and_emit`] uses.
         //
         // The event is attributed to `seller_player_id` so a successful
-        // sale surfaces in the seller's per-player history (Task 13d's
+        // sale surfaces in the seller's per-player history ('s
         // future "your sales" surface). For NPC/system listings
         // (`seller_player_id IS NULL`) the event lands as a system row
         // — visible in the global bulletin, absent from any single
@@ -823,14 +823,14 @@ RETURNING id, created_at, seller_player_id, item_key, display_name, \
 }
 
 /// Render the human-readable `world_events.message` body the kit emits
-/// after a successful buy (SPEC_v3 §Task 5f). Pulled into a free
+/// after a successful buy. Pulled into a free
 /// function so the `buy_listing` callsite stays focused on
 /// transactional plumbing and tests can assert the exact rendered shape
 /// without re-running a full buy round-trip.
 ///
 /// Format: `market listing #{id} ({display_name}) sold {qty} unit(s) at {price} each`.
 /// The post-decrement listing is the right argument because it carries
-/// the canonical `id`, `display_name`, and `price` SQLite assigned —
+/// the canonical `id`, `display_name`, and `price` SQLite assigned
 /// and `quantity_sold` is passed separately because the post-decrement
 /// row's `quantity` is the *remaining* count, not the sold count. A
 /// regression that swapped them would render "sold 3" when 2 were
@@ -847,7 +847,7 @@ fn format_market_buy_event_message(listing: &MarketListing, quantity_sold: i64) 
 
 /// Decode a `market_listings` row into [`MarketListing`].
 ///
-/// Pulled out so the Task 5b write path and the upcoming Task 5c/5d
+/// Pulled out so the write path and the upcoming
 /// query and buy paths can share one decoder. Column order matches
 /// the `RETURNING` clause in [`WorldDb::create_listing`] *and* the
 /// future `active_listings` `SELECT`; a regression that reorders
@@ -875,14 +875,14 @@ mod tests {
     use crate::players::PLAYERS_MIGRATION;
     use tempfile::tempdir;
 
-    /// SPEC_v3 §Task 5a acceptance: applying
+    ///   acceptance: applying
     /// [`MARKET_LISTINGS_MIGRATION`] creates the documented
-    /// `market_listings` table with the column shape SPEC §4.3 pins.
+    /// `market_listings` table with the column shape pins.
     /// Asserts both:
     ///
     /// 1. The table exists in `sqlite_master` (so a regression that
     ///    silently dropped the migration body would flunk).
-    /// 2. The columns and order match the SPEC §4.3 contract (so a
+    /// 2. The columns and order match the contract (so a
     ///    later edit that renames or reorders a column flunks here
     ///    rather than buried in a 5b–5f behavioural test).
     ///
@@ -942,13 +942,13 @@ mod tests {
                 "expires_at".to_string(),
                 "metadata".to_string(),
             ],
-            "market_listings column shape must match the SPEC_v3 §4.3 contract"
+            "market_listings column shape must match the contract"
         );
     }
 
-    /// SPEC §4.3 mandates "The kit MUST reject negative prices and
+    ///  mandates "The kit MUST reject negative prices and
     /// negative quantities". The Rust-side validator landing in
-    /// Task 5b is the primary enforcement; the schema-level `CHECK`
+    ///  is the primary enforcement; the schema-level `CHECK`
     /// constraints pinned here are the safety net for any path that
     /// bypasses the validator (raw SQL fixtures, future helpers
     /// that forget to validate). Pin both halves explicitly so a
@@ -1003,7 +1003,7 @@ mod tests {
                 });
         }
 
-        // Negative price must be rejected — SPEC §4.3.
+        // Negative price must be rejected
         let bad_price = world.connection().execute(
             "INSERT INTO market_listings \
              (seller_player_id, item_key, display_name, price, quantity) \
@@ -1012,10 +1012,10 @@ mod tests {
         );
         assert!(
             bad_price.is_err(),
-            "CHECK constraint must reject negative prices per SPEC §4.3"
+            "CHECK constraint must reject negative prices"
         );
 
-        // Negative quantity must be rejected — SPEC §4.3.
+        // Negative quantity must be rejected
         let bad_quantity = world.connection().execute(
             "INSERT INTO market_listings \
              (seller_player_id, item_key, display_name, price, quantity) \
@@ -1024,11 +1024,11 @@ mod tests {
         );
         assert!(
             bad_quantity.is_err(),
-            "CHECK constraint must reject negative quantities per SPEC §4.3"
+            "CHECK constraint must reject negative quantities"
         );
     }
 
-    /// The Task 5c `active_listings` helper will walk the partial
+    /// The `active_listings` helper will walk the partial
     /// `idx_market_listings_active` index; if that index ever stops
     /// being created, the read silently becomes a full table scan
     /// in production. Pin both the index name and its partial
@@ -1069,7 +1069,7 @@ mod tests {
     }
 
     /// The migration is idempotent. v2's relaunch path applies the
-    /// same migration list every open; v3 inherits that contract. A
+    /// same migration list every open; inherits that contract. A
     /// second `apply_migration(&MARKET_LISTINGS_MIGRATION)` MUST be
     /// a no-op (the version is already in `world_migrations`), not
     /// an error from `CREATE TABLE` on an existing table. Same
@@ -1104,7 +1104,7 @@ mod tests {
         world
             .apply_migration(&PLAYERS_MIGRATION)
             .expect("players migration applies");
-        // `buy_listing` (Task 5d–5f) appends a `market.buy` event
+        // `buy_listing` appends a `market.buy` event
         // inside its wrapping transaction, so every buy-path test
         // needs `world_events` present. Applying it unconditionally in
         // the helper means the create/active-listing tests pay a tiny
@@ -1128,8 +1128,8 @@ mod tests {
         (dir, world, seller_id)
     }
 
-    /// SPEC_v3 §Task 5b happy path: a valid `create_listing` round-
-    /// trips a fully-populated [`MarketListing`] back to the caller —
+    ///   happy path: a valid `create_listing` round-
+    /// trips a fully-populated [`MarketListing`] back to the caller
     /// the kit-assigned `id` is non-zero, `created_at` is the SQLite-
     /// stamped ISO timestamp, and every input field is preserved
     /// verbatim. Pinning the full struct here guards against a
@@ -1168,7 +1168,7 @@ mod tests {
         );
     }
 
-    /// SPEC_v3 §4.3 explicitly allows NPC/system listings with no
+    ///  explicitly allows NPC/system listings with no
     /// seller. A `None` `seller_player_id` MUST round-trip — pinned
     /// here so a future helper that defensively defaults to "must
     /// have a seller" flunks the test rather than silently breaking
@@ -1194,7 +1194,7 @@ mod tests {
         assert_eq!(listing.quantity, 10);
     }
 
-    /// SPEC §4.3 lists `item_key` as required. The kit additionally
+    ///  lists `item_key` as required. The kit additionally
     /// rejects `""` at the boundary so a blank-key regression
     /// surfaces as a typed [`MarketError::EmptyItemKey`] before it
     /// touches `world.sqlite`. Mirrors `send_notice_rejects_empty_subject`.
@@ -1225,7 +1225,7 @@ mod tests {
         );
     }
 
-    /// SPEC §4.3 lists `display_name` as required. Empty display
+    ///  lists `display_name` as required. Empty display
     /// names are rejected at the boundary for the same reason as
     /// empty subjects on notices (see
     /// [`crate::notices::NoticeError::EmptySubject`]) — a marketplace
@@ -1243,7 +1243,7 @@ mod tests {
         );
     }
 
-    /// SPEC §4.3 mandates "The kit MUST reject negative prices". Pin
+    ///  mandates "The kit MUST reject negative prices". Pin
     /// the typed-error surface so authoring screens can render a
     /// targeted error message without parsing a generic SQL
     /// constraint failure. The schema-level CHECK is the safety net
@@ -1269,7 +1269,7 @@ mod tests {
         }
     }
 
-    /// SPEC §4.3 mandates "The kit MUST reject negative quantities".
+    ///  mandates "The kit MUST reject negative quantities".
     /// Same rationale as the negative-price test: typed error for the
     /// UI, schema CHECK as the safety net.
     #[test]
@@ -1360,7 +1360,7 @@ mod tests {
         }
     }
 
-    /// SPEC_v3 §Task 5c: an empty marketplace returns an empty vec,
+    ///  : an empty marketplace returns an empty vec.
     /// not an error. Mirrors `inbox_returns_empty_vec_for_player_with_no_notices`
     /// — a fresh game world should render the marketplace screen
     /// without surfacing a "query failed" toast.
@@ -1453,10 +1453,10 @@ mod tests {
     }
 
     /// Listings with a lapsed `expires_at` MUST fall out of the
-    /// marketplace view. SPEC §4.3 lists `expires_at` in the field
+    /// marketplace view. lists `expires_at` in the field
     /// set; the schema docs document the kit's policy of read-time
     /// filtering (no sweeper). Open-ended listings (`NULL`) and
-    /// future-dated listings stay visible. Using `datetime('now',
+    /// future-dated listings stay visible. Using `datetime('now'.
     /// modifier)` SQL fixtures keeps the test deterministic without
     /// a stubbed clock.
     #[test]
@@ -1522,7 +1522,7 @@ mod tests {
         );
     }
 
-    /// SPEC_v3 §Task 5d happy path: buying decrements the listing's
+    ///   happy path: buying decrements the listing's
     /// `quantity` by exactly the requested amount, returns the post-
     /// decrement row, and the new value is durably visible to a
     /// follow-up read. Pinning a primary-key SELECT after the call
@@ -1599,7 +1599,7 @@ mod tests {
         );
     }
 
-    /// Non-positive buy quantities are typed errors at the boundary,
+    /// Non-positive buy quantities are typed errors at the boundary.
     /// caught **before** the transaction opens (the helper docs pin
     /// this as a deliberate design choice — a broken UI shouldn't pay
     /// for a `BEGIN`). Both `0` and a negative number must surface as
@@ -1701,7 +1701,7 @@ mod tests {
         );
     }
 
-    /// The buyer callback receives the **post-decrement** listing row,
+    /// The buyer callback receives the **post-decrement** listing row.
     /// not the pre-decrement view. Game code that uses the listing's
     /// current quantity in the callback (e.g. "if this was the last
     /// one, also award the achievement") relies on this contract, so
@@ -1756,11 +1756,11 @@ mod tests {
         );
     }
 
-    /// SPEC_v3 §Task 5e — when the buyer callback returns `Err`, the
+    ///  — when the buyer callback returns `Err`, the
     /// wrapping transaction MUST roll back as a unit: the kit's own
     /// quantity decrement is undone *and* every write the callback
-    /// itself attempted is undone. SPEC §4.3 "Buying MUST be atomic"
-    /// and SPEC §7 "no partial debit" both depend on this invariant —
+    /// itself attempted is undone. "Buying MUST be atomic"
+    /// and "no partial debit" both depend on this invariant
     /// a regression that committed the decrement before running the
     /// callback (or that swallowed the callback's `Err` after writes)
     /// would observably flunk here.
@@ -1797,7 +1797,7 @@ mod tests {
         // Seed a listing with a small, exact quantity. Buying every
         // unit is the strongest test: a regression that committed the
         // decrement before checking the callback would leave
-        // quantity = 0 and drop the row out of `active_listings`,
+        // quantity = 0 and drop the row out of `active_listings`.
         // which is the second assertion below.
         let listing = world
             .create_listing(
@@ -1814,7 +1814,7 @@ mod tests {
         // Scratch table the failing callback writes to *before*
         // returning Err. If the rollback works, both writes (the
         // kit's listing decrement and the callback's INSERT) are
-        // undone together; if the rollback only covers one of them,
+        // undone together; if the rollback only covers one of them.
         // the assertions below catch which one leaked through.
         world
             .connection()
@@ -1845,7 +1845,7 @@ mod tests {
                 // Simulate "buyer can't afford this". Using
                 // `SqliteFailure` matches the documented mapping
                 // convention; the marketplace UI would surface the
-                // wrapped `extended_code` / message verbatim.
+                // wrapped `extended_code` message verbatim.
                 Err(rusqlite::Error::SqliteFailure(
                     rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT),
                     Some("insufficient buyer balance".to_string()),
@@ -1909,8 +1909,8 @@ mod tests {
         );
     }
 
-    /// SPEC_v3 §Task 5f acceptance: a successful `buy_listing` appends
-    /// exactly one [`MARKET_BUY_EVENT_KIND`] event to `world_events`,
+    ///   acceptance: a successful `buy_listing` appends
+    /// exactly one [`MARKET_BUY_EVENT_KIND`] event to `world_events`.
     /// attributed to the seller, with a deterministic message body
     /// covering the listing id, display name, sold quantity, and price.
     ///
@@ -1922,7 +1922,7 @@ mod tests {
     /// a format change would silently break Murder Motel's bulletin
     /// rendering. The message asserts substring matches rather than
     /// exact-string equality so a future tweak to the connector words
-    /// ("sold" → "for") doesn't flunk this test for cosmetic reasons,
+    /// ("sold" → "for") doesn't flunk this test for cosmetic reasons.
     /// but every load-bearing fact (id, display_name, qty, price) is
     /// individually pinned.
     #[test]
@@ -2009,17 +2009,17 @@ mod tests {
         );
     }
 
-    /// SPEC_v3 §Task 5f acceptance: NPC/system listings (no
+    ///   acceptance: NPC/system listings (no
     /// `seller_player_id`) emit a *system* event — `player_id IS NULL`
     /// — so the bulletin still shows the sale but no player's per-
-    /// player view is polluted with it. Pins the same SPEC §4.7
+    /// player view is polluted with it. Pins the same
     /// "system events have NULL player_id" convention the kit uses
     /// elsewhere, applied to the buy path.
     #[test]
     fn buy_listing_emits_system_event_for_npc_listings() {
         let (_dir, mut world, _seller_id) = world_with_listings();
 
-        // No seller — SPEC §4.3 explicitly allows this for NPC/system
+        // No seller — explicitly allows this for NPC/system
         // listings.
         let listing = world
             .create_listing(None, "item.npc", "NPC Crate", 10, 3, None, None)
@@ -2038,9 +2038,9 @@ mod tests {
         );
     }
 
-    /// SPEC_v3 §Task 5f / §7 atomicity: when the buyer callback fails,
+    ///  atomicity: when the buyer callback fails.
     /// the world-event row that *would* have been appended must also
-    /// roll back. Layered on top of the §Task 5e listing-and-callback
+    /// roll back. Layered on top of the listing-and-callback
     /// rollback test: 5e proves listing quantity and callback writes
     /// roll back; this proves the event row does too. A regression that
     /// committed the event before checking the callback (or that
@@ -2085,7 +2085,7 @@ mod tests {
 
         // Zero events: the wrapping transaction rolled back, so the
         // `market.buy` row never landed. A leaked event row would
-        // surface as `len() == 1` here.
+        // surface as `len == 1` here.
         let events = world.recent_events(10).expect("recent_events runs");
         assert!(
             events.is_empty(),

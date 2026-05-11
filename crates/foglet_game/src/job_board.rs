@@ -30,11 +30,11 @@ use crate::world_db::WorldDb;
 /// display strings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum JobBoardSource {
-    /// Entry sourced from the v5 `contracts` primitive.
+    /// Entry sourced from the `contracts` primitive.
     Contract,
-    /// Entry sourced from the v3 `bounties` primitive.
+    /// Entry sourced from the `bounties` primitive.
     Bounty,
-    /// Entry sourced from the v3 `challenges` primitive.
+    /// Entry sourced from the `challenges` primitive.
     Challenge,
     /// Entry sourced from a game-defined external provider.
     External,
@@ -89,17 +89,17 @@ pub struct JobBoardEntry {
 
 /// Sort strategy for [`JobBoard::query`].
 ///
-/// The default strategy follows the v5 contract:
+/// The default strategy follows the contract:
 ///
-/// - first by `expires_at` ascending,
-/// - then by `source`,
+/// - first by `expires_at` ascending.
+/// - then by `source`.
 /// - then by `source_id`.
 ///
 /// Games that want to preserve provider emission order exactly can use
 /// [`Self::ProviderOrder`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum JobBoardSort {
-    /// Canonical v5 default ordering.
+    /// Canonical default ordering.
     #[default]
     Default,
     /// Leave rows in provider emission order.
@@ -152,7 +152,7 @@ impl JobBoard {
     /// Aggregate rows from all `providers`, apply `filter`, and return
     /// one stable-ordered list.
     ///
-    /// Default ordering is SPEC_v5 §4.2: `expires_at` ascending, then
+    /// Default ordering is: `expires_at` ascending, then
     /// `source`, then `source_id`.
     pub fn query(
         world_db: &WorldDb,
@@ -163,7 +163,7 @@ impl JobBoard {
         for (provider_index, provider) in providers.iter().enumerate() {
             let provider_entries = provider.entries(world_db)?;
             for (entry_index, mut entry) in provider_entries.into_iter().enumerate() {
-                // SPEC_v5 §7 requires sanitization at the aggregation
+                //  requires sanitization at the aggregation
                 // boundary regardless of provider. We sanitize here so
                 // both built-in and external rows obey the same
                 // terminal-safety + bounded-text contract before any
@@ -309,7 +309,7 @@ pub enum JobBoardError {
     },
 }
 
-/// Built-in provider that projects v5 `contracts` rows into board
+/// Built-in provider that projects `contracts` rows into board
 /// entries.
 ///
 /// The provider returns one [`JobBoardEntry`] per **available**
@@ -320,7 +320,7 @@ pub enum JobBoardError {
 pub struct ContractProvider;
 
 impl ContractProvider {
-    /// Construct a provider for v5 contract-backed opportunities.
+    /// Construct a provider for contract-backed opportunities.
     #[must_use]
     pub fn new() -> Self {
         Self
@@ -367,7 +367,7 @@ impl OpportunityProvider for ContractProvider {
     }
 }
 
-/// Built-in provider that projects v3 `bounties` rows into board
+/// Built-in provider that projects `bounties` rows into board
 /// entries.
 ///
 /// The provider returns one [`JobBoardEntry`] per `open` bounty:
@@ -380,7 +380,7 @@ impl OpportunityProvider for ContractProvider {
 pub struct BountyProvider;
 
 impl BountyProvider {
-    /// Construct a provider for v3 bounty-backed opportunities.
+    /// Construct a provider for bounty-backed opportunities.
     #[must_use]
     pub fn new() -> Self {
         Self
@@ -440,7 +440,7 @@ ORDER BY created_at ASC, id ASC";
     }
 }
 
-/// Built-in provider that projects v3 `challenges` rows into board
+/// Built-in provider that projects `challenges` rows into board
 /// entries.
 ///
 /// The provider returns one [`JobBoardEntry`] per `open` challenge:
@@ -453,7 +453,7 @@ ORDER BY created_at ASC, id ASC";
 pub struct ChallengeProvider;
 
 impl ChallengeProvider {
-    /// Construct a provider for v3 challenge-backed opportunities.
+    /// Construct a provider for challenge-backed opportunities.
     #[must_use]
     pub fn new() -> Self {
         Self
@@ -520,10 +520,10 @@ ORDER BY created_at ASC, id ASC";
     }
 }
 
-/// Built-in provider bundle selected from v5/v3 config toggles.
+/// Built-in provider bundle selected from v5/config toggles.
 ///
 /// The bundle always includes [`ContractProvider`] because v5's
-/// `job_board` primitive depends on `contracts`. v3 providers are
+/// `job_board` primitive depends on `contracts`. providers are
 /// included only when their specific multiplayer toggles are enabled.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct BuiltInProviders {
@@ -533,11 +533,11 @@ pub struct BuiltInProviders {
 }
 
 impl BuiltInProviders {
-    /// Build the built-in provider set from v3 multiplayer toggles.
+    /// Build the built-in provider set from multiplayer toggles.
     ///
     /// Gating rules:
     ///
-    /// - `multiplayer = None` (v3 disabled): only contracts.
+    /// - `multiplayer = None` (disabled): only contracts.
     /// - `multiplayer.bounties = true`: include [`BountyProvider`].
     /// - `multiplayer.challenges = true`: include [`ChallengeProvider`].
     #[must_use]
@@ -1017,12 +1017,12 @@ mod tests {
         assert_eq!(
             entry.title.chars().count(),
             super::JOB_BOARD_TITLE_MAX_CHARS,
-            "title should be truncated to the v3 short-text bound after sanitization"
+            "title should be truncated to the short-text bound after sanitization"
         );
         assert_eq!(
             entry.summary.chars().count(),
             super::JOB_BOARD_SUMMARY_MAX_CHARS,
-            "summary should be truncated to the v3 long-text bound after sanitization"
+            "summary should be truncated to the long-text bound after sanitization"
         );
         assert!(
             !entry.title.contains('\u{001B}') && !entry.summary.contains('\u{001B}'),

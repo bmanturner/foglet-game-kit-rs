@@ -1,16 +1,16 @@
-//! ASCII map parser (SPEC §9.2).
+//! ASCII map parser.
 //!
 //! Foglet door games describe their world with two artifacts:
 //!
 //! 1. **A tile legend** in TOML — a `[tiles]` table mapping a single
-//!    character glyph to a semantic kind string (`"wall"`, `"floor"`,
+//!    character glyph to a semantic kind string (`"wall"`, `"floor"`.
 //!    `"door"`, `"npc:<id>"`, `"item:<id>"`, or an author-defined
-//!    custom kind). SPEC §9.2 ships this alongside the map so the same
+//!    custom kind). ships this alongside the map so the same
 //!    glyph can mean different things in different games.
 //! 2. **An ASCII grid** — a plain-text rectangle where every cell
 //!    matches a glyph in the legend. The player spawn glyph (`@`) is
 //!    treated like any other glyph by the parser; `[game].start_x` /
-//!    `start_y` in `assets/game.toml` are the authoritative spawn,
+//!    `start_y` in `assets/game.toml` are the authoritative spawn.
 //!    so games typically map `@` to "floor" in their legend and rely
 //!    on config for placement.
 //!
@@ -34,9 +34,9 @@
 //!   passes it to [`parse_map`]. This keeps the parser pure and
 //!   testable, and lets the runtime decide whether maps come from
 //!   `include_str!`, `assets/maps/*.txt`, or somewhere else.
-//! - It does not enforce a player-spawn glyph. SPEC §5.2 names
-//!   `start_x` / `start_y` in `[game]` as the spawn, so spawn lives
-//!   in config (Task 4), not the map.
+//! - It does not enforce a player-spawn glyph. names
+//!   `start_x` `start_y` in `[game]` as the spawn, so spawn lives
+//!   in config, not the map.
 //! - It does not implement movement or pathing. Walkability is a
 //!   per-tile predicate; how a `Screen` consumes it is the game's
 //!   choice.
@@ -61,12 +61,12 @@ pub const PLAYER_GLYPH: char = '@';
 /// to a typed enum so games can pattern-match instead of comparing
 /// strings. The `Custom` variant preserves the original legend
 /// string verbatim — this is the escape hatch for author-defined
-/// terrain (lava, water, ladder, etc.) without forcing the SPEC to
+/// terrain (lava, water, ladder, etc.) without forcing the to
 /// enumerate every possibility.
 ///
 /// # Walkability
 ///
-/// `Wall` is the only built-in *blocking* kind. `Floor`, `Door`,
+/// `Wall` is the only built-in *blocking* kind. `Floor`, `Door`.
 /// `Npc`, and `Item` are walkable so the player can stand on them
 /// (NPCs and items occupy a floor-equivalent cell underneath; the
 /// game decides whether to block movement when the player tries to
@@ -113,7 +113,7 @@ impl TileKind {
 ///
 /// # Why a wrapper instead of `HashMap<char, TileKind>` directly
 ///
-/// 1. The constructor enforces "exactly one character per key",
+/// 1. The constructor enforces "exactly one character per key".
 ///    which `serde` won't catch on its own.
 /// 2. It's the natural place to hang a [`TileLegend::lookup`] helper
 ///    that returns the structured error type.
@@ -252,10 +252,10 @@ pub struct EntityPlacement {
     pub kind: TileKind,
 }
 
-/// Parsed ASCII map (SPEC §9.2).
+/// Parsed ASCII map.
 ///
 /// The grid is rectangular by construction (the parser rejects ragged
-/// input). `entities` is the *separate* list of NPC/item anchors —
+/// input). `entities` is the *separate* list of NPC/item anchors
 /// the corresponding cells in `cells` are stored as their entity kind
 /// so renderers that want to honour the original glyph can do so;
 /// movement code that wants "is this cell walkable" should still call
@@ -270,7 +270,7 @@ pub struct Map {
     /// `cells[y][x]` — row-major. Always exactly `height` rows of
     /// exactly `width` tiles.
     pub cells: Vec<Vec<Tile>>,
-    /// Entity placements harvested from `Npc(_)` / `Item(_)` cells,
+    /// Entity placements harvested from `Npc(_)` `Item(_)` cells.
     /// in row-major reading order.
     pub entities: Vec<EntityPlacement>,
 }
@@ -425,7 +425,7 @@ pub fn parse_map(text: &str, legend: &TileLegend) -> Result<Map, MapError> {
 mod tests {
     use super::*;
 
-    /// Build a legend that covers every glyph in the SPEC §9.2 example
+    /// Build a legend that covers every glyph in the example
     /// plus the player marker mapped to floor (the convention `fgk new`
     /// templates follow).
     fn spec_legend() -> TileLegend {

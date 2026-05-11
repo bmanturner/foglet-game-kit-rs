@@ -1,11 +1,11 @@
-//! `spatial` — directed location graph primitives (SPEC_v4 Tasks 3 and 4).
+//! `spatial` — directed location graph primitives ( and 4).
 //!
 //! The module covers `places` and `routes`, and stays
 //! intentionally genre-neutral:
 //!
 //! - In a **space exploration** game, a row can represent a docking
 //!   dock, star gate, or sector node.
-//! - In a **dungeon crawler** game, a row can represent a cave room,
+//! - In a **dungeon crawler** game, a row can represent a cave room.
 //!   bridge crossing, or hidden vault.
 //!
 //! This lets the table evolve through adjacency and movement tasks
@@ -15,16 +15,16 @@ use thiserror::Error;
 
 use crate::world_db::{WorldDb, WorldMigration};
 
-/// A durable location node in the v4 spatial graph.
+/// A durable location node in the spatial graph.
 ///
 /// The row is intentionally minimal. It stores what every game world
 /// needs to reason about a place and nothing more:
 ///
-/// - `key` identifies the place in game-authored data (`"airlock-01"`,
+/// - `key` identifies the place in game-authored data (`"airlock-01"`.
 ///   `"forge-room"`, `"north-gate"`). It is unique for the life of
 ///   the world so migration code and saved references remain stable.
 /// - `display_name` is a user-facing short label.
-/// - `kind` is game-defined and unopinionated (e.g. `"dock"`,
+/// - `kind` is game-defined and unopinionated (e.g. `"dock"`.
 ///   `"chamber"`, `"market"`).
 /// - `metadata_json` carries any optional arbitrary JSON that the game
 ///   chooses (descriptive text, fog-of-war flags, encounter lists).
@@ -51,7 +51,7 @@ pub struct Place {
     pub created_at: String,
 }
 
-/// A directed edge in the v4 location graph.
+/// A directed edge in the location graph.
 ///
 /// The row is designed to be a very small, durable adjacency fact:
 ///
@@ -89,10 +89,10 @@ pub struct Route {
 ///
 /// Public write paths return a single enum so callers can branch on
 /// "insertion failed" versus other module-specific errors as the API
-/// expands in Task 3c.
+/// expands in.
 #[derive(Debug, Error)]
 pub enum PlaceError {
-    /// The underlying SQL `INSERT` failed (constraint violation, disk,
+    /// The underlying SQL `INSERT` failed (constraint violation, disk.
     /// lock timeout, schema mismatch).
     #[error("failed to insert place `{key}`: {source}")]
     Sqlite {
@@ -112,7 +112,7 @@ pub enum PlaceError {
 /// the boundary.
 #[derive(Debug, Error)]
 pub enum RouteError {
-    /// The underlying SQL `INSERT` failed (constraint violation, disk,
+    /// The underlying SQL `INSERT` failed (constraint violation, disk.
     /// lock timeout, schema mismatch).
     #[error("failed to create route from `{from_place_id}` to `{to_place_id}`: {source}")]
     Sqlite {
@@ -144,7 +144,7 @@ pub enum RouteError {
     },
 }
 
-/// Migration for the shared `places` table (SPEC_v4 Task 3a).
+/// Migration for the shared `places` table.
 ///
 /// The table intentionally stores only the structural fields the kit
 /// needs for navigation:
@@ -153,7 +153,7 @@ pub enum RouteError {
 ///   `routes`.
 /// - `key` — stable string key authored by the game (must be unique).
 /// - `display_name` — human-readable label for UI.
-/// - `kind` — caller-owned subtype label (e.g. `"dock"` or `"chamber"`),
+/// - `kind` — caller-owned subtype label (e.g. `"dock"` or `"chamber"`).
 ///   intentionally unopinionated.
 /// - `metadata_json` — opaque game-defined payload.
 /// - `created_at` — UTC creation timestamp.
@@ -177,7 +177,7 @@ CREATE TABLE IF NOT EXISTS places (\n\
 ",
 };
 
-/// Migration for the shared `routes` table (SPEC_v4 Task 4a).
+/// Migration for the shared `routes` table.
 ///
 /// `routes` encodes directed edges in the graph built from
 /// [`PLACES_MIGRATION`].
@@ -221,7 +221,7 @@ CREATE TABLE IF NOT EXISTS routes (\n\
 impl WorldDb {
     /// Insert one `Place` row and return the full stored record.
     ///
-    /// Callers use this from their door bootstrap / admin code or from a
+    /// Callers use this from their door bootstrap admin code or from a
     /// world-building screen to seed place nodes. The method intentionally
     /// returns the inserted row, so callers get:
     ///
@@ -241,7 +241,7 @@ impl WorldDb {
     /// # Concurrency
     ///
     /// Uses one `INSERT` statement with `RETURNING`; readers can execute
-    /// it through `&self`, matching existing v2 shared-world patterns.
+    /// it through `&self`, matching existing shared-world patterns.
     /// Unique-key conflicts are surfaced as [`PlaceError::Sqlite`] and are
     /// validated explicitly in the follow-up task for key collisions.
     pub fn insert_place(
@@ -274,7 +274,7 @@ RETURNING id, key, display_name, kind, metadata_json, created_at";
     ///
     /// - No route is implied by place creation.
     /// - No route directionality is inferred by convention.
-    /// - `requirements_json` / `metadata_json` are opaque, so game
+    /// - `requirements_json` `metadata_json` are opaque, so game
     ///   authors can encode any constraints they want.
     ///
     /// This is the first write API for the route table and returns the
@@ -508,7 +508,7 @@ mod tests {
     use crate::world_db::WorldDb;
     use tempfile::tempdir;
 
-    /// SPEC_v4 Task 3a accepts that `create_places` applies and
+    ///  accepts that `create_places` applies and
     /// creates the documented columns in order, including metadata
     /// openness.
     #[test]
@@ -540,7 +540,7 @@ mod tests {
                 "metadata_json".to_string(),
                 "created_at".to_string(),
             ],
-            "places schema must match SPEC_v4 Task 3a exactly"
+            "places schema must match exactly"
         );
 
         let row_count: i64 = world
@@ -554,7 +554,7 @@ mod tests {
         assert_eq!(row_count, PLACES_MIGRATION.version);
     }
 
-    /// SPEC_v4 Task 4a accepts that `create_routes` applies after
+    ///  accepts that `create_routes` applies after
     /// `create_places` and declares both edge columns plus both place
     /// foreign keys.
     ///
@@ -596,7 +596,7 @@ mod tests {
                 "metadata_json".to_string(),
                 "created_at".to_string(),
             ],
-            "routes schema must match SPEC_v4 Task 4a exactly"
+            "routes schema must match exactly"
         );
 
         let mut fk_stmt = world
@@ -630,7 +630,7 @@ mod tests {
         )));
     }
 
-    /// SPEC_v4 Task 3b requires a typed round-trip surface for a
+    ///  requires a typed round-trip surface for a
     /// single place insert.
     ///
     /// The test seeds one space-themed place and asserts that:
@@ -680,7 +680,7 @@ mod tests {
         assert_eq!(inserted, by_id);
     }
 
-    /// SPEC_v4 Task 3c requires key-level uniqueness enforcement.
+    ///  requires key-level uniqueness enforcement.
     ///
     /// Insert the same logical key twice and confirm the second
     /// operation fails through the `insert_place` path with a
@@ -722,7 +722,7 @@ mod tests {
         );
     }
 
-    /// SPEC_v4 Task 3d requires deterministic list ordering so game-side
+    ///  requires deterministic list ordering so game-side
     /// UIs and tests can depend on stable output.
     #[test]
     fn list_places_returns_sorted_rows() {
@@ -759,7 +759,7 @@ mod tests {
         assert!(alpha.id > 0, "inserted fixture row should have concrete id");
     }
 
-    /// SPEC_v4 Task 3d also requires key lookup semantics.
+    ///  also requires key lookup semantics.
     #[test]
     fn get_place_by_key_returns_match_or_none() {
         let dir = tempdir().expect("tempdir creates");
@@ -792,10 +792,10 @@ mod tests {
         );
     }
 
-    /// SPEC_v4 Task 3e requires opaque metadata storage semantics: the
+    ///  requires opaque metadata storage semantics: the
     /// byte sequence in `metadata_json` must be preserved by the write path.
     ///
-    /// This uses a dense JSON fixture with whitespace, nested objects,
+    /// This uses a dense JSON fixture with whitespace, nested objects.
     /// and escaped characters to catch accidental normalization.
     #[test]
     fn insert_place_preserves_metadata_json_byte_for_byte() {
@@ -824,13 +824,13 @@ mod tests {
         assert_eq!(from_db, metadata);
     }
 
-    /// SPEC_v4 Task 4b accepts `create_route` and that the returned
+    ///  accepts `create_route` and that the returned
     /// `Route` row is the same row written to SQLite.
     ///
     /// This test creates two place nodes, then one directed route and
     /// reads it back by primary id:
     ///
-    /// - The row includes the caller-provided `kind`, `requirements_json`,
+    /// - The row includes the caller-provided `kind`, `requirements_json`.
     ///   and `metadata_json`.
     /// - The `created_at` timestamp is non-empty and comes from SQLite.
     #[test]
@@ -896,7 +896,7 @@ mod tests {
         assert_eq!(route, by_id);
     }
 
-    /// SPEC_v4 Task 4c — `outbound_routes` must reflect only the source
+    ///  — `outbound_routes` must reflect only the source
     /// side of the directed route row.
     ///
     /// This is a strict-direction test: one route A→B and one route B→A
@@ -977,7 +977,7 @@ mod tests {
         assert_eq!(inbound_routes[0].to_place_id, star_hatch.id);
     }
 
-    /// SPEC_v4 Task 4f requires route topology to remain directional:
+    ///  requires route topology to remain directional:
     /// a route from a station to an engine room does not imply the reverse
     /// path unless a separate reverse row exists, which keeps directed world
     /// graphs explicit for both space and dungeon games.
@@ -1029,7 +1029,7 @@ mod tests {
         assert_eq!(to_dungeon[0], tunnel);
     }
 
-    /// SPEC_v4 Task 4d — `inbound_routes` should return only routes whose
+    ///  — `inbound_routes` should return only routes whose
     /// destination is the provided place.
     ///
     /// The test keeps two separate source nodes feeding a common destination
@@ -1098,7 +1098,7 @@ mod tests {
         assert_eq!(inbound[1].from_place_id, hangar.id);
     }
 
-    /// SPEC_v4 Task 4e requires parallel routes between the same
+    ///  requires parallel routes between the same
     /// source-destination pair to be possible when `kind` differs.
     ///
     /// This test models **space** logistics and **dungeon** traversal at
@@ -1166,7 +1166,7 @@ mod tests {
         assert_ne!(routes[0].id, routes[1].id);
     }
 
-    /// SPEC_v4 Task 4g requires bidirectional access to be represented
+    ///  requires bidirectional access to be represented
     /// by two explicit directed rows, not one implied edge.
     ///
     /// In a **space dock** graph, a route from bay-to-satellite is not

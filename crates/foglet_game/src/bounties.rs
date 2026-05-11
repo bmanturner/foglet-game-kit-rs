@@ -1,29 +1,29 @@
-//! `bounties` — shared-world bounty/job-board schema (SPEC_v3 §4.5 /
-//! §Task 7a).
+//! `bounties` — shared-world bounty/job-board schema ( /
+//! ).
 //!
-//! v3 introduces a durable async bounty board: a poster (a player or
+//!  introduces a durable async bounty board: a poster (a player or
 //! the system) writes up a job with a reward payload, claimants pick
 //! it up, and one of them eventually completes it with game-defined
 //! evidence. The whole lifecycle sits on top of a single `bounties`
 //! table whose shape is pinned by [`BOUNTIES_MIGRATION`]. This module
 //! exists only to declare that schema and prove it applies; the
-//! `Bounty` Rust type and the `post_bounty` / `claim_bounty` /
-//! `complete_bounty` / `expire_bounties` helpers land in subsequent
-//! §Task 7 sub-items (7b–7f). Splitting the migration into its own
+//! `Bounty` Rust type and the `post_bounty` `claim_bounty` /
+//! `complete_bounty` `expire_bounties` helpers land in subsequent
+//!  sub-items (7b–7f). Splitting the migration into its own
 //! commit keeps the bisect signal sharp — a column rename, a relaxed
 //! `CHECK`, or a dropped partial index flunks the schema test in this
 //! module rather than a higher-level state-machine test that's harder
-//! to attribute. Same convention as [`crate::challenges`] §Task 4a
-//! and [`crate::market`] §Task 5a.
+//! to attribute. Same convention as [`crate::challenges`]
+//! and [`crate::market`].
 //!
 //! # Why a dedicated table
 //!
-//! SPEC_v3 §3 lists bounties alongside notices, challenges, market
+//!  lists bounties alongside notices, challenges, market
 //! listings, and factions as separate primitives. We follow the same
-//! v2/v3 convention: one table, one migration, one named index
+//! v2/convention: one table, one migration, one named index
 //! family. Folding bounties onto `world_events` would conflate the
-//! append-only event stream with mutable lifecycle state (`state`,
-//! `claimed_by_player_id`, `claimed_at`, `completed_at`) —
+//! append-only event stream with mutable lifecycle state (`state`.
+//! `claimed_by_player_id`, `claimed_at`, `completed_at`)
 //! fundamentally different write patterns. Folding bounties onto
 //! `challenges` would force one state machine to model two domains
 //! (rival challenges are private and 1:1; bounties are public and
@@ -32,30 +32,30 @@
 //!
 //! # Why `version = 10`
 //!
-//! v2 occupies migration versions 1–5 (see `docs/shared-world.md`
-//! §8.1). v3 claims `6` and above, dense and grouped per primitive:
+//!  occupies migration versions 1–5 (see `docs/shared-world.md`
+//! ). claims `6` and above, dense and grouped per primitive:
 //! notices=6, challenges=7, market_listings=8, factions=9. Bounties
-//! are the fifth and final v3 primitive to land, so they take 10.
+//! are the fifth and final primitive to land, so they take 10.
 //! Game-authored migrations live in their own higher band and are
 //! not affected.
 
 use crate::world_db::{WorldDb, WorldMigration};
 use thiserror::Error;
 
-/// Schema for the bounty/job-board table — SPEC_v3 §4.5 / §Task 7a.
+/// Schema for the bounty/job-board table —.
 ///
 /// One row per bounty. Bounties are mutable in the narrow sense that
 /// `state`, `claimed_by_player_id`, `claimed_at`, and `completed_at`
-/// are flipped by the typed helpers landing in Tasks 7b–7e; the
+/// are flipped by the typed helpers landing in ; the
 /// addressing, `title`, `description`, `reward`, and creation
 /// timestamp are write-once. The kit's contract is "if you only go
 /// through the public API, the only state changes are the documented
 /// transitions, and every transition runs inside a SQLite
-/// transaction" (SPEC_v3 §4.5 / §7). An operator with `sqlite3` can
+/// transaction". An operator with `sqlite3` can
 /// of course rewrite anything; that's the same caveat as
-/// [`crate::events::WORLD_EVENTS_MIGRATION`],
-/// [`crate::notices::NOTICES_MIGRATION`],
-/// [`crate::challenges::CHALLENGES_MIGRATION`],
+/// [`crate::events::WORLD_EVENTS_MIGRATION`].
+/// [`crate::notices::NOTICES_MIGRATION`].
+/// [`crate::challenges::CHALLENGES_MIGRATION`].
 /// [`crate::market::MARKET_LISTINGS_MIGRATION`], and
 /// [`crate::factions::FACTIONS_MIGRATION`].
 ///
@@ -64,14 +64,14 @@ use thiserror::Error;
 /// - `id` — `INTEGER PRIMARY KEY`. Autoincrement-aliased rowid.
 ///   Doubles as the deterministic tiebreaker for queries that order
 ///   by `created_at` and need a stable secondary sort, matching the
-///   convention on every other v2/v3 primitive.
+///   convention on every other v2/ primitive.
 /// - `created_at` — `TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP`. UTC
 ///   timestamp written by SQLite at insert time. ISO text so it
 ///   sorts lexically the same way it sorts chronologically and
 ///   reads cleanly under the `sqlite3` CLI — the same contract as
-///   every other v2/v3 timestamp column.
-/// - `posted_by_player_id` — `INTEGER REFERENCES players(id)`,
-///   nullable. SPEC §4.5 explicitly lists "posted_by player id
+///   every other v2/timestamp column.
+/// - `posted_by_player_id` — `INTEGER REFERENCES players(id)`.
+///   nullable. explicitly lists "posted_by player id
 ///   optional": detective agencies, the city, or other in-game NPC
 ///   organisations may post bounties without a real Foglet user
 ///   behind them. Mirrors [`crate::notices`]'s
@@ -82,7 +82,7 @@ use thiserror::Error;
 /// - `title` — `TEXT NOT NULL`. Short player-facing headline shown
 ///   in the bounty board listing. Required: a bounty without a
 ///   title can't be rendered as a board entry. Length bounding
-///   lives at the helper layer (Task 7b) — the schema enforces
+///   lives at the helper layer — the schema enforces
 ///   non-null but not max length, the same convention as
 ///   `notices.subject` and `market_listings.display_name`.
 /// - `description` — `TEXT NOT NULL`. Longer body copy explaining
@@ -93,9 +93,9 @@ use thiserror::Error;
 /// - `reward` — `TEXT NOT NULL`. Opaque JSON describing the payout
 ///   (in-game currency, items, XP, faction reputation). The kit
 ///   treats this column as opaque — the game owns the schema, the
-///   kit owns the lifecycle. Same contract as `challenges.stake`,
+///   kit owns the lifecycle. Same contract as `challenges.stake`.
 ///   `notices.metadata`, and `world_events.metadata`. Marked
-///   `NOT NULL` because SPEC §4.5 lists `reward` without an
+///   `NOT NULL` because lists `reward` without an
 ///   "optional" modifier (unlike `posted_by`) — every bounty
 ///   advertises a payout, even if the JSON encodes "0 credits"
 ///   for narrative-only bounties.
@@ -104,18 +104,18 @@ use thiserror::Error;
 ///   ('open','claimed','completed','expired')`. The state-machine
 ///   vocabulary lives in the schema so a regression that introduced
 ///   a new state in code without a matching migration would fail at
-///   INSERT/UPDATE time, not silently in production. SPEC §4.5
-///   documents the legal transitions through the §Task 7b–7e
-///   acceptance criteria: `open -> claimed -> completed`,
+///   INSERT/UPDATE time, not silently in production.
+///   documents the legal transitions through the
+///   acceptance criteria: `open -> claimed -> completed`.
 ///   `open -> expired`, `claimed -> expired`. Default `'open'`
-///   matches Task 7b's "starts open" acceptance. Same shape as the
+///   matches 's "starts open" acceptance. Same shape as the
 ///   `state` column on `challenges`.
-/// - `claimed_by_player_id` — `INTEGER REFERENCES players(id)`,
+/// - `claimed_by_player_id` — `INTEGER REFERENCES players(id)`.
 ///   nullable. The investigator who claimed the bounty. Stays
 ///   `NULL` for `open` and `expired`-without-claim rows; populated
-///   on the `open -> claimed` transition (Task 7c) and preserved
-///   through `claimed -> completed` (Task 7d) so the completion
-///   credit stays attributable. SPEC §4.5 lists this as
+///   on the `open -> claimed` transition and preserved
+///   through `claimed -> completed` so the completion
+///   credit stays attributable. lists this as
 ///   "claimed_by optional player id".
 /// - `claimed_at` — `TEXT`, nullable. ISO timestamp of the
 ///   `open -> claimed` transition. Same audit-view rationale as
@@ -125,7 +125,7 @@ use thiserror::Error;
 ///   `claimed -> completed` transition. Stays `NULL` for bounties
 ///   that never completed (still open, still claimed, expired).
 /// - `expires_at` — `TEXT`, nullable. ISO timestamp after which the
-///   Task 7e sweeper may flip an `open` or `claimed` bounty to
+///    sweeper may flip an `open` or `claimed` bounty to
 ///   `expired`. Nullable so a bounty can be open-ended (no
 ///   deadline) without reserving a sentinel value; the partial
 ///   index below filters on `expires_at IS NOT NULL` so the sweeper
@@ -135,11 +135,11 @@ use thiserror::Error;
 /// # Indexes
 ///
 /// Three partial indexes are created up-front so the lookup patterns
-/// Tasks 7b–7e rely on are seek-bound from the moment they land.
+///  rely on are seek-bound from the moment they land.
 /// Adding them later would require a follow-up migration and a
 /// backfill window where the query path scans the table; pay the
 /// index cost at the same migration that creates the table — the
-/// same rationale as the partial indexes on `notices`, `challenges`,
+/// same rationale as the partial indexes on `notices`, `challenges`.
 /// `market_listings`, and `factions`.
 ///
 /// - `idx_bounties_open` is a partial index over
@@ -163,21 +163,21 @@ use thiserror::Error;
 ///   declines to spend bytes on it either way.
 /// - `idx_bounties_expiring` is a partial index over
 ///   `(expires_at, id)` `WHERE state IN ('open','claimed') AND
-///   expires_at IS NOT NULL`. The Task 7e sweeper walks this in
+///   expires_at IS NOT NULL`. The sweeper walks this in
 ///   `expires_at` order and stops at the first row where
 ///   `expires_at > now`, so the cost of "expire all due bounties"
 ///   stays proportional to the number of bounties that actually
 ///   need expiring — not to the total bounty count. Both `open`
-///   and `claimed` bounties are eligible for expiry per SPEC §4.5
+///   and `claimed` bounties are eligible for expiry
 ///   (a claimant who never completes their work shouldn't pin the
 ///   bounty open forever); the index covers both states with one
 ///   partial predicate.
 ///
 /// # Version
 ///
-/// `version = 10`. v2 uses 1–5; v3 uses 6+ (notices=6, challenges=7,
+/// `version = 10`. uses 1–5; uses 6+ (notices=6, challenges=7.
 /// market_listings=8, factions=9). Bounties are the fifth and final
-/// v3 primitive to land, so they take 10. v3.1+ migrations pick up
+///  primitive to land, so they take 10. v3.1+ migrations pick up
 /// at 11.
 pub const BOUNTIES_MIGRATION: WorldMigration = WorldMigration {
     version: 10,
@@ -210,7 +210,7 @@ CREATE INDEX IF NOT EXISTS idx_bounties_expiring\n\
 
 /// Kit-internal cap for a bounty's player- or game-authored `title`.
 ///
-/// SPEC_v3 §5.2 ships only `max_notice_body_chars` as configurable;
+///  ships only `max_notice_body_chars` as configurable;
 /// bounty titles follow the same convention as
 /// [`crate::notices::NOTICE_SUBJECT_MAX_CHARS`] and
 /// [`crate::market::MARKET_DISPLAY_NAME_MAX_CHARS`] — bounded by the
@@ -219,8 +219,8 @@ CREATE INDEX IF NOT EXISTS idx_bounties_expiring\n\
 /// the notice-subject and market-display-name caps and fits one
 /// 80-column line with room for a reward suffix on board list views.
 ///
-/// Counted in Unicode scalar values (`str::chars().count()`), not
-/// bytes — SPEC §4.5 / §7 talk in *characters*, and a byte cap would
+/// Counted in Unicode scalar values (`str::chars.count`), not
+/// bytes — talk in *characters*, and a byte cap would
 /// let a single emoji eat four "chars" of budget. Same rule as the
 /// notice-subject and market-display-name caps.
 pub const BOUNTY_TITLE_MAX_CHARS: usize = 120;
@@ -228,21 +228,21 @@ pub const BOUNTY_TITLE_MAX_CHARS: usize = 120;
 /// Kit-internal cap for a bounty's player- or game-authored
 /// `description`.
 ///
-/// SPEC §4.5 frames `description` as the longer body copy explaining
+///  frames `description` as the longer body copy explaining
 /// the work and the evidence required. The kit caps it at 1000 chars
 /// — the same default the notice-body field ships with via
 /// `MultiplayerSection::max_notice_body_chars` — but bounty
-/// descriptions are not configurable per game in v3 (SPEC §5.2 only
+/// descriptions are not configurable per game in ( only
 /// lists the notice body knob). 1000 chars is a few short paragraphs:
 /// enough to set up a clue chain, list evidence requirements, and
 /// add some flavour, without inviting a wall of text the bounty board
 /// can't render in its detail panel.
 ///
 /// Counted in Unicode scalar values, the same rule as
-/// [`BOUNTY_TITLE_MAX_CHARS`] and every other v3 player-authored cap.
+/// [`BOUNTY_TITLE_MAX_CHARS`] and every other player-authored cap.
 pub const BOUNTY_DESCRIPTION_MAX_CHARS: usize = 1000;
 
-/// Lifecycle state for a [`Bounty`] — SPEC_v3 §4.5 vocabulary.
+/// Lifecycle state for a [`Bounty`] — vocabulary.
 ///
 /// The kit's helpers ([`WorldDb::post_bounty`] and the upcoming
 /// 7c–7e transitions) use this enum at their boundaries so call sites
@@ -253,22 +253,22 @@ pub const BOUNTY_DESCRIPTION_MAX_CHARS: usize = 1000;
 /// edit (schema migration plus enum variant). Same shape as
 /// [`crate::challenges::ChallengeState`].
 ///
-/// Variants are listed in the natural lifecycle order — `Open` first,
+/// Variants are listed in the natural lifecycle order — `Open` first.
 /// terminal states last — so `Debug` output reads naturally in
 /// failure messages.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BountyState {
-    /// Freshly posted and awaiting a claimant. SPEC §4.5 default;
+    /// Freshly posted and awaiting a claimant. default;
     /// matches the schema-level `DEFAULT 'open'`.
     Open,
     /// A claimant has picked up the bounty and is working on it. Set
-    /// by Task 7c on the `open -> claimed` transition.
+    /// by on the `open -> claimed` transition.
     Claimed,
     /// The claimant submitted evidence and game code accepted it.
-    /// Terminal state set by Task 7d on `claimed -> completed`.
+    /// Terminal state set by on `claimed -> completed`.
     Completed,
     /// The bounty's `expires_at` deadline lapsed before completion.
-    /// Terminal state set by Task 7e's sweeper on `open -> expired`
+    /// Terminal state set by 's sweeper on `open -> expired`
     /// or `claimed -> expired`.
     Expired,
 }
@@ -295,18 +295,18 @@ impl BountyState {
 /// Library-internal `thiserror` shape — the runtime wraps these with
 /// `anyhow` at the process boundary. Mirrors
 /// [`crate::market::MarketError`] and
-/// [`crate::challenges::ChallengeError`] so all v3 multiplayer write
+/// [`crate::challenges::ChallengeError`] so all multiplayer write
 /// paths surface errors with the same shape. (A future code review
 /// pass could fold these into a single multiplayer-error trait once
-/// every v3 primitive lands; SPEC tenet "no premature abstraction"
+/// every primitive lands; tenet "no premature abstraction"
 /// keeps them separate today — there is no shared consumer yet.)
 ///
-/// Task 7b needs: `EmptyTitle`, `EmptyDescription`, `EmptyReward`,
+///  needs: `EmptyTitle`, `EmptyDescription`, `EmptyReward`.
 /// `TitleTooLong`, `DescriptionTooLong`, and `Sqlite`. `NotFound`
-/// and the transition-time variants land with Tasks 7c–7e.
+/// and the transition-time variants land with.
 #[derive(Debug, Error)]
 pub enum BountyError {
-    /// `title` was empty. SPEC §4.5 lists `title` as required; the
+    /// `title` was empty. lists `title` as required; the
     /// kit additionally rejects the empty string here so the bounty
     /// board never renders a row with a blank headline that the
     /// browser can't tell apart from a rendering bug. Same rationale
@@ -315,18 +315,18 @@ pub enum BountyError {
     #[error("bounty title must not be empty")]
     EmptyTitle,
     /// `description` was empty. Same rationale as
-    /// [`Self::EmptyTitle`]: schema-level `NOT NULL` accepts `""`,
+    /// [`Self::EmptyTitle`]: schema-level `NOT NULL` accepts `""`.
     /// but a bounty whose detail screen is blank is indistinguishable
     /// from a UI glitch. Player-authored "see attached" or "ask the
-    /// poster" bounties belong in a flavour line in the description,
+    /// poster" bounties belong in a flavour line in the description.
     /// not in a literally-empty body.
     #[error("bounty description must not be empty")]
     EmptyDescription,
-    /// `reward` was empty. SPEC §4.5 lists `reward JSON` without an
+    /// `reward` was empty. lists `reward JSON` without an
     /// "optional" modifier — every bounty advertises a payout. The
     /// kit additionally rejects the empty string at the boundary so
     /// a regression that dropped the reward mid-call (an
-    /// `unwrap_or_default()` pattern, say) surfaces here as a typed
+    /// `unwrap_or_default` pattern, say) surfaces here as a typed
     /// error rather than as an indistinguishable-from-narrative `""`
     /// payload in the audit view. Game code that genuinely has no
     /// structured reward MUST still pass an explicit JSON value
@@ -337,7 +337,7 @@ pub enum BountyError {
     EmptyReward,
     /// `title` exceeded [`BOUNTY_TITLE_MAX_CHARS`]. Surfacing both
     /// the limit and the actual length lets the authoring screen
-    /// show "120 / 137 characters" without re-counting. Same shape
+    /// show "120 137 characters" without re-counting. Same shape
     /// as [`crate::notices::NoticeError::SubjectTooLong`].
     #[error("bounty title exceeds {max}-character limit (got {actual})")]
     TitleTooLong {
@@ -345,7 +345,7 @@ pub enum BountyError {
         /// [`BOUNTY_TITLE_MAX_CHARS`], named so future per-game caps
         /// (if ever introduced) don't break the error shape.
         max: usize,
-        /// Actual `chars().count()` of the rejected title, in scalar
+        /// Actual `chars.count` of the rejected title, in scalar
         /// values.
         actual: usize,
     },
@@ -357,7 +357,7 @@ pub enum BountyError {
         /// Cap that was breached — currently always
         /// [`BOUNTY_DESCRIPTION_MAX_CHARS`].
         max: usize,
-        /// Actual `chars().count()` of the rejected description, in
+        /// Actual `chars.count` of the rejected description, in
         /// scalar values.
         actual: usize,
     },
@@ -375,7 +375,7 @@ pub enum BountyError {
     },
     /// No `bounties` row exists with the given id. Surfaced by the
     /// transition helpers ([`WorldDb::claim_bounty`] and the upcoming
-    /// `complete_bounty` / `expire_bounties` paths) when the
+    /// `complete_bounty` `expire_bounties` paths) when the
     /// caller's id is stale or the row was removed by an operator.
     /// Same shape as [`crate::challenges::ChallengeError::NotFound`].
     #[error("bounty {id} does not exist")]
@@ -385,7 +385,7 @@ pub enum BountyError {
         id: i64,
     },
     /// The transition is not legal from the bounty's current state.
-    /// SPEC §4.5 mandates exactly three transitions: `open ->
+    ///  mandates exactly three transitions: `open ->
     /// claimed`, `claimed -> completed`, and `{open,claimed} ->
     /// expired`. Every other (from, to) pair fails with this
     /// variant. Carrying both `from` (the actual state the row was
@@ -407,9 +407,9 @@ pub enum BountyError {
         to: BountyState,
     },
     /// The bounty was still in `open` but its `expires_at` deadline
-    /// has already passed. SPEC §4.5 makes deadlined bounties
+    /// has already passed. makes deadlined bounties
     /// uncl­aimable past their deadline — the kit refuses to flip
-    /// `open -> claimed` even before the Task 7e sweeper runs, so
+    /// `open -> claimed` even before the sweeper runs, so
     /// a slow sweeper can't widen the window in which a stale
     /// bounty looks claimable. A separate variant from
     /// [`Self::InvalidTransition`] lets the UI distinguish "this
@@ -423,9 +423,9 @@ pub enum BountyError {
     },
 }
 
-/// In-memory mirror of a `bounties` row — SPEC_v3 §4.5.
+/// In-memory mirror of a `bounties` row
 ///
-/// Returned by [`WorldDb::post_bounty`] and the upcoming Task 7c–7e
+/// Returned by [`WorldDb::post_bounty`] and the upcoming
 /// transition helpers. The struct shape matches the table column
 /// shape one-for-one and in declaration order so `row_to_bounty` is
 /// a positional decode and a future column reorder surfaces as a
@@ -442,15 +442,15 @@ pub enum BountyError {
 pub struct Bounty {
     /// Autoincrement primary key. Doubles as the deterministic
     /// tiebreaker for queries that order by `created_at` and need a
-    /// stable secondary sort, the same role as `notices.id`,
+    /// stable secondary sort, the same role as `notices.id`.
     /// `challenges.id`, and `market_listings.id`.
     pub id: i64,
     /// UTC timestamp written by SQLite at insert time
     /// (`CURRENT_TIMESTAMP`). Kept as ISO text so it sorts lexically
     /// the same way it sorts chronologically. See module docs.
     pub created_at: String,
-    /// Poster's `players.id`, or `None` for system / NPC-organisation
-    /// bounties. SPEC §4.5 explicitly lists "posted_by player id
+    /// Poster's `players.id`, or `None` for system NPC-organisation
+    /// bounties. explicitly lists "posted_by player id
     /// optional".
     pub posted_by_player_id: Option<i64>,
     /// Player- or game-authored short headline rendered on the bounty
@@ -462,18 +462,18 @@ pub struct Bounty {
     /// the evidence required. Length bounds are enforced by
     /// [`WorldDb::post_bounty`] at [`BOUNTY_DESCRIPTION_MAX_CHARS`].
     pub description: String,
-    /// Opaque reward payload (typically JSON describing currency,
+    /// Opaque reward payload (typically JSON describing currency.
     /// items, faction reputation). Round-tripped verbatim; the kit
     /// imposes no schema. Required — see [`BountyError::EmptyReward`].
     pub reward: String,
-    /// Lifecycle state — one of `open`, `claimed`, `completed`,
+    /// Lifecycle state — one of `open`, `claimed`, `completed`.
     /// `expired`. The schema-level `CHECK` constraint pins the
     /// vocabulary; see [`BOUNTIES_MIGRATION`].
     pub state: String,
     /// Claimant's `players.id`, or `None` while the bounty is still
     /// open or expired-without-claim. Populated on the
-    /// `open -> claimed` transition (Task 7c) and preserved through
-    /// `claimed -> completed` (Task 7d).
+    /// `open -> claimed` transition and preserved through
+    /// `claimed -> completed`.
     pub claimed_by_player_id: Option<i64>,
     /// ISO timestamp of the `open -> claimed` transition, or `None`
     /// while the bounty has not been claimed.
@@ -481,7 +481,7 @@ pub struct Bounty {
     /// ISO timestamp of the `claimed -> completed` transition, or
     /// `None` while the bounty has not been completed.
     pub completed_at: Option<String>,
-    /// Optional ISO deadline. After this time, the Task 7e sweeper
+    /// Optional ISO deadline. After this time, the sweeper
     /// may transition an `open` or `claimed` bounty to `expired`.
     /// `None` means open-ended (no deadline).
     pub expires_at: Option<String>,
@@ -489,27 +489,27 @@ pub struct Bounty {
 
 impl WorldDb {
     /// Insert one row into `bounties` and return the canonical
-    /// [`Bounty`] SQLite produced (SPEC_v3 §4.5 / §Task 7b).
+    /// [`Bounty`] SQLite produced.
     ///
     /// The contract is "the bounty I asked you to post is now
     /// durably on the board, in state `open`, with the id and
     /// `created_at` SQLite assigned, and `claimed_by_player_id` /
-    /// `claimed_at` / `completed_at` all still `NULL`". The state
-    /// is intentionally not a parameter — SPEC §4.5 mandates `open`
-    /// as the entry state per Task 7b's "starts open" acceptance,
+    /// `claimed_at` `completed_at` all still `NULL`". The state
+    /// is intentionally not a parameter — mandates `open`
+    /// as the entry state per 's "starts open" acceptance.
     /// and the kit owns that invariant. The schema-level
     /// `DEFAULT 'open'` plus this helper's `RETURNING` round-trip
     /// keeps the lifecycle honest: even an operator who tampered
     /// with the helper signature can't smuggle a row in at
     /// `claimed` without also dropping the migration's CHECK.
     ///
-    /// `posted_by_player_id` is `Option<i64>` because SPEC §4.5
+    /// `posted_by_player_id` is `Option<i64>` because
     /// explicitly allows "posted_by player id optional" — detective
     /// agencies, the city, or other in-game NPC organisations may
     /// post bounties without a real Foglet user behind them.
     /// `title`, `description`, and `reward` are required text;
     /// `expires_at` is optional (`None` means open-ended, no
-    /// deadline). The lifecycle columns (`claimed_by_player_id`,
+    /// deadline). The lifecycle columns (`claimed_by_player_id`.
     /// `claimed_at`, `completed_at`) are intentionally not exposed
     /// on this path — a brand-new bounty has no claimant or
     /// completion, and exposing them as parameters would invite a
@@ -520,7 +520,7 @@ impl WorldDb {
     ///
     /// All checks run **before** the SQL round-trip so a rejected
     /// bounty never produces a row, an autoincrement gap, or a
-    /// future event-log entry. Order — emptiness first (cheapest),
+    /// future event-log entry. Order — emptiness first (cheapest).
     /// then length — mirrors [`Self::send_notice`] and
     /// [`Self::create_listing`] so a UI that re-renders the
     /// authoring screen on failure shows a consistent surface
@@ -533,7 +533,7 @@ impl WorldDb {
     ///
     /// We use SQLite's `RETURNING` clause (≥ 3.35) to read the
     /// canonical row — `id`, the SQL-side `created_at`, the
-    /// `'open'` default for `state`, plus every other column —
+    /// `'open'` default for `state`, plus every other column
     /// without a second round-trip, the same pattern as
     /// [`Self::send_notice`], [`Self::create_listing`], and
     /// [`Self::create_challenge`].
@@ -541,12 +541,12 @@ impl WorldDb {
     /// # Concurrency
     ///
     /// Takes `&self`: a single insert statement under the
-    /// configured busy timeout. SPEC §4.5 requires
+    /// configured busy timeout. requires
     /// "Claim/complete transitions MUST be transactional"; the
     /// *posting* path is a single `INSERT` and thus already
     /// atomic, so no explicit transactional wrapper is needed
     /// here. The 7c–7e transition helpers will need explicit
-    /// transactions because they read the current state, validate,
+    /// transactions because they read the current state, validate.
     /// and then write.
     pub fn post_bounty(
         &self,
@@ -557,7 +557,7 @@ impl WorldDb {
         expires_at: Option<&str>,
     ) -> Result<Bounty, BountyError> {
         // Validation runs before the SQL round-trip so a rejected
-        // bounty never produces a row. Emptiness first (cheapest),
+        // bounty never produces a row. Emptiness first (cheapest).
         // then length — same ordering as the notice and market
         // paths, so a UI that re-renders the authoring screen on
         // failure shows a consistent surface across primitives.
@@ -570,7 +570,7 @@ impl WorldDb {
         if reward.is_empty() {
             return Err(BountyError::EmptyReward);
         }
-        // Count Unicode scalar values, not bytes — SPEC §4.5 / §7
+        // Count Unicode scalar values, not bytes
         // talk in characters, and a byte cap would penalise non-
         // ASCII titles and descriptions.
         let title_chars = title.chars().count();
@@ -611,19 +611,19 @@ RETURNING id, created_at, posted_by_player_id, title, description, \
     }
 
     /// Transition a bounty from `open` to `claimed` and stamp
-    /// `claimed_by_player_id` + `claimed_at` (SPEC_v3 §4.5 / §Task
+    /// `claimed_by_player_id` + `claimed_at` ( Task
     /// 7c).
     ///
     /// The contract is "if and only if the row was still `open` and
     /// not past its deadline, it is now `claimed` with the named
     /// claimant and a `claimed_at` timestamp; otherwise the row is
     /// unchanged and the helper returns a typed error explaining
-    /// why". SPEC §4.5 lists `open -> claimed` as the only legal
+    /// why". lists `open -> claimed` as the only legal
     /// entry into the `claimed` state — every other current state
     /// (already `claimed`, terminal `completed`/`expired`) surfaces
     /// as [`BountyError::InvalidTransition`], and that includes the
-    /// "second claimant rejected" acceptance case from the §Task 7c
-    /// brief: the loser of a claim race sees `from = "claimed"`,
+    /// "second claimant rejected" acceptance case from the
+    /// brief: the loser of a claim race sees `from = "claimed"`.
     /// `to = BountyState::Claimed`, with the row already attributed
     /// to the winner.
     ///
@@ -634,7 +634,7 @@ RETURNING id, created_at, posted_by_player_id, title, description, \
     ///
     /// 1. `id = ?1` — addresses the row.
     /// 2. `state = 'open'` — only the `open -> claimed` transition
-    ///    is legal (SPEC §4.5); any other current state must fall
+    ///    is legal ; any other current state must fall
     ///    through to the diagnostic SELECT and become an
     ///    [`BountyError::InvalidTransition`].
     /// 3. `expires_at IS NULL OR datetime(expires_at) > datetime('now')`
@@ -642,7 +642,7 @@ RETURNING id, created_at, posted_by_player_id, title, description, \
     ///    claimable; deadlined bounties are claimable only while
     ///    the deadline is still in the future. Wrapping both sides
     ///    in `datetime(…)` normalises the two ISO forms the kit
-    ///    accepts (`'YYYY-MM-DDTHH:MM:SSZ'` from callers,
+    ///    accepts (`'YYYY-MM-DDTHH:MM:SSZ'` from callers.
     ///    `'YYYY-MM-DD HH:MM:SS'` from `CURRENT_TIMESTAMP`) so the
     ///    comparison is chronological rather than lexicographic.
     ///    Same shape as [`Self::accept_challenge`].
@@ -676,7 +676,7 @@ RETURNING id, created_at, posted_by_player_id, title, description, \
     /// `QueryReturnedNoRows`, the diagnostic SELECT reads the
     /// just-flipped `'claimed'` state, and the loser surfaces
     /// `InvalidTransition { from: "claimed", to: Claimed }`. This
-    /// is the §Task 7c "second claimant rejected" acceptance —
+    /// is the "second claimant rejected" acceptance
     /// pinned by the `claim_bounty_rejects_second_claimant` test.
     ///
     /// # Failure
@@ -686,14 +686,14 @@ RETURNING id, created_at, posted_by_player_id, title, description, \
     ///   `expires_at` deadline has passed.
     /// - [`BountyError::InvalidTransition`] — row is in any state
     ///   other than `open` (already `claimed`, `completed`, or
-    ///   swept to `expired` by Task 7e).
+    ///   swept to `expired` by ).
     /// - [`BountyError::Sqlite`] — any other `rusqlite` error.
     ///
     /// # Concurrency
     ///
     /// Takes `&self`: a single `UPDATE … RETURNING` plus an
     /// optional diagnostic `SELECT` under the configured busy
-    /// timeout. SPEC §4.5 requires "Claim/complete transitions MUST
+    /// timeout. requires "Claim/complete transitions MUST
     /// be transactional"; a single conditional `UPDATE` is natively
     /// atomic in SQLite, so no explicit `BEGIN`/`COMMIT` wrapper is
     /// needed here. Same borrow shape as [`Self::post_bounty`].
@@ -703,7 +703,7 @@ RETURNING id, created_at, posted_by_player_id, title, description, \
         claimant_player_id: i64,
     ) -> Result<Bounty, BountyError> {
         // Conditional UPDATE: only an `open + still-fresh` row gets
-        // transitioned. SPEC §4.5 transitions are exhaustive — any
+        // transitioned. transitions are exhaustive — any
         // non-matching row falls through to the diagnostic SELECT
         // below for typed-error mapping.
         const UPDATE_SQL: &str = "\
@@ -732,9 +732,9 @@ RETURNING id, created_at, posted_by_player_id, title, description, \
     }
 
     /// Transition a bounty from `claimed` to `completed` and stamp
-    /// `completed_at` (SPEC_v3 §4.5 / §Task 7d).
+    /// `completed_at`.
     ///
-    /// The contract is "if and only if the row was still `claimed`,
+    /// The contract is "if and only if the row was still `claimed`.
     /// it is now `completed` with a `completed_at` timestamp; the
     /// `reward`, `claimed_by_player_id`, and `claimed_at` columns
     /// are preserved verbatim so the audit view shows who claimed
@@ -742,8 +742,8 @@ RETURNING id, created_at, posted_by_player_id, title, description, \
     /// current state (still `open`, already `completed`, swept to
     /// `expired`) surfaces as [`BountyError::InvalidTransition`]".
     ///
-    /// SPEC §4.5 says "Game code validates completion evidence" —
-    /// the kit's responsibility is the transactional state flip,
+    ///  says "Game code validates completion evidence"
+    /// the kit's responsibility is the transactional state flip.
     /// not the evidence. Game code calls `complete_bounty` after
     /// it has validated whatever the player submitted (a photograph
     /// id, a captured suspect, a delivered item) against its own
@@ -759,7 +759,7 @@ RETURNING id, created_at, posted_by_player_id, title, description, \
     /// complete" vs "the poster confirms completion" all live in
     /// the calling code's evidence-validation step. Pinning the
     /// claimant inside the kit would force one of those choices on
-    /// every consuming game; SPEC §4.5 deliberately leaves it open.
+    /// every consuming game; deliberately leaves it open.
     /// Same convention as [`Self::resolve_challenge`], which doesn't
     /// gate on which side calls it either.
     ///
@@ -770,7 +770,7 @@ RETURNING id, created_at, posted_by_player_id, title, description, \
     ///
     /// 1. `id = ?1` — addresses the row.
     /// 2. `state = 'claimed'` — only the `claimed -> completed`
-    ///    transition is legal (SPEC §4.5); any other current state
+    ///    transition is legal ; any other current state
     ///    falls through to the diagnostic SELECT for typed-error
     ///    mapping.
     ///
@@ -778,7 +778,7 @@ RETURNING id, created_at, posted_by_player_id, title, description, \
     /// `state = 'completed'` and `completed_at = CURRENT_TIMESTAMP`.
     /// `reward`, `claimed_by_player_id`, and `claimed_at` are
     /// deliberately not in the SET list — they were set on earlier
-    /// transitions and must survive untouched so the §Task 7d
+    /// transitions and must survive untouched so the
     /// "reward payload retained" acceptance criterion holds.
     ///
     /// Note this path does NOT gate on `expires_at`: a `claimed`
@@ -788,7 +788,7 @@ RETURNING id, created_at, posted_by_player_id, title, description, \
     /// `diagnose_failed_bounty_transition` helper restricts
     /// [`BountyError::Expired`] to `attempted == Claimed` so this
     /// path can never accidentally surface it. (A separate sweeper
-    /// path — Task 7e — will flip lapsed `claimed` rows to
+    /// path — — will flip lapsed `claimed` rows to
     /// `expired`, after which a future `complete_bounty` against
     /// the same id surfaces `InvalidTransition` from `expired`.)
     ///
@@ -796,23 +796,23 @@ RETURNING id, created_at, posted_by_player_id, title, description, \
     ///
     /// - [`BountyError::NotFound`] — no row matches `id`.
     /// - [`BountyError::InvalidTransition`] — row is in any state
-    ///   other than `claimed` (still `open`, already `completed`,
-    ///   or swept to `expired` by Task 7e).
+    ///   other than `claimed` (still `open`, already `completed`.
+    ///   or swept to `expired` by ).
     /// - [`BountyError::Sqlite`] — any other `rusqlite` error.
     ///
     /// # Concurrency
     ///
     /// Takes `&self`: a single `UPDATE … RETURNING` plus an
     /// optional diagnostic `SELECT` under the configured busy
-    /// timeout. SPEC §4.5 requires "Claim/complete transitions
+    /// timeout. requires "Claim/complete transitions
     /// MUST be transactional"; a single conditional `UPDATE` is
     /// natively atomic in SQLite, so no explicit `BEGIN`/`COMMIT`
     /// wrapper is needed here. Same borrow shape as
     /// [`Self::claim_bounty`].
     pub fn complete_bounty(&self, bounty_id: i64) -> Result<Bounty, BountyError> {
         // Conditional UPDATE: only a `claimed` row gets transitioned.
-        // The SET list intentionally excludes `reward`,
-        // `claimed_by_player_id`, and `claimed_at` so the §Task 7d
+        // The SET list intentionally excludes `reward`.
+        // `claimed_by_player_id`, and `claimed_at` so the
         // "reward payload retained" acceptance and the audit-view
         // attribution survive the flip.
         const UPDATE_SQL: &str = "\
@@ -840,9 +840,9 @@ RETURNING id, created_at, posted_by_player_id, title, description, \
     /// Sweep every `open` or `claimed` bounty whose `expires_at` is
     /// non-`NULL` and has lapsed at `now`, flipping it to the
     /// terminal `expired` state and returning the swept rows
-    /// (SPEC_v3 §4.5 / §Task 7e).
+    /// .
     ///
-    /// SPEC §4.5 lifts a state machine where `expired` is a terminal
+    ///  lifts a state machine where `expired` is a terminal
     /// state distinct from `completed`: a bounty whose deadline ran
     /// out without a successful completion is *not* the same as one
     /// that paid out — the audit view must keep them apart so an
@@ -858,12 +858,12 @@ RETURNING id, created_at, posted_by_player_id, title, description, \
     /// deadline gate and is in flight), bounty sweep covers BOTH
     /// `open` and `claimed`. The rationale is in
     /// [`BOUNTIES_MIGRATION`]'s `idx_bounties_expiring` doc and
-    /// reflects SPEC §4.5: "a claimant who never completes their
+    /// reflects: "a claimant who never completes their
     /// work shouldn't pin the bounty open forever". A bounty board
     /// with rows stuck in `claimed` because the claimant walked away
     /// is worse than one that re-opens to a fresh poster — and the
     /// audit view still preserves who *did* claim it via the
-    /// surviving `claimed_by_player_id` / `claimed_at` columns,
+    /// surviving `claimed_by_player_id` `claimed_at` columns.
     /// which the SET list deliberately leaves untouched.
     ///
     /// `completed` and already-`expired` rows are out of scope: the
@@ -879,7 +879,7 @@ RETURNING id, created_at, posted_by_player_id, title, description, \
     /// identical to the deadline-gate shape used in
     /// [`Self::claim_bounty`] (the same `datetime(expires_at) <=
     /// datetime(?1)` comparison that gate inverts), lets tests pin
-    /// the cutoff to a specific instant, and matches SPEC §Task 7e's
+    /// the cutoff to a specific instant, and matches 's
     /// call signature shape (`expire_bounties(now)`). Production
     /// callers pass an ISO timestamp synthesised from the runtime
     /// clock at the call site.
@@ -897,12 +897,12 @@ RETURNING id, created_at, posted_by_player_id, title, description, \
     ///    deadline must never be swept. A regression that dropped
     ///    this gate would silently expire every "ongoing" bounty.
     /// 3. `datetime(expires_at) <= datetime(?1)` — the deadline has
-    ///    already passed at `now`. The `datetime()` wrapping handles
+    ///    already passed at `now`. The `datetime` wrapping handles
     ///    both ISO forms the kit accepts (`'YYYY-MM-DDTHH:MM:SSZ'`
     ///    from callers, `'YYYY-MM-DD HH:MM:SS'` from
-    ///    `CURRENT_TIMESTAMP` / SQLite-native columns) so the
+    ///    `CURRENT_TIMESTAMP` SQLite-native columns) so the
     ///    comparison is chronological, not lexicographic — same
-    ///    normalisation Task 7c's claim gate uses, so a row that
+    ///    normalisation 's claim gate uses, so a row that
     ///    fails the claim gate is the exact same row this sweep
     ///    catches on the next pass.
     ///
@@ -929,7 +929,7 @@ RETURNING id, created_at, posted_by_player_id, title, description, \
     /// can log them, append world events (e.g. a "bounty expired"
     /// bulletin), or render an "expired since last visit"
     /// notification — all without a follow-up `SELECT`. Callers that
-    /// only need a count call `.len()` on the result. An empty
+    /// only need a count call `.len` on the result. An empty
     /// `Vec` is the success case when nothing was due. Same return
     /// shape as [`Self::expire_open_challenges`].
     ///
@@ -937,7 +937,7 @@ RETURNING id, created_at, posted_by_player_id, title, description, \
     ///
     /// - [`BountyError::Sqlite`] — the `UPDATE … RETURNING` failed.
     ///
-    /// `NotFound` / `InvalidTransition` / `Expired` are not in the
+    /// `NotFound` `InvalidTransition` `Expired` are not in the
     /// failure set: a sweeper that finds nothing is a success, not
     /// an error.
     ///
@@ -945,7 +945,7 @@ RETURNING id, created_at, posted_by_player_id, title, description, \
     ///
     /// Takes `&self`: a single `UPDATE … RETURNING` under the
     /// configured busy timeout. Naturally atomic as a single
-    /// statement (SPEC §4.5 "Claim/complete transitions MUST be
+    /// statement ( "Claim/complete transitions MUST be
     /// transactional"; the sweep's `open -> expired` /
     /// `claimed -> expired` flips inherit the same guarantee). Same
     /// borrow shape as [`Self::expire_open_challenges`] and the
@@ -983,7 +983,7 @@ RETURNING id, created_at, posted_by_player_id, title, description, \
     /// Pulled out of [`Self::claim_bounty`] so the upcoming
     /// `complete_bounty` and `expire_bounties` helpers (Tasks
     /// 7d/7e) can share the same diagnostic. The function does
-    /// exactly one SELECT and returns the most specific error —
+    /// exactly one SELECT and returns the most specific error
     /// `NotFound` > `Expired` > `InvalidTransition` — without ever
     /// returning `Ok`. Internal-only; not part of the public API.
     /// Same shape as [`crate::challenges`]'s diagnostic helper.
@@ -1002,7 +1002,7 @@ RETURNING id, created_at, posted_by_player_id, title, description, \
         attempted: BountyState,
     ) -> BountyError {
         // Compute the deadline check in SQL so it uses the same
-        // `datetime()` normalisation as the UPDATE — a mismatch
+        // `datetime` normalisation as the UPDATE — a mismatch
         // here would let the diagnostic disagree with the gate that
         // produced the no-rows in the first place.
         const DIAG_SQL: &str = "\
@@ -1045,8 +1045,8 @@ FROM bounties WHERE id = ?1";
 
 /// Decode one `bounties` row into a [`Bounty`].
 ///
-/// Pulled out so the Task 7b write path and the upcoming Task
-/// 7c–7e transition / query paths can share one decoder. Column
+/// Pulled out so the write path and the upcoming Task
+/// 7c–7e transition query paths can share one decoder. Column
 /// order matches the `RETURNING` clause in
 /// [`WorldDb::post_bounty`] *and* future SELECTs (e.g. an
 /// `open_bounties` listing); a regression that reorders columns
@@ -1075,14 +1075,14 @@ mod tests {
     use crate::players::PLAYERS_MIGRATION;
     use tempfile::tempdir;
 
-    /// SPEC_v3 §Task 7a acceptance: applying [`BOUNTIES_MIGRATION`]
+    ///   acceptance: applying [`BOUNTIES_MIGRATION`]
     /// creates the documented `bounties` table with the column shape
-    /// SPEC §4.5 pins. Asserts both:
+    ///  pins. Asserts both:
     ///
     /// 1. The table exists in `sqlite_master` (so a regression that
     ///    silently dropped `CREATE TABLE` from the migration body
     ///    would flunk).
-    /// 2. The columns and order match the SPEC §4.5 contract (so a
+    /// 2. The columns and order match the contract (so a
     ///    later edit that renames or reorders a column flunks here
     ///    rather than buried in a 7b–7e behavioural test).
     ///
@@ -1127,13 +1127,13 @@ mod tests {
                 "completed_at".to_string(),
                 "expires_at".to_string(),
             ],
-            "bounties column shape must match the SPEC_v3 §4.5 contract"
+            "bounties column shape must match the contract"
         );
     }
 
-    /// SPEC §4.5 implies the bounty state machine is
+    ///  implies the bounty state machine is
     /// `open -> claimed -> completed`, plus `open -> expired` and
-    /// `claimed -> expired` (Tasks 7c–7e flip the columns). The
+    /// `claimed -> expired` ( flip the columns). The
     /// migration encodes that vocabulary via a `CHECK` constraint
     /// so a code path that ever tried to write an out-of-vocabulary
     /// state (e.g. `'cancelled'`, `'paid'`, a typo like
@@ -1167,17 +1167,17 @@ mod tests {
         );
         assert!(
             bogus.is_err(),
-            "CHECK constraint must reject states outside the SPEC §4.5 vocabulary"
+            "CHECK constraint must reject states outside the vocabulary"
         );
     }
 
-    /// The Task 7b/7c/7d/7e helpers walk three partial indexes the
+    /// The helpers walk three partial indexes the
     /// migration creates up-front. If any of them ever stops being
     /// created, the read silently becomes a full table scan in
     /// production. Pin every index name plus its partial predicate
     /// so a regression flunks at `cargo test` rather than under
     /// load. Same rationale as
-    /// `challenges_partial_indexes_are_present`,
+    /// `challenges_partial_indexes_are_present`.
     /// `market_listings_active_partial_index_is_present`, and
     /// `factions_partial_indexes_are_present`.
     #[test]
@@ -1210,7 +1210,7 @@ mod tests {
             "idx_bounties_expiring must filter expires_at IS NOT NULL; got: {expiring_sql}"
         );
         // Both 'open' and 'claimed' bounties must be eligible for
-        // expiry per SPEC §4.5 — a claimant who never completes
+        // expiry — a claimant who never completes
         // their work shouldn't pin the bounty open forever. Pin
         // both states in the predicate so a regression that
         // narrowed the index to one state flunks here.
@@ -1221,11 +1221,11 @@ mod tests {
     }
 
     /// The migration is idempotent. v2's relaunch path applies the
-    /// same migration list every open; v3 inherits that contract.
+    /// same migration list every open; inherits that contract.
     /// A second `apply_migration(&BOUNTIES_MIGRATION)` MUST be a
     /// no-op (the version is already in `world_migrations`), not
     /// an error from `CREATE TABLE` on an existing table. Same
-    /// shape as `challenges_migration_is_idempotent`,
+    /// shape as `challenges_migration_is_idempotent`.
     /// `market_listings_migration_is_idempotent`, and
     /// `factions_migration_is_idempotent`.
     #[test]
@@ -1249,7 +1249,7 @@ mod tests {
     /// migrations applied. Returned tuple keeps the `TempDir` alive
     /// for the test's scope (dropping it would unlink the SQLite
     /// file mid-test). Same shape as
-    /// `notices::tests::world_with_notices`,
+    /// `notices::tests::world_with_notices`.
     /// `market::tests::world_with_listings`, and
     /// `factions::tests::world_with_factions`.
     fn world_with_bounties() -> (tempfile::TempDir, WorldDb) {
@@ -1285,7 +1285,7 @@ mod tests {
         (dir, world, poster_id)
     }
 
-    /// SPEC_v3 §Task 7b acceptance: a valid `post_bounty` round-
+    ///   acceptance: a valid `post_bounty` round-
     /// trips a fully-populated [`Bounty`] back to the caller — the
     /// kit-assigned `id` is non-zero, `created_at` is the SQLite-
     /// stamped ISO timestamp, every input field is preserved
@@ -1321,7 +1321,7 @@ mod tests {
             "Last seen on the 3rd-floor landing. Bring photographic evidence."
         );
         assert_eq!(bounty.reward, r#"{"credits":250}"#);
-        // The §Task 7b "starts open" acceptance criterion. Pinned
+        // The "starts open" acceptance criterion. Pinned
         // against both the schema-side default and the typed enum
         // encoding so a regression in either layer flunks here.
         assert_eq!(bounty.state, BountyState::Open.as_str());
@@ -1360,8 +1360,8 @@ mod tests {
         assert_eq!(durable_state, "open");
     }
 
-    /// SPEC §4.5 explicitly allows "posted_by player id optional"
-    /// — system / NPC-organisation bounties (e.g. the city offering
+    ///  explicitly allows "posted_by player id optional"
+    /// — system NPC-organisation bounties (e.g. the city offering
     /// a clue bounty in `murder_motel`). A `None`
     /// `posted_by_player_id` MUST round-trip — pinned here so a
     /// future helper that defensively defaults to "must have a
@@ -1389,7 +1389,7 @@ mod tests {
         );
     }
 
-    /// SPEC §4.5 lists `title` as required. The kit additionally
+    ///  lists `title` as required. The kit additionally
     /// rejects `""` at the boundary so a blank-title regression
     /// surfaces as a typed [`BountyError::EmptyTitle`] before it
     /// touches `world.sqlite`. Mirrors
@@ -1421,7 +1421,7 @@ mod tests {
         );
     }
 
-    /// SPEC §4.5 lists `description` as required. Empty
+    ///  lists `description` as required. Empty
     /// descriptions are rejected at the boundary for the same
     /// reason as empty notice bodies — a bounty whose detail
     /// screen is blank is indistinguishable from a UI bug.
@@ -1438,7 +1438,7 @@ mod tests {
         );
     }
 
-    /// SPEC §4.5 lists `reward JSON` without an "optional" modifier
+    ///  lists `reward JSON` without an "optional" modifier
     /// — every bounty advertises a payout. The kit additionally
     /// rejects `""` at the boundary so a "regression dropped the
     /// reward" bug surfaces as a typed
@@ -1549,7 +1549,7 @@ mod tests {
 
     /// Variant of [`world_with_bounties`] that pre-creates a poster
     /// and two distinct claimant players, returning their player ids.
-    /// Used by the §Task 7c claim-bounty tests that need at least
+    /// Used by the claim-bounty tests that need at least
     /// two attributable claimants (the second-claimant-rejected case).
     fn world_with_poster_and_two_claimants() -> (tempfile::TempDir, WorldDb, i64, i64, i64) {
         let (dir, world, poster_id) = world_with_poster();
@@ -1574,7 +1574,7 @@ mod tests {
         (dir, world, poster_id, alice_id, bob_id)
     }
 
-    /// SPEC_v3 §Task 7c acceptance, half 1: a fresh `open` bounty
+    ///   acceptance, half 1: a fresh `open` bounty
     /// transitions to `claimed` on a successful claim. Pin the full
     /// post-conditions in one place so a regression in any of them
     /// flunks here:
@@ -1653,15 +1653,15 @@ mod tests {
         assert_eq!(stored, claimed, "stored row must equal RETURNING row");
     }
 
-    /// SPEC_v3 §Task 7c acceptance, half 2: a second claimant must
+    ///   acceptance, half 2: a second claimant must
     /// be rejected. The conditional UPDATE with `WHERE state =
     /// 'open'` ensures only the first caller wins the race; the
-    /// loser surfaces as `InvalidTransition { from: "claimed",
+    /// loser surfaces as `InvalidTransition { from: "claimed".
     /// to: Claimed }`. Pin three things to lock the contract:
     ///
     /// - The typed error category (so a future regression that
     ///   silently swallowed the second claim's loss flunks here).
-    /// - The `from` state shows the *winner's* state ("claimed"),
+    /// - The `from` state shows the *winner's* state ("claimed").
     ///   not the loser's intent — proves the diagnostic SELECT
     ///   reads the post-flip row, not a stale snapshot.
     /// - The original claimant's id and `claimed_at` are unchanged
@@ -1722,8 +1722,8 @@ mod tests {
         );
     }
 
-    /// SPEC §4.5 makes deadlined bounties uncl­aimable past their
-    /// `expires_at` — even before the Task 7e sweeper runs. An
+    ///  makes deadlined bounties uncl­aimable past their
+    /// `expires_at` — even before the sweeper runs. An
     /// `open` row whose deadline is already in the past must
     /// surface [`BountyError::Expired`] **and** leave the row
     /// untouched. We pin both halves: the typed error AND the row-
@@ -1735,7 +1735,7 @@ mod tests {
     #[test]
     fn claim_bounty_rejects_expired_bounty() {
         let (_dir, world, poster_id, alice_id, _bob_id) = world_with_poster_and_two_claimants();
-        // A deadline well in the past so the `datetime()` comparison
+        // A deadline well in the past so the `datetime` comparison
         // in claim_bounty rejects regardless of wall-clock skew.
         let posted = world
             .post_bounty(
@@ -1756,7 +1756,7 @@ mod tests {
             posted.id
         );
 
-        // Row-unchanged invariant: state still 'open',
+        // Row-unchanged invariant: state still 'open'.
         // claimed_by_player_id still NULL, claimed_at still NULL.
         // Pinning all three so a regression that wrote claimant
         // info before checking the deadline flunks here.
@@ -1822,7 +1822,7 @@ mod tests {
         assert!(claimed.expires_at.is_none());
     }
 
-    /// SPEC_v3 §Task 7d acceptance, half 1: a `claimed` bounty
+    ///   acceptance, half 1: a `claimed` bounty
     /// transitions to `completed` and stamps `completed_at`. Pin
     /// the full post-conditions in one place so a regression in
     /// any of them flunks here:
@@ -1887,11 +1887,11 @@ mod tests {
         assert_eq!(stored.claimed_at, claimed.claimed_at);
     }
 
-    /// SPEC_v3 §Task 7d acceptance, half 2: the **reward payload
+    ///   acceptance, half 2: the **reward payload
     /// is retained** through completion. Same applies to every
-    /// other write-once column (`title`, `description`,
+    /// other write-once column (`title`, `description`.
     /// `posted_by_player_id`, `created_at`, `expires_at`) and the
-    /// claim-time bookkeeping (`claimed_by_player_id`,
+    /// claim-time bookkeeping (`claimed_by_player_id`.
     /// `claimed_at`). A regression that broadened the SET list
     /// would null out one of these mid-UPDATE; pin every survivor
     /// here so that flunks at `cargo test`. Without this pin the
@@ -1923,7 +1923,7 @@ mod tests {
             .complete_bounty(posted.id)
             .expect("complete_bounty succeeds");
 
-        // The §Task 7d "reward payload retained" acceptance —
+        // The "reward payload retained" acceptance
         // verbatim, byte-for-byte. Pinning equality on the JSON
         // string (not a parsed shape) catches a regression that
         // re-encoded the value through a JSON round-trip and lost
@@ -1932,7 +1932,7 @@ mod tests {
             completed.reward, reward_json,
             "reward must be preserved verbatim through completion"
         );
-        // Every other write-once / claim-time column must survive.
+        // Every other write-once claim-time column must survive.
         assert_eq!(completed.id, posted.id);
         assert_eq!(completed.created_at, posted.created_at);
         assert_eq!(completed.posted_by_player_id, posted.posted_by_player_id);
@@ -1953,7 +1953,7 @@ mod tests {
     /// Completing a bounty that is still `open` (never claimed)
     /// must surface `InvalidTransition { from: "open", to:
     /// Completed }` rather than silently flipping or surfacing a
-    /// confusing `NotFound`. The SPEC §4.5 lifecycle is
+    /// confusing `NotFound`. The lifecycle is
     /// `open -> claimed -> completed`; skipping the claim step is
     /// not a legal transition.
     #[test]
@@ -1981,7 +1981,7 @@ mod tests {
             "expected InvalidTransition from 'open' to Completed, got {err:?}"
         );
 
-        // Row-unchanged invariant: state still 'open',
+        // Row-unchanged invariant: state still 'open'.
         // completed_at still NULL. Catches a regression that
         // wrote completed_at before checking state.
         let (state, completed_at): (String, Option<String>) = world
@@ -1998,10 +1998,10 @@ mod tests {
 
     /// Completing a bounty that has already been completed must be
     /// rejected with `InvalidTransition { from: "completed", to:
-    /// Completed }`. SPEC §4.5 makes `completed` a terminal state.
+    /// Completed }`. makes `completed` a terminal state.
     /// Pinning this guards against a regression that loosened the
     /// `state = 'claimed'` predicate to permit a completion
-    /// re-stamp (which would also re-stamp `completed_at`,
+    /// re-stamp (which would also re-stamp `completed_at`.
     /// corrupting the audit timeline).
     #[test]
     fn complete_bounty_rejects_already_completed_bounty() {
@@ -2051,7 +2051,7 @@ mod tests {
     /// one) must surface [`BountyError::NotFound`] rather than a
     /// generic SQL error or a misleading `InvalidTransition`.
     /// Same shape as `claim_bounty_missing_id_returns_not_found`
-    /// — the §Task 7c equivalent.
+    /// — the equivalent.
     #[test]
     fn complete_bounty_missing_id_returns_not_found() {
         let (_dir, world, _poster_id, _alice_id, _bob_id) = world_with_poster_and_two_claimants();
@@ -2064,7 +2064,7 @@ mod tests {
         );
     }
 
-    /// SPEC_v3 §Task 7e acceptance, central case: only `open` and
+    ///   acceptance, central case: only `open` and
     /// `claimed` rows whose `expires_at` has lapsed at `now` are
     /// swept. Pin every cell of the policy matrix in one place so
     /// a regression in any of them flunks here:
@@ -2262,7 +2262,7 @@ mod tests {
     /// every still-fresh row's deadline is still in the future.
     /// Pin idempotency so a regression that (say) dropped the state
     /// gate and started re-stamping the row on every pass would
-    /// observably flunk on `is_empty()`. Same shape as
+    /// observably flunk on `is_empty`. Same shape as
     /// `expire_open_challenges_is_idempotent`.
     #[test]
     fn expire_bounties_is_idempotent() {
@@ -2289,7 +2289,7 @@ mod tests {
     }
 
     /// An empty `bounties` table (or a table whose only rows are
-    /// not due) returns an empty `Vec`, not an error. The SPEC §4.5
+    /// not due) returns an empty `Vec`, not an error. The
     /// sweeper contract treats "nothing to do" as a success — a
     /// regression that surfaced this as `Sqlite { … }` would force
     /// every caller to special-case it. Same shape as
@@ -2311,7 +2311,7 @@ mod tests {
     /// regression that flipped the comparator to strict `<` would
     /// leave on-the-second deadlines stuck until the next sweep
     /// tick. Using identical text on both sides also pins that the
-    /// `datetime()` normalisation is the same on both sides of the
+    /// `datetime` normalisation is the same on both sides of the
     /// comparison. Same shape as
     /// `expire_open_challenges_includes_exact_deadline`.
     #[test]
@@ -2336,14 +2336,14 @@ mod tests {
         );
     }
 
-    // -- SPEC_v3 §Task 7f — invalid-transition table tests --------------
+    // -- — invalid-transition table tests --------------
     //
     // Standalone tests above already pin specific scenarios with extra
-    // invariants (claim attribution, reward-payload preservation,
+    // invariants (claim attribution, reward-payload preservation.
     // durability round-trips, deadline-equality sweep). The three
-    // `rstest` tables below complete the matrix: one row per (helper,
+    // `rstest` tables below complete the matrix: one row per (helper.
     // starting-state) pair, asserting the *exact* outcome — `Ok` on
-    // each SPEC §4.5 legal edge, typed `InvalidTransition { from }`
+    // each legal edge, typed `InvalidTransition { from }`
     // everywhere else (and silent non-inclusion for the sweeper).
     // Without this exhaustive grid, a regression that (say) relaxed
     // `complete_bounty`'s gate to also accept an `open` row could pass
@@ -2384,7 +2384,7 @@ mod tests {
     /// (which the schema disallows from carrying a claimant before
     /// the transition stamps it). Returns the new row id.
     fn seed_bounty_in_state(world: &WorldDb, poster: i64, claimant: i64, state: &str) -> i64 {
-        // Each non-open state needs the audit fields the SPEC §4.5
+        // Each non-open state needs the audit fields the
         // lifecycle would have stamped; we synthesise plausible
         // values (real ISO timestamps, attributed claimant) so a
         // future test that primary-key-SELECTs the row also sees a
@@ -2427,7 +2427,7 @@ mod tests {
             .unwrap_or_else(|err| panic!("seed {state:?} row: {err}"))
     }
 
-    /// SPEC_v3 §Task 7f acceptance — `claim_bounty` table.
+    ///   acceptance — `claim_bounty` table.
     ///
     /// `open` is the only legal starting state; every other state
     /// MUST surface as `InvalidTransition { from: <state> }` with
@@ -2498,7 +2498,7 @@ mod tests {
         }
     }
 
-    /// SPEC_v3 §Task 7f acceptance — `complete_bounty` table.
+    ///   acceptance — `complete_bounty` table.
     ///
     /// `claimed` is the only legal starting state. The kit does not
     /// gate completion on a deadline (a `claimed` row already passed
@@ -2528,7 +2528,7 @@ mod tests {
             );
             // The reward payload and claim attribution MUST survive
             // — pinned in detail by
-            // `complete_bounty_retains_reward_and_claim_attribution`,
+            // `complete_bounty_retains_reward_and_claim_attribution`.
             // sanity-checked here so the table catches a regression
             // that broadened the SET list.
             assert_eq!(bounty.reward, r#"{"credits":1}"#);
@@ -2577,14 +2577,14 @@ mod tests {
         }
     }
 
-    /// SPEC_v3 §Task 7f acceptance — `expire_bounties` table.
+    ///   acceptance — `expire_bounties` table.
     ///
     /// The sweeper operates on a set, not a single id, and its
     /// "invalid transition" is silent non-inclusion (no typed
     /// error). The table covers every starting state plus deadline
-    /// variants (no deadline / future deadline / past deadline) to
+    /// variants (no deadline future deadline past deadline) to
     /// pin the `expires_at IS NOT NULL` and `<= now` gates and the
-    /// `state IN ('open','claimed')` membership. SPEC §4.5 makes
+    /// `state IN ('open','claimed')` membership. makes
     /// both `open` and `claimed` rows eligible — a claimant who
     /// never finishes their work shouldn't pin the bounty open
     /// forever.
@@ -2677,7 +2677,7 @@ mod tests {
         );
     }
 
-    /// Read column names from `pragma_table_info` in cid order —
+    /// Read column names from `pragma_table_info` in cid order
     /// the storage-side column order, which is what the column-
     /// shape assertion pins.
     fn pragma_columns(world: &WorldDb, table: &str) -> Vec<String> {

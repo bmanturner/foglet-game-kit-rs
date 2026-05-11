@@ -1,4 +1,4 @@
-//! `presence` — current-location tracking schema (SPEC_v4 Tasks 5a–5c).
+//! `presence` — current-location tracking schema.
 //!
 //! This module owns the durable schema for per-player current place.
 //! Movement and transactional APIs are now available for atomic movement
@@ -16,15 +16,15 @@ use crate::world_db::{WorldDb, WorldMigration};
 
 /// Per-player current location row shape.
 ///
-/// The table itself is introduced in Task 5a and consumed by
+/// The table itself is introduced in and consumed by
 /// later API tasks:
 ///
 /// - `set_presence(player_id, place_id, metadata_json)` creates/updates
-///   this record (Task 5b).
+///   this record.
 /// - `move_player(player_id, dest_place_id, on_commit)` updates it in a
-///   single transaction with movement callbacks (Task 5c).
+///   single transaction with movement callbacks.
 /// - `get_presence(player_id)` and `players_at(place_id)` read this row
-///   (Task 5e, 5f).
+///   ( 5f).
 ///
 /// Both game families are kept in mind:
 ///
@@ -110,7 +110,7 @@ pub enum PresenceError {
     },
 }
 
-/// Migration for `presence` (Task 5a).
+/// Migration for `presence`.
 ///
 /// The schema is intentionally compact:
 ///
@@ -120,7 +120,7 @@ pub enum PresenceError {
 /// - `entered_at` captures when this row became current.
 /// - `metadata_json` stores any game-authored payload.
 ///
-/// The `Task 5a` contract requires this exact column shape; no
+/// The `` contract requires this exact column shape; no
 /// movement semantics or auto-placement policy live here.
 pub const PRESENCE_MIGRATION: WorldMigration = WorldMigration {
     version: 12,
@@ -140,7 +140,7 @@ CREATE TABLE IF NOT EXISTS presence (\n\
 impl WorldDb {
     /// Create or replace a presence row for a player.
     ///
-    /// This is the v4 Task 5b "initial-placement" API:
+    /// This is the "initial-placement" API:
     ///
     /// - It writes one presence row for a player if absent.
     /// - It refreshes `entered_at` whenever called again, which lets
@@ -153,7 +153,7 @@ impl WorldDb {
     ///   instead of forcing call sites to choose between two write
     ///   paths.
     /// - `place_id` can be reset if a game intentionally remaps a
-    ///   player between rooms before movement rules begin (for example,
+    ///   player between rooms before movement rules begin (for example.
     ///   moving from a loading room to a dock in a **space exploration**
     ///   flow or from an entry hall to a vault in a **dungeon crawler**
     ///   flow).
@@ -161,7 +161,7 @@ impl WorldDb {
     /// Transactionality note for later tasks:
     ///
     /// This method intentionally writes a single row with `INSERT …
-    /// ON CONFLICT ... DO UPDATE` and returns the committed row via
+    /// ON CONFLICT... DO UPDATE` and returns the committed row via
     /// `RETURNING`. A future movement wrapper (`move_player`) should
     /// use an explicit `Connection::transaction` to keep callbacks and
     /// presence updates atomic.
@@ -191,7 +191,7 @@ RETURNING player_id, place_id, entered_at, metadata_json";
 
     /// Move a player to a new place inside one SQLite transaction.
     ///
-    /// This is the v4 Task 5c `move_player` primitive. `move_player`
+    /// This is the `move_player` primitive. `move_player`
     /// always updates one presence row and passes the post-move snapshot to
     /// `on_commit` so game logic can run additional checks inside the same
     /// transaction.
@@ -269,7 +269,7 @@ RETURNING player_id, place_id, entered_at, metadata_json";
 
     /// Read the current presence row for one player, if present.
     ///
-    /// This is the v4 Task 5e query:
+    /// This is the query:
     ///
     /// - It returns `Ok(Some(...))` when the player has an active
     ///   presence row.
@@ -363,7 +363,7 @@ mod tests {
     use std::time::Duration;
     use tempfile::tempdir;
 
-    /// SPEC_v4 Task 5a requires that the `presence` migration applies
+    ///  requires that the `presence` migration applies
     /// and creates the documented columns in table order.
     #[test]
     fn applies_presence_migration_with_documented_columns() {
@@ -372,7 +372,7 @@ mod tests {
         let mut world = WorldDb::open(&db_path).expect("open succeeds");
 
         // Presence references `places`, so we reuse the spatial migration
-        // from Task 3 to keep the FK target available for CREATE TABLE.
+        // from to keep the FK target available for CREATE TABLE.
         world
             .apply_migration(&PLACES_MIGRATION)
             .expect("places migration applies");
@@ -397,7 +397,7 @@ mod tests {
                 "entered_at".to_string(),
                 "metadata_json".to_string(),
             ],
-            "presence schema must match SPEC_v4 Task 5a exactly"
+            "presence schema must match exactly"
         );
 
         let row_count: i64 = world
@@ -411,7 +411,7 @@ mod tests {
         assert_eq!(row_count, PRESENCE_MIGRATION.version);
     }
 
-    /// SPEC_v4 Task 5b requires a timestamped placement row for the
+    ///  requires a timestamped placement row for the
     /// first call to `set_presence`.
     ///
     /// A valid player and place are required because both foreign-key
@@ -473,7 +473,7 @@ mod tests {
         Ok(())
     }
 
-    /// SPEC_v4 Task 5c requires `move_player` to update the player's
+    ///  requires `move_player` to update the player's
     /// current location atomically and refresh `entered_at`.
     ///
     /// This test also proves the callback receives the committed
@@ -620,7 +620,7 @@ mod tests {
         assert_eq!(loaded.entered_at, initial.entered_at);
     }
 
-    /// Task 6f requires `move_player` to remain a pure presence
+    ///  requires `move_player` to remain a pure presence
     /// transition unless the caller explicitly invokes place recall.
     ///
     /// This test writes a recall row for the source place, executes a move
@@ -712,7 +712,7 @@ mod tests {
         );
     }
 
-    /// Task 5e proves the read path and the optional return:
+    ///  proves the read path and the optional return:
     /// players that have never been placed report `None`.
     ///
     /// This keeps the primitive intentionally genre-neutral:
@@ -757,7 +757,7 @@ mod tests {
 
     /// A freshly upserted player must not be auto-placed.
     ///
-    /// Task 5g keeps player creation and presence orthogonal:
+    ///  keeps player creation and presence orthogonal:
     /// `upsert_player` writes the `players` table only, and
     /// explicit `set_presence` calls own the initial location decision.
     ///
@@ -817,7 +817,7 @@ mod tests {
         Ok(())
     }
 
-    /// Task 5f proves occupant enumeration reflects the current place only:
+    ///  proves occupant enumeration reflects the current place only:
     ///
     /// 1) Only players whose presence row is currently at the queried
     ///    place are returned.

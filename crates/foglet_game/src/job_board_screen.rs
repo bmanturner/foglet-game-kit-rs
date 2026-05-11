@@ -1,4 +1,4 @@
-//! `JobBoardScreen` — reusable v5 Job Board list surface.
+//! `JobBoardScreen` — reusable Job Board list surface.
 //!
 //! This screen renders aggregated [`crate::job_board::JobBoardEntry`]
 //! rows into a terminal-friendly table so games can present one list
@@ -11,7 +11,7 @@
 //! - A **dungeon crawler** can render guild commissions and rival
 //!   bounty postings from multiple town districts.
 //!
-//! Task 6a lands the render baseline, while Task 6b adds keyboard
+//!  lands the render baseline, while adds keyboard
 //! navigation, pagination, and a quit hotkey. Detail modals and
 //! accept/claim callbacks arrive in follow-up tasks.
 
@@ -128,7 +128,7 @@ impl JobBoardScreen {
     /// Build a renderable Job Board list from pre-aggregated entries.
     ///
     /// The screen does not query providers directly. Games keep control
-    /// over timing so they can cache rows, debounce expensive queries,
+    /// over timing so they can cache rows, debounce expensive queries.
     /// or gate refreshes behind explicit user actions.
     #[must_use]
     pub fn new(entries: Vec<JobBoardEntry>) -> Self {

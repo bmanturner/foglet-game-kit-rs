@@ -1,43 +1,43 @@
 //! Input normalization — `crossterm::event::Event` → [`Input`].
 //!
-//! SPEC §8.3 defines a small, terminal-agnostic [`Input`] enum that
-//! game `Screen`s consume. The runtime loop (Task 7) polls
+//!  defines a small, terminal-agnostic [`Input`] enum that
+//! game `Screen`s consume. The runtime loop polls
 //! `crossterm` events and pipes them through [`from_event`] so screens
-//! never touch `crossterm` types directly. Keeping the mapping pure —
+//! never touch `crossterm` types directly. Keeping the mapping pure
 //! no terminal state, no globals — means it is fully unit-testable
 //! without a TTY and stays trivially swappable if the runtime ever
 //! grows a different event source.
 //!
 //! ## Mapping rules
 //!
-//! - Arrow keys → `Up` / `Down` / `Left` / `Right`.
+//! - Arrow keys → `Up` `Down` `Left` `Right`.
 //! - `Enter`, `Esc`, `Backspace` → their named variants.
 //! - `Resize(w, h)` → `Input::Resize { width: w, height: h }`.
 //! - `Char(c)` with no modifiers (or only `SHIFT`) → `Input::Char(c)`.
-//!   `SHIFT` is intentionally not stripped from the `char` itself —
-//!   `crossterm` already delivers the shifted character (e.g. `'A'`),
+//!   `SHIFT` is intentionally not stripped from the `char` itself
+//!   `crossterm` already delivers the shifted character (e.g. `'A'`).
 //!   so consumers see what the user typed.
 //! - `Char(c)` with `CTRL` → `Input::Ctrl(c)`. `CTRL+SHIFT+c` still
-//!   maps to `Ctrl(c)` because the `CTRL` intent dominates; SPEC §8.3
+//!   maps to `Ctrl(c)` because the `CTRL` intent dominates;
 //!   does not distinguish further. **Ctrl-C is reported as
 //!   `Input::Ctrl('c')`** rather than swallowed, so the runtime loop
 //!   can treat it as a quit signal *after* terminal restoration.
-//! - Anything else (mouse events, focus events, paste, F-keys, Tab,
-//!   media keys, …) → [`Input::Unknown`]. SPEC §8.3 lists the variants
-//!   v1 cares about; other inputs are deliberately collapsed so games
+//! - Anything else (mouse events, focus events, paste, F-keys, Tab.
+//!   media keys, …) → [`Input::Unknown`]. lists the variants
+//!   cares about; other inputs are deliberately collapsed so games
 //!   don't grow ad-hoc per-key handling that won't survive a future
 //!   crossterm bump.
 //!
 //! Press/release distinction: on platforms where `crossterm` reports
 //! both `Press` and `Release` events, only `Press` produces a non-
-//! [`Input::Unknown`] result. Repeats map the same as presses; SPEC
-//! §8.3 has no held-key concept.
+//! [`Input::Unknown`] result. Repeats map the same as presses;
+//!  has no held-key concept.
 
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 /// Terminal-agnostic input variants consumed by `Screen`s.
 ///
-/// Mirrors SPEC §8.3 verbatim. Adding a variant is a SPEC change and
+/// Mirrors verbatim. Adding a variant is a change and
 /// must be reflected there first; removing or renaming one is a
 /// breaking API change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,7 +50,7 @@ pub enum Input {
     Left,
     /// Right arrow.
     Right,
-    /// Enter / Return.
+    /// Enter Return.
     Enter,
     /// Escape.
     Esc,
@@ -77,7 +77,7 @@ pub enum Input {
     Unknown,
 }
 
-/// Translate a single `crossterm` event into the SPEC §8.3 [`Input`].
+/// Translate a single `crossterm` event into the [`Input`].
 ///
 /// This is the single seam the runtime loop calls on every polled
 /// event. Pure: same input always yields the same output, no I/O, no
@@ -86,7 +86,7 @@ pub fn from_event(event: Event) -> Input {
     match event {
         Event::Key(key) => from_key_event(key),
         Event::Resize(width, height) => Input::Resize { width, height },
-        // Mouse, focus, paste are out-of-scope for v1 (SPEC §8.3 lists
+        // Mouse, focus, paste are out-of-scope for ( lists
         // exactly what we map). Collapsing keeps screens immune to
         // crossterm growing new event variants.
         _ => Input::Unknown,
@@ -94,11 +94,11 @@ pub fn from_event(event: Event) -> Input {
 }
 
 /// Translate a `KeyEvent` into [`Input`]. Public so tests and future
-/// alternative event sources (e.g. a fake terminal driver in Task 7d)
+/// alternative event sources (e.g. a fake terminal driver in )
 /// can reuse the key-level rules without synthesising whole `Event`s.
 pub fn from_key_event(key: KeyEvent) -> Input {
     // Some platforms (Windows, kitty protocol, …) deliver Release and
-    // Repeat in addition to Press. v1 only cares about Press +
+    // Repeat in addition to Press. only cares about Press +
     // Repeat-as-press; Release is collapsed to Unknown so a single
     // physical keystroke doesn't fire a screen handler twice.
     match key.kind {
@@ -192,7 +192,7 @@ mod tests {
 
     #[test]
     fn ctrl_c_is_reported_not_swallowed() {
-        // SPEC: Ctrl-C reaches the runtime so it can run the terminal
+        // : Ctrl-C reaches the runtime so it can run the terminal
         // guard's restore path before the process tears down.
         assert_eq!(
             from_event(press(KeyCode::Char('c'), KeyModifiers::CONTROL)),
@@ -226,7 +226,7 @@ mod tests {
     #[test]
     fn unmapped_keys_become_unknown() {
         // F-keys, Tab, Insert, Home, etc. are intentionally collapsed
-        // to Unknown — adding them is a SPEC change.
+        // to Unknown — adding them is a change.
         assert_eq!(
             from_event(press(KeyCode::F(5), KeyModifiers::NONE)),
             Input::Unknown

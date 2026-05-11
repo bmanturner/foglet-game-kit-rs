@@ -1,12 +1,12 @@
-//! Save-path resolution for Foglet door games (SPEC §12).
+//! Save-path resolution for Foglet door games.
 //!
-//! Task 8 splits into two halves: this module is **path resolution
-//! only** (Task 8a). Atomic write/read lands in Task 8b.
+//!  splits into two halves: this module is **path resolution
+//! only**. Atomic write/read lands in.
 //!
 //! # Why a dedicated module
 //!
-//! SPEC §7.1 step 5 names "Resolve per-user save path" as part of the
-//! startup ordering — it happens *before* terminal raw mode is entered,
+//!  step 5 names "Resolve per-user save path" as part of the
+//! startup ordering — it happens *before* terminal raw mode is entered.
 //! so the runtime can surface a clear error (e.g. malformed
 //! `FGK_SAVE_DIR`) without first wrecking the terminal. Keeping the
 //! resolution pure and side-effect-free (no directory creation, no
@@ -16,7 +16,7 @@
 //! # Precedence
 //!
 //! Resolution honours four sources in order, matching the wrapper
-//! script in SPEC §10.4 and the deployment paths in SPEC §12:
+//! script and the deployment paths:
 //!
 //! 1. **`SaveStrategy::None`** — game opted out of persistence
 //!    (`assets/game.toml` says so). Returns `Ok(None)`.
@@ -26,24 +26,24 @@
 //!    `save.json` — no further `<user_id>` interpolation happens here.
 //! 3. **`FGK_SAVE_DIR`** environment variable. Same shape as the CLI
 //!    override; lets operators redirect saves without rebuilding the
-//!    wrapper. Per SPEC §10.4 the wrapper itself reads this var, but
+//!    wrapper. Per the wrapper itself reads this var, but
 //!    that wrapper isn't used in `cargo run` smoke tests, so the
 //!    runtime honours the env directly as a redundant safety net.
 //! 4. **Fallback by [`ContextSource`]**:
-//!    - `ContextFile` / `Env` (running under Foglet) →
+//!    - `ContextFile` `Env` (running under Foglet) →
 //!      `/srv/foglet/doors/<slug>/saves/<user_id>/save.json` per
-//!      SPEC §12. Missing `user_id` falls back to a literal
-//!      `anonymous` segment so saves still go *somewhere* per-door —
+//!       Missing `user_id` falls back to a literal
+//!      `anonymous` segment so saves still go *somewhere* per-door
 //!      consistent with Foglet supporting anonymous-access doors
-//!      (SPEC §5.1).
-//!    - `LocalDev` → project-local `.fgk/saves/local-dev/save.json`,
+//!      .
+//!    - `LocalDev` → project-local `.fgk/saves/local-dev/save.json`.
 //!      relative to the current working directory.
 //!
 //! # Side effects
 //!
 //! None at this layer. The returned [`PathBuf`] always ends in
 //! `save.json` and may point at a directory that does not yet exist;
-//! Task 8b's writer is responsible for `mkdir -p` and atomic write.
+//! 's writer is responsible for `mkdir -p` and atomic write.
 
 use std::cell::{Cell, Ref, RefCell, RefMut};
 use std::fs;
@@ -59,31 +59,31 @@ use crate::foglet::{ContextSource, FogletContext};
 
 /// Filename stored at the resolved save directory.
 ///
-/// Lifted to a constant so Task 8b's writer and any future tooling
+/// Lifted to a constant so 's writer and any future tooling
 /// (e.g. `fgk` debug commands that locate a user's save) agree on one
-/// spelling. SPEC §12 documents `save.json` explicitly.
+/// spelling. documents `save.json` explicitly.
 pub const SAVE_FILENAME: &str = "save.json";
 
 /// Environment variable that overrides the resolved save directory.
 ///
-/// Matches the variable the `run.sh` wrapper reads in SPEC §10.4. The
+/// Matches the variable the `run.sh` wrapper reads The
 /// runtime honours it directly in addition to the wrapper's expansion
 /// so `cargo run` smoke tests of the binary still respect operator
 /// overrides without going through `run.sh`.
 pub const SAVE_DIR_ENV: &str = "FGK_SAVE_DIR";
 
-/// Production root for per-user saves. SPEC §12.
+/// Production root for per-user saves.
 const PROD_SAVE_ROOT: &str = "/srv/foglet/doors";
 
 /// Local-dev save directory, relative to the current working dir.
 const LOCAL_DEV_SAVE_DIR: &str = ".fgk/saves/local-dev";
 
 /// Filesystem segment used when running under Foglet but `user_id` is
-/// absent. Foglet supports anonymous doors (SPEC §5.1), so the loader
+/// absent. Foglet supports anonymous doors, so the loader
 /// surfaces `user_id = None`; rather than failing here we direct those
 /// saves to a stable per-door `anonymous` bucket. Documented for the
 /// operator reading the failure mode in `docs/foglet-install.md`
-/// (Task 14b).
+/// .
 const ANONYMOUS_USER_SEGMENT: &str = "anonymous";
 
 /// Errors produced while resolving a save path.
@@ -94,7 +94,7 @@ const ANONYMOUS_USER_SEGMENT: &str = "anonymous";
 pub enum SavePathError {
     /// `slug` was empty. The runtime treats this as a programmer
     /// error — `GameConfig` parsing already rejects empty slugs
-    /// (SPEC §5.2 / `config::GameConfig` validation) — but this layer
+    ///  — but this layer
     /// double-checks so a hand-built [`SavePathInputs`] (e.g. in
     /// tests) can't sneak past and produce a path like
     /// `/srv/foglet/doors//saves/<user>/save.json`.
@@ -106,7 +106,7 @@ pub enum SavePathError {
 ///
 /// Bundled into a struct (rather than a long argument list) so the
 /// runtime can construct it once at startup and pass it through to
-/// Task 8b's writer alongside the resolved path. New knobs (e.g. a
+/// 's writer alongside the resolved path. New knobs (e.g. a
 /// future `force_per_machine` mode) land additively here without
 /// rippling through call sites.
 #[derive(Debug, Clone, Copy)]
@@ -121,7 +121,7 @@ pub struct SavePathInputs<'a> {
     /// together pick between the production and local-dev paths.
     pub context: &'a FogletContext,
     /// `--save-dir` from the CLI, if the operator passed one. Wins
-    /// over `FGK_SAVE_DIR` and over the SPEC §12 default roots.
+    /// over `FGK_SAVE_DIR` and over the default roots.
     pub cli_override: Option<&'a Path>,
 }
 
@@ -148,7 +148,7 @@ where
         return Ok(None);
     }
 
-    // 1. CLI override wins outright. The wrapper script in SPEC §10.4
+    // 1. CLI override wins outright. The wrapper script
     //    builds this path from `FOGLET_USER_ID`, so by the time we see
     //    it the per-user component is already encoded — we just append
     //    the filename.
@@ -165,7 +165,7 @@ where
 
     // 3. Default roots, picked by where the Foglet context came from.
     //    `ContextFile`/`Env` mean we believe Foglet (or a Foglet-like
-    //    shell) is in the loop, so the SPEC §12 production root
+    //    shell) is in the loop, so the production root
     //    applies. `LocalDev` means we synthesised the context and
     //    must not write to `/srv/foglet/...`.
     let path = match inputs.context.source {
@@ -195,7 +195,7 @@ where
 /// per PROMPT.md's "errors at boundaries" rule.
 ///
 /// Variants are deliberately granular: when a save fails the operator
-/// reading the door log (SPEC §11) wants to know whether the parent
+/// reading the door log wants to know whether the parent
 /// directory was unwritable, the JSON was corrupt, or the rename
 /// itself blew up — each suggests a different remediation.
 #[derive(Debug, Error)]
@@ -251,7 +251,7 @@ pub enum SaveIoError {
 
 /// Write `value` to `path` atomically.
 ///
-/// The contract — matching SPEC §13's reliability bar and the
+/// The contract — matching 's reliability bar and the
 /// "atomic writes" architecture tenet in PROMPT.md — is:
 ///
 /// 1. Ensure the parent directory exists (`mkdir -p`).
@@ -261,7 +261,7 @@ pub enum SaveIoError {
 ///    copy+delete and leave a half-written file visible during the
 ///    copy.
 /// 3. Serialize `value` as pretty-printed JSON, flush the writer's
-///    user-space buffer, and `sync_all()` the file to push the bytes
+///    user-space buffer, and `sync_all` the file to push the bytes
 ///    out of the kernel page cache to disk. Pretty-printing is a
 ///    deliberate choice for save files: they're rarely written, are
 ///    read by humans during debugging, and the size cost is
@@ -277,7 +277,7 @@ pub enum SaveIoError {
 ///
 /// The crash-mid-write test in this module's tests asserts this
 /// invariant directly by simulating an interrupted write (constructing
-/// a `NamedTempFile` and dropping it without `persist()`).
+/// a `NamedTempFile` and dropping it without `persist`).
 pub fn write_atomic<T: Serialize>(path: &Path, value: &T) -> Result<(), SaveIoError> {
     let parent = path.parent().ok_or_else(|| SaveIoError::NoParent {
         path: path.display().to_string(),
@@ -331,7 +331,7 @@ pub fn write_atomic<T: Serialize>(path: &Path, value: &T) -> Result<(), SaveIoEr
 /// Read the JSON save at `path` into a typed value.
 ///
 /// Returns `Ok(None)` exactly when `path` does not exist — the common
-/// case for a brand-new player launching the game for the first time,
+/// case for a brand-new player launching the game for the first time.
 /// and the only branch where "missing" is not an error. Other I/O
 /// failures (permission denied, unreadable file) surface as
 /// [`SaveIoError::Read`] so the runtime can distinguish "no save yet"
@@ -343,7 +343,7 @@ pub fn read_save<T: DeserializeOwned>(path: &Path) -> Result<Option<T>, SaveIoEr
         Err(e) => return Err(SaveIoError::Read(e)),
     };
 
-    // Reading the whole save into memory is fine: SPEC §12 expects a
+    // Reading the whole save into memory is fine: expects a
     // single-document `save.json` per user, which is small. Streaming
     // through `from_reader` would also work but `read_to_string` gives
     // us a tidier error path for malformed UTF-8.
@@ -354,24 +354,24 @@ pub fn read_save<T: DeserializeOwned>(path: &Path) -> Result<Option<T>, SaveIoEr
 }
 
 // ---------------------------------------------------------------------------
-// SaveSlot<T> — typed handle bridging the runtime to read_save / write_atomic
+// SaveSlot<T> — typed handle bridging the runtime to read_save write_atomic
 // ---------------------------------------------------------------------------
 //
-// SPEC_v2_1.md §2.1 introduces `SaveSlot<T>` as the v2.1 ergonomics primitive
+// .md introduces `SaveSlot<T>` as the v2.1 ergonomics primitive
 // that replaces the hand-rolled `Rc<RefCell<T>>` + dirty-bit pattern every
-// game previously had to write by hand (see the v2 `murder_motel` example
-// before the Task 5 refactor). The slot is deliberately a thin wrapper:
+// game previously had to write by hand (see the `murder_motel` example
+// before the refactor). The slot is deliberately a thin wrapper:
 //
 // * `inner: Rc<RefCell<T>>` is the shared, interior-mutable handle that
 //   screen constructors can clone freely. Multiple screens hold the same
-//   `T` and observe each other's writes the same way the v2 example did
+//   `T` and observe each other's writes the same way the example did
 //   with hand-written handles.
 // * `dirty: Rc<Cell<bool>>` is the "needs persisting" flag that
-//   `borrow_mut` flips on (Task 1b) and `save` clears (Task 1d). The
-//   runtime's save handler (Task 4) reads this to skip no-op writes.
+//   `borrow_mut` flips on and `save` clears. The
+//   runtime's save handler reads this to skip no-op writes.
 //
 // Persistence is **not** owned by the slot — it delegates to the existing
-// `read_save` / `write_atomic` free functions so the v1 reliability bar
+// `read_save` `write_atomic` free functions so the reliability bar
 // (atomic rename, parent mkdir, fsync) keeps applying unchanged. The slot
 // is a typed *handle*, not a second persistence path.
 
@@ -381,15 +381,15 @@ pub fn read_save<T: DeserializeOwned>(path: &Path) -> Result<Option<T>, SaveIoEr
 /// rolling their own `Rc<RefCell<T>>` plus a sibling dirty flag. It
 /// gives every screen in a game the same view of `T`, tracks whether
 /// the value has been mutated since the last save, and bridges to the
-/// existing [`read_save`] / [`write_atomic`] persistence helpers — so
-/// the SPEC §13 atomic-write contract still applies without a second
+/// existing [`read_save`] [`write_atomic`] persistence helpers — so
+/// the atomic-write contract still applies without a second
 /// code path.
 ///
 /// # When to reach for it
 ///
 /// - You have a single game-state value (a struct, an enum, a map) that
 ///   multiple screens need to read or mutate while the runtime is live.
-/// - You want "save on quit" / "save on demand" without each screen
+/// - You want "save on quit" "save on demand" without each screen
 ///   re-discovering how to serialise the value.
 /// - You are willing to model the value as `T: Serialize +
 ///   DeserializeOwned + Default + Clone`.
@@ -412,12 +412,12 @@ pub fn read_save<T: DeserializeOwned>(path: &Path) -> Result<Option<T>, SaveIoEr
 pub struct SaveSlot<T> {
     /// Shared, interior-mutable handle to the game state value. Kept
     /// private so callers go through [`SaveSlot::borrow`] /
-    /// `borrow_mut` (Task 1b) — that's what lets the slot enforce the
+    /// `borrow_mut` — that's what lets the slot enforce the
     /// "borrow_mut implies dirty" contract.
     pub(crate) inner: Rc<RefCell<T>>,
     /// "Has the value been mutated since the last successful save?"
-    /// flag. Flipped on by `borrow_mut` (Task 1b) and cleared by
-    /// `save` (Task 1d). The runtime's save handler (Task 4) consults
+    /// flag. Flipped on by `borrow_mut` and cleared by
+    /// `save`. The runtime's save handler consults
     /// this to skip writes when nothing changed.
     pub(crate) dirty: Rc<Cell<bool>>,
 }
@@ -438,10 +438,10 @@ impl<T> Clone for SaveSlot<T> {
 impl<T> SaveSlot<T> {
     /// Wrap `value` in a fresh slot.
     ///
-    /// The slot starts **clean** (`is_dirty() == false`): the value has
+    /// The slot starts **clean** (`is_dirty == false`): the value has
     /// not yet been mutated since "load", and nothing needs persisting.
     /// Authors typically build a slot from `read_save`'s output via
-    /// `SaveSlot::load_or_default` (Task 1c); calling `new` directly
+    /// `SaveSlot::load_or_default` ; calling `new` directly
     /// is for tests and for games that synthesise their initial state.
     pub fn new(value: T) -> Self {
         Self {
@@ -464,7 +464,7 @@ impl<T> SaveSlot<T> {
     /// Borrow the wrapped value mutably, **marking the slot dirty**.
     ///
     /// The dirty flag is flipped on **entry**, before the caller has a
-    /// chance to actually mutate `T`. SPEC_v2_1 §4.1 requires this
+    /// chance to actually mutate `T`. requires this
     /// even if the resulting borrow goes unused: the slot has no way
     /// to observe whether a caller mutated through the returned
     /// [`RefMut`], so it conservatively assumes any `borrow_mut`
@@ -495,11 +495,11 @@ impl<T> SaveSlot<T> {
 
     /// Overwrite the wrapped value in place and mark the slot dirty.
     ///
-    /// Equivalent to `*slot.borrow_mut() = value;` but avoids the
+    /// Equivalent to `*slot.borrow_mut = value;` but avoids the
     /// `RefMut` round-trip at the call site and reads more naturally
     /// when authors are bulk-replacing state (e.g. a "reset to new
     /// game" button or a "load this snapshot" admin command). Like
-    /// [`SaveSlot::borrow_mut`], it always sets the dirty flag —
+    /// [`SaveSlot::borrow_mut`], it always sets the dirty flag
     /// assigning the same value is still treated as a write because
     /// the slot can't
     /// cheaply prove equality for an arbitrary `T`.
@@ -510,9 +510,9 @@ impl<T> SaveSlot<T> {
 
     /// Has the slot been mutated since the last `save` (or load)?
     ///
-    /// Advisory only: SPEC_v2_1 §4.1 explicitly forbids using this to
+    /// Advisory only: explicitly forbids using this to
     /// *gate* a save — authors decide when to persist. The runtime's
-    /// save handler (Task 4) reads it to skip no-op writes when
+    /// save handler reads it to skip no-op writes when
     /// nothing has changed since startup.
     pub fn is_dirty(&self) -> bool {
         self.dirty.get()
@@ -522,8 +522,8 @@ impl<T> SaveSlot<T> {
     ///
     /// Functionally identical to [`Clone::clone`]; exposed under a
     /// different name so authors reading constructor signatures like
-    /// `MapScreen::with_slots(slots.save.handle())` immediately see
-    /// the cheap-`Rc` semantics. SPEC_v2_1 §4.1 mandates this method
+    /// `MapScreen::with_slots(slots.save.handle)` immediately see
+    /// the cheap-`Rc` semantics. mandates this method
     /// precisely so the API documents the sharing model at the call
     /// site.
     pub fn handle(&self) -> SaveSlot<T> {
@@ -535,7 +535,7 @@ impl<T: Serialize> SaveSlot<T> {
     /// Persist the slot's current value to `path` atomically, then clear
     /// the dirty flag.
     ///
-    /// Thin typed wrapper over [`write_atomic`]: SPEC §13's reliability
+    /// Thin typed wrapper over [`write_atomic`]: 's reliability
     /// bar (parent `mkdir -p`, temp-file write, fsync, `rename(2)`)
     /// keeps applying because the actual byte-level write is delegated.
     /// The slot adds two things on top:
@@ -544,9 +544,9 @@ impl<T: Serialize> SaveSlot<T> {
     ///    a `&T` borrowed from the right place, the slot already holds
     ///    the canonical handle.
     /// 2. Dirty-flag bookkeeping — once `write_atomic` succeeds the slot
-    ///    is by definition in sync with disk, so `is_dirty()` returns
+    ///    is by definition in sync with disk, so `is_dirty` returns
     ///    `false` again and the runtime's "save iff dirty" hook
-    ///    (Task 4) won't immediately rewrite the same bytes.
+    ///     won't immediately rewrite the same bytes.
     ///
     /// On failure the dirty flag is **left set** so the next save
     /// attempt still tries to push the unsaved changes — clearing it
@@ -572,7 +572,7 @@ impl<T: Serialize + 'static> SaveSlot<T> {
     /// current contents to `path` whenever the runtime invokes it.
     ///
     /// The returned closure captures **a clone of the slot's `Rc`
-    /// handles**, not the binding itself. SPEC_v2_1 §4.1 mandates this
+    /// handles**, not the binding itself. mandates this
     /// so the handler stays valid even if the original `SaveSlot`
     /// binding goes out of scope (e.g. the author moves the slot into
     /// a screen constructor, then registers the handler with
@@ -581,9 +581,9 @@ impl<T: Serialize + 'static> SaveSlot<T> {
     ///
     /// Each invocation calls [`SaveSlot::save`], which delegates to
     /// [`write_atomic`]. Errors are remapped to [`crate::runtime::GameError::Save`]
-    /// using the underlying [`SaveIoError`]'s `Display` impl —
+    /// using the underlying [`SaveIoError`]'s `Display` impl
     /// stringifying preserves the granular variant message (`writing
-    /// save file failed`, `renaming temp save into place failed`,
+    /// save file failed`, `renaming temp save into place failed`.
     /// etc.) in the operator-facing log without forcing the runtime
     /// to grow a `From<SaveIoError> for GameError` impl that the rest
     /// of the codebase doesn't need.
@@ -595,11 +595,11 @@ impl<T: Serialize + 'static> SaveSlot<T> {
     ///
     /// # Why no dirty check here
     ///
-    /// The handler unconditionally writes when invoked. SPEC_v2_1
-    /// §4.1 explicitly forbids using `is_dirty` to *gate* persistence
-    /// — that decision belongs to the runtime / the author. A
+    /// The handler unconditionally writes when invoked.
+    ///  explicitly forbids using `is_dirty` to *gate* persistence
+    /// — that decision belongs to the runtime the author. A
     /// "save iff dirty" loop builds on top of this primitive by
-    /// checking `is_dirty()` before invoking the handler, not inside
+    /// checking `is_dirty` before invoking the handler, not inside
     /// it.
     pub fn save_handler(&self, path: PathBuf) -> crate::runtime::SaveHandler {
         // Clone the `Rc`-bearing slot so the closure owns its own
@@ -616,12 +616,12 @@ impl<T: Serialize + 'static> SaveSlot<T> {
 impl<T: DeserializeOwned> SaveSlot<T> {
     /// Load a slot from `path`, returning `Ok(None)` if no save exists.
     ///
-    /// Thin typed wrapper over [`read_save`]: the v1 reliability bar
+    /// Thin typed wrapper over [`read_save`]: the reliability bar
     /// (atomic rename, distinct corrupt-vs-missing errors) keeps
     /// applying because the actual byte-level read is delegated. The
     /// only addition over `read_save` is wrapping the deserialised
     /// value in a fresh, **clean** [`SaveSlot`] so the runtime's
-    /// "save on dirty" hook (Task 4) doesn't immediately rewrite a
+    /// "save on dirty" hook doesn't immediately rewrite a
     /// just-loaded file.
     ///
     /// Returns:
@@ -640,18 +640,18 @@ impl<T: DeserializeOwned> SaveSlot<T> {
         }
     }
 
-    /// Load a slot from `path`, falling back to `T::default()` on
+    /// Load a slot from `path`, falling back to `T::default` on
     /// missing file.
     ///
-    /// The 90% authoring path: a brand-new player has no save on disk,
-    /// so the game starts from `T::default()`; a returning player gets
+    /// The 90% authoring path: a brand-new player has no save on disk.
+    /// so the game starts from `T::default`; a returning player gets
     /// their previous state. Corrupt or unreadable saves still surface
     /// as `Err` — silently overwriting a player's broken save with a
     /// fresh default would be a data-loss bug.
     ///
     /// The returned slot is always **clean**: a default-constructed
     /// slot has no unsaved changes, and a freshly-loaded slot's bytes
-    /// are already on disk by definition. This pairs with Task 1d's
+    /// are already on disk by definition. This pairs with 's
     /// `save` (which clears the flag) so a "save iff dirty" loop is
     /// well-behaved from the first launch.
     pub fn load_or_default(path: &Path) -> Result<SaveSlot<T>, SaveIoError>
@@ -801,7 +801,7 @@ mod tests {
     #[test]
     fn production_path_used_when_context_came_from_env_vars() {
         // Source = Env means a Foglet-like shell wrapped us with
-        // `FOGLET_*` env vars but no JSON context file. Same SPEC §12
+        // `FOGLET_*` env vars but no JSON context file. Same
         // production path applies.
         let context = ctx(ContextSource::Env, Some("u-99"));
         let path = resolve_save_path(
@@ -929,7 +929,7 @@ mod tests {
         assert!(path.is_none());
     }
 
-    // ----- Atomic write/read tests (Task 8b) -------------------------
+    // ----- Atomic write/read tests -------------------------
     //
     // These tests live alongside the path-resolution tests because the
     // two halves of `save` are tightly coupled in the runtime: the
@@ -939,14 +939,14 @@ mod tests {
     use serde::Deserialize;
 
     /// Tiny stand-in for an authored game's save state. Fields cover
-    /// the shapes a real game cares about (scalar, string, sequence,
+    /// the shapes a real game cares about (scalar, string, sequence.
     /// nested) so the round-trip test exercises serde's normal paths.
-    // `Default` derive lets the Task 1c `load_or_default` tests use
-    // `SaveFixture::default()` for the brand-new-player branch. The
-    // derived value is `version: 0`, empty player/inventory/flags —
+    // `Default` derive lets the `load_or_default` tests use
+    // `SaveFixture::default` for the brand-new-player branch. The
+    // derived value is `version: 0`, empty player/inventory/flags
     // deliberately distinct from `fixture_v1` (which uses `version: 1`)
     // so a test failure can distinguish "we hit the default path" from
-    // "we loaded v1 from disk".
+    // "we loaded from disk".
     #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
     struct SaveFixture {
         version: u32,
@@ -999,7 +999,7 @@ mod tests {
 
     #[test]
     fn write_creates_missing_parent_directories() {
-        // SPEC §12's per-user save path includes a `<user_id>` dir that
+        // 's per-user save path includes a `<user_id>` dir that
         // doesn't exist on first launch. The writer must `mkdir -p` it.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("saves").join("u-42").join("save.json");
@@ -1025,34 +1025,34 @@ mod tests {
 
     #[test]
     fn crash_mid_write_leaves_previous_version_intact() {
-        // Simulates the failure mode the SPEC §13 reliability bar and
+        // Simulates the failure mode the reliability bar and
         // PROMPT.md's "atomic writes" tenet are meant to defend
         // against: process death between "started writing" and
         // "successfully renamed". The temp file is created and written
-        // but never `persist()`ed; on drop, `tempfile` removes the
+        // but never `persist`ed; on drop, `tempfile` removes the
         // scratch file and the previously-renamed `save.json` must
-        // still hold v1 — never half-written, never absent.
+        // still hold — never half-written, never absent.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("save.json");
 
-        // First, an honest save lands v1 atomically.
+        // First, an honest save lands atomically.
         write_atomic(&path, &fixture_v1()).unwrap();
 
-        // Now begin a v2 write the way `write_atomic` does, but bail
-        // out before the `persist()` step.
+        // Now begin a write the way `write_atomic` does, but bail
+        // out before the `persist` step.
         {
             let parent = path.parent().unwrap();
             let mut tmp = tempfile::NamedTempFile::new_in(parent).unwrap();
             serde_json::to_writer_pretty(&mut tmp, &fixture_v2()).unwrap();
             tmp.as_file_mut().flush().unwrap();
             // Intentionally drop `tmp` without calling `.persist(&path)`.
-            // This models a crash mid-write: the temp file vanishes,
+            // This models a crash mid-write: the temp file vanishes.
             // and `path` itself was never touched.
             drop(tmp);
         }
 
         // Final check: `save.json` is *exactly* v1, byte-for-byte the
-        // outcome of the previous successful write. Never absent,
+        // outcome of the previous successful write. Never absent.
         // never half-written, never v2.
         let loaded: SaveFixture = read_save(&path).unwrap().unwrap();
         assert_eq!(loaded, fixture_v1());
@@ -1079,9 +1079,9 @@ mod tests {
         assert!(matches!(err, SaveIoError::Deserialize(_)));
     }
 
-    // ----- SaveSlot<T> tests (Task 1) ------------------------------
+    // ----- SaveSlot<T> tests ------------------------------
     //
-    // 1a covers only the constructor + immutable borrow. Mutation,
+    // 1a covers only the constructor + immutable borrow. Mutation.
     // dirty-flag tracking, snapshot/apply, handle cloning, and the
     // load/save helpers land in 1b–1e and grow the test surface there.
 
@@ -1104,7 +1104,7 @@ mod tests {
         // 1b precondition: a freshly-built slot is not dirty. The dirty
         // flag is intended to track *post-construction* mutations, not
         // the initial assignment via `new`. Authors rely on this so a
-        // "save on Quit if dirty" runtime hook (Task 4) doesn't write
+        // "save on Quit if dirty" runtime hook doesn't write
         // an unmodified file every launch.
         let slot: SaveSlot<SaveFixture> = SaveSlot::new(fixture_v1());
         assert!(!slot.is_dirty(), "freshly-constructed slot must be clean");
@@ -1112,7 +1112,7 @@ mod tests {
 
     #[test]
     fn save_slot_borrow_mut_sets_dirty_flag() {
-        // SPEC_v2_1 §4.1 rule: `borrow_mut()` flips the dirty flag on
+        //  rule: `borrow_mut` flips the dirty flag on
         // entry, regardless of whether the caller actually mutates
         // through the returned `RefMut`. We exercise both halves:
         // (a) merely calling `borrow_mut` dirties the slot, and
@@ -1178,7 +1178,7 @@ mod tests {
 
     #[test]
     fn save_slot_apply_overwrites_in_place_and_dirties() {
-        // `apply` is the bulk-replace path used by reset / load. After
+        // `apply` is the bulk-replace path used by reset load. After
         // it returns, observers see the new value and the slot is
         // dirty so the next save will persist it.
         let slot: SaveSlot<SaveFixture> = SaveSlot::new(fixture_v1());
@@ -1190,7 +1190,7 @@ mod tests {
 
     #[test]
     fn save_slot_handle_shares_state_with_original() {
-        // Cloning via `handle` (or `Clone::clone`) bumps refcounts —
+        // Cloning via `handle` (or `Clone::clone`) bumps refcounts
         // both handles see each other's writes and share one dirty
         // flag. This is the property that makes `SaveSlot<T>` viable
         // as a per-screen constructor argument: every screen's clone
@@ -1207,9 +1207,9 @@ mod tests {
 
     #[test]
     fn save_slot_handle_is_alias_for_clone() {
-        // `handle()` and `clone()` are documented as equivalent; pin
+        // `handle` and `clone` are documented as equivalent; pin
         // that. If one ever grows divergent semantics it should be
-        // a deliberate API change with a `DECISIONS.md` entry.
+        // a deliberate API change with a entry.
         let slot: SaveSlot<SaveFixture> = SaveSlot::new(fixture_v1());
         let via_handle = slot.handle();
         let via_clone = slot.clone();
@@ -1220,7 +1220,7 @@ mod tests {
         assert_eq!(*via_clone.borrow(), fixture_v2());
     }
 
-    // ----- SaveSlot::load / load_or_default tests (Task 1c) ---------
+    // ----- SaveSlot::load load_or_default tests ---------
 
     #[test]
     fn save_slot_load_returns_none_for_missing_file() {
@@ -1275,7 +1275,7 @@ mod tests {
         assert_eq!(*slot.borrow(), SaveFixture::default());
         assert!(
             !slot.is_dirty(),
-            "default-constructed slot starts clean — Task 1b contract",
+            "default-constructed slot starts clean — contract",
         );
     }
 
@@ -1309,13 +1309,13 @@ mod tests {
         assert!(matches!(err, SaveIoError::Deserialize(_)));
     }
 
-    // ----- SaveSlot::save tests (Task 1d) ---------------------------
+    // ----- SaveSlot::save tests ---------------------------
 
     #[test]
     fn save_slot_save_round_trips_through_write_atomic() {
         // After `save`, the bytes on disk must match what a subsequent
         // `load` returns — the slot is just a typed handle on top of
-        // `write_atomic` / `read_save`, so the round-trip property the
+        // `write_atomic` `read_save`, so the round-trip property the
         // free functions guarantee must propagate to the slot API.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("save.json");
@@ -1374,7 +1374,7 @@ mod tests {
         slot.borrow_mut().player = "bob".into();
         assert!(slot.is_dirty());
 
-        // `save.json` with no directory triggers `SaveIoError::NoParent`,
+        // `save.json` with no directory triggers `SaveIoError::NoParent`.
         // mirroring the existing `write_to_path_with_no_parent_errors`
         // case for the free function.
         let err = slot.save(Path::new("save.json")).unwrap_err();
@@ -1385,12 +1385,12 @@ mod tests {
         );
     }
 
-    // ----- SaveSlot::save_handler tests (Task 1e) ------------------
+    // ----- SaveSlot::save_handler tests ------------------
 
     #[test]
     fn save_slot_save_handler_persists_current_contents() {
         // A handler invocation must produce the same on-disk bytes as
-        // a direct `save()` call — proving the indirection through
+        // a direct `save` call — proving the indirection through
         // `SaveHandler` is just plumbing, not a behavioural fork.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("save.json");
@@ -1428,10 +1428,10 @@ mod tests {
 
     #[test]
     fn save_slot_save_handler_outlives_original_binding() {
-        // SPEC_v2_1 §4.1 rule: the handler captures the slot via `Rc`,
+        //  rule: the handler captures the slot via `Rc`.
         // so it MUST keep working after the originally-named binding
         // is dropped. We model the realistic call shape: build the
-        // slot, hand a handle to a "screen" (here, a vector cell),
+        // slot, hand a handle to a "screen" (here, a vector cell).
         // register the handler, then drop the original binding by
         // moving it into a no-op closure that immediately falls out
         // of scope.

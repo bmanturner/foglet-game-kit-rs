@@ -1,7 +1,7 @@
 //! `DialogScreen` — optional [`crate::screen::Screen`] adapter that
-//! drives a [`crate::dialog::Dialog`] / [`crate::dialog::DialogState`]
+//! drives a [`crate::dialog::Dialog`] [`crate::dialog::DialogState`]
 //! pair through the standard render and input loop, parallel to
-//! [`crate::prompt_screen::PromptScreen`] (SPEC_v2_1.md §4.2).
+//! [`crate::prompt_screen::PromptScreen`] (.md ).
 //!
 //! # When to reach for this
 //!
@@ -10,10 +10,10 @@
 //! pop back when the dialog finishes." That is the shape of every
 //! talk-to-an-NPC scene in the Murder Motel example, and it has been
 //! the shape of the example's hand-rolled `scenes/dialog.rs` ever
-//! since v1 — ~562 lines of generic plumbing that never needed to be
+//! since — ~562 lines of generic plumbing that never needed to be
 //! per-game.
 //!
-//! Compose [`crate::dialog::Dialog`] / [`crate::dialog::DialogState`]
+//! Compose [`crate::dialog::Dialog`] [`crate::dialog::DialogState`]
 //! manually inside a custom [`crate::screen::Screen`] when the dialog
 //! is one panel among several (e.g. an NPC
 //! talking head next to a live inventory pane), or when the screen
@@ -26,14 +26,14 @@
 //! layer down to [`crate::dialog::dialog_handle_prompt_input`]
 //! directly.
 //!
-//! See `docs/dialog-screens.md` (Task 9b) for the full authoring rule
+//! See `docs/dialog-screens.md` for the full authoring rule
 //! of thumb on choosing between this adapter and a hand-rolled
 //! [`crate::screen::Screen`] that composes [`crate::dialog::Dialog`]
 //! manually.
 //!
 //! # Why a callback, not a return-value-only design
 //!
-//! [`crate::screen::ScreenCommand`] is the SPEC §5.5 vocabulary the
+//! [`crate::screen::ScreenCommand`] is the vocabulary the
 //! runtime understands; [`DialogAction`] is this adapter's narrower
 //! vocabulary. The mapping between them is game-specific (one game's
 //! `Finished` becomes `Pop`; another's becomes `Replace` into a new
@@ -48,13 +48,13 @@
 //! # Layout default differs from `PromptScreen`
 //!
 //! Unlike [`crate::prompt_screen::PromptScreen`], which defaults to
-//! the SPEC §4.3 compact layout, `DialogScreen` defaults to
+//! the compact layout, `DialogScreen` defaults to
 //! [`DialogLayout::Modal`]. Real Foglet door-game dialogs are almost
-//! always centred, bordered, and titled with the speaker's name —
+//! always centred, bordered, and titled with the speaker's name
 //! that is what every Murder Motel NPC scene already does, and the
 //! default should reflect the common case. Authors who want the
 //! compact unboxed layout will be able to opt in with the
-//! `DialogScreen::compact` builder method (Task 2e).
+//! `DialogScreen::compact` builder method.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -72,7 +72,7 @@ use crate::input::Input;
 use crate::prompt::PromptAction;
 use crate::screen::{GameContext, Screen, ScreenCommand};
 
-// Task 2e (accessors) will pull a couple more items in alongside its
+//  (accessors) will pull a couple more items in alongside its
 // own commit; this module's import set otherwise stabilises here.
 
 /// Boxed callback type translating a [`DialogAction`] outcome into a
@@ -82,7 +82,7 @@ use crate::screen::{GameContext, Screen, ScreenCommand};
 /// [`crate::prompt_screen`]'s `ActionCallback<T>`.
 type ActionCallback = Box<dyn FnMut(DialogAction) -> ScreenCommand + 'static>;
 
-/// Layout mode for `DialogScreen` rendering (Task 2b lands the
+/// Layout mode for `DialogScreen` rendering ( lands the
 /// struct itself).
 ///
 /// Mirrors [`crate::prompt_screen::PromptLayout`]: a bordered modal
@@ -108,13 +108,13 @@ pub enum DialogLayout {
     Compact,
 }
 
-/// Outcome of a single `DialogScreen::handle_input` call (Task 2d),
+/// Outcome of a single `DialogScreen::handle_input` call.
 /// surfaced to the author's callback.
 ///
 /// `DialogAction` exists so the adapter does not have to express
 /// every possible game-side reaction inline. `ChoicePicked` is the
 /// hot path — every Enter on a non-terminal node — and carries enough
-/// information for the author to decide whether to log, animate,
+/// information for the author to decide whether to log, animate.
 /// stash a quest flag, or simply ignore. `Finished` fires when the
 /// player advances past a terminal node, and `Cancelled` fires when
 /// the player presses [`crate::input::Input::Esc`] on a cancellable
@@ -158,11 +158,11 @@ pub enum DialogAction {
     Cancelled,
 }
 
-/// `Screen` adapter wrapping a [`Dialog`] / [`DialogState`] /
+/// `Screen` adapter wrapping a [`Dialog`] [`DialogState`] /
 /// [`FlagSet`] triple plus a callback that converts each
-/// [`DialogAction`] into a [`ScreenCommand`] (SPEC_v2_1.md §4.2).
+/// [`DialogAction`] into a [`ScreenCommand`] (.md ).
 ///
-/// # Lifecycle (Tasks 2c–2d will fill these in)
+/// # Lifecycle ( will fill these in)
 ///
 /// 1. `render` will paint the speaker name (when present), the
 ///    current node body, and the filtered choice list using the
@@ -201,7 +201,7 @@ pub struct DialogScreen {
     /// The parsed, validated dialog graph the screen is walking.
     /// Owned (not borrowed) so a `DialogScreen` can outlive whatever
     /// loaded the YAML — the typical Murder Motel pattern is
-    /// `load_dialog(asset_yaml).map(|d| DialogScreen::new(d, ...))`,
+    /// `load_dialog(asset_yaml).map(|d| DialogScreen::new(d,...))`.
     /// after which the asset string is dropped.
     dialog: Dialog,
     /// The mutable cursor through `dialog`. Constructed by the
@@ -210,12 +210,12 @@ pub struct DialogScreen {
     state: DialogState,
     /// Shared flag store. The adapter only mutates it inside the
     /// branch-transition path described by the loaded `Dialog`
-    /// (SPEC_v2_1.md §4.2 forbids side-channel writes); other
+    /// (.md forbids side-channel writes); other
     /// screens are free to read or mutate concurrently between
     /// frames.
     flags: Rc<RefCell<FlagSet>>,
     /// Index into [`DialogState::available_choices`] highlighted on
-    /// the current frame. Reset to `0` on construction; Task 2d
+    /// the current frame. Reset to `0` on construction;
     /// updates it on `Up`/`Down` navigation. Stored as `usize`
     /// rather than `Option<usize>` because the cursor always points
     /// at a real choice once one exists — when the choice list is
@@ -224,7 +224,7 @@ pub struct DialogScreen {
     choice_cursor: usize,
     /// Top of the visible-choices window when the current node has
     /// more than [`DIALOG_PROMPT_MAX_CHOICES`] available branches
-    /// (SPEC_v2_1.md §4.2 Task 2f). `0` for any node within the cap,
+    /// (.md ). `0` for any node within the cap.
     /// which is the common case — only wide branching nodes (12+
     /// suspects, long item lists threaded through dialog) ever set
     /// this above zero. Maintained as the invariant
@@ -244,10 +244,10 @@ impl DialogScreen {
     /// Build a new `DialogScreen` from a [`Dialog`], its starting
     /// [`DialogState`], a shared [`FlagSet`] handle, and a callback
     /// mapping [`DialogAction`] outcomes to [`ScreenCommand`] values
-    /// (SPEC_v2_1.md §4.2 required API).
+    /// (.md required API).
     ///
     /// Defaults to [`DialogLayout::Modal`]; the `compact` builder
-    /// method (Task 2e) switches to the unboxed layout. The
+    /// method switches to the unboxed layout. The
     /// starting [`DialogState`] is supplied by the
     /// caller rather than constructed internally because
     /// [`DialogState::start`] requires `&mut FlagSet` access — the
@@ -285,7 +285,7 @@ impl DialogScreen {
     ///
     /// Mirrors [`crate::prompt_screen::PromptScreen::layout`]. Useful
     /// for tests that want to pin the constructor default
-    /// ([`DialogLayout::Modal`], SPEC_v2_1.md §4.2) and for screens that
+    /// ([`DialogLayout::Modal`],.md ) and for screens that
     /// compose a [`DialogScreen`] inside a larger layout and need to
     /// know whether the adapter is drawing its own border.
     pub fn layout(&self) -> DialogLayout {
@@ -320,11 +320,11 @@ impl DialogScreen {
         &self.state
     }
 
-    /// Switch the layout to [`DialogLayout::Modal`] (SPEC_v2_1.md §4.2
+    /// Switch the layout to [`DialogLayout::Modal`] (.md
     /// default). Builder-style so the call site reads
-    /// `DialogScreen::new(...).modal()` even though it is the default —
+    /// `DialogScreen::new(...).modal` even though it is the default
     /// useful when an author wants to spell the layout choice out
-    /// explicitly for readers (or to undo a prior `.compact()` in a
+    /// explicitly for readers (or to undo a prior `.compact` in a
     /// builder chain).
     pub fn modal(mut self) -> Self {
         self.layout = DialogLayout::Modal;
@@ -349,7 +349,7 @@ impl DialogScreen {
 impl Screen for DialogScreen {
     /// Paint the dialog into `frame`, picking the body shape from the
     /// current [`DialogState`] cursor (line-pumping, choice mode, or
-    /// finished) and the framing from [`Self::layout`] (Task 2c).
+    /// finished) and the framing from [`Self::layout`].
     ///
     /// # Layout
     ///
@@ -360,10 +360,10 @@ impl Screen for DialogScreen {
     /// **not** rendered here because the kit's [`Dialog`] schema does
     /// not carry one — the modal frame is left untitled and games that
     /// want a speaker label will compose `crate::widgets::render_modal`
-    /// (Task 3b — not yet landed) themselves before pushing the
+    /// ( — not yet landed) themselves before pushing the
     /// screen, or wrap a
     /// [`DialogScreen`] in a custom [`Screen`] that paints the title
-    /// row first. The Murder Motel refactor (Task 6) will spell that
+    /// row first. The Murder Motel refactor will spell that
     /// pattern out concretely.
     ///
     /// # Body modes
@@ -371,17 +371,17 @@ impl Screen for DialogScreen {
     /// 1. **Line-pumping.** [`DialogState::current_line`] returns
     ///    `Some(line)` while the cursor sits on a script line. Render
     ///    the line text wrapped to the body area and a centred
-    ///    `[Enter] continue   [Esc] leave` hint along the bottom row.
+    ///    `[Enter] continue [Esc] leave` hint along the bottom row.
     /// 2. **Finished.** [`DialogState::is_finished`] is `true` after
     ///    the cursor has walked off the end of the graph. Render a
     ///    `(They turn away.)` leave hint — the dialog has nothing more
-    ///    to say. Task 2d will translate the next `Enter`/`Esc` into a
-    ///    [`DialogAction::Finished`] / [`DialogAction::Cancelled`]
+    ///    to say. will translate the next `Enter`/`Esc` into a
+    ///    [`DialogAction::Finished`] [`DialogAction::Cancelled`]
     ///    callback.
     /// 3. **Choice mode.** Lines exhausted, dialog not yet finished.
     ///    Build a [`crate::prompt::ChoicePrompt`] from the live flag
-    ///    snapshot via [`crate::dialog::dialog_choice_prompt`] (the SPEC §8 helper
-    ///    that already filters `requires` / `requires_not` predicates
+    ///    snapshot via [`crate::dialog::dialog_choice_prompt`] (the helper
+    ///    that already filters `requires` `requires_not` predicates
     ///    and caps the choice list at [`crate::dialog::DIALOG_PROMPT_MAX_CHOICES`])
     ///    and delegate rendering to [`crate::prompt::ChoicePrompt::render`].
     ///    The screen's `choice_cursor` is fed in via the prompt's
@@ -391,7 +391,7 @@ impl Screen for DialogScreen {
     ///
     /// # Why delegate to `dialog_choice_prompt` rather than re-render
     ///
-    /// SPEC_v2_1.md §4.2 explicitly forbids re-implementing dialog
+    /// .md explicitly forbids re-implementing dialog
     /// mechanics here: "The adapter MUST use `dialog_choice_prompt`
     /// and `dialog_handle_prompt_input` internally rather than
     /// re-implementing dialog mechanics." Routing through the helper
@@ -460,9 +460,9 @@ impl Screen for DialogScreen {
 
         // 3. Choice mode. Build the prompt under an immutable flag
         // borrow; mutate nothing — render is read-only with respect
-        // to game state per SPEC §7. We use the *windowed* helper
+        // to game state We use the *windowed* helper
         // here so a node with more than `DIALOG_PROMPT_MAX_CHOICES`
-        // available branches scrolls deterministically (Task 2f) —
+        // available branches scrolls deterministically
         // the un-windowed helper is the offset-0 case.
         let flags = self.flags.borrow();
         let total = self.state.available_choices(&self.dialog, &flags).len();
@@ -511,19 +511,19 @@ impl Screen for DialogScreen {
 
     /// Drive the dialog forward in response to a single [`Input`] and
     /// translate the outcome into a [`ScreenCommand`] via the
-    /// configured `on_action` callback (Task 2d / SPEC_v2_1.md §4.2).
+    /// configured `on_action` callback ( /.md ).
     ///
     /// # Routing rules
     ///
     /// 1. **`Esc`** always emits [`DialogAction::Cancelled`]. The
-    ///    adapter does not gate cancellation on a `cancellable` flag —
+    ///    adapter does not gate cancellation on a `cancellable` flag
     ///    every Murder Motel dialog has historically allowed Esc to
     ///    walk away, and games that want to forbid it can simply
     ///    return [`ScreenCommand::None`] from their callback for the
     ///    `Cancelled` arm.
     /// 2. **Finished state.** When [`DialogState::is_finished`] is
     ///    true, `Enter` emits [`DialogAction::Finished`] and any other
-    ///    non-`Esc` key is absorbed silently — the SPEC §4.2 contract
+    ///    non-`Esc` key is absorbed silently — the contract
     ///    is "the dialog has nothing more to say," so we don't react
     ///    to stray input.
     /// 3. **Line-pumping mode.** While [`DialogState::current_line`]
@@ -532,18 +532,18 @@ impl Screen for DialogScreen {
     ///    end of the graph (terminal node, no further lines or
     ///    choices) the same press promotes to
     ///    [`DialogAction::Finished`] without forcing the player to
-    ///    press Enter twice — the v2 example's hand-rolled scene
+    ///    press Enter twice — the example's hand-rolled scene
     ///    behaved the same way and the refactor MUST preserve that.
     /// 4. **Choice mode.** `Up`/`Down` move `choice_cursor` over
     ///    the *full* available-choice list. When the node has more
-    ///    than [`DIALOG_PROMPT_MAX_CHOICES`] branches (Task 2f), the
+    ///    than [`DIALOG_PROMPT_MAX_CHOICES`] branches, the
     ///    adapter maintains a `choice_scroll` window so the visible
     ///    page follows the cursor: walking off the bottom edge
     ///    advances the page; walking off the top retreats it. `Enter`
     ///    synthesises the *window-relative* numeric hotkey
     ///    (`'1'..'9'`) and routes it through
     ///    [`crate::dialog::dialog_handle_prompt_input_window`], so
-    ///    this adapter never re-implements the SPEC §8 selection /
+    ///    this adapter never re-implements the selection /
     ///    flag-application pipeline. A literal `Char('1'..'9')` press
     ///    goes through the same windowed helper and is interpreted
     ///    page-relative — `2` always picks the second visible row
@@ -552,7 +552,7 @@ impl Screen for DialogScreen {
     /// # Why synthesise a digit for Enter rather than call
     /// [`DialogState::choose`] directly
     ///
-    /// SPEC_v2_1.md §4.2 mandates that the adapter "MUST use
+    /// .md mandates that the adapter "MUST use
     /// `dialog_choice_prompt` and `dialog_handle_prompt_input`
     /// internally rather than re-implementing dialog mechanics." The
     /// helper applies the picked choice's `set:` flags, advances the
@@ -566,7 +566,7 @@ impl Screen for DialogScreen {
     /// # Cursor cap and scroll window
     ///
     /// The cursor is bounded by the live `available_choices` count
-    /// (no `DIALOG_PROMPT_MAX_CHOICES` cap on the cursor itself —
+    /// (no `DIALOG_PROMPT_MAX_CHOICES` cap on the cursor itself
     /// only on the visible window). When the node has more branches
     /// than fit on a page, an internal `visible_window_offset`
     /// helper keeps the `choice_scroll` field anchored so the
@@ -602,7 +602,7 @@ impl Screen for DialogScreen {
         }
 
         // 3. Line-pumping mode — walk the cursor forward one line per
-        // Enter. Other keys are ignored so the player cannot, e.g.,
+        // Enter. Other keys are ignored so the player cannot, e.g..
         // accidentally pick a hotkey before reading the setup text.
         if self.state.current_line(&self.dialog).is_some() {
             if input == Input::Enter {
@@ -625,7 +625,7 @@ impl Screen for DialogScreen {
         // 4. Choice mode. Compute the live total-choice count once
         // up-front so navigation, hotkey routing, and the synthesised
         // Enter path all agree on the same boundary. The cursor
-        // ranges over the *full* available-choices list — Task 2f's
+        // ranges over the *full* available-choices list — 's
         // scroll window keeps it visible inside the
         // `DIALOG_PROMPT_MAX_CHOICES` cap.
         let total = {
@@ -642,7 +642,7 @@ impl Screen for DialogScreen {
         // outside the visible page.
         self.choice_scroll = self.visible_window_offset(total);
         // Cursor cannot point past the live list — clamp before any
-        // navigation arithmetic so subsequent `+ 1` / `- 1` operate
+        // navigation arithmetic so subsequent `+ 1` `- 1` operate
         // on a valid index. This also covers the case where a stale
         // cursor inherited from a longer list points off the end.
         if self.choice_cursor >= total {
@@ -682,7 +682,7 @@ impl Screen for DialogScreen {
             }
             Input::Enter => {
                 // Capture the picked choice's `goto` *before*
-                // applying — once the helper advances the state,
+                // applying — once the helper advances the state.
                 // `current_node` reflects the destination and the
                 // pre-advance metadata is gone. The cursor is the
                 // full-list index; the windowed helper consumes it
@@ -698,7 +698,7 @@ impl Screen for DialogScreen {
                 // Synthesise the matching numeric hotkey (`'1'..='9'`)
                 // for the cursor's *window-relative* position. The
                 // window invariant guarantees
-                // `0 <= cursor - scroll < DIALOG_PROMPT_MAX_CHOICES`,
+                // `0 <= cursor - scroll < DIALOG_PROMPT_MAX_CHOICES`.
                 // so the digit conversion is total.
                 let window_relative = self.choice_cursor - self.choice_scroll;
                 let digit = char::from_digit((window_relative as u32) + 1, 10)
@@ -718,7 +718,7 @@ impl Screen for DialogScreen {
                 // Reset cursor *and* scroll unconditionally — the next
                 // frame's filtered choice list may be smaller (a
                 // `set:` flag could have hidden a previously-visible
-                // branch) and landing back at index 0 / page 0 is the
+                // branch) and landing back at index 0 page 0 is the
                 // conservative default. Without this reset, paging
                 // through suspect dialogs would leave the next dialog
                 // mid-page on its first frame.
@@ -732,7 +732,7 @@ impl Screen for DialogScreen {
                         })
                     }
                     // The helper returns Ok for non-Selected outcomes
-                    // (None / Disabled / Cancelled). None of those are
+                    // (None Disabled Cancelled). None of those are
                     // reachable from a synthesised numeric hotkey on a
                     // visible choice, but we surface them as no-ops
                     // rather than panicking so a future change to the
@@ -786,8 +786,8 @@ impl Screen for DialogScreen {
 }
 
 impl DialogScreen {
-    /// Compute the top-of-window offset for the visible choice page,
-    /// given the live `total` available-choice count (Task 2f).
+    /// Compute the top-of-window offset for the visible choice page.
+    /// given the live `total` available-choice count.
     ///
     /// Centralises the scroll-clamping arithmetic so the render path
     /// and `handle_input` agree byte-for-byte: a flag flip that
@@ -857,7 +857,7 @@ mod tests {
     /// Construction sanity check for [`DialogLayout`]. The variants
     /// are `Copy` so we can assert equality without cloning, and the
     /// `PartialEq` impl is what downstream tests will lean on when
-    /// pinning the default layout in Task 2b.
+    /// pinning the default layout in.
     #[test]
     fn dialog_layout_variants_are_distinct() {
         assert_ne!(DialogLayout::Modal, DialogLayout::Compact);
@@ -868,7 +868,7 @@ mod tests {
     /// captured-`Rc<RefCell<Vec<_>>>` pattern from
     /// [`crate::prompt_screen`]'s tests). `target_node` is `String`
     /// so this clone is a real heap allocation, not a `Copy`, which
-    /// is the contract Task 2b's tests will rely on.
+    /// is the contract 's tests will rely on.
     #[test]
     fn dialog_action_choice_picked_clones() {
         let action = DialogAction::ChoicePicked {
@@ -893,7 +893,7 @@ mod tests {
     /// other and from `ChoicePicked`. Future contributors who want to
     /// merge variants (a recurring temptation: "couldn't `Cancelled`
     /// just be `Finished` with a flag?") will trip this test and
-    /// have to revisit SPEC_v2_1.md §4.2 first.
+    /// have to revisit.md first.
     #[test]
     fn dialog_action_terminal_variants_are_distinct() {
         assert_ne!(DialogAction::Finished, DialogAction::Cancelled);
@@ -945,15 +945,15 @@ nodes:
             ScreenCommand::None
         });
 
-        // Storage check — the constructor must hand the dialog,
+        // Storage check — the constructor must hand the dialog.
         // state, and flag handle through unchanged. We compare via
         // the private fields (the test module sees them) so the
-        // assertion does not depend on Task 2e's `dialog()` /
-        // `state()` accessors landing first.
+        // assertion does not depend on 's `dialog` /
+        // `state` accessors landing first.
         assert_eq!(screen.dialog, dialog);
         assert_eq!(screen.state, start);
         assert!(Rc::ptr_eq(&screen.flags, &flags));
-        // Cursor starts at zero — Task 2d will move it on Up/Down.
+        // Cursor starts at zero — will move it on Up/Down.
         assert_eq!(screen.choice_cursor, 0);
         // The callback must not have fired yet — the constructor
         // is meant to be inert with respect to the action stream.
@@ -962,7 +962,7 @@ nodes:
 
     #[test]
     fn new_defaults_to_modal_layout() {
-        // SPEC_v2_1.md §4.2 picks `Modal` as the default because
+        // .md picks `Modal` as the default because
         // every Murder Motel dialog scene already renders that way;
         // pin that here so a future contributor switching the
         // default has to revisit the spec.
@@ -999,9 +999,9 @@ nodes:
         assert!(screen.flags.borrow().contains("heard_rumor"));
     }
 
-    // ---------- Task 2c render tests ----------
+    // ---------- render tests ----------
     //
-    // The render impl picks one of three body modes (line-pumping,
+    // The render impl picks one of three body modes (line-pumping.
     // finished, choice) and one of two layouts (modal, compact). We
     // pin each mode/layout combination through a `TestBackend` rather
     // than via `insta` snapshots: the assertions below check shape
@@ -1115,7 +1115,7 @@ nodes:
     fn render_modal_paints_border_and_first_line() {
         // Default layout is `Modal`. Render the fixture at the start
         // (cursor on `greeting`, line 0) and pin two things: the
-        // top-left border glyph proves the bordered block was drawn,
+        // top-left border glyph proves the bordered block was drawn.
         // and the rendered buffer contains the line text.
         let dialog = load_dialog(fixture_dialog_yaml()).expect("fixture parses");
         let flags = Rc::new(RefCell::new(FlagSet::new()));
@@ -1147,7 +1147,7 @@ nodes:
 
     #[test]
     fn render_compact_skips_border() {
-        // `compact()` builder doesn't exist yet (Task 2e), so we
+        // `compact` builder doesn't exist yet, so we
         // toggle the layout via the field that the test module can
         // see. The post-Task-2e tests will switch to the builder.
         let dialog = load_dialog(fixture_dialog_yaml()).expect("fixture parses");
@@ -1192,7 +1192,7 @@ nodes:
             DialogState::start(&dialog, &mut borrowed)
         };
         // Manual advance past the script line so `available_choices`
-        // returns the branches — Task 2d will own the input-driven
+        // returns the branches — will own the input-driven
         // version of this walk.
         {
             let mut borrowed = flags.borrow_mut();
@@ -1259,14 +1259,14 @@ nodes:
         );
     }
 
-    // ---------- Task 2d handle_input tests ----------
+    // ---------- handle_input tests ----------
     //
-    // The handle_input impl has four routing rules (Esc, finished,
+    // The handle_input impl has four routing rules (Esc, finished.
     // line-pumping, choice). The tests below pin each — and in the
     // choice case, both navigation and selection — so a refactor that
     // collapses the body modes can be caught by a single test run
     // rather than only surfacing in the example's behavioural-parity
-    // suite (Tasks 5–8). `GameContext` is required by the trait method
+    // suite. `GameContext` is required by the trait method
     // signature even though `handle_input` ignores it; we build the
     // same fixture the render tests use.
 
@@ -1422,8 +1422,8 @@ nodes:
         // Use the simple fixture (one line, then `goto: end`); after
         // a single Enter the dialog should be finished, which fires
         // `Finished` automatically (no second Enter needed) — pinning
-        // the SPEC §4.2 "advance through terminals on the same press"
-        // contract that the v2 example relied on.
+        // the "advance through terminals on the same press"
+        // contract that the example relied on.
         let dialog = load_dialog(fixture_dialog_yaml()).expect("fixture parses");
         let flags = Rc::new(RefCell::new(FlagSet::new()));
         let start = {
@@ -1447,7 +1447,7 @@ nodes:
     #[test]
     fn handle_input_numeric_hotkey_picks_choice_directly() {
         // Pressing `2` should pick the second visible choice without
-        // touching the cursor. Mirrors the SPEC §4.1 numeric-hotkey
+        // touching the cursor. Mirrors the numeric-hotkey
         // path that the helper already supports.
         let (dialog, flags, state) = fixture_in_choice_mode();
         let recorded: Rc<RefCell<Vec<DialogAction>>> = Rc::new(RefCell::new(Vec::new()));
@@ -1499,14 +1499,14 @@ nodes:
         assert_eq!(recorded.borrow()[0], DialogAction::Finished);
     }
 
-    // ---------- Task 2e accessor tests ----------
+    // ---------- accessor tests ----------
     //
     // The accessors are tiny — they hand back references or rebind the
     // layout field — so the tests only need to confirm each one routes
     // to the right field without side effects. They also pin builder
-    // chaining (`new(..).modal().compact()` lands in `Compact`) so a
+    // chaining (`new(..).modal.compact` lands in `Compact`) so a
     // future contributor cannot inadvertently break the
-    // [`PromptScreen`] symmetry that motivated Task 2e.
+    // [`PromptScreen`] symmetry that motivated.
 
     #[test]
     fn dialog_accessor_returns_loaded_graph() {
@@ -1527,7 +1527,7 @@ nodes:
     #[test]
     fn state_accessor_reflects_cursor_advances() {
         // Drive the state forward via `handle_input` (the public path)
-        // and confirm `state()` reflects the new cursor. The simple
+        // and confirm `state` reflects the new cursor. The simple
         // fixture has one line then a goto to the terminal — one Enter
         // walks both, so the post-input state must be `is_finished`.
         let dialog = load_dialog(fixture_dialog_yaml()).expect("fixture parses");
@@ -1550,7 +1550,7 @@ nodes:
 
     #[test]
     fn modal_and_compact_builders_set_layout() {
-        // Cover the builder-chain shape — `.modal()` and `.compact()`
+        // Cover the builder-chain shape — `.modal` and `.compact`
         // must each set the corresponding variant, and the last call
         // wins. This is the test that catches an accidental swap of
         // the two methods (a copy-paste hazard given how similar they
@@ -1574,7 +1574,7 @@ nodes:
             .compact();
         assert_eq!(compact_screen.layout(), DialogLayout::Compact);
 
-        // Last call wins — chaining `.modal().compact()` lands in
+        // Last call wins — chaining `.modal.compact` lands in
         // Compact, mirroring [`PromptScreen`]'s builder semantics.
         let chained = DialogScreen::new(dialog, start, flags, |_| ScreenCommand::None)
             .modal()
@@ -1618,9 +1618,9 @@ nodes:
         );
     }
 
-    // ---------- Task 2f scroll-on-overflow tests ----------
+    // ---------- scroll-on-overflow tests ----------
     //
-    // SPEC_v2_1.md §4.2 requires deterministic scrolling when an
+    // .md requires deterministic scrolling when an
     // available-choice list exceeds [`DIALOG_PROMPT_MAX_CHOICES`].
     // The fixture below has 12 ungated choices on a single node; the
     // tests pin both navigation (cursor + window invariants) and
@@ -1828,7 +1828,7 @@ nodes:
             }
             other => panic!("expected ChoicePicked, got {other:?}"),
         }
-        // Cursor and scroll must reset for the next dialog frame —
+        // Cursor and scroll must reset for the next dialog frame
         // the next conversation should start from the top.
         assert_eq!(screen.choice_cursor, 0);
         assert_eq!(screen.choice_scroll, 0);

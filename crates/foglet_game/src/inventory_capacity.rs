@@ -15,7 +15,7 @@ use thiserror::Error;
 use crate::inventory::{InventoryError, InventorySlot};
 use crate::world_db::WorldDb;
 
-/// Game-supplied capacity policy used by v5 inventory helpers.
+/// Game-supplied capacity policy used by inventory helpers.
 ///
 /// The trait intentionally exposes two scalar callbacks:
 ///
@@ -35,7 +35,7 @@ pub trait CapacityPolicy {
         -> Result<Option<i64>, CapacityError>;
 }
 
-/// Errors produced by v5 capacity validation and transfers.
+/// Errors produced by capacity validation and transfers.
 #[derive(Debug, Error)]
 pub enum CapacityError {
     /// Adding the requested capacity would exceed the owner's limit.
@@ -51,10 +51,10 @@ pub enum CapacityError {
     /// A game-supplied policy callback failed.
     #[error("capacity policy failed: {0}")]
     PolicyError(String),
-    /// The underlying v4 inventory primitive failed.
+    /// The underlying inventory primitive failed.
     #[error("inventory capacity operation failed: {source}")]
     InventoryError {
-        /// Wrapped v4 inventory error.
+        /// Wrapped inventory error.
         #[source]
         source: Box<InventoryError>,
     },
@@ -99,7 +99,7 @@ impl WorldDb {
     /// Validate that adding `quantity` of `item_key` would fit.
     ///
     /// Existing owner/item metadata is reused when a slot already
-    /// exists, because v4 inventory treats incoming quantity as additive
+    /// exists, because inventory treats incoming quantity as additive
     /// to the first matching slot. If no slot exists, the policy sees
     /// JSON `null` metadata for the proposed item.
     pub fn validate_incoming(

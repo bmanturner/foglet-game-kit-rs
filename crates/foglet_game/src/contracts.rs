@@ -1,4 +1,4 @@
-//! `contracts` — durable contract lifecycle schema (SPEC_v5 Task 3a).
+//! `contracts` — durable contract lifecycle schema.
 //!
 //! This module defines the shared-world table shape for contract-style
 //! opportunities. The schema stays intentionally genre-neutral:
@@ -8,7 +8,7 @@
 //! - In a **dungeon crawler**, a row can represent a guild commission
 //!   to recover an artifact from a crypt.
 //!
-//! Later v5 tasks layer CRUD and lifecycle transitions on top of this
+//! Later tasks layer CRUD and lifecycle transitions on top of this
 //! durable shape.
 
 use thiserror::Error;
@@ -204,7 +204,7 @@ pub struct CreateContractInput<'a> {
     pub expires_at: Option<&'a str>,
 }
 
-/// Migration for the `contracts` table (SPEC_v5 Task 3a).
+/// Migration for the `contracts` table.
 ///
 /// The schema captures one contract lifecycle row with optional
 /// acceptance/completion timestamps and a state machine guard:
@@ -420,7 +420,7 @@ ORDER BY created_at ASC, id ASC";
 
     /// List contracts issued by one owner bucket and owner id.
     ///
-    /// Issuer indexing stays generic so the same API works for station boards,
+    /// Issuer indexing stays generic so the same API works for station boards.
     /// tavern guild boards, town councils, or any other game-defined issuer.
     ///
     /// Genre-neutral usage:
@@ -469,7 +469,7 @@ ORDER BY created_at ASC, id ASC";
 
     /// Accept one contract for a player inside a single SQLite transaction.
     ///
-    /// This is the Task 4a lifecycle transition primitive. It updates
+    /// This is the lifecycle transition primitive. It updates
     /// one contract row to `accepted`, records `acceptor_player_id`, and
     /// stamps `accepted_at = CURRENT_TIMESTAMP` atomically.
     ///
@@ -477,7 +477,7 @@ ORDER BY created_at ASC, id ASC";
     /// accepted by this helper.
     ///
     /// The optional `on_commit` callback runs after the SQL mutation while
-    /// still inside the active transaction. If the callback returns `Err`,
+    /// still inside the active transaction. If the callback returns `Err`.
     /// the transaction rolls back and no acceptance persists.
     ///
     /// Genre-neutral usage:
@@ -540,7 +540,7 @@ RETURNING id, key, kind, issuer_owner_kind, issuer_owner_id, \
 
     /// Complete one accepted contract inside a single SQLite transaction.
     ///
-    /// This is the Task 4e lifecycle transition primitive. It updates one
+    /// This is the lifecycle transition primitive. It updates one
     /// contract row from `accepted` to `completed` and stamps
     /// `completed_at = CURRENT_TIMESTAMP` atomically.
     ///
@@ -548,7 +548,7 @@ RETURNING id, key, kind, issuer_owner_kind, issuer_owner_id, \
     /// cannot accidentally complete rows still available (or already terminal).
     ///
     /// The optional `on_commit` callback runs after the SQL mutation while
-    /// still inside the active transaction. If the callback returns `Err`,
+    /// still inside the active transaction. If the callback returns `Err`.
     /// the transaction rolls back and no completion persists.
     ///
     /// Genre-neutral usage:
@@ -616,14 +616,14 @@ RETURNING id, key, kind, issuer_owner_kind, issuer_owner_id, \
 
     /// Mark one accepted contract as failed inside a single SQLite transaction.
     ///
-    /// This is the Task 4f lifecycle transition primitive. It updates one
+    /// This is the lifecycle transition primitive. It updates one
     /// contract row from `accepted` to `failed` atomically.
     ///
     /// Contracts not currently in the `accepted` state are rejected so games
     /// cannot accidentally fail rows still available (or already terminal).
     ///
     /// The optional `on_commit` callback runs after the SQL mutation while
-    /// still inside the active transaction. If the callback returns `Err`,
+    /// still inside the active transaction. If the callback returns `Err`.
     /// the transaction rolls back and no failure persists.
     ///
     /// Genre-neutral usage:
@@ -690,7 +690,7 @@ RETURNING id, key, kind, issuer_owner_kind, issuer_owner_id, \
 
     /// Mark one accepted contract as abandoned inside a single SQLite transaction.
     ///
-    /// This is the Task 4f lifecycle transition primitive. It updates one
+    /// This is the lifecycle transition primitive. It updates one
     /// contract row from `accepted` to `abandoned` atomically and clears
     /// `acceptor_player_id` so later analytics can distinguish abandoned rows
     /// from actively held commitments.
@@ -699,7 +699,7 @@ RETURNING id, key, kind, issuer_owner_kind, issuer_owner_id, \
     /// cannot accidentally abandon rows still available (or already terminal).
     ///
     /// The optional `on_commit` callback runs after the SQL mutation while
-    /// still inside the active transaction. If the callback returns `Err`,
+    /// still inside the active transaction. If the callback returns `Err`.
     /// the transaction rolls back and no abandonment persists.
     ///
     /// Genre-neutral usage:
@@ -874,7 +874,7 @@ WHERE id = ?1";
     /// Map a failed state-to-state transition onto `NotFound` or `InvalidTransition`.
     ///
     /// Lifecycle helpers with fixed source-state preconditions call this after
-    /// a guarded `UPDATE ... RETURNING` reports no rows. The diagnostic read is
+    /// a guarded `UPDATE... RETURNING` reports no rows. The diagnostic read is
     /// intentionally tiny: if the row exists we surface its current `state` as
     /// `from`; otherwise we surface `NotFound`.
     fn diagnose_failed_state_transition(
@@ -1057,7 +1057,7 @@ mod tests {
                 ("completed_at".to_string(), 0, 0, "TEXT".to_string()),
                 ("expires_at".to_string(), 0, 0, "TEXT".to_string()),
             ],
-            "contracts schema must match Task 3a contract"
+            "contracts schema must match contract"
         );
 
         let sql: String = world

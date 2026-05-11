@@ -1,6 +1,6 @@
-//! `turns` — daily turn ledger schema (SPEC_v2 §Task 6).
+//! `turns` — daily turn ledger schema.
 //!
-//! Task 6a (this iteration) ships the `turn_ledger` migration only.
+//!  (this iteration) ships the `turn_ledger` migration only.
 //! Subsequent sub-tasks layer behavior on top of the schema introduced
 //! here:
 //!
@@ -17,13 +17,13 @@
 //! sharp: a regression that drops a column flunks the schema test in
 //! this module rather than a higher-level spend assertion that's harder
 //! to attribute. The migration is exported as a `pub const` so the
-//! runtime startup path (Task 10) and game-author code can reference one
+//! runtime startup path and game-author code can reference one
 //! canonical definition without redeclaring the schema and drifting from
 //! it — same pattern as [`crate::players::PLAYERS_MIGRATION`].
 //!
 //! # Why a per-(player, date) row instead of a single rolling balance
 //!
-//! SPEC_v2 §4.6 mandates four behaviors that all assume a notion of
+//!  mandates four behaviors that all assume a notion of
 //! "today's allowance":
 //!
 //! 1. Initialize a player with today's allowance.
@@ -32,17 +32,17 @@
 //! 4. Carry over up to `carryover_max` to the new day.
 //!
 //! A single `players.balance` column would force the runtime to detect
-//! "is today a new day?" *and* mutate balance in the same round-trip,
-//! racing every other writer. Keeping one row per (`player_id`,
+//! "is today a new day?" *and* mutate balance in the same round-trip.
+//! racing every other writer. Keeping one row per (`player_id`.
 //! `local_date`) makes the active row a pure lookup (`WHERE player_id =
-//! ? AND local_date = ?`) and reduces the carryover step (Task 6f) to
+//! ? AND local_date = ?`) and reduces the carryover step to
 //! "read yesterday's balance, write today's row" — both single-row
-//! operations the SPEC §9 transaction wrapper can compose without
+//! operations the transaction wrapper can compose without
 //! touching unrelated rows.
 //!
 //! It also gives operators a queryable history: a sysop poking at
 //! `sqlite3` can see *when* a player burned their turns rather than
-//! just the current count. That's not a SPEC requirement, but it's a
+//! just the current count. That's not a requirement, but it's a
 //! free side-effect of the keying choice and worth not throwing away.
 
 use std::fmt;
@@ -52,11 +52,11 @@ use thiserror::Error;
 
 use crate::world_db::{WorldDb, WorldMigration};
 
-/// Schema for the daily turn ledger — SPEC_v2 §4.6 / §Task 6a.
+/// Schema for the daily turn ledger —.
 ///
 /// One row per (`player_id`, `local_date`) pair. The "active" row for a
 /// player on a given day is the one matching today's local date in the
-/// configured timezone (Task 6b will introduce the date provider that
+/// configured timezone ( will introduce the date provider that
 /// makes "today" testable). Old rows are retained on purpose so the
 /// carryover step (6f) can read yesterday's balance directly and so
 /// operators have a queryable history.
@@ -64,21 +64,21 @@ use crate::world_db::{WorldDb, WorldMigration};
 /// # Column shape
 ///
 /// - `player_id` — `INTEGER NOT NULL REFERENCES players(id)`. Foreign
-///   keyed to the player registry from Task 5 so the ledger can never
+///   keyed to the player registry from so the ledger can never
 ///   refer to a phantom identity. SQLite enforces foreign keys only
-///   when `PRAGMA foreign_keys = ON`; the runtime layer (Task 10) is
+///   when `PRAGMA foreign_keys = ON`; the runtime layer is
 ///   responsible for enabling it at open time. Until then the constraint
 ///   is documentation, but the column shape is already correct so
 ///   enabling FK enforcement later is a one-line change rather than a
 ///   migration.
 /// - `local_date` — `TEXT NOT NULL`. Stored as `YYYY-MM-DD` in the
-///   server's local timezone (the only `[turns].reset` value v2 ships
+///   server's local timezone (the only `[turns].reset` value ships
 ///   is `local_midnight`). Text rather than `INTEGER` because the
 ///   sortable ISO format is human-readable in the `sqlite3` CLI and
-///   round-trips cleanly through `chrono::NaiveDate` once Task 6b lands.
+///   round-trips cleanly through `chrono::NaiveDate` once lands.
 /// - `balance` — `INTEGER NOT NULL`. Remaining turns for that day.
 ///   Allowed to be zero (a player who burned every turn) but never
-///   negative — Task 6e's insufficient-turn rejection lives in code
+///   negative — 's insufficient-turn rejection lives in code
 ///   rather than as a `CHECK` constraint so the failure surfaces with
 ///   a typed error instead of `SQLITE_CONSTRAINT`. We could add the
 ///   `CHECK` belt-and-braces later; for now the simpler schema wins.
@@ -87,18 +87,18 @@ use crate::world_db::{WorldDb, WorldMigration};
 ///   created. Stored (rather than recomputed from config) so an
 ///   operator who lowers the allowance mid-day doesn't retroactively
 ///   shrink yesterday's balances, and so the carryover step (6f) can
-///   compute "unspent turns today" as `daily_allowance - balance` —
+///   compute "unspent turns today" as `daily_allowance - balance`
 ///   wait, that's only true when balance hasn't been touched by 6d
 ///   below. We store the original allowance to keep the row
 ///   self-describing for operators reading it cold.
-/// - `created_at` / `updated_at` — UTC timestamps for audit. Defaulted
+/// - `created_at` `updated_at` — UTC timestamps for audit. Defaulted
 ///   to `CURRENT_TIMESTAMP` so 6c can `INSERT` without threading a
 ///   clock; 6d updates `updated_at` on every spend.
 ///
 /// # Primary key choice
 ///
-/// `(player_id, local_date)` is the natural key — the SPEC's "keyed by
-/// player and local date" wording in CHECKLIST_v2 §6a maps directly
+/// `(player_id, local_date)` is the natural key — the 's "keyed by
+/// player and local date" wording in
 /// onto a composite primary key. SQLite implements this as a
 /// non-rowid covering index, so today-row lookups (`WHERE player_id =
 /// ? AND local_date = ?`) are an index seek and the carryover lookup
@@ -109,13 +109,13 @@ use crate::world_db::{WorldDb, WorldMigration};
 /// Declaring it `WITHOUT ROWID` would shave a row of overhead per
 /// entry; we don't, because (a) the table is small (one row per player
 /// per day), (b) `WITHOUT ROWID` rules out future `RETURNING rowid`
-/// patterns, and (c) the SPEC doesn't ask for it.
+/// patterns, and (c) the doesn't ask for it.
 ///
 /// # Version
 ///
 /// `version = 3`. Versions 1 and 2 are reserved for future kit-level
 /// migrations and the players table respectively. Game-authored
-/// migrations (Murder Motel's `motel_world_state` from Task 12a) start
+/// migrations (Murder Motel's `motel_world_state` from ) start
 /// from a higher band so they don't collide with kit migrations the
 /// runtime applies on every open.
 pub const TURN_LEDGER_MIGRATION: WorldMigration = WorldMigration {
@@ -136,14 +136,14 @@ CREATE TABLE IF NOT EXISTS turn_ledger (\n\
 
 /// A local calendar date in `YYYY-MM-DD` form — the value the
 /// `turn_ledger.local_date` column stores and the unit of "today" the
-/// rest of Task 6 keys off.
+/// rest of keys off.
 ///
 /// Wrapped in a newtype rather than passed around as a bare `String`
 /// for two reasons:
 ///
 /// 1. **Format invariant.** Once you hold a [`LocalDate`] you know the
 ///    string is exactly ten characters long, ASCII, and shaped like
-///    `YYYY-MM-DD`. Task 6c's "today's row" lookup is a literal SQL
+///    `YYYY-MM-DD`. 's "today's row" lookup is a literal SQL
 ///    parameter bind, so any drift in shape (e.g. `2026-5-8` vs
 ///    `2026-05-08`) would silently miss rows. Validating once at the
 ///    boundary lets every consumer downstream compare with `==` and
@@ -156,10 +156,10 @@ CREATE TABLE IF NOT EXISTS turn_ledger (\n\
 /// The internal representation is a 10-byte `String` rather than a
 /// `(year, month, day)` triple because the consumer (SQLite) ultimately
 /// wants the ISO text anyway. Storing the canonical text avoids a
-/// `format!()` allocation on every bind. Calendar math (Task 6f's
+/// `format!` allocation on every bind. Calendar math ('s
 /// "yesterday" lookup) does not happen on `LocalDate` itself — it
 /// happens via the SQL `WHERE local_date < ? ORDER BY local_date DESC
-/// LIMIT 1` query SPEC §4.6 sketches, which only needs lexical
+/// LIMIT 1` query sketches, which only needs lexical
 /// comparison and is exactly what the ISO format gives us for free.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct LocalDate(String);
@@ -171,7 +171,7 @@ impl LocalDate {
     /// Validation is intentionally **shape-only**: every position is an
     /// ASCII digit except the two `-` separators, and the string is
     /// exactly ten bytes long. This catches the realistic regression
-    /// modes — a `format!()` macro that drops the zero pad, an upstream
+    /// modes — a `format!` macro that drops the zero pad, an upstream
     /// API returning `2026/05/08`, a stray newline — without pulling
     /// in a full calendar implementation that would also reject
     /// `2026-02-30` etc.
@@ -179,7 +179,7 @@ impl LocalDate {
     /// We do *not* validate semantic legality (month <= 12, day-of-
     /// month bounds, leap years) at this layer because:
     ///
-    /// - The only production [`DateProvider`] (Task 6c) will compute
+    /// - The only production [`DateProvider`] will compute
     ///   the date from the system clock, which never produces an
     ///   illegal date.
     /// - Test code passing a date through this constructor is
@@ -190,7 +190,7 @@ impl LocalDate {
     ///   bug shows up in the test the date is meant to drive, not in a
     ///   constructor panic.
     ///
-    /// If a later iteration *does* want strict calendar validation,
+    /// If a later iteration *does* want strict calendar validation.
     /// it can be added without breaking callers — the constructor
     /// already returns `Result`.
     pub fn parse(input: impl Into<String>) -> Result<Self, TurnError> {
@@ -229,11 +229,11 @@ impl fmt::Display for LocalDate {
     }
 }
 
-/// Library-internal turn-ledger errors — SPEC_v2 §Task 6.
+/// Library-internal turn-ledger errors —.
 ///
 /// `thiserror`-derived per the architecture tenet "thiserror inside
-/// libraries". Variants are added as Tasks 6c–6f land. Task 6b
-/// introduced the validation variant for [`LocalDate::parse`]; Task 6c
+/// libraries". Variants are added as land.
+/// introduced the validation variant for [`LocalDate::parse`];
 /// adds [`TurnError::Sqlite`] for failures coming out of the SQLite
 /// driver while reading or writing today's row.
 #[derive(Debug, Error)]
@@ -249,7 +249,7 @@ pub enum TurnError {
     },
     /// The SQLite round-trip backing a turn-ledger read or write failed.
     /// Wraps `rusqlite::Error` rather than re-wording it so `tracing`
-    /// and the operator-facing `anyhow` boundary in Task 10 keep the
+    /// and the operator-facing `anyhow` boundary in keep the
     /// underlying SQLite reason intact.
     #[error("turn ledger SQLite operation failed: {source}")]
     Sqlite {
@@ -258,12 +258,12 @@ pub enum TurnError {
         source: rusqlite::Error,
     },
     /// A spend was rejected because today's balance is below the
-    /// requested amount — SPEC_v2 §Task 6e. The persisted balance is
+    /// requested amount —. The persisted balance is
     /// **not** mutated when this variant is returned; callers can
     /// surface `balance` to the player as "you only have N turns
     /// left" without re-querying.
     ///
-    /// `requested` is the unsigned amount the caller asked to spend,
+    /// `requested` is the unsigned amount the caller asked to spend.
     /// widened to `i64` so the error formats consistently with
     /// `balance` (which is the SQLite `INTEGER` storage type).
     #[error(
@@ -282,7 +282,7 @@ pub enum TurnError {
 
 /// Source of "what is today's local date" for the turn ledger.
 ///
-/// SPEC_v2 §4.6 specifies daily allowance, atomic spend, midnight
+///  specifies daily allowance, atomic spend, midnight
 /// reset, and capped carryover — every one of those behaviors is
 /// gated on knowing today's date. Reading the system clock directly
 /// inside the ledger code would make those behaviors untestable
@@ -290,7 +290,7 @@ pub enum TurnError {
 /// answer through a trait lets:
 ///
 /// - Production code use a system-clock-backed provider (introduced
-///   in Task 6c when the first ledger-writing path actually consumes
+///   in when the first ledger-writing path actually consumes
 ///   it; deliberately not pre-built here to avoid landing dead code).
 /// - Tests use [`FixedDateProvider`] to assert "first call on day 1
 ///   creates the row, second call on day 2 resets it" without
@@ -298,11 +298,11 @@ pub enum TurnError {
 ///
 /// # Why a trait rather than a function pointer or `dyn Fn`
 ///
-/// A `Box<dyn Fn() -> LocalDate>` would also work and would save a
+/// A `Box<dyn Fn -> LocalDate>` would also work and would save a
 /// generic bound on every consumer. A trait is preferred because:
 ///
 /// 1. The provider is a *role*, not a one-shot. A future iteration
-///    might extend it with `now()` for event timestamps; a trait
+///    might extend it with `now` for event timestamps; a trait
 ///    accommodates that without rewriting every call site.
 /// 2. Generic bounds (`fn spend<P: DateProvider>(p: &P, …)`) keep the
 ///    ledger paths monomorphizable and allocation-free, which matches
@@ -327,13 +327,13 @@ pub trait DateProvider {
 ///
 /// Constructed once per scenario and handed to the ledger code under
 /// test. Mutate via [`FixedDateProvider::set`] to simulate the clock
-/// advancing — useful for the Task 6f "carryover on new day" test that
+/// advancing — useful for the "carryover on new day" test that
 /// needs to write yesterday's row, then ask the ledger for today's
 /// balance with a different date in the provider.
 ///
 /// Lives in production code (not behind `#[cfg(test)]`) so example
 /// programs and integration tests outside the `foglet_game` crate can
-/// use it. SPEC §6 explicitly calls out that authoring code should be
+/// use it. explicitly calls out that authoring code should be
 /// able to drive the runtime deterministically; this is the date-side
 /// piece of that contract.
 #[derive(Debug, Clone)]
@@ -349,7 +349,7 @@ impl FixedDateProvider {
         Self { date }
     }
 
-    /// Replace the reported date. Used by Task 6f-flavored tests to
+    /// Replace the reported date. Used by -flavored tests to
     /// simulate "the next day" without spinning up a second provider.
     /// Takes `&mut self` (rather than interior mutability) because the
     /// only callers are tests that own the provider; introducing a
@@ -365,13 +365,13 @@ impl DateProvider for FixedDateProvider {
     }
 }
 
-/// Snapshot of a single `turn_ledger` row — what every Task 6
+/// Snapshot of a single `turn_ledger` row — what every
 /// operation hands back to the caller.
 ///
 /// The struct is intentionally a flat data carrier rather than a handle
 /// onto the database. Once the caller has a [`TurnLedgerRow`] the
 /// connection is free for the next statement; the runtime layer
-/// (Task 10) needs that property because screen renders display
+///  needs that property because screen renders display
 /// remaining turns without keeping a write lock open.
 ///
 /// Field types mirror the SQLite columns: `i64` for the integer
@@ -385,8 +385,8 @@ pub struct TurnLedgerRow {
     /// The local calendar date this row tracks (`YYYY-MM-DD`).
     pub local_date: LocalDate,
     /// Remaining turns for `(player_id, local_date)`. Equal to
-    /// `daily_allowance` immediately after Task 6c creates the row;
-    /// Task 6d's spend path will decrement it.
+    /// `daily_allowance` immediately after creates the row;
+    /// 's spend path will decrement it.
     pub balance: i64,
     /// Snapshot of `[turns].daily_allowance` at the moment this row
     /// was created. Preserved across the day so an operator who
@@ -397,8 +397,8 @@ pub struct TurnLedgerRow {
 
 impl WorldDb {
     /// Return today's [`TurnLedgerRow`] for `player_id`, creating the
-    /// row from `daily_allowance` on its first read of the day —
-    /// SPEC_v2 §Task 6c "initial daily allowance creation".
+    /// row from `daily_allowance` on its first read of the day
+    ///   "initial daily allowance creation".
     ///
     /// Two callers in v2:
     ///
@@ -407,10 +407,10 @@ impl WorldDb {
     ///    On the first call of a given day the row doesn't exist
     ///    yet, so this function lazily writes it from the configured
     ///    allowance.
-    /// 2. The spend path (Task 6d) reads today's balance before
+    /// 2. The spend path reads today's balance before
     ///    decrementing. Its preflight is the same "make sure today's
     ///    row exists" question, which is exactly what this method
-    ///    answers — Task 6d will compose with this rather than open-
+    ///    answers — will compose with this rather than open-
     ///    coding the ensure-then-spend dance.
     ///
     /// # Why `INSERT OR IGNORE` then `SELECT`
@@ -419,7 +419,7 @@ impl WorldDb {
     /// rendering for the same player at boot must not both insert
     /// the row. `INSERT OR IGNORE` makes "row already exists" a
     /// no-op at the SQLite layer rather than a typed error, and the
-    /// follow-up `SELECT` returns whichever row is now there —
+    /// follow-up `SELECT` returns whichever row is now there
     /// either the one we wrote or the one a sibling writer beat us
     /// to. That keeps a stale or in-progress balance from being
     /// clobbered with a fresh `daily_allowance`, which is the bug
@@ -428,15 +428,15 @@ impl WorldDb {
     /// We deliberately *don't* wrap the two statements in a
     /// transaction. The `INSERT` is atomic on its own, the `SELECT`
     /// is read-only, and the busy timeout configured at open time
-    /// (SPEC §3) handles the only contention story. Adding a
+    ///  handles the only contention story. Adding a
     /// transaction here would buy nothing while making the function
     /// require `&mut self`, which would fight the runtime layer's
-    /// borrow shape (Task 10 holds the world DB by shared reference
+    /// borrow shape ( holds the world DB by shared reference
     /// from the screen render path).
     ///
     /// # Why the date provider rather than a `&LocalDate`
     ///
-    /// Taking `&P: DateProvider` matches the shape Tasks 6d–6f will
+    /// Taking `&P: DateProvider` matches the shape will
     /// reach for: every ledger operation asks "what's today?" at the
     /// moment of the call. A `&LocalDate` parameter would force the
     /// caller to query the provider, which is fine for one call site
@@ -453,18 +453,18 @@ impl WorldDb {
     /// or the follow-up select fails (table missing, FK violation
     /// when foreign keys are enabled, IO error). The variant wraps
     /// the original `rusqlite::Error` so the operator-facing message
-    /// in Task 10 keeps SQLite's wording.
+    /// in keeps SQLite's wording.
     ///
     /// # Idempotency
     ///
     /// Calling twice on the same `(player_id, local_date)` returns
     /// the same row both times — including any spend that landed
-    /// between the two calls (Task 6d). The function therefore
+    /// between the two calls. The function therefore
     /// doubles as a "read today's balance" query for callers that
     /// don't care whether the row was just created or already
     /// existed.
     ///
-    /// # Carryover (SPEC_v2 §Task 6f)
+    /// # Carryover
     ///
     /// On the very first call of a new day for a player, the
     /// starting balance is `daily_allowance + carry`, where `carry`
@@ -473,7 +473,7 @@ impl WorldDb {
     /// collapses to "no carryover" (the safe default). The most-
     /// recent prior row is used (rather than strictly "yesterday")
     /// so a player who skips a day still receives their unspent
-    /// balance, capped — SPEC §4.6 says "carry over up to
+    /// balance, capped — says "carry over up to
     /// `carryover_max`" without restricting to a single calendar
     /// day, and capping by the configured maximum keeps a long
     /// absence from materialising as a windfall.
@@ -495,14 +495,14 @@ impl WorldDb {
     }
 
     /// Atomically decrement today's balance for `player_id` by
-    /// `amount` and return the resulting [`TurnLedgerRow`] —
-    /// SPEC_v2 §Task 6d "atomic turn spend".
+    /// `amount` and return the resulting [`TurnLedgerRow`]
+    ///   "atomic turn spend".
     ///
     /// Composes with [`WorldDb::ensure_today_turns`]: if today's row
     /// does not yet exist (first action of the day), it is materialised
     /// at the configured `daily_allowance` *before* the spend lands.
     /// Game code therefore only needs one call to "burn a turn" — the
-    /// lazy initialisation that Task 6c set up is plumbed in here so
+    /// lazy initialisation that set up is plumbed in here so
     /// callers don't have to remember the two-step dance.
     ///
     /// # Atomicity
@@ -513,13 +513,13 @@ impl WorldDb {
     /// clause matches exactly the one row keyed by the composite
     /// primary key — no cursor walks, no read-then-write race. Two
     /// concurrent spenders queued on the busy timeout therefore see
-    /// the second decrement applied to the *result* of the first,
+    /// the second decrement applied to the *result* of the first.
     /// rather than both reading the same balance and clobbering each
-    /// other. SPEC §4.6 calls that property out as a hard requirement
+    /// other. calls that property out as a hard requirement
     /// for the ledger; the single-statement form delivers it without
     /// an explicit transaction.
     ///
-    /// # Insufficient-turn rejection (SPEC_v2 §Task 6e)
+    /// # Insufficient-turn rejection
     ///
     /// The `UPDATE` carries a `WHERE balance >= ?` guard so a spend
     /// that would push the balance below zero matches zero rows
@@ -535,7 +535,7 @@ impl WorldDb {
     ///
     /// # What this method does *not* do (yet)
     ///
-    /// - **New-day reset / carryover.** Task 6f. The spend path
+    /// - **New-day reset carryover.**. The spend path
     ///   always operates on *today's* row as reported by the
     ///   `date_provider`; if the date has rolled over since the last
     ///   spend, `ensure_today_turns` materialises a fresh row at full
@@ -550,21 +550,21 @@ impl WorldDb {
     ///
     /// 1. The supported SQLite version floor is set by `rusqlite`'s
     ///    bundled feature being **off** in our crate budget (ADR
-    ///    documented in `DECISIONS.md`). Relying on a newer SQL
+    ///    ). Relying on a newer SQL
     ///    feature would silently break on hosts that ship an older
     ///    system SQLite. A plain `SELECT` is portable to every
     ///    SQLite version we support.
     /// 2. The two-statement form keeps `ensure_today_turns`'s
     ///    select-the-current-row code path the single source of
     ///    truth for "what does a `TurnLedgerRow` look like coming
-    ///    out of the DB?". When 6e adds insufficient-turn rejection,
+    ///    out of the DB?". When 6e adds insufficient-turn rejection.
     ///    or 6f adds carryover, the readback shape stays stable.
     ///
     /// # Errors
     ///
-    /// - [`TurnError::Sqlite`] if any of the round-trips (ensure-row,
+    /// - [`TurnError::Sqlite`] if any of the round-trips (ensure-row.
     ///   update, readback) fails. The variant wraps the underlying
-    ///   `rusqlite::Error` so the operator-facing layer (Task 10) can
+    ///   `rusqlite::Error` so the operator-facing layer can
     ///   surface SQLite's wording verbatim.
     /// - [`TurnError::InsufficientTurns`] if today's balance is below
     ///   `amount`. The persisted row is unchanged when this is
@@ -596,7 +596,7 @@ impl WorldDb {
 /// closure inside [`WorldDb::transaction`] (since `rusqlite::Transaction`
 /// derefs to `Connection`).
 ///
-/// Pulled out so the SPEC_v2 §Task 9c spend-turn + mutate + append-event
+/// Pulled out so the spend-turn + mutate + append-event
 /// helper can run the same SQL inside a single transaction without
 /// re-borrowing the [`WorldDb`] (which the in-flight transaction
 /// already borrows mutably). The body is identical to the documented
@@ -608,7 +608,7 @@ pub(crate) fn ensure_today_turns_on(
     carryover_max: u32,
     today: &LocalDate,
 ) -> Result<TurnLedgerRow, TurnError> {
-    // Cast `u32 → i64` once: SQLite stores INTEGER as 64-bit signed,
+    // Cast `u32 → i64` once: SQLite stores INTEGER as 64-bit signed.
     // and the cast cannot overflow because `u32::MAX < i64::MAX`.
     let allowance = i64::from(daily_allowance);
     let cap = i64::from(carryover_max);
@@ -618,7 +618,7 @@ pub(crate) fn ensure_today_turns_on(
     // the player has never had a ledger row, so there's nothing to
     // carry over. We query "any prior date" rather than strictly
     // yesterday so a player who skipped a day still receives their
-    // capped unspent balance — see SPEC §4.6.
+    // capped unspent balance
     let prior_balance: Option<i64> = conn
         .query_row(
             "SELECT balance FROM turn_ledger \
@@ -666,11 +666,11 @@ pub(crate) fn ensure_today_turns_on(
 
 /// Free-function form of [`WorldDb::spend_turns`] that operates on any
 /// `&Connection`. Mirrors [`ensure_today_turns_on`]: pulled out so the
-/// Task 9c `spend_turn_and_emit` helper can compose the spend, the
+///  `spend_turn_and_emit` helper can compose the spend, the
 /// caller's world mutation, and the event append inside a single
 /// transaction without re-borrowing the [`WorldDb`].
 ///
-/// The behavior — atomic decrement with a `WHERE balance >= ?` guard,
+/// The behavior — atomic decrement with a `WHERE balance >= ?` guard.
 /// canonical readback for the error payload — is identical to the
 /// method version. See [`WorldDb::spend_turns`] for the full rationale.
 pub(crate) fn spend_turns_on(
@@ -685,7 +685,7 @@ pub(crate) fn spend_turns_on(
 
     let delta = i64::from(amount);
 
-    // Atomic decrement with the SPEC §Task 6e insufficient-turn guard
+    // Atomic decrement with the insufficient-turn guard
     // folded into the same UPDATE so two racing spenders can't both
     // satisfy `balance >= ?` against the same starting balance.
     let updated = conn
@@ -699,7 +699,7 @@ pub(crate) fn spend_turns_on(
 
     if updated == 0 {
         // Re-read the canonical balance for the error payload — a
-        // sibling spend may have landed between ensure and update,
+        // sibling spend may have landed between ensure and update.
         // and we want the error to reflect what the next caller will
         // actually see.
         let current_balance: i64 = conn
@@ -741,19 +741,19 @@ mod tests {
     use crate::world_db::WorldDb;
     use tempfile::tempdir;
 
-    /// SPEC_v2 §Task 6a acceptance: applying [`TURN_LEDGER_MIGRATION`]
+    ///   acceptance: applying [`TURN_LEDGER_MIGRATION`]
     /// creates the documented `turn_ledger` table with the column shape
     /// later sub-tasks (6c–6f) depend on. Asserts both:
     ///
     /// 1. The table exists in `sqlite_master` (so a regression that
     ///    silently dropped the migration body would flunk).
-    /// 2. The columns and order match the SPEC contract (so a later
+    /// 2. The columns and order match the contract (so a later
     ///    edit that renames or reorders a column flunks here rather
     ///    than buried in a 6d spend test).
     ///
     /// We apply the players migration first because `turn_ledger`
     /// references it via `FOREIGN KEY`. With FK enforcement off (the
-    /// SQLite default until Task 10 turns it on) the migration would
+    /// SQLite default until turns it on) the migration would
     /// succeed even without the parent table, but exercising the real
     /// dependency order here mirrors how the runtime startup path will
     /// drive migrations on a real door open.
@@ -808,7 +808,7 @@ mod tests {
     }
 
     /// The composite primary key `(player_id, local_date)` is what
-    /// makes "today's row" a single index lookup and lets the Task 6f
+    /// makes "today's row" a single index lookup and lets the
     /// carryover step `SELECT … ORDER BY local_date DESC LIMIT 1`
     /// without a sequential scan. A regression that downgrades it to a
     /// simple `INTEGER PRIMARY KEY` (or drops the composite altogether)
@@ -854,11 +854,11 @@ mod tests {
     }
 
     /// Inserting two rows that share `(player_id, local_date)` must
-    /// raise a uniqueness error — the contract Task 6c–6f relies on
+    /// raise a uniqueness error — the contract relies on
     /// when it reads "today's row" without first locking the table.
     /// Without this guarantee a race between two writers could leave
     /// the ledger with two contradictory balance rows for the same
-    /// (player, day) pair and SPEC §4.6's "spend turns atomically"
+    /// (player, day) pair and 's "spend turns atomically"
     /// promise would be unenforceable.
     #[test]
     fn turn_ledger_rejects_duplicate_player_day_rows() {
@@ -874,7 +874,7 @@ mod tests {
             .expect("turn_ledger migration applies");
 
         // Insert a parent player so the FK column has something to
-        // reference. We don't enable `PRAGMA foreign_keys` (Task 10's
+        // reference. We don't enable `PRAGMA foreign_keys` ('s
         // job) so the parent isn't strictly required, but writing a
         // realistic row keeps the test true to how the runtime will
         // drive the table.
@@ -914,14 +914,14 @@ mod tests {
 
     /// Canonical `YYYY-MM-DD` strings round-trip through
     /// [`LocalDate::parse`] without modification. The parsed value's
-    /// `as_str()` matches the input verbatim — this is the contract the
-    /// SQL parameter binder relies on (Task 6c–6f: bind today's date,
+    /// `as_str` matches the input verbatim — this is the contract the
+    /// SQL parameter binder relies on (: bind today's date.
     /// match yesterday's row by lexical comparison).
     #[test]
     fn local_date_parse_accepts_canonical_iso_form() {
         let date = LocalDate::parse("2026-05-08").expect("canonical date parses");
         assert_eq!(date.as_str(), "2026-05-08");
-        // Display matches as_str so format!() in messages is safe.
+        // Display matches as_str so format! in messages is safe.
         assert_eq!(format!("{date}"), "2026-05-08");
         // into_string yields the same canonical text without copying.
         assert_eq!(date.into_string(), "2026-05-08");
@@ -930,7 +930,7 @@ mod tests {
     /// [`LocalDate::parse`] rejects every realistic shape regression we
     /// expect to see: missing zero pad, alternate separators, extra
     /// whitespace, wrong length, non-digit content. Each case has a
-    /// real-world failure mode behind it (manual `format!()`,
+    /// real-world failure mode behind it (manual `format!`.
     /// upstream API drift, copy-paste from a log line) so a regression
     /// in the validator surfaces as a named scenario rather than a
     /// vague "string did not parse".
@@ -982,7 +982,7 @@ mod tests {
     }
 
     /// [`FixedDateProvider::set`] simulates the clock advancing — the
-    /// shape Task 6f's "carryover on a new day" test will use to
+    /// shape 's "carryover on a new day" test will use to
     /// write yesterday's row, advance the clock, then ask for today's
     /// balance and assert the carryover ran. Asserting the behavior
     /// here pins the contract before the consumer lands.
@@ -997,7 +997,7 @@ mod tests {
     }
 
     /// [`DateProvider`] is dispatchable through a generic bound — the
-    /// shape Task 6c+ ledger functions will use (`fn ensure_today<P:
+    /// shape + ledger functions will use (`fn ensure_today<P:
     /// DateProvider>(p: &P, …)`). A regression that accidentally tied
     /// the trait to a `Self: Sized` bound or otherwise broke generic
     /// usage would be caught here rather than in a downstream
@@ -1014,7 +1014,7 @@ mod tests {
 
     /// Stand up a fresh world DB with the players + turn_ledger
     /// migrations already applied and one seeded player. Centralises
-    /// the boilerplate the Task 6c–6f tests share so the assertions
+    /// the boilerplate the tests share so the assertions
     /// in each test stay focused on the behavior under test rather
     /// than the setup ceremony.
     fn world_with_player(dir: &tempfile::TempDir) -> (WorldDb, i64) {
@@ -1027,7 +1027,7 @@ mod tests {
             .apply_migration(&TURN_LEDGER_MIGRATION)
             .expect("turn_ledger migration applies");
         // Seed a player directly via SQL — the players module's
-        // upsert path is covered by Task 5 tests; here we only need
+        // upsert path is covered by tests; here we only need
         // a stable id to attach the ledger to.
         world
             .connection()
@@ -1036,7 +1036,7 @@ mod tests {
         (world, 1)
     }
 
-    /// SPEC_v2 §Task 6c headline: a player who has no row for today
+    ///   headline: a player who has no row for today
     /// receives one with `balance == daily_allowance`. The test seeds
     /// only the schema and a player record — no ledger row — and
     /// asserts the first call materialises the row at the configured
@@ -1079,9 +1079,9 @@ mod tests {
         assert_eq!(count, 1, "exactly one ledger row must be persisted");
     }
 
-    /// Calling `ensure_today_turns` twice on the same `(player,
+    /// Calling `ensure_today_turns` twice on the same `(player.
     /// date)` is a no-op on the second call — the existing balance
-    /// is preserved verbatim. This is the contract Task 6d's spend
+    /// is preserved verbatim. This is the contract 's spend
     /// path relies on: a render that calls `ensure_today_turns` to
     /// display "remaining turns" must not undo a spend that landed
     /// earlier in the same day.
@@ -1101,7 +1101,7 @@ mod tests {
             .expect("first ensure creates the row");
         assert_eq!(first.balance, 30);
 
-        // Stand in for Task 6d's spend: drop the balance directly.
+        // Stand in for 's spend: drop the balance directly.
         world
             .connection()
             .execute(
@@ -1164,7 +1164,7 @@ mod tests {
     /// Same player, two different dates → two rows. Confirms the
     /// composite primary key actually keys on the date and that
     /// advancing the [`FixedDateProvider`] yields a fresh row at the
-    /// new date — the bedrock Task 6f's reset behavior will build on.
+    /// new date — the bedrock 's reset behavior will build on.
     #[test]
     fn ensure_today_turns_creates_separate_rows_per_date() {
         let dir = tempdir().expect("tempdir creates");
@@ -1185,8 +1185,8 @@ mod tests {
         assert_eq!(day_two.local_date.as_str(), "2026-05-09");
         assert_eq!(
             day_two.balance, 30,
-            "Task 6c writes a fresh allowance for the new date — \
-             carryover (Task 6f) is a separate concern"
+            "a fresh allowance is written for the new date — \
+             carryover is a separate concern"
         );
 
         let total: i64 = world
@@ -1203,9 +1203,9 @@ mod tests {
     /// SQLite errors propagate as [`TurnError::Sqlite`]. We force a
     /// failure by skipping the `turn_ledger` migration entirely so
     /// the INSERT hits a missing-table error. A regression that
-    /// `unwrap()`ed on the `rusqlite::Error` would panic instead of
+    /// `unwrap`ed on the `rusqlite::Error` would panic instead of
     /// returning a typed error, which the operator-facing layer
-    /// (Task 10) wouldn't be able to wrap into `anyhow`.
+    ///  wouldn't be able to wrap into `anyhow`.
     #[test]
     fn ensure_today_turns_returns_typed_sqlite_error_on_missing_table() {
         let dir = tempdir().expect("tempdir creates");
@@ -1228,9 +1228,9 @@ mod tests {
         );
     }
 
-    /// SPEC_v2 §Task 6d headline: spending decrements today's balance.
+    ///   headline: spending decrements today's balance.
     /// The first call materialises today's row at the configured
-    /// allowance (composing with Task 6c) and then applies the
+    /// allowance (composing with ) and then applies the
     /// decrement; the returned [`TurnLedgerRow`] reflects the post-
     /// spend balance. A regression that forgot to call the UPDATE
     /// (or ran it against the wrong row) would leave the balance at
@@ -1305,7 +1305,7 @@ mod tests {
 
     /// Spending an amount of zero is a no-op on the balance — the
     /// row is materialised if missing, but the UPDATE leaves the
-    /// counter alone. We don't reject it as an error because Task 6e
+    /// counter alone. We don't reject it as an error because
     /// will own the typed-error story for "spend can't proceed";
     /// for 6d we just need to confirm the decrement formula
     /// (`balance - 0 == balance`) doesn't accidentally clobber the
@@ -1364,7 +1364,7 @@ mod tests {
     /// `spend_turns` calls today's lazy-init path internally, so a
     /// brand-new player whose ledger row does not yet exist still gets
     /// a correct post-spend balance. This is the shape callers in
-    /// Murder Motel (Task 13a) will use: they spend on the first
+    /// Murder Motel will use: they spend on the first
     /// inspection of the day without first calling `ensure_today_turns`
     /// themselves.
     #[test]
@@ -1406,7 +1406,7 @@ mod tests {
     /// A SQLite failure during spend (here forced by skipping the
     /// `turn_ledger` migration) surfaces as a typed
     /// [`TurnError::Sqlite`] rather than a panic. This is the
-    /// contract Task 10's operator-facing layer relies on to wrap
+    /// contract 's operator-facing layer relies on to wrap
     /// world errors into `anyhow` without losing the underlying
     /// SQLite reason.
     #[test]
@@ -1432,7 +1432,7 @@ mod tests {
         );
     }
 
-    /// SPEC_v2 §Task 6e headline: a spend that exceeds today's
+    ///   headline: a spend that exceeds today's
     /// balance is rejected as [`TurnError::InsufficientTurns`] **and**
     /// the persisted row is left untouched. The test spends the
     /// allowance most of the way down, then asks for more than is
@@ -1529,7 +1529,7 @@ mod tests {
     }
 
     /// Zero-amount spend at zero balance is still a no-op success.
-    /// `balance >= 0` is trivially true, so the existing Task 6d
+    /// `balance >= 0` is trivially true, so the existing
     /// "zero amount leaves balance unchanged" contract continues to
     /// hold even after the 6e guard is in place. Without this test a
     /// future tightening of the guard (e.g. `balance >= ?1 AND ?1 >
@@ -1553,7 +1553,7 @@ mod tests {
         assert_eq!(again.balance, 0);
     }
 
-    /// SPEC_v2 §Task 6f "no carryover" leg: with `carryover_max = 0`,
+    ///   "no carryover" leg: with `carryover_max = 0`.
     /// a player who finished yesterday with unspent turns sees a
     /// fresh `daily_allowance` on the new day — yesterday's leftover
     /// vanishes. This pins the safe default behavior for any game
@@ -1589,7 +1589,7 @@ mod tests {
         );
     }
 
-    /// SPEC_v2 §Task 6f "capped carryover" leg: when yesterday's
+    ///   "capped carryover" leg: when yesterday's
     /// unspent balance exceeds `carryover_max`, today's starting
     /// balance is `daily_allowance + carryover_max` — the cap is the
     /// hard ceiling, regardless of how much went unspent. A
@@ -1610,7 +1610,7 @@ mod tests {
         assert_eq!(day_one.balance, 30, "precondition: full allowance unspent");
 
         // Day two with carryover_max = 5 → starting balance must be
-        // capped at daily_allowance (30) + carryover_max (5) = 35,
+        // capped at daily_allowance (30) + carryover_max (5) = 35.
         // *not* 30 + 30 = 60.
         provider.set(LocalDate::parse("2026-05-09").expect("day two parses"));
         let day_two = world
@@ -1661,7 +1661,7 @@ mod tests {
     /// their **most recent** prior row, not zero. Day 1 leaves 4
     /// unspent; day 2 has no row at all (player did not log in);
     /// day 3 starts at `daily_allowance + min(4, cap)`. This is the
-    /// shape SPEC §4.6's "carry over up to carryover_max" implies
+    /// shape 's "carry over up to carryover_max" implies
     /// without a "yesterday only" restriction, and the cap keeps a
     /// long absence from accumulating beyond the configured maximum.
     #[test]

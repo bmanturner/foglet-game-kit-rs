@@ -1,4 +1,4 @@
-//! Dialog state machine (SPEC §9.3, Task 9b).
+//! Dialog state machine.
 //!
 //! Dialog in a Foglet door game is a graph of *nodes*. Each node has
 //! a sequence of lines the player advances through, an optional set
@@ -14,24 +14,24 @@
 //! # Why a state machine and not a coroutine
 //!
 //! A door game's runtime loop already pumps one input at a time
-//! through `Screen::handle_input` (SPEC §8.2). A pull-based machine
+//! through `Screen::handle_input`. A pull-based machine
 //! fits that shape directly: the dialog screen calls
 //! [`DialogState::current_line`] each render and one of
-//! [`DialogState::advance`] / [`DialogState::choose`] each input.
-//! No threads, no async, no hidden suspensions — easy to snapshot,
+//! [`DialogState::advance`] [`DialogState::choose`] each input.
+//! No threads, no async, no hidden suspensions — easy to snapshot.
 //! easy to save, easy to test.
 //!
 //! # What this module does NOT do
 //!
 //! - It does not render the dialog box. That's the screen's job
-//!   (Task 9c will provide a widget; before then, games can render
-//!   directly from `current_line()` and `available_choices()`).
+//!   ( will provide a widget; before then, games can render
+//!   directly from `current_line` and `available_choices`).
 //! - It does not own the flag store. Flags live on the game's
 //!   `GameContext` so they can be saved with the rest of the world
 //!   state. The dialog reads/writes them through a borrowed
 //!   [`FlagSet`] handed in on each call.
 //! - It does not load files. `load_dialog` parses a YAML string;
-//!   game code decides whether the bytes came from `include_str!`,
+//!   game code decides whether the bytes came from `include_str!`.
 //!   `assets/dialog/*.yaml`, or somewhere else.
 
 use std::collections::{BTreeSet, HashMap};
@@ -50,7 +50,7 @@ use thiserror::Error;
 ///
 /// `BTreeSet` (rather than `HashSet`) is deliberate: ordered
 /// iteration makes save snapshots stable across runs, which keeps
-/// JSON saves (SPEC §12) deterministic for diffing and testing.
+/// JSON saves deterministic for diffing and testing.
 pub type FlagSet = BTreeSet<String>;
 
 /// Errors raised while loading a dialog script.
@@ -95,7 +95,7 @@ pub enum ChoiceError {
     #[error("choice index {0} out of range")]
     OutOfRange(usize),
 
-    /// `choose` / `advance` was called after the dialog finished.
+    /// `choose` `advance` was called after the dialog finished.
     /// Callers should check [`DialogState::is_finished`] first.
     #[error("dialog has already finished")]
     Finished,
@@ -111,7 +111,7 @@ pub struct Choice {
     /// fail.
     pub goto: String,
     /// Flag that must be present for the choice to be offered. `None`
-    /// means the choice is always available. SPEC's "branching
+    /// means the choice is always available. 's "branching
     /// dialog" requirement comes down to this single field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub requires: Option<String>,
@@ -167,7 +167,7 @@ pub struct Dialog {
     /// load time to exist in `nodes`.
     pub start: String,
     /// Node table keyed by name. Iteration order is not significant
-    /// — only the explicit `start` / `goto` edges matter.
+    /// — only the explicit `start` `goto` edges matter.
     pub nodes: HashMap<String, Node>,
 }
 
@@ -184,7 +184,7 @@ pub struct Dialog {
 ///       - "What do you want?"
 ///     choices:
 ///       - text: "I need a room"
-///         requires_not: has_room_assigned   # hide once the player has a room
+///         requires_not: has_room_assigned # hide once the player has a room
 ///         goto: room_request
 ///       - text: "Tell me about the murder"
 ///         requires: heard_rumor
@@ -349,7 +349,7 @@ impl DialogState {
     /// dialog. Callers should not call `advance` when
     /// `available_choices` is non-empty — they should call `choose`
     /// instead. If they do call `advance` with choices waiting, the
-    /// state stays put and the call is a no-op (returning `Ok(())`),
+    /// state stays put and the call is a no-op (returning `Ok`).
     /// because silently picking choice 0 would surprise authors.
     pub fn advance(&mut self, dialog: &Dialog, flags: &mut FlagSet) -> Result<(), ChoiceError> {
         if self.finished {
@@ -417,7 +417,7 @@ impl DialogState {
             .copied()
             .ok_or(ChoiceError::OutOfRange(index))?;
         // Clone fields out of the immutable borrow before mutating
-        // flags / state — `available` borrows `dialog`, and we need
+        // flags state — `available` borrows `dialog`, and we need
         // a `&mut self` for `jump_to` below.
         let goto = choice.goto.clone();
         let set: Vec<String> = choice.set.clone();
@@ -441,19 +441,19 @@ impl DialogState {
 ///
 /// Exposed as a `const` so callers that hand-author very wide branching
 /// nodes can detect the truncation case and fall back to a custom prompt
-/// builder rather than silently dropping choices. SPEC §4.1 explicitly
+/// builder rather than silently dropping choices. explicitly
 /// calls out numeric hotkeys as a supported style ("number keys when
 /// games choose numeric hotkeys"), and 1..=9 is the natural ceiling
 /// before two-digit keys would break direct-input semantics.
 pub const DIALOG_PROMPT_MAX_CHOICES: usize = 9;
 
 /// Render the currently-available dialog choices as a [`crate::prompt::ChoicePrompt`]
-/// (SPEC §8 dialog/prompt integration; Task 8a).
+/// .
 ///
 /// The returned prompt's `T = usize` parameter carries the index into
 /// the slice [`DialogState::available_choices`] returns *for the same
 /// `flags` snapshot*. A direct-key press resolves to
-/// [`crate::prompt::PromptAction::Selected`]`(index)`, and Task 8b's input helper feeds
+/// [`crate::prompt::PromptAction::Selected`]`(index)`, and 's input helper feeds
 /// that index straight into [`DialogState::choose`].
 ///
 /// # Hotkey assignment
@@ -465,7 +465,7 @@ pub const DIALOG_PROMPT_MAX_CHOICES: usize = 9;
 /// pair — adding a per-choice key would invite collisions across nodes
 /// and force every dialog author to think about input. Numeric digits
 /// give a stable, predictable mapping that matches the
-/// `1)` / `2)` listing the renderer uses for the body.
+/// `1)` `2)` listing the renderer uses for the body.
 ///
 /// # Truncation
 ///
@@ -478,7 +478,7 @@ pub const DIALOG_PROMPT_MAX_CHOICES: usize = 9;
 ///
 /// # Body lines
 ///
-/// The current line (if any) is **not** copied into the prompt body —
+/// The current line (if any) is **not** copied into the prompt body
 /// dialog screens typically render the script lines themselves with
 /// their own pacing, then surface the prompt only once the cursor has
 /// walked past the last line. Callers who want the prompt to be
@@ -486,18 +486,18 @@ pub const DIALOG_PROMPT_MAX_CHOICES: usize = 9;
 /// builder; the helper deliberately returns a builder, not a finished
 /// modal, so that composition stays open.
 ///
-/// # When NOT to use this helper (SPEC §8 / Task 8c)
+/// # When NOT to use this helper
 ///
 /// This helper exists for **branching NPC conversations** authored in
 /// the dialog YAML graph — a fixed set of `text`/`goto`/`if` lines that
-/// the writer wants to ship as content rather than code. SPEC §8
+/// the writer wants to ship as content rather than code.
 /// explicitly calls out the inverse case:
 ///
 /// > "The kit MUST NOT force all prompts into the dialog YAML graph.
 /// > Loot/shop prompts often need live game data, so Rust-authored
 /// > prompt builders remain first-class."
 ///
-/// Concretely: do **not** reach for [`Dialog`] / `dialog_choice_prompt`
+/// Concretely: do **not** reach for [`Dialog`] `dialog_choice_prompt`
 /// when the prompt's choices, labels, or enabled state depend on
 /// runtime game state. The dialog YAML schema deliberately keeps
 /// choices to static `text`/`goto` pairs; bending it to carry live
@@ -508,11 +508,11 @@ pub const DIALOG_PROMPT_MAX_CHOICES: usize = 9;
 ///
 /// Concrete cases that should stay Rust-authored:
 ///
-/// - **Loot prompts** like the Lost-and-Found Drawer (SPEC §9): the
+/// - **Loot prompts** like the Lost-and-Found Drawer: the
 ///   `(K)` "take Room 7 key" choice must disappear or disable once the
 ///   key is in inventory — that's a live inventory check, not a flag
 ///   the writer flips in YAML.
-/// - **Shop / vendor prompts** like the night clerk (SPEC §9): the
+/// - **Shop vendor prompts** like the night clerk: the
 ///   "Tip 50g for a rumor" label needs the player's *current* gold
 ///   spliced into the hint and must disable when funds are short.
 /// - **Inventory pickers, capacity-bounded menus, container UIs**:
@@ -529,8 +529,8 @@ pub fn dialog_choice_prompt(
     dialog_choice_prompt_window(state, dialog, flags, 0)
 }
 
-/// Window-aware variant of [`dialog_choice_prompt`] (SPEC_v2_1.md §4.2
-/// Task 2f) used by [`crate::dialog_screen::DialogScreen`] to support
+/// Window-aware variant of [`dialog_choice_prompt`] (.md
+/// ) used by [`crate::dialog_screen::DialogScreen`] to support
 /// nodes whose available-choice count exceeds
 /// [`DIALOG_PROMPT_MAX_CHOICES`].
 ///
@@ -547,7 +547,7 @@ pub fn dialog_choice_prompt(
 ///
 /// # Why this is the only mechanism for >9 choices
 ///
-/// SPEC_v2_1.md §4.2 forbids the adapter from re-implementing dialog
+/// .md forbids the adapter from re-implementing dialog
 /// mechanics, so the window is a *helper-level* feature: any caller
 /// that needs paged display routes through this function (or
 /// [`dialog_handle_prompt_input_window`]) and inherits the same
@@ -556,7 +556,7 @@ pub fn dialog_choice_prompt(
 ///
 /// # Why the value carries the full-list index
 ///
-/// `state.choose(idx, ..)` operates against
+/// `state.choose(idx,..)` operates against
 /// [`DialogState::available_choices`] in its entirety — there is no
 /// "choose page-relative". Returning a window-relative index from
 /// `Selected(...)` would force every caller to reconstruct the page
@@ -567,9 +567,9 @@ pub fn dialog_choice_prompt(
 /// # Out-of-range `offset`
 ///
 /// An `offset` past the end of the available-choice list yields an
-/// empty prompt (`prompt.choices.is_empty()`), not a panic. Callers
+/// empty prompt (`prompt.choices.is_empty`), not a panic. Callers
 /// that want a friendly leave-hint render still need to detect the
-/// empty prompt themselves; the helper's contract is "skip-then-take",
+/// empty prompt themselves; the helper's contract is "skip-then-take".
 /// matching `Iterator::skip` + `Iterator::take`, not "clamp the
 /// offset."
 pub fn dialog_choice_prompt_window(
@@ -601,7 +601,7 @@ pub fn dialog_choice_prompt_window(
 
 /// Route a single [`crate::input::Input`] through the current dialog node's choice
 /// prompt and apply a `Selected` outcome to the [`DialogState`]
-/// (SPEC §8 / Task 8b: bind prompt selection back to
+/// ( /: bind prompt selection back to
 /// [`DialogState::choose`]).
 ///
 /// Internally this just composes [`dialog_choice_prompt`] with
@@ -623,7 +623,7 @@ pub fn dialog_choice_prompt_window(
 ///
 /// Because the prompt is built fresh from
 /// [`DialogState::available_choices`] on every call, gated choices
-/// the player has not unlocked simply do not appear in the keymap —
+/// the player has not unlocked simply do not appear in the keymap
 /// pressing their would-be digit returns
 /// [`crate::prompt::PromptAction::None`]. The caller does not have to filter
 /// anything itself.
@@ -632,7 +632,7 @@ pub fn dialog_choice_prompt_window(
 ///
 /// Returns [`ChoiceError::OutOfRange`] only if the prompt and
 /// `available_choices` ever disagree, which by construction they do
-/// not — the helper builds both from the same `(state, dialog,
+/// not — the helper builds both from the same `(state, dialog.
 /// flags)` snapshot under a `&FlagSet` borrow that is upgraded to
 /// `&mut` only for the apply step. The `Result` exists so a future
 /// caller passing a *cached* prompt (built from an older flag
@@ -647,8 +647,8 @@ pub fn dialog_handle_prompt_input(
     dialog_handle_prompt_input_window(state, dialog, flags, input, 0)
 }
 
-/// Window-aware variant of [`dialog_handle_prompt_input`] (SPEC_v2_1.md
-/// §4.2 Task 2f) used by [`crate::dialog_screen::DialogScreen`] when
+/// Window-aware variant of [`dialog_handle_prompt_input`] (.md
+///  ) used by [`crate::dialog_screen::DialogScreen`] when
 /// the player is paging through a node with more than
 /// [`DIALOG_PROMPT_MAX_CHOICES`] available branches.
 ///
@@ -872,7 +872,7 @@ nodes:
 
     #[test]
     fn requires_and_requires_not_combine() {
-        // When a choice carries both a positive and a negative gate,
+        // When a choice carries both a positive and a negative gate.
         // the choice is offered only when *both* hold: the required
         // flag is present AND the excluded flag is absent. This is
         // the natural shape for "you can ask about the key after
@@ -938,7 +938,7 @@ nodes:
         // single line, then follows the intermediate goto to the
         // empty `end` terminal. `advance` chases the goto in the
         // same step that consumes the last line because
-        // `room_request` has no choices for the player to make —
+        // `room_request` has no choices for the player to make
         // the screen should never render an empty in-between frame.
         let dialog = load_dialog(sample_yaml()).unwrap();
         let mut flags = FlagSet::new();
@@ -985,7 +985,7 @@ nodes:
 
     #[test]
     fn advance_with_choices_waiting_is_noop() {
-        // If the screen mistakenly calls advance() while choices are
+        // If the screen mistakenly calls advance while choices are
         // available, state must not silently mutate (which would skip
         // the choice prompt).
         let dialog = load_dialog(sample_yaml()).unwrap();
@@ -1024,13 +1024,13 @@ nodes:
         assert!(state.is_finished());
     }
 
-    // ----- Task 8a: dialog → ChoicePrompt helper -----
+    // -----: dialog → ChoicePrompt helper -----
 
     use crate::prompt::PromptKey;
 
     fn walk_to_choices(dialog: &Dialog, flags: &mut FlagSet) -> DialogState {
         let mut state = DialogState::start(dialog, flags);
-        // sample_yaml() puts two lines on `greeting` before its choices
+        // sample_yaml puts two lines on `greeting` before its choices
         // become visible; pump past them.
         while state.current_line(dialog).is_some() {
             state.advance(dialog, flags).unwrap();
@@ -1118,7 +1118,7 @@ nodes:
         }
     }
 
-    // ----- Task 8b: prompt input → DialogState::choose helper -----
+    // -----: prompt input → DialogState::choose helper -----
 
     use crate::input::Input;
     use crate::prompt::PromptAction;

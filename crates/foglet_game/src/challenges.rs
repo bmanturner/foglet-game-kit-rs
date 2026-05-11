@@ -1,16 +1,16 @@
-//! `challenges` — shared-world rival-challenge schema (SPEC_v3 §4.2 /
-//! §Task 4a).
+//! `challenges` — shared-world rival-challenge schema ( /
+//! ).
 //!
-//! v3 introduces durable async player-to-player challenges: one
+//!  introduces durable async player-to-player challenges: one
 //! investigator dares another to solve a clue chain or beat a score
 //! within a deadline, the target accepts/declines, and (eventually) one
 //! side resolves the challenge with a game-defined outcome. The whole
 //! lifecycle sits on top of one `challenges` table whose shape is pinned
 //! by [`CHALLENGES_MIGRATION`]. This module exists only to declare that
 //! schema and prove it applies; the `Challenge` Rust type and the
-//! `create_challenge` / `accept_challenge` / `decline_challenge` /
-//! `resolve_challenge` / `expire_open_challenges` helpers land in
-//! subsequent §Task 4 sub-items (4b–4g). Splitting the migration into
+//! `create_challenge` `accept_challenge` `decline_challenge` /
+//! `resolve_challenge` `expire_open_challenges` helpers land in
+//! subsequent sub-items (4b–4g). Splitting the migration into
 //! its own commit keeps the bisect signal sharp — a column rename, a
 //! relaxed `CHECK`, or a dropped partial index flunks the schema test in
 //! this module rather than a higher-level state-machine test that's
@@ -18,9 +18,9 @@
 //!
 //! # Why a dedicated table
 //!
-//! SPEC_v3 §3 lists challenges alongside notices, market listings,
+//!  lists challenges alongside notices, market listings.
 //! factions, and bounties as separate primitives. We follow the same
-//! v2/v3 convention as [`crate::notices`]: one table, one migration, one
+//! v2/convention as [`crate::notices`]: one table, one migration, one
 //! named index family. Folding challenges onto the `world_events` log
 //! would conflate the append-only event stream with mutable lifecycle
 //! state (`state`, `accepted_at`, `resolved_at`) — fundamentally
@@ -29,10 +29,10 @@
 //!
 //! # Why `version = 7`
 //!
-//! v2 occupies migration versions 1–5 (see `docs/shared-world.md`
-//! §8.1). v3 claims `6` and above, dense and grouped per primitive.
-//! Notices took version 6 (the first v3 primitive to land). Challenges
-//! take version 7. Subsequent v3 migrations (market listings, factions,
+//!  occupies migration versions 1–5 (see `docs/shared-world.md`
+//! ). claims `6` and above, dense and grouped per primitive.
+//! Notices took version 6 (the first primitive to land). Challenges
+//! take version 7. Subsequent migrations (market listings, factions.
 //! bounties) MUST pick the next available kit version — game-authored
 //! migrations live in their own higher band and are not affected.
 
@@ -40,15 +40,15 @@ use thiserror::Error;
 
 use crate::world_db::{WorldDb, WorldMigration};
 
-/// Schema for the rival-challenge table — SPEC_v3 §4.2 / §Task 4a.
+/// Schema for the rival-challenge table —.
 ///
 /// One row per challenge. Challenges are mutable in the narrow sense
 /// that `state`, `accepted_at`, `resolved_at`, and `result` are flipped
-/// by the typed helpers landing in Tasks 4c–4f; the addressing,
+/// by the typed helpers landing in ; the addressing.
 /// `kind`, `stake`, and creation timestamp are write-once. The kit's
 /// contract is "if you only go through the public API, the only state
 /// changes are the documented transitions, and every transition runs
-/// inside a SQLite transaction" (SPEC_v3 §4.2 / §7). An operator with
+/// inside a SQLite transaction". An operator with
 /// `sqlite3` can of course rewrite anything; that's the same caveat as
 /// [`crate::events::WORLD_EVENTS_MIGRATION`] and
 /// [`crate::notices::NOTICES_MIGRATION`].
@@ -58,7 +58,7 @@ use crate::world_db::{WorldDb, WorldMigration};
 /// - `id` — `INTEGER PRIMARY KEY`. Autoincrement-aliased rowid. Doubles
 ///   as the deterministic tiebreaker for queries that order by
 ///   `created_at` and need a stable secondary sort (matching the same
-///   pattern as `notices` / `world_events`).
+///   pattern as `notices` `world_events`).
 /// - `created_at` — `TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP`. UTC
 ///   timestamp written by SQLite at insert time. ISO text so it sorts
 ///   lexically the same way it sorts chronologically and reads cleanly
@@ -78,7 +78,7 @@ use crate::world_db::{WorldDb, WorldMigration};
 ///   exactly one addressee, mirroring the inbox model. "Open
 ///   challenges" (no specific target, anyone can accept) are
 ///   intentionally not modelled here — a future v3.1 sub-task can add
-///   a nullable target if the gameplay calls for it; v3 ships only
+///   a nullable target if the gameplay calls for it; ships only
 ///   directed challenges to keep the state machine simple.
 /// - `kind` — `TEXT NOT NULL`. Short machine-readable label
 ///   (e.g. `"clue_race"`, `"deduction_duel"`). Game authors pick the
@@ -93,13 +93,13 @@ use crate::world_db::{WorldDb, WorldMigration};
 ///   bragging rights), and modelling "no stake" as the absence of the
 ///   field is cleaner than reserving a sentinel JSON value.
 /// - `state` — `TEXT NOT NULL DEFAULT 'open'` with a `CHECK` constraint
-///   pinning `state IN ('open','accepted','declined','resolved',
+///   pinning `state IN ('open','accepted','declined','resolved'.
 ///   'expired')`. The state-machine vocabulary lives in the schema so
 ///   a regression that introduced a new state in code without a
 ///   matching migration would fail at INSERT/UPDATE time, not silently
-///   in production. SPEC §4.2 documents the legal transitions:
-///   `open -> accepted -> resolved`, `open -> declined`,
-///   `open -> expired`. Default `'open'` matches Task 4b's "starts in
+///   in production. documents the legal transitions:
+///   `open -> accepted -> resolved`, `open -> declined`.
+///   `open -> expired`. Default `'open'` matches 's "starts in
 ///   open" acceptance.
 /// - `accepted_at` — `TEXT`, nullable. ISO timestamp the target
 ///   accepted the challenge. Stays `NULL` for challenges that never
@@ -112,13 +112,13 @@ use crate::world_db::{WorldDb, WorldMigration};
 ///   declined and expired challenges leave it `NULL`. Same audit-view
 ///   rationale as `accepted_at`.
 /// - `expires_at` — `TEXT`, nullable. ISO timestamp after which an
-///   `open` challenge can be transitioned to `expired` by Task 4f's
+///   `open` challenge can be transitioned to `expired` by 's
 ///   sweeper. Nullable so a challenge can be open-ended (no deadline)
 ///   without reserving a sentinel value; the partial index below
 ///   filters on `expires_at IS NOT NULL` so the sweeper only walks
-///   challenges that *can* expire. SPEC §4.2 requires "Expired
+///   challenges that *can* expire. requires "Expired
 ///   challenges cannot be accepted" — the helper enforcing that lives
-///   in Task 4c, but the timestamp it consults lives here.
+///   in, but the timestamp it consults lives here.
 /// - `result` — `TEXT`, nullable. Opaque JSON describing the
 ///   resolution outcome (winner, payouts, narrative beats). Game code
 ///   computes and stores this on the `accepted -> resolved`
@@ -131,7 +131,7 @@ use crate::world_db::{WorldDb, WorldMigration};
 /// # Indexes
 ///
 /// Two partial indexes are created up-front so the lookup patterns
-/// Tasks 4c–4f rely on are seek-bound from the moment they land.
+///  rely on are seek-bound from the moment they land.
 /// Adding them later would require a follow-up migration and a
 /// backfill window where the query path scans the table; pay the
 /// index cost at the same migration that creates the table — the same
@@ -146,7 +146,7 @@ use crate::world_db::{WorldDb, WorldMigration};
 ///   `open`) and matches the planned default query exactly.
 /// - `idx_challenges_open_expiring` is a partial index over
 ///   `(expires_at, id)` `WHERE state = 'open' AND expires_at IS NOT
-///   NULL`. The Task 4f sweeper walks this in `expires_at` order and
+///   NULL`. The sweeper walks this in `expires_at` order and
 ///   stops at the first row where `expires_at > now`, so the cost of
 ///   "expire all due challenges" stays proportional to the number of
 ///   challenges that actually need expiring — not to the total
@@ -157,7 +157,7 @@ use crate::world_db::{WorldDb, WorldMigration};
 ///
 /// `version = 7`. Notices claim version 6 (see
 /// [`crate::notices::NOTICES_MIGRATION`]); challenges are the second
-/// v3 primitive to land, so they take 7. Subsequent v3 migrations
+///  primitive to land, so they take 7. Subsequent migrations
 /// (market listings, factions, bounties) take 8 and onward.
 pub const CHALLENGES_MIGRATION: WorldMigration = WorldMigration {
     version: 7,
@@ -184,7 +184,7 @@ CREATE INDEX IF NOT EXISTS idx_challenges_open_expiring\n\
 ",
 };
 
-/// Decoded `challenges` row — SPEC_v3 §4.2 read model.
+/// Decoded `challenges` row — read model.
 ///
 /// Mirrors the column shape pinned by [`CHALLENGES_MIGRATION`]
 /// one-for-one, in the same order, so the SQL `RETURNING` clause and
@@ -197,7 +197,7 @@ CREATE INDEX IF NOT EXISTS idx_challenges_open_expiring\n\
 /// All timestamps stay as raw SQLite ISO text, the same contract as
 /// [`crate::notices::Notice`] and [`crate::events::EventRecord`]:
 /// parsing into a richer type would be a one-way trip that hides
-/// corrupt data and forces a chrono / time dependency on every
+/// corrupt data and forces a chrono time dependency on every
 /// consumer. `stake` and `result` are likewise opaque text — game
 /// code that wants structured payloads serialises JSON before
 /// handing it to the kit, and decodes on read.
@@ -213,10 +213,10 @@ pub struct Challenge {
     /// Challenger's `players.id`. Required by the schema — every
     /// challenge has exactly one initiator.
     pub challenger_player_id: i64,
-    /// Target's `players.id`. Required by the schema — v3 ships only
+    /// Target's `players.id`. Required by the schema — ships only
     /// directed challenges (see [`CHALLENGES_MIGRATION`] notes).
     pub target_player_id: i64,
-    /// Game-authored kind label (e.g. `"clue_race"`,
+    /// Game-authored kind label (e.g. `"clue_race"`.
     /// `"deduction_duel"`). Round-tripped verbatim; the kit imposes
     /// no namespace.
     pub kind: String,
@@ -224,29 +224,29 @@ pub struct Challenge {
     /// so `sqlite3 -json` can pretty-print it; the kit does not parse
     /// it. `None` for a friendly duel with no wager.
     pub stake: Option<String>,
-    /// Lifecycle state — one of `open`, `accepted`, `declined`,
+    /// Lifecycle state — one of `open`, `accepted`, `declined`.
     /// `resolved`, `expired`. The schema-level `CHECK` constraint
     /// pins the vocabulary; see [`CHALLENGES_MIGRATION`].
     pub state: String,
     /// ISO timestamp the target accepted the challenge, or `None`
-    /// while it has not been accepted (still open, declined,
+    /// while it has not been accepted (still open, declined.
     /// expired).
     pub accepted_at: Option<String>,
     /// ISO timestamp the challenge was resolved, or `None` if it has
     /// not been resolved.
     pub resolved_at: Option<String>,
     /// Optional ISO deadline. After this time, an `open` challenge
-    /// can be transitioned to `expired` by the Task 4f sweeper.
+    /// can be transitioned to `expired` by the sweeper.
     /// `None` means open-ended (no deadline).
     pub expires_at: Option<String>,
     /// Optional opaque result payload (typically JSON describing
-    /// winner, payouts, narrative beats). Populated by Task 4e on
+    /// winner, payouts, narrative beats). Populated by on
     /// the `accepted -> resolved` transition; the kit treats it as
     /// opaque, same contract as `stake`.
     pub result: Option<String>,
 }
 
-/// Lifecycle state for a [`Challenge`] — SPEC_v3 §4.2 vocabulary.
+/// Lifecycle state for a [`Challenge`] — vocabulary.
 ///
 /// The kit's helpers ([`WorldDb::create_challenge`] and the upcoming
 /// 4c–4f transitions) use this enum at their boundaries so call
@@ -256,23 +256,23 @@ pub struct Challenge {
 /// one place the mapping lives so a future state addition is a
 /// single edit, schema migration plus enum variant.
 ///
-/// Values are listed in the natural lifecycle order — `Open` first,
+/// Values are listed in the natural lifecycle order — `Open` first.
 /// terminal states last — so `Debug` output reads naturally in
 /// failure messages.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ChallengeState {
     /// Freshly created and awaiting the target's accept/decline.
-    /// SPEC §4.2 default; matches the schema-level `DEFAULT 'open'`.
+    ///  default; matches the schema-level `DEFAULT 'open'`.
     Open,
     /// Target accepted; the challenge is in flight and awaiting
-    /// resolution by Task 4e.
+    /// resolution by.
     Accepted,
     /// Target declined the challenge. Terminal state.
     Declined,
-    /// Resolved by game code via Task 4e. Terminal state; carries
+    /// Resolved by game code via. Terminal state; carries
     /// the `result` payload.
     Resolved,
-    /// Expired without acceptance via Task 4f's deadline sweeper.
+    /// Expired without acceptance via 's deadline sweeper.
     /// Terminal state.
     Expired,
 }
@@ -298,31 +298,31 @@ impl ChallengeState {
 ///
 /// Library-internal `thiserror` shape — the runtime wraps these with
 /// `anyhow` at the process boundary. Mirrors
-/// [`crate::notices::NoticeError`] so all v3 multiplayer write paths
+/// [`crate::notices::NoticeError`] so all multiplayer write paths
 /// surface errors with the same shape (a future code review pass
 /// can fold these into a single multiplayer-error trait if a third
 /// primitive needs the same variants, but two primitives doesn't
-/// justify the abstraction yet — SPEC tenet "no premature
+/// justify the abstraction yet — tenet "no premature
 /// abstraction").
 ///
-/// Task 4b–4e need: `EmptyKind`, `EmptyResult`, `Sqlite`,
+///  need: `EmptyKind`, `EmptyResult`, `Sqlite`.
 /// `NotFound`, `InvalidTransition`, and `Expired`. Validation
 /// variants for length caps or self-challenge are deferred to
-/// follow-up tasks if SPEC ever calls for them; SPEC §4.2 does not
+/// follow-up tasks if ever calls for them; does not
 /// require either.
 #[derive(Debug, Error)]
 pub enum ChallengeError {
-    /// `kind` was empty. SPEC §4.2 lists `kind` as required; the kit
+    /// `kind` was empty. lists `kind` as required; the kit
     /// additionally rejects an empty string here so a challenge can
     /// always be filtered/rendered by category. A regression that
     /// silently accepted `""` would surface as a phantom row in
     /// every "challenges of kind X" query.
     #[error("challenge kind must not be empty")]
     EmptyKind,
-    /// `result` was empty on a resolve call. SPEC §4.2 lists
+    /// `result` was empty on a resolve call. lists
     /// `result JSON` as the resolution payload; the kit additionally
     /// rejects an empty string at the boundary so a regression that
-    /// dropped the result mid-call (an `unwrap_or_default()` pattern,
+    /// dropped the result mid-call (an `unwrap_or_default` pattern.
     /// say) surfaces as a typed error rather than as an
     /// indistinguishable-from-declined `""` payload in the audit
     /// view. Game code that genuinely has no structured result MUST
@@ -342,7 +342,7 @@ pub enum ChallengeError {
         source: rusqlite::Error,
     },
     /// No `challenges` row exists with the given id. Surfaced by
-    /// transition helpers (`accept_challenge`, `decline_challenge`,
+    /// transition helpers (`accept_challenge`, `decline_challenge`.
     /// `resolve_challenge`) when the caller's id is stale or the
     /// row has been removed by an operator.
     #[error("challenge {id} does not exist")]
@@ -352,8 +352,8 @@ pub enum ChallengeError {
         id: i64,
     },
     /// The transition is not legal from the challenge's current
-    /// state. SPEC §4.2 mandates exactly four transitions:
-    /// `open -> accepted`, `open -> declined`, `open -> expired`,
+    /// state. mandates exactly four transitions:
+    /// `open -> accepted`, `open -> declined`, `open -> expired`.
     /// `accepted -> resolved`. Every other (from, to) pair fails
     /// with this variant. Carrying both `from` (the actual state
     /// the row was found in) and the desired `to` lets the UI
@@ -376,12 +376,12 @@ pub enum ChallengeError {
         to: ChallengeState,
     },
     /// The challenge was still in `open` but its `expires_at`
-    /// deadline has already passed. SPEC §4.2 requires "Expired
+    /// deadline has already passed. requires "Expired
     /// challenges cannot be accepted"; a separate variant from
     /// [`Self::InvalidTransition`] lets the UI distinguish "the
     /// deadline lapsed before you got here" from "this challenge
     /// is in some other terminal state". Note that the row may
-    /// still be `state = 'open'` in the database — the Task 4f
+    /// still be `state = 'open'` in the database — the
     /// sweeper hasn't run yet — but the helper refuses to accept
     /// regardless, so a slow sweeper can't widen the window in
     /// which an already-stale challenge is acceptable.
@@ -394,14 +394,14 @@ pub enum ChallengeError {
 
 impl WorldDb {
     /// Insert one row into `challenges` and return the canonical
-    /// [`Challenge`] SQLite produced (SPEC_v3 §4.2 / §Task 4b).
+    /// [`Challenge`] SQLite produced.
     ///
     /// The contract is "the challenge I asked you to create is now
     /// durably in the table, addressed to the named target, in
-    /// state `open`, with the id and `created_at` SQLite assigned,
-    /// and `accepted_at` / `resolved_at` / `result` all still
-    /// `NULL`". The state is intentionally not a parameter — SPEC
-    /// §4.2 mandates "open" as the entry state, and the kit owns
+    /// state `open`, with the id and `created_at` SQLite assigned.
+    /// and `accepted_at` `resolved_at` `result` all still
+    /// `NULL`". The state is intentionally not a parameter
+    ///  mandates "open" as the entry state, and the kit owns
     /// that invariant. The schema-level `DEFAULT 'open'` plus this
     /// helper's `RETURNING` round-trip keeps the lifecycle honest:
     /// even an operator who tampered with the helper signature
@@ -411,7 +411,7 @@ impl WorldDb {
     /// `challenger_player_id` and `target_player_id` are required
     /// by the schema. `kind` is required text (e.g. `"clue_race"`).
     /// `stake`, `expires_at` are optional — `None` means "no
-    /// wager" / "no deadline". The `result` column is intentionally
+    /// wager" "no deadline". The `result` column is intentionally
     /// not a parameter on this path: a brand-new challenge has no
     /// result, and exposing it as a parameter would invite a
     /// regression where game code populated it before the
@@ -419,7 +419,7 @@ impl WorldDb {
     ///
     /// # Validation order
     ///
-    /// The empty-kind check (the only validation Task 4b needs)
+    /// The empty-kind check (the only validation needs)
     /// runs **before** the SQL round-trip so a rejected challenge
     /// never produces a row, an autoincrement gap, or an event-log
     /// entry. Same rationale and ordering as
@@ -433,7 +433,7 @@ impl WorldDb {
     /// # Concurrency
     ///
     /// Takes `&self`: a single insert statement under the configured
-    /// busy timeout. SPEC §4.2 requires "Challenge state transitions
+    /// busy timeout. requires "Challenge state transitions
     /// MUST be transactional"; the *creation* path is a single
     /// `INSERT` and thus already atomic, so no explicit
     /// transactional wrapper is needed here. The 4c–4f transition
@@ -448,7 +448,7 @@ impl WorldDb {
         expires_at: Option<&str>,
     ) -> Result<Challenge, ChallengeError> {
         // Validation runs before the SQL round-trip so a rejected
-        // challenge never produces a row. SPEC §4.2 lists `kind` as
+        // challenge never produces a row. lists `kind` as
         // required; the kit additionally rejects the empty string.
         if kind.is_empty() {
             return Err(ChallengeError::EmptyKind);
@@ -482,12 +482,12 @@ RETURNING id, created_at, challenger_player_id, target_player_id, \
     }
 
     /// Transition a challenge from `open` to `accepted` and stamp
-    /// `accepted_at` (SPEC_v3 §4.2 / §Task 4c).
+    /// `accepted_at`.
     ///
     /// The contract is "if and only if the row was still open and
     /// not past its deadline, it is now `accepted` with an
     /// `accepted_at` timestamp; otherwise the row is unchanged and
-    /// the helper returns a typed error explaining why". SPEC §4.2
+    /// the helper returns a typed error explaining why".
     /// requires "Challenge state transitions MUST be transactional";
     /// the implementation is one conditional `UPDATE … RETURNING`
     /// statement, which is natively atomic in SQLite — same shape
@@ -503,7 +503,7 @@ RETURNING id, created_at, challenger_player_id, target_player_id, \
     ///
     /// 1. `id = ?1` — addresses the row.
     /// 2. `state = 'open'` — only the `open -> accepted` transition
-    ///    is legal (SPEC §4.2); any other current state must fall
+    ///    is legal ; any other current state must fall
     ///    through to the diagnostic SELECT and become an
     ///    [`ChallengeError::InvalidTransition`].
     /// 3. `expires_at IS NULL OR datetime(expires_at) > datetime('now')`
@@ -511,7 +511,7 @@ RETURNING id, created_at, challenger_player_id, target_player_id, \
     ///    acceptable; deadlined challenges are acceptable only
     ///    while the deadline is still in the future. Wrapping both
     ///    sides in `datetime(…)` normalises the two ISO forms the
-    ///    kit accepts (`'YYYY-MM-DDTHH:MM:SSZ'` from callers,
+    ///    kit accepts (`'YYYY-MM-DDTHH:MM:SSZ'` from callers.
     ///    `'YYYY-MM-DD HH:MM:SS'` from `CURRENT_TIMESTAMP`) so the
     ///    comparison is chronological rather than lexicographic.
     ///
@@ -538,8 +538,8 @@ RETURNING id, created_at, challenger_player_id, target_player_id, \
     /// - [`ChallengeError::Expired`] — row is still `open` but its
     ///   `expires_at` deadline has passed.
     /// - [`ChallengeError::InvalidTransition`] — row is in any
-    ///   state other than `open` (already accepted, declined,
-    ///   resolved, or swept to `expired` by Task 4f).
+    ///   state other than `open` (already accepted, declined.
+    ///   resolved, or swept to `expired` by ).
     /// - [`ChallengeError::Sqlite`] — any other `rusqlite` error.
     ///
     /// # Concurrency
@@ -550,7 +550,7 @@ RETURNING id, created_at, challenger_player_id, target_player_id, \
     /// [`WorldDb::mark_read`].
     pub fn accept_challenge(&self, challenge_id: i64) -> Result<Challenge, ChallengeError> {
         // Conditional UPDATE: only the `open + still-fresh` row
-        // gets transitioned. SPEC §4.2 transitions are exhaustive
+        // gets transitioned. transitions are exhaustive
         // — any non-matching row falls through to the diagnostic
         // SELECT below for typed-error mapping.
         const UPDATE_SQL: &str = "\
@@ -575,21 +575,21 @@ RETURNING id, created_at, challenger_player_id, target_player_id, \
         }
     }
 
-    /// Transition a challenge from `open` to `declined` (SPEC_v3 §4.2
-    /// / §Task 4d).
+    /// Transition a challenge from `open` to `declined` (
+    /// ).
     ///
     /// The contract is "if and only if the row was still `open`, it
     /// is now `declined`; otherwise the row is unchanged and the
-    /// helper returns a typed error explaining why". SPEC §4.2 lists
+    /// helper returns a typed error explaining why". lists
     /// `open -> declined` as the only legal decline transition; any
-    /// other current state (`accepted`, `declined`, `resolved`,
+    /// other current state (`accepted`, `declined`, `resolved`.
     /// `expired`) must surface as
     /// [`ChallengeError::InvalidTransition`].
     ///
     /// Unlike [`Self::accept_challenge`], the decline path does
     /// **not** gate on `expires_at`: a target can always decline
     /// while the row is open, even if its deadline has lapsed and
-    /// the sweeper hasn't run yet. SPEC §4.2's "Expired challenges
+    /// the sweeper hasn't run yet. 's "Expired challenges
     /// cannot be accepted" is specifically scoped to the accept
     /// transition; declining a stale challenge is harmless and
     /// occasionally the right outcome (the target sees the lapsed
@@ -599,7 +599,7 @@ RETURNING id, created_at, challenger_player_id, target_player_id, \
     /// There is no `declined_at` column in the schema (see
     /// [`CHALLENGES_MIGRATION`]) — declined is a terminal state with
     /// no follow-up audit timestamp, so the transition only flips
-    /// `state`. If a future SPEC revision adds a decline timestamp,
+    /// `state`. If a future revision adds a decline timestamp.
     /// the migration and `Challenge` struct change first, and this
     /// helper stamps it in the same `UPDATE`.
     ///
@@ -611,7 +611,7 @@ RETURNING id, created_at, challenger_player_id, target_player_id, \
     /// - [`ChallengeError::Sqlite`] — any other `rusqlite` error.
     ///
     /// Note that [`ChallengeError::Expired`] is intentionally not in
-    /// the failure set: per SPEC §4.2 the expired-deadline gate
+    /// the failure set: the expired-deadline gate
     /// applies only to acceptance, and the shared
     /// `diagnose_failed_transition` helper already scopes `Expired`
     /// to `attempted == Accepted` so a future caller can't
@@ -624,7 +624,7 @@ RETURNING id, created_at, challenger_player_id, target_player_id, \
     /// borrow shape as [`Self::accept_challenge`].
     pub fn decline_challenge(&self, challenge_id: i64) -> Result<Challenge, ChallengeError> {
         // Conditional UPDATE: only an `open` row gets transitioned.
-        // No deadline gate — see helper docs for the SPEC §4.2
+        // No deadline gate — see helper docs for the
         // rationale.
         const UPDATE_SQL: &str = "\
 UPDATE challenges \
@@ -648,18 +648,18 @@ RETURNING id, created_at, challenger_player_id, target_player_id, \
     }
 
     /// Transition a challenge from `accepted` to `resolved` and stamp
-    /// `resolved_at` + `result` (SPEC_v3 §4.2 / §Task 4e).
+    /// `resolved_at` + `result`.
     ///
     /// The contract is "if and only if the row was in `accepted`, it
     /// is now `resolved` with a `resolved_at` timestamp and the caller-
     /// provided `result` payload; otherwise the row is unchanged and
-    /// the helper returns a typed error explaining why". SPEC §4.2
+    /// the helper returns a typed error explaining why".
     /// lists `accepted -> resolved` as the only legal resolve
-    /// transition; any other current state (`open`, `declined`,
+    /// transition; any other current state (`open`, `declined`.
     /// `resolved`, `expired`) must surface as
     /// [`ChallengeError::InvalidTransition`].
     ///
-    /// Game code owns result calculation (SPEC §4.2 "Game code owns
+    /// Game code owns result calculation ( "Game code owns
     /// result calculation; the kit owns durable lifecycle
     /// invariants"). The kit treats `result` as opaque text — same
     /// contract as `stake` on create — so a future `result` shape
@@ -673,7 +673,7 @@ RETURNING id, created_at, challenger_player_id, target_player_id, \
     ///
     /// 1. `id = ?1` — addresses the row.
     /// 2. `state = 'accepted'` — only `accepted -> resolved` is
-    ///    legal. SPEC §4.2 forbids resolving an `open` challenge
+    ///    legal. forbids resolving an `open` challenge
     ///    (the target hasn't agreed) and resolving any terminal
     ///    state (already resolved/declined/expired).
     ///
@@ -684,15 +684,15 @@ RETURNING id, created_at, challenger_player_id, target_player_id, \
     /// Note this path does NOT gate on `expires_at`: an `accepted`
     /// challenge has already passed the deadline gate via
     /// [`Self::accept_challenge`], and the deadline is irrelevant
-    /// once the challenge is in flight. SPEC §4.2's "Expired
-    /// challenges cannot be accepted" is scoped to acceptance only,
+    /// once the challenge is in flight. 's "Expired
+    /// challenges cannot be accepted" is scoped to acceptance only.
     /// and the shared `diagnose_failed_transition` helper restricts
     /// `Expired` to `attempted == Accepted` so a future caller can't
     /// accidentally surface it on the resolve path.
     ///
     /// # Validation order
     ///
-    /// The empty-`result` check runs **before** the SQL round-trip,
+    /// The empty-`result` check runs **before** the SQL round-trip.
     /// same ordering rationale as [`Self::create_challenge`]: a
     /// rejected resolve never produces a state flip, never burns an
     /// autoincrement, and never lands a partial row.
@@ -726,7 +726,7 @@ RETURNING id, created_at, challenger_player_id, target_player_id, \
         // Conditional UPDATE: only an `accepted` row gets
         // transitioned. `result = ?2` is written in the same
         // statement so the row never exists in a "resolved with NULL
-        // result" intermediate state — SPEC §4.2's `result JSON` is
+        // result" intermediate state — 's `result JSON` is
         // mandatory on the resolved row.
         const UPDATE_SQL: &str = "\
 UPDATE challenges \
@@ -750,13 +750,13 @@ RETURNING id, created_at, challenger_player_id, target_player_id, \
     }
 
     /// Sweep `open` challenges whose `expires_at` deadline has passed
-    /// at `now` and transition them to `expired` (SPEC_v3 §4.2 / §Task
+    /// at `now` and transition them to `expired` ( Task
     /// 4f).
     ///
     /// The contract is "every `open` row with a non-NULL `expires_at`
     /// less than or equal to `now` becomes `expired` in one batch;
     /// every other row is untouched". This is the kit-owned
-    /// counterpart to the Task 4c deadline gate: `accept_challenge`
+    /// counterpart to the deadline gate: `accept_challenge`
     /// refuses lapsed open rows in real time, and this sweeper
     /// eventually flips them to `expired` so inboxes and audit views
     /// can stop showing them as "open".
@@ -770,7 +770,7 @@ RETURNING id, created_at, challenger_player_id, target_player_id, \
     /// through the helper keeps the SQL identical to the production
     /// shape (the same `datetime(expires_at) <= datetime(?1)`
     /// comparison the accept gate uses), lets tests pin the cutoff
-    /// to a specific instant, and matches SPEC §4.2's call signature
+    /// to a specific instant, and matches 's call signature
     /// shape (`expire_open_challenges(now)`). Production callers
     /// pass an ISO timestamp synthesised from the runtime clock at
     /// the call site.
@@ -779,18 +779,18 @@ RETURNING id, created_at, challenger_player_id, target_player_id, \
     ///
     /// The `WHERE` clause folds three checks into a single statement:
     ///
-    /// 1. `state = 'open'` — terminal states (`accepted`, `declined`,
-    ///    `resolved`, `expired`) are never re-transitioned. SPEC §4.2
+    /// 1. `state = 'open'` — terminal states (`accepted`, `declined`.
+    ///    `resolved`, `expired`) are never re-transitioned.
     ///    only lists `open -> expired` for the sweeper.
     /// 2. `expires_at IS NOT NULL` — open-ended challenges with no
     ///    deadline must never be swept. A regression that dropped
     ///    this gate would silently expire every friendly duel.
     /// 3. `datetime(expires_at) <= datetime(?1)` — the deadline has
-    ///    already passed at `now`. The `datetime()` wrapping handles
+    ///    already passed at `now`. The `datetime` wrapping handles
     ///    both ISO forms the kit accepts (`'YYYY-MM-DDTHH:MM:SSZ'`
     ///    from callers, `'YYYY-MM-DD HH:MM:SS'` from
-    ///    `CURRENT_TIMESTAMP`) so the comparison is chronological,
-    ///    not lexicographic — same normalisation the Task 4c accept
+    ///    `CURRENT_TIMESTAMP`) so the comparison is chronological.
+    ///    not lexicographic — same normalisation the accept
     ///    gate uses, so a row that fails the accept gate also gets
     ///    swept here on the next pass.
     ///
@@ -805,14 +805,14 @@ RETURNING id, created_at, challenger_player_id, target_player_id, \
     /// Returns the swept rows in `RETURNING` order so the caller can
     /// log them, append world events, or render an "expired since
     /// last visit" notification — all without a follow-up `SELECT`.
-    /// Callers that only need a count call `.len()` on the result.
+    /// Callers that only need a count call `.len` on the result.
     /// An empty `Vec` is the success case when nothing was due.
     ///
     /// # Failure
     ///
     /// - [`ChallengeError::Sqlite`] — the `UPDATE … RETURNING` failed.
     ///
-    /// `NotFound` / `InvalidTransition` / `Expired` are not in the
+    /// `NotFound` `InvalidTransition` `Expired` are not in the
     /// failure set: a sweeper that finds nothing is a success, not
     /// an error.
     ///
@@ -820,7 +820,7 @@ RETURNING id, created_at, challenger_player_id, target_player_id, \
     ///
     /// Takes `&self`: a single `UPDATE … RETURNING` under the
     /// configured busy timeout. Naturally atomic as a single
-    /// statement (SPEC §4.2 "transitions MUST be transactional").
+    /// statement.
     /// Same borrow shape as the other transition helpers.
     pub fn expire_open_challenges(&self, now: &str) -> Result<Vec<Challenge>, ChallengeError> {
         // Conditional UPDATE: only `open` rows with a non-NULL
@@ -853,7 +853,7 @@ RETURNING id, created_at, challenger_player_id, target_player_id, \
     /// Pulled out of [`Self::accept_challenge`] so the upcoming
     /// `decline_challenge` and `resolve_challenge` helpers (Tasks
     /// 4d/4e) can share the same diagnostic. The function does
-    /// exactly one SELECT and returns the most specific error —
+    /// exactly one SELECT and returns the most specific error
     /// `NotFound` > `Expired` > `InvalidTransition` — without ever
     /// returning `Ok`. Internal-only; not part of the public API.
     fn diagnose_failed_transition(
@@ -863,7 +863,7 @@ RETURNING id, created_at, challenger_player_id, target_player_id, \
     ) -> ChallengeError {
         // We need the current state plus a "is the deadline already
         // past?" flag. Compute the deadline check in SQL so it uses
-        // the same `datetime()` normalisation as the UPDATE — a
+        // the same `datetime` normalisation as the UPDATE — a
         // mismatch here would let the diagnostic disagree with the
         // gate that produced the no-rows in the first place.
         const DIAG_SQL: &str = "\
@@ -909,8 +909,8 @@ FROM challenges WHERE id = ?1";
 
 /// Decode a `challenges` row into [`Challenge`].
 ///
-/// Pulled out so the Task 4b write path and the upcoming 4c–4f
-/// transition / query helpers can share one decoder. Column order
+/// Pulled out so the write path and the upcoming 4c–4f
+/// transition query helpers can share one decoder. Column order
 /// matches the `RETURNING` clause in [`WorldDb::create_challenge`];
 /// a regression that reorders columns will surface here as a type
 /// error rather than as a silent field swap. Same shape as
@@ -956,7 +956,7 @@ mod tests {
     }
 
     /// Helper: open a fresh world DB with players + challenges
-    /// migrations applied. Used by every Task 4 behavioural test.
+    /// migrations applied. Used by every behavioural test.
     fn world_with_challenges() -> (tempfile::TempDir, WorldDb) {
         let dir = tempdir().expect("tempdir creates");
         let db_path = dir.path().join("world.sqlite");
@@ -970,13 +970,13 @@ mod tests {
         (dir, world)
     }
 
-    /// SPEC_v3 §Task 4a acceptance: applying [`CHALLENGES_MIGRATION`]
+    ///   acceptance: applying [`CHALLENGES_MIGRATION`]
     /// creates the documented `challenges` table with the column shape
-    /// SPEC §4.2 pins. Asserts both:
+    ///  pins. Asserts both:
     ///
     /// 1. The table exists in `sqlite_master` (so a regression that
     ///    silently dropped the migration body would flunk).
-    /// 2. The columns and order match the SPEC §4.2 contract (so a
+    /// 2. The columns and order match the contract (so a
     ///    later edit that renames or reorders a column flunks here
     ///    rather than buried in a 4b–4g behavioural test).
     ///
@@ -1038,11 +1038,11 @@ mod tests {
                 "expires_at".to_string(),
                 "result".to_string(),
             ],
-            "challenges column shape must match the SPEC_v3 §4.2 contract"
+            "challenges column shape must match the contract"
         );
     }
 
-    /// SPEC §4.2 enumerates the legal states: `open`, `accepted`,
+    ///  enumerates the legal states: `open`, `accepted`.
     /// `declined`, `resolved`, `expired`. The migration encodes that
     /// vocabulary via a `CHECK` constraint so a code-path that ever
     /// tried to write an out-of-vocabulary state (e.g. a typo like
@@ -1054,7 +1054,7 @@ mod tests {
     /// 2. An obviously-invalid state is rejected.
     ///
     /// This is the schema-level safety net for the typed state
-    /// machine that lands in Tasks 4b–4f. The Rust helpers will
+    /// machine that lands in. The Rust helpers will
     /// additionally enforce *which* transitions are legal between
     /// states; this test only proves the alphabet itself is locked
     /// down.
@@ -1118,11 +1118,11 @@ mod tests {
         );
         assert!(
             bogus.is_err(),
-            "CHECK constraint must reject states outside the SPEC §4.2 vocabulary"
+            "CHECK constraint must reject states outside the vocabulary"
         );
     }
 
-    /// The Task 4c–4f helpers will read challenges via two query
+    /// The helpers will read challenges via two query
     /// shapes: "open challenges aimed at this target" (the accept/
     /// decline screen) and "open challenges past their deadline" (the
     /// expiry sweeper). Both paths walk partial indexes the migration
@@ -1132,7 +1132,7 @@ mod tests {
     /// `cargo test` rather than in production under load.
     ///
     /// Same rationale as `notices_inbox_partial_index_is_present` for
-    /// `idx_notices_inbox` — one schema-level test per index family,
+    /// `idx_notices_inbox` — one schema-level test per index family.
     /// asserting both its existence and the partial-predicate text.
     #[test]
     fn challenges_partial_indexes_are_present() {
@@ -1188,7 +1188,7 @@ mod tests {
     }
 
     /// The migration is idempotent. v2's relaunch path applies the
-    /// same migration list every open; v3 inherits that contract. A
+    /// same migration list every open; inherits that contract. A
     /// second `apply_migration(&CHALLENGES_MIGRATION)` MUST be a
     /// no-op (the version is already in `world_migrations`), not an
     /// error from `CREATE TABLE` on an existing table. Same shape as
@@ -1210,17 +1210,17 @@ mod tests {
             .expect("second challenges migration applies (idempotent)");
     }
 
-    /// SPEC_v3 §Task 4b acceptance: a freshly created challenge
+    ///   acceptance: a freshly created challenge
     /// lands in state `open`, with the schema-side `created_at`
-    /// populated, the `RETURNING` row matching the request inputs,
-    /// and `accepted_at` / `resolved_at` / `result` all `NULL`.
-    /// The "starts in open" half is the explicit Task 4b ask; the
+    /// populated, the `RETURNING` row matching the request inputs.
+    /// and `accepted_at` `resolved_at` `result` all `NULL`.
+    /// The "starts in open" half is the explicit ask; the
     /// other field assertions guard against a refactor that
     /// quietly populated a transition timestamp at insert time
     /// (which would defeat the audit-view contract documented on
     /// [`Challenge::accepted_at`]).
     ///
-    /// We also verify the row is visible by primary key directly,
+    /// We also verify the row is visible by primary key directly.
     /// so a regression that returned a `Challenge` from `RETURNING`
     /// without actually persisting (e.g. a future change that
     /// wrapped the insert in a transaction and forgot to commit)
@@ -1246,11 +1246,11 @@ mod tests {
             )
             .expect("create_challenge succeeds");
 
-        // The central Task 4b claim: starts in `open`.
+        // The central claim: starts in `open`.
         assert_eq!(
             created.state,
             ChallengeState::Open.as_str(),
-            "freshly created challenge must be in state 'open' (SPEC §4.2)"
+            "freshly created challenge must be in state 'open'"
         );
 
         // Returned record reflects the inputs and SQL-side defaults.
@@ -1267,7 +1267,7 @@ mod tests {
 
         // Transition timestamps and result MUST be NULL on a fresh
         // challenge — populating any of them at insert time would
-        // break the lifecycle contract (see SPEC §4.2 transitions).
+        // break the lifecycle contract ( transitions).
         assert!(
             created.accepted_at.is_none(),
             "freshly created challenge must not be accepted"
@@ -1297,7 +1297,7 @@ mod tests {
         assert_eq!(stored, created, "stored row must equal RETURNING row");
     }
 
-    /// SPEC §4.2 lists `kind` as required. The schema's `NOT NULL`
+    ///  lists `kind` as required. The schema's `NOT NULL`
     /// would accept `""`; the kit refuses at the boundary so a
     /// "challenges of kind X" filter never has to skip phantom
     /// rows. Pin both the typed error and the "no row landed"
@@ -1325,7 +1325,7 @@ mod tests {
     /// the lifecycle still starts clean. Without this test, a
     /// future signature change that "helpfully" defaulted either
     /// field to a sentinel (e.g. the empty JSON object `{}` for
-    /// stake) would silently break SPEC §4.2's "challenges may
+    /// stake) would silently break 's "challenges may
     /// carry no stake" contract.
     #[test]
     fn create_challenge_supports_optional_stake_and_deadline() {
@@ -1348,7 +1348,7 @@ mod tests {
         );
     }
 
-    /// SPEC_v3 §Task 4c acceptance: the canonical happy path. A
+    ///   acceptance: the canonical happy path. A
     /// freshly created `open` challenge with no deadline (or a
     /// future deadline) flips to `accepted` and gets `accepted_at`
     /// populated by SQL. The other transition timestamps stay
@@ -1404,7 +1404,7 @@ mod tests {
         assert_eq!(stored, accepted, "stored row must equal RETURNING row");
     }
 
-    /// SPEC §4.2 says "Expired challenges cannot be accepted". An
+    ///  says "Expired challenges cannot be accepted". An
     /// `open` row whose `expires_at` is already in the past must
     /// return [`ChallengeError::Expired`] *and* leave the row
     /// untouched — neither `state` nor `accepted_at` advance. We
@@ -1418,7 +1418,7 @@ mod tests {
         let (_dir, world) = world_with_challenges();
         let alice = world.upsert_player(&ctx("u-a", "alice")).unwrap();
         let bob = world.upsert_player(&ctx("u-b", "bob")).unwrap();
-        // A deadline well in the past so the `datetime()`
+        // A deadline well in the past so the `datetime`
         // comparison in `accept_challenge` rejects regardless of
         // wall-clock skew.
         let created = world
@@ -1440,7 +1440,7 @@ mod tests {
             created.id
         );
 
-        // Row-unchanged invariant: state still 'open',
+        // Row-unchanged invariant: state still 'open'.
         // accepted_at still NULL.
         let (state, accepted_at): (String, Option<String>) = world
             .connection()
@@ -1462,8 +1462,8 @@ mod tests {
     /// `from` state. Pin the canonical case — a second accept on
     /// an already-accepted row — because that's the regression
     /// most likely to slip in (a UI re-fires accept after a
-    /// double-keypress). The other terminal states (`declined`,
-    /// `resolved`, `expired`) ride the same code path; Task 4g's
+    /// double-keypress). The other terminal states (`declined`.
+    /// `resolved`, `expired`) ride the same code path; 's
     /// invalid-transition matrix will cover them exhaustively.
     #[test]
     fn accept_challenge_rejects_already_accepted() {
@@ -1489,7 +1489,7 @@ mod tests {
             "expected InvalidTransition from 'accepted' to Accepted, got {second:?}"
         );
 
-        // accepted_at must NOT have moved between the two calls —
+        // accepted_at must NOT have moved between the two calls
         // the second attempt is a no-op on the row, mirroring the
         // idempotency contract on `mark_read` (only the *typed
         // error* differs because the state machine is stricter
@@ -1523,14 +1523,14 @@ mod tests {
         );
     }
 
-    /// SPEC_v3 §Task 4d acceptance: the canonical happy path. A
+    ///   acceptance: the canonical happy path. A
     /// freshly created `open` challenge transitions to `declined` on
     /// the first decline call. Declined is terminal and there is no
     /// `declined_at` column, so we additionally pin that
-    /// `accepted_at`, `resolved_at`, and `result` all stay `NULL` —
+    /// `accepted_at`, `resolved_at`, and `result` all stay `NULL`
     /// a regression that "helpfully" stamped one of those alongside
     /// the state flip would defeat the audit-view contract on
-    /// [`Challenge::accepted_at`] / [`Challenge::resolved_at`] and
+    /// [`Challenge::accepted_at`] [`Challenge::resolved_at`] and
     /// quietly diverge from the schema's transition timestamps.
     /// Round-trip through a primary-key SELECT to also prove the
     /// `RETURNING` row is durable.
@@ -1578,7 +1578,7 @@ mod tests {
         assert_eq!(stored, declined, "stored row must equal RETURNING row");
     }
 
-    /// SPEC §4.2's deadline gate ("Expired challenges cannot be
+    /// 's deadline gate ("Expired challenges cannot be
     /// accepted") applies only to acceptance. Declining a stale open
     /// challenge is legitimate — the target sees the lapsed entry in
     /// their inbox before the sweeper runs and explicitly says "no
@@ -1606,14 +1606,14 @@ mod tests {
         assert_eq!(declined.state, ChallengeState::Declined.as_str());
     }
 
-    /// SPEC §4.2: only `open -> declined` is a legal decline. Any
+    /// : only `open -> declined` is a legal decline. Any
     /// non-open current state must surface as
     /// [`ChallengeError::InvalidTransition`] carrying the actual
     /// `from`. Pin the canonical regression — declining an already-
     /// accepted challenge — and additionally pin the row-unchanged
     /// invariant so a future helper that flipped state then
     /// returned an error couldn't slip through. Other terminal
-    /// states ride the same code path; Task 4g's invalid-transition
+    /// states ride the same code path; 's invalid-transition
     /// matrix covers them exhaustively.
     #[test]
     fn decline_challenge_rejects_already_accepted() {
@@ -1652,7 +1652,7 @@ mod tests {
 
     /// Decline on a re-decline must surface
     /// [`ChallengeError::InvalidTransition`] from `'declined'` rather
-    /// than masquerading as a successful no-op. SPEC §4.2 is strict
+    /// than masquerading as a successful no-op. is strict
     /// here: declined is terminal, and a UI that fires decline twice
     /// (a double-keypress, an at-least-once retry) needs the typed
     /// signal to render the right message. Same shape rationale as
@@ -1698,7 +1698,7 @@ mod tests {
         );
     }
 
-    /// SPEC_v3 §Task 4e acceptance: the canonical happy path. An
+    ///   acceptance: the canonical happy path. An
     /// `accepted` challenge transitions to `resolved`, the caller-
     /// provided `result` JSON is stored verbatim, `resolved_at` is
     /// stamped by SQL, and `accepted_at` from the prior transition
@@ -1754,10 +1754,10 @@ mod tests {
         assert_eq!(stored, resolved, "stored row must equal RETURNING row");
     }
 
-    /// SPEC §4.2: only `accepted -> resolved` is legal. Resolving an
+    /// : only `accepted -> resolved` is legal. Resolving an
     /// `open` row (target hasn't accepted yet) must fail with
     /// [`ChallengeError::InvalidTransition`] from `'open'` and leave
-    /// the row entirely untouched — no state flip, no `resolved_at`,
+    /// the row entirely untouched — no state flip, no `resolved_at`.
     /// no `result`. Pin the row-unchanged invariant so a regression
     /// that wrote partial state then returned the typed error
     /// couldn't slip through.
@@ -1802,7 +1802,7 @@ mod tests {
 
     /// Re-resolving an already-resolved challenge must surface
     /// [`ChallengeError::InvalidTransition`] from `'resolved'` rather
-    /// than overwriting the original result payload. SPEC §4.2 makes
+    /// than overwriting the original result payload. makes
     /// `resolved` terminal; a UI that fires resolve twice (a double-
     /// keypress, an at-least-once retry, two referees racing) needs
     /// the typed signal to render the right message AND the original
@@ -1850,12 +1850,12 @@ mod tests {
     }
 
     /// Resolving a `declined` challenge must surface
-    /// [`ChallengeError::InvalidTransition`] from `'declined'`. SPEC
-    /// §4.2 makes `declined` terminal, and there is no path back to
+    /// [`ChallengeError::InvalidTransition`] from `'declined'`.
+    ///  makes `declined` terminal, and there is no path back to
     /// `accepted` — covering this case here (alongside the open and
-    /// already-resolved cases) gives Task 4e three of the four
+    /// already-resolved cases) gives three of the four
     /// non-accepted starting states; the fourth (`expired`) lands
-    /// with Task 4f's sweeper. Task 4g's invalid-transition matrix
+    /// with 's sweeper. 's invalid-transition matrix
     /// covers the full grid.
     #[test]
     fn resolve_challenge_rejects_declined() {
@@ -1902,7 +1902,7 @@ mod tests {
             .expect_err("empty result must be rejected");
         assert!(matches!(err, ChallengeError::EmptyResult), "got {err:?}");
 
-        // Row-unchanged invariant: state still 'accepted',
+        // Row-unchanged invariant: state still 'accepted'.
         // resolved_at still NULL, result still NULL.
         let (state, resolved_at, result): (String, Option<String>, Option<String>) = world
             .connection()
@@ -1944,7 +1944,7 @@ mod tests {
     /// mapping the enum to the storage encoding pinned by the
     /// schema-level `CHECK` constraint. A regression that ever
     /// returned the wrong text for any variant would silently break
-    /// the create / transition paths (state would not match the
+    /// the create transition paths (state would not match the
     /// `CHECK` vocabulary). Pin every variant here.
     #[test]
     fn challenge_state_as_str_matches_schema_vocabulary() {
@@ -1955,7 +1955,7 @@ mod tests {
         assert_eq!(ChallengeState::Expired.as_str(), "expired");
     }
 
-    /// SPEC_v3 §Task 4f acceptance: only `open` challenges with a
+    ///   acceptance: only `open` challenges with a
     /// `expires_at` deadline at or before `now` get swept to
     /// `expired`. Every other row — open with no deadline, open
     /// with a future deadline, already-accepted (regardless of
@@ -1996,7 +1996,7 @@ mod tests {
                 Some("2999-12-31T23:59:59Z"),
             )
             .unwrap();
-        // Case 3: open + no deadline → MUST stay open. SPEC §4.2
+        // Case 3: open + no deadline → MUST stay open.
         // "expires_at TIMESTAMP NULL"; an open-ended challenge
         // never expires.
         let openended = world
@@ -2007,7 +2007,7 @@ mod tests {
         // exactly this case — an accepted challenge has passed the
         // deadline gate and the deadline is irrelevant once it's
         // in flight. Built via raw `INSERT` because
-        // `accept_challenge` (correctly) refuses a lapsed deadline,
+        // `accept_challenge` (correctly) refuses a lapsed deadline.
         // so we cannot reach this state through the helper API; the
         // production analog is "row was accepted before the deadline
         // lapsed and still hasn't been resolved".
@@ -2025,7 +2025,7 @@ mod tests {
             )
             .unwrap();
 
-        // Sweep at a `now` after Case 1 / Case 4's deadline but
+        // Sweep at a `now` after Case 1 Case 4's deadline but
         // well before Case 2's. Case 3 has no deadline so it's
         // never in scope.
         let swept = world
@@ -2068,7 +2068,7 @@ mod tests {
     /// excludes them, while every still-open row's deadline is
     /// still in the future. Pin idempotency so a regression that
     /// (say) dropped the state gate and started re-stamping the
-    /// row on every pass would observably flunk on `is_empty()`.
+    /// row on every pass would observably flunk on `is_empty`.
     /// Same shape as `mark_read_is_idempotent` and
     /// `archive_notice_is_idempotent`.
     #[test]
@@ -2102,7 +2102,7 @@ mod tests {
     }
 
     /// An empty `challenges` table (or a table whose only rows are
-    /// not due) returns an empty `Vec`, not an error. The SPEC §4.2
+    /// not due) returns an empty `Vec`, not an error. The
     /// sweeper contract treats "nothing to do" as a success — a
     /// regression that surfaced this as `Sqlite { … }` would force
     /// every caller to special-case it.
@@ -2123,7 +2123,7 @@ mod tests {
     /// regression that flipped the comparator to strict `<` would
     /// leave on-the-second deadlines stuck in `open` until the
     /// next sweep tick. Using identical text on both sides also
-    /// pins that the `datetime()` normalisation is the same on
+    /// pins that the `datetime` normalisation is the same on
     /// both sides of the comparison.
     #[test]
     fn expire_open_challenges_includes_exact_deadline() {
@@ -2151,13 +2151,13 @@ mod tests {
         );
     }
 
-    // -- SPEC_v3 §Task 4g — invalid-transition table tests -------------
+    // -- — invalid-transition table tests -------------
     //
     // Standalone tests above already pin specific scenarios with extra
     // invariants (timestamp preservation, row-count guards, durability
     // round-trips). The four `rstest` tables below complete the
     // matrix: one row per (helper, starting-state) pair, asserting the
-    // *exact* outcome — `Ok` on the single SPEC §4.2 legal edge,
+    // *exact* outcome — `Ok` on the single legal edge.
     // typed `InvalidTransition { from }` everywhere else. Without this
     // exhaustive grid, a regression that (say) relaxed `accept`'s
     // gate to also accept a `declined` row could pass every existing
@@ -2192,7 +2192,7 @@ mod tests {
     ///
     /// Returns the new row id.
     fn seed_challenge_in_state(world: &WorldDb, challenger: i64, target: i64, state: &str) -> i64 {
-        // Each non-open state needs the audit fields the SPEC §4.2
+        // Each non-open state needs the audit fields the
         // lifecycle would have stamped; we synthesise plausible
         // values (real ISO timestamps, valid result JSON) so a
         // future test that primary-key-SELECTs the row also sees a
@@ -2236,7 +2236,7 @@ mod tests {
             .unwrap_or_else(|err| panic!("seed {state:?} row: {err}"))
     }
 
-    /// SPEC_v3 §Task 4g acceptance — `accept_challenge` table.
+    ///   acceptance — `accept_challenge` table.
     ///
     /// `open` is the only legal starting state; every other state
     /// MUST surface as `InvalidTransition { from: <state> }` with
@@ -2299,7 +2299,7 @@ mod tests {
         }
     }
 
-    /// SPEC_v3 §Task 4g acceptance — `decline_challenge` table.
+    ///   acceptance — `decline_challenge` table.
     ///
     /// `open` is the only legal starting state. Decline does not
     /// have a deadline gate, so unlike `accept` there is no
@@ -2349,7 +2349,7 @@ mod tests {
         }
     }
 
-    /// SPEC_v3 §Task 4g acceptance — `resolve_challenge` table.
+    ///   acceptance — `resolve_challenge` table.
     ///
     /// `accepted` is the only legal starting state. The `result`
     /// payload is well-formed (`{}`) so the only failure mode under
@@ -2395,7 +2395,7 @@ mod tests {
             }
             // The seed `result` for a `resolved` starting row is
             // `{"winner":"alice"}` — confirming that a rejected
-            // resolve never overwrote it pins SPEC §4.2's "the row
+            // resolve never overwrote it pins 's "the row
             // is unchanged" invariant on the audit trail.
             let (stored_state, stored_result): (String, Option<String>) = world
                 .connection()
@@ -2416,12 +2416,12 @@ mod tests {
         }
     }
 
-    /// SPEC_v3 §Task 4g acceptance — `expire_open_challenges` table.
+    ///   acceptance — `expire_open_challenges` table.
     ///
     /// The sweeper operates on a set, not a single id, and its
     /// "invalid transition" is silent non-inclusion (no typed
     /// error). The table covers every starting state plus two
-    /// open-row deadline variants (no deadline / future deadline)
+    /// open-row deadline variants (no deadline future deadline)
     /// to pin the `expires_at IS NOT NULL` and `<= now` gates.
     ///
     /// The single legal sweep is `open + past deadline -> expired`.

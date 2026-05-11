@@ -1,7 +1,7 @@
-//! Top-level [`Game`] builder and runtime entry point per SPEC §8.1.
+//! Top-level [`Game`] builder and runtime entry point
 //!
-//! Task 7d wires the runtime loop on top of the type machinery shipped in
-//! 7a/7b/7c. The loop's responsibilities (SPEC §7.2) are:
+//!  wires the runtime loop on top of the type machinery shipped in
+//! 7a/7b/7c. The loop's responsibilities are:
 //!
 //! 1. Render the top screen.
 //! 2. Poll a normalized [`Input`] from the event source (timing out at
@@ -15,7 +15,7 @@
 //!
 //! ## Why two entry points
 //!
-//! - [`Game::run`] / [`run_built`] is the *production* surface. It owns
+//! - [`Game::run`] [`run_built`] is the *production* surface. It owns
 //!   the [`TerminalGuard`] (raw mode + alt screen + panic hook), builds a
 //!   `ratatui::Terminal` over `crossterm`, and wraps a [`CrosstermEventSource`].
 //!   It is what authors call from `main.rs`.
@@ -27,44 +27,44 @@
 //! Splitting them this way keeps the production wiring narrow (a few
 //! lines of orchestration) while letting the loop body itself — the part
 //! most likely to regress — live behind a fully-deterministic test
-//! harness. SPEC §13.1 forbids us from running the live loop in CI; this
+//! harness. forbids us from running the live loop in CI; this
 //! split is how we still get coverage.
 //!
 //! ## Tick policy
 //!
-//! Per SPEC §7.2 the tick interval is "implementation-defined". We hold
+//! Per the tick interval is "implementation-defined". We hold
 //! it at [`TICK_INTERVAL`] (50 ms, ~20 fps for animation/cooldowns).
 //! Authors who need a different cadence today should override behaviour
 //! inside `tick`; widening this to a builder knob waits for a real
 //! authoring need.
 //!
-//! ## Save handler contract (SPEC_v2_1 §4.4)
+//! ## Save handler contract
 //!
 //! Authors install persistence via [`Game::with_save_handler`], which
-//! takes a [`SaveHandler`] — a `Box<dyn FnMut() -> Result<(), GameError>>`.
+//! takes a [`SaveHandler`] — a `Box<dyn FnMut -> Result<, GameError>>`.
 //! The runtime invokes the handler in two situations:
 //!
 //! 1. Whenever a screen emits [`crate::ScreenCommand::Save`], so that
 //!    [`SideEffect::Save`] flushes synchronously before the next render
-//!    (Task 4c).
+//!    .
 //! 2. Exactly once on a clean Quit drain — either an explicit
 //!    [`crate::ScreenCommand::Quit`] or the screen stack going empty
-//!    (Task 4d). The drain is *skipped* when the loop exits via error,
+//!    . The drain is *skipped* when the loop exits via error.
 //!    so a half-broken game cannot overwrite a known-good save with a
 //!    half-built state.
 //!
-//! The handler is called **inside** the [`TerminalGuard`]'s lifetime,
+//! The handler is called **inside** the [`TerminalGuard`]'s lifetime.
 //! while the runtime owns raw mode and the alternate screen. That has
 //! three consequences worth pinning here so they are not rediscovered
 //! per-author:
 //!
-//! - **No stdout / stderr writes from the handler.** Anything written
+//! - **No stdout stderr writes from the handler.** Anything written
 //!   to the inherited TTY corrupts the alternate screen and leaks past
 //!   teardown. Persist via files, sockets, or `tracing` with a file
 //!   appender. The same rule already applies to the rest of the TUI
-//!   path (SPEC §13.2); the save handler is no exception.
+//!   path ; the save handler is no exception.
 //! - **Errors normalise to [`GameError::Save`].** A handler that
-//!   returns `Err(_)` aborts the loop, but the guard's `cleanup()`
+//!   returns `Err(_)` aborts the loop, but the guard's `cleanup`
 //!   still runs (the result threads back through
 //!   [`run_built_with_opener`] *after* the guard's `Drop`), so the
 //!   terminal is restored before the error reaches the operator.
@@ -81,9 +81,9 @@
 //!
 //! ## What the loop does **not** do (yet)
 //!
-//! - Message / error UI: [`SideEffect::Message`] and
+//! - Message error UI: [`SideEffect::Message`] and
 //!   [`SideEffect::Error`] are routed to a no-op stub. The real status
-//!   line lands with the widget primitives in Task 9c.
+//!   line lands with the widget primitives in.
 
 use std::time::{Duration, Instant};
 
@@ -103,25 +103,25 @@ use crate::world_ticks::WorldTickError;
 /// How long the runtime is willing to wait on the event source before
 /// firing a [`Screen::tick`].
 ///
-/// 50 ms ≈ 20 frames per second, which is the cadence the SPEC §9.4
+/// 50 ms ≈ 20 frames per second, which is the cadence the
 /// example animations were sized against. Game logic that needs a
 /// finer-grained timer should drive its own `Instant` arithmetic from
 /// inside `tick` rather than ask the runtime to tick faster.
 pub const TICK_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Where save files should be written. Mirrors the policy options in
-/// SPEC §12 and the `[save] strategy` field from SPEC §9.1.
+///  and the `[save] strategy` field
 ///
 /// Kept as a small enum (rather than e.g. a `PathBuf`) so the runtime
 /// can resolve the *concrete* directory at startup using the loaded
 /// [`crate::FogletContext`]. Directly handing in a path here would let
-/// authors hard-code per-host assumptions, which SPEC §12 explicitly
+/// authors hard-code per-host assumptions, which explicitly
 /// forbids.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SavePolicy {
     /// Default: `<install_dir>/saves/<FOGLET_USER_ID>/save.json` in
     /// production, `.fgk/saves/local-dev/save.json` for local-dev (per
-    /// SPEC §12). The runtime resolves which root applies based on the
+    /// ). The runtime resolves which root applies based on the
     /// context source — authors do not pick.
     PerFogletUser,
     /// Disable on-disk saves entirely. Useful for screens-only demos
@@ -131,7 +131,7 @@ pub enum SavePolicy {
 }
 
 impl Default for SavePolicy {
-    /// Mirrors SPEC §9.1's default `strategy = "per_foglet_user"`. An
+    /// Mirrors 's default `strategy = "per_foglet_user"`. An
     /// author who does not call [`Game::save_policy`] gets the
     /// production-shaped behaviour.
     fn default() -> Self {
@@ -146,14 +146,14 @@ impl Default for SavePolicy {
 /// convert this into `anyhow::Error` at the process boundary.
 #[derive(Debug, thiserror::Error)]
 pub enum GameError {
-    /// `Game::new("")` or any whitespace-only title. SPEC §5.2 lists
+    /// `Game::new("")` or any whitespace-only title. lists
     /// `title` as a required `GameConfig` field; the runtime carries
     /// the same invariant for ad-hoc construction.
     #[error("game title must not be empty or whitespace")]
     EmptyTitle,
 
     /// `min_size(0, _)` or `min_size(_, 0)`. A zero-cell minimum would
-    /// degenerate the SPEC §7.1 "size check" into a tautology and is
+    /// degenerate the "size check" into a tautology and is
     /// almost certainly a typo.
     #[error("min_size must be at least 1x1, got {width}x{height}")]
     InvalidMinSize {
@@ -163,28 +163,28 @@ pub enum GameError {
         height: u16,
     },
 
-    /// `run()` was called without a starting screen. The runtime needs
+    /// `run` was called without a starting screen. The runtime needs
     /// a top-of-stack screen to dispatch the first input to; without
     /// one there is nothing to do.
     #[error("at least one screen must be pushed before run()")]
     NoStartingScreen,
 
-    /// `run()` was called without a [`GameConfig`]. The runtime needs
-    /// the parsed `assets/game.toml` to populate [`GameContext`] —
+    /// `run` was called without a [`GameConfig`]. The runtime needs
+    /// the parsed `assets/game.toml` to populate [`GameContext`]
     /// authors must call [`Game::with_config`] before [`Game::run`].
     /// (The testable seam [`run_with_io`] takes the config as a
     /// parameter and so cannot hit this path.)
     #[error("Game::run() requires a GameConfig — call .with_config() before .run()")]
     MissingConfig,
 
-    /// `run()` was called without a [`FogletContext`]. Same shape as
+    /// `run` was called without a [`FogletContext`]. Same shape as
     /// [`GameError::MissingConfig`]: load via [`crate::load_context`]
     /// (or supply your own) and pass it through [`Game::with_foglet_context`].
     #[error("Game::run() requires a FogletContext — call .with_foglet_context() before .run()")]
     MissingContext,
 
     /// The configured terminal is smaller than the game's declared
-    /// minimum (SPEC §7.1 step 7). The runtime refuses to enter raw
+    /// minimum. The runtime refuses to enter raw
     /// mode rather than render a corrupted layout. Sizes are reported
     /// so the operator's error message is actionable.
     #[error(
@@ -202,22 +202,22 @@ pub enum GameError {
     },
 
     /// The event source returned an I/O error while polling or
-    /// reading. Rendered as a string because the underlying source —
+    /// reading. Rendered as a string because the underlying source
     /// [`crossterm`] in production, anything in tests — is generic.
-    /// Authors typically surface this and exit non-zero per SPEC §7.3.
+    /// Authors typically surface this and exit non-zero
     #[error("event source I/O error: {0}")]
     EventIo(String),
 
     /// `ratatui::Terminal::draw` reported an error. Same string-based
     /// shape as [`GameError::EventIo`] for the same reason: the
-    /// underlying backend is generic (CrosstermBackend in production,
+    /// underlying backend is generic (CrosstermBackend in production.
     /// `TestBackend` in tests).
     #[error("render error: {0}")]
     Render(String),
 
     /// A save callback returned an error. The loop converts whatever
     /// the callback produced into this variant; the on-disk save
-    /// manager itself (Task 8) carries its own error type and
+    /// manager itself carries its own error type and
     /// translates at the runtime boundary.
     #[error("save error: {0}")]
     Save(String),
@@ -232,7 +232,7 @@ pub enum GameError {
     /// Opening or bootstrapping the shared-world SQLite database failed
     /// during startup. Wraps [`WorldDbError`] so the runtime can
     /// `?`-propagate the underlying world-db error without reaching for
-    /// `anyhow` inside the library. Task 10c will arrange for this
+    /// `anyhow` inside the library. will arrange for this
     /// failure to surface *after* terminal restoration; today the open
     /// happens before the guard arms, so a clean error message reaches
     /// the operator without any raw-mode side effects.
@@ -250,28 +250,28 @@ pub enum GameError {
     WorldTickOnLogin(String),
 }
 
-/// Convenience alias matching SPEC §8.1's `GameResult<T>`.
+/// Convenience alias matching 's `GameResult<T>`.
 ///
 /// Re-exported from the crate root so authors only need to bring
 /// `foglet_game::GameResult` into scope.
 pub type GameResult<T> = std::result::Result<T, GameError>;
 
-/// Boxed save closure type used by `Game::with_save_handler` (Task 4)
-/// and produced by [`crate::save::SaveSlot::save_handler`] (Task 1e).
+/// Boxed save closure type used by `Game::with_save_handler`
+/// and produced by [`crate::save::SaveSlot::save_handler`].
 ///
-/// SPEC_v2_1 §4.4 pins this exact signature so the runtime, the
+///  pins this exact signature so the runtime, the
 /// `SaveSlot` typed wrapper, and any author-written closure share one
 /// vocabulary. The type lives here (rather than in `save.rs`) because
 /// it references [`GameError`] — the failure mode the runtime turns
 /// handler errors into via `GameError::Save(_)`.
 ///
-/// `FnMut` (not `Fn`) so handlers may carry mutable bookkeeping —
+/// `FnMut` (not `Fn`) so handlers may carry mutable bookkeeping
 /// e.g. a "writes-since-last-flush" counter — without resorting to
 /// interior mutability. `'static` because the runtime stores the box
 /// for the lifetime of the [`Game`] instance.
 ///
-/// Defined eagerly in Task 1e so [`crate::save::SaveSlot::save_handler`]
-/// has a concrete return type to point at; Task 4 wires the runtime
+/// Defined eagerly in so [`crate::save::SaveSlot::save_handler`]
+/// has a concrete return type to point at; wires the runtime
 /// plumbing that consumes values of this type.
 pub type SaveHandler = Box<dyn FnMut() -> Result<(), GameError>>;
 
@@ -291,7 +291,7 @@ pub type SaveHandler = Box<dyn FnMut() -> Result<(), GameError>>;
 /// - Returning `Ok(Some(_))` MUST consume exactly one input. The loop
 ///   processes one input per iteration; queueing two would let the
 ///   second skip rendering.
-/// - `Err(...)` is treated as a fatal runtime error per SPEC §7.3.
+/// - `Err(...)` is treated as a fatal runtime error
 pub trait EventSource {
     /// Wait up to `timeout` for the next normalized input.
     ///
@@ -327,7 +327,7 @@ impl EventSource for CrosstermEventSource {
     fn next_input(&mut self, timeout: Duration) -> std::io::Result<Option<Input>> {
         // `event::poll` blocks up to `timeout` waiting for any event.
         // It returns Ok(false) on timeout — that's our "fire a tick"
-        // signal. On Ok(true) the next `event::read()` call is
+        // signal. On Ok(true) the next `event::read` call is
         // guaranteed not to block.
         if crossterm::event::poll(timeout)? {
             let ev = crossterm::event::read()?;
@@ -341,7 +341,7 @@ impl EventSource for CrosstermEventSource {
 /// Fluent builder for a Foglet door game.
 ///
 /// All methods take `self` by value and return `Self`, so the builder
-/// chains naturally as in SPEC §8.1's example. `push_screen` may be
+/// chains naturally as 's example. `push_screen` may be
 /// called multiple times — screens are pushed in call order, which
 /// means the *last* `push_screen` becomes the top-of-stack the runtime
 /// dispatches input to first. Authors typically push one screen and
@@ -352,12 +352,12 @@ impl EventSource for CrosstermEventSource {
 /// Screen>` is not `Debug`. We print the count of pushed screens
 /// instead, which is what tests and operators actually care about.
 pub struct Game {
-    /// Display title from [`Game::new`]. Validated on `build()`.
+    /// Display title from [`Game::new`]. Validated on `build`.
     title: String,
-    /// Minimum supported terminal size. Defaults to the SPEC §2.2
+    /// Minimum supported terminal size. Defaults to the
     /// baseline of 80x24 when the author does not override it. The
     /// runtime checks the live size against this value *before*
-    /// entering raw mode (SPEC §7.1 step 7).
+    /// entering raw mode.
     min_size: (u16, u16),
     /// Selected save policy; defaults to
     /// [`SavePolicy::PerFogletUser`].
@@ -374,16 +374,16 @@ pub struct Game {
     /// [`Game::run`], optional on the builder.
     foglet: Option<FogletContext>,
     /// Optional save handler installed via [`Game::with_save_handler`]
-    /// (Task 4b). The runtime invokes this on every
+    /// . The runtime invokes this on every
     /// [`crate::ScreenCommand::Save`] emission and once on the Quit
-    /// drain (Tasks 4c–4d). Defaults to `None` so existing v2 games
+    /// drain. Defaults to `None` so existing games
     /// keep their stub-callback behaviour until the author opts in.
     ///
     /// Stored as `Option<SaveHandler>` rather than `SaveHandler` so a
     /// game built without persistence stays cheap (no allocation for
     /// an unused boxed closure) and so `with_save_handler` can be a
     /// "set or replace" rather than a "stack" — calling it twice
-    /// overwrites, matching the SPEC_v2_1 §4.4 contract that exactly
+    /// overwrites, matching the contract that exactly
     /// one handler is in scope at runtime.
     save_handler: Option<SaveHandler>,
 }
@@ -412,7 +412,7 @@ impl Game {
     ///
     /// The title becomes the window/header label various screens
     /// surface to the player. Empty or whitespace-only titles are
-    /// rejected at `build()` time so authors get a clear error
+    /// rejected at `build` time so authors get a clear error
     /// regardless of whether they call `Game::new("")` directly or end
     /// up with an empty title via interpolation.
     pub fn new(title: impl Into<String>) -> Self {
@@ -429,9 +429,9 @@ impl Game {
 
     /// Override the minimum supported terminal size. The runtime
     /// refuses to enter raw mode if the live terminal is smaller than
-    /// this (SPEC §7.1).
+    /// this.
     ///
-    /// Defaults to `(80, 24)` per the SPEC §2.2 Foglet baseline. Most
+    /// Defaults to `(80, 24)` per the Foglet baseline. Most
     /// authors should leave this at the default; tightening it
     /// (e.g. `min_size(64, 22)`) is fine if the game has been
     /// explicitly designed for a cramped layout.
@@ -476,10 +476,10 @@ impl Game {
 
     /// Attach the loaded Foglet context. Required for [`Game::run`].
     ///
-    /// Authors typically call [`crate::load_context`] in `main()` and
+    /// Authors typically call [`crate::load_context`] in `main` and
     /// thread the result here. Bypassing the loader (e.g. constructing
     /// a [`FogletContext`] from internal sources) is fine for tests
-    /// and embedded usage but goes against SPEC §2.4's "trust only
+    /// and embedded usage but goes against 's "trust only
     /// `FOGLET_DOOR_CONTEXT`" guidance for production doors.
     #[must_use]
     pub fn with_foglet_context(mut self, foglet: FogletContext) -> Self {
@@ -489,7 +489,7 @@ impl Game {
 
     /// Install a save handler that the runtime will invoke whenever a
     /// screen emits [`crate::ScreenCommand::Save`] and once on the
-    /// Quit drain (SPEC_v2_1 §4.4 / Tasks 4c–4d).
+    /// Quit drain.
     ///
     /// The canonical producer is [`crate::SaveSlot::save_handler`]:
     ///
@@ -498,22 +498,22 @@ impl Game {
     /// Game::new("…")
     ///     .with_config(cfg)
     ///     .with_foglet_context(ctx)
-    ///     .with_save_handler(slot.save_handler(path.clone()))
-    ///     .push_screen(Box::new(TitleScreen::new(slot.handle())))
-    ///     .run()?;
+    ///     .with_save_handler(slot.save_handler(path.clone))
+    ///     .push_screen(Box::new(TitleScreen::new(slot.handle)))
+    ///     .run?;
     /// ```
     ///
     /// Authors can also write a closure by hand — anything that is
-    /// `FnMut() -> Result<(), GameError> + 'static` is accepted, so a
+    /// `FnMut -> Result<, GameError> + 'static` is accepted, so a
     /// game persisting to e.g. an HTTP endpoint can wire its own
     /// effect here without going through `SaveSlot`.
     ///
     /// ## Replacement, not stacking
     ///
     /// Calling `with_save_handler` twice replaces the previous
-    /// handler. SPEC_v2_1 §4.4 pins this: the runtime owns exactly
+    /// handler. pins this: the runtime owns exactly
     /// one save effect at a time so the Quit drain can call it
-    /// idempotently. If a game needs multiple persistence effects,
+    /// idempotently. If a game needs multiple persistence effects.
     /// the author composes them inside a single closure (e.g. write
     /// the JSON save *and* publish a metric) — the runtime stays
     /// agnostic to that fan-out.
@@ -526,7 +526,7 @@ impl Game {
     ///   `tracing`'s no-op subscriber instead.
     /// - Returning `Err(_)` aborts the runtime with
     ///   [`GameError::Save`]; terminal restoration still runs because
-    ///   the loop result threads back through the guard's `cleanup()`
+    ///   the loop result threads back through the guard's `cleanup`
     ///   call. (See [`run_built_with_opener`].)
     /// - The closure may carry mutable state (`FnMut`) — useful for a
     ///   "writes since last flush" counter or for retrying a transient
@@ -573,7 +573,7 @@ impl Game {
 
     /// Run the game.
     ///
-    /// SPEC §8.1's advertised entry point. Validates the builder via
+    /// 's advertised entry point. Validates the builder via
     /// [`Game::build`], then delegates to [`run_built`] for the
     /// production wiring (terminal guard, ratatui terminal, crossterm
     /// event source, runtime loop).
@@ -587,7 +587,7 @@ impl Game {
 ///
 /// Exposed so `fgk` can inspect the validated shape (e.g. to print the
 /// resolved `min_size` in a `--dry-run` mode) without reimplementing
-/// validation, and so [`run_built`] / [`run_with_io`] can take an
+/// validation, and so [`run_built`] [`run_with_io`] can take an
 /// already-validated value rather than re-running checks.
 ///
 /// Fields are `pub(crate)` for now: external callers should treat this
@@ -601,9 +601,9 @@ pub struct BuiltGame {
     pub(crate) config: Option<GameConfig>,
     pub(crate) foglet: Option<FogletContext>,
     /// Save handler threaded through from [`Game::with_save_handler`]
-    /// (Task 4b). [`run_built_with_opener`] takes this out of the
-    /// validated game and feeds it to [`run_with_io`] as `on_save`,
-    /// replacing the v2 stub. `None` means the author opted out of
+    /// . [`run_built_with_opener`] takes this out of the
+    /// validated game and feeds it to [`run_with_io`] as `on_save`.
+    /// replacing the stub. `None` means the author opted out of
     /// persistence — the loop falls back to a no-op closure so a
     /// stray [`crate::ScreenCommand::Save`] is silently ignored
     /// rather than aborting the run.
@@ -655,20 +655,20 @@ impl BuiltGame {
 /// Open the shared-world SQLite DB for this run, *only* when the
 /// loaded config opted in via `[world].enabled = true`.
 ///
-/// This is the Task 10b seam. Splitting it out from [`run_built`] gives
+/// This is the seam. Splitting it out from [`run_built`] gives
 /// us:
 ///
 /// - a unit-testable function that exercises both branches (enabled
 ///   vs. disabled) without spinning up a TUI, and
-/// - a clean place for Task 10c to swap in an injectable opener so a
+/// - a clean place for to swap in an injectable opener so a
 ///   simulated DB-open failure can verify the post-guard error path
 ///   restores the terminal first.
 ///
 /// Returns `Ok(None)` when the world layer is disabled or the section
-/// is missing entirely (`WorldSection::default().enabled == false`),
-/// so a v1 game with no `[world]` block keeps booting unchanged.
+/// is missing entirely (`WorldSection::default.enabled == false`).
+/// so a game with no `[world]` block keeps booting unchanged.
 ///
-/// Errors propagate as [`GameError::WorldOpen`] — see SPEC §5.1
+/// Errors propagate as [`GameError::WorldOpen`]
 /// "clear-error" path: the runtime never silently degrades a
 /// world-enabled config to a no-op.
 pub fn open_world_db_if_enabled(config: &GameConfig) -> GameResult<Option<WorldDb>> {
@@ -683,7 +683,7 @@ pub fn open_world_db_if_enabled(config: &GameConfig) -> GameResult<Option<WorldD
 /// Run the validated game against production I/O — terminal guard, a
 /// ratatui terminal over crossterm, and the crossterm event source.
 ///
-/// SPEC §7.1 startup ordering enforced here:
+///  startup ordering enforced here:
 ///
 /// 1. Verify config + foglet context are present.
 /// 2. Determine live terminal size (via `crossterm::terminal::size`).
@@ -692,19 +692,19 @@ pub fn open_world_db_if_enabled(config: &GameConfig) -> GameResult<Option<WorldD
 /// 4. Construct the [`TerminalGuard`] (which arms the panic hook).
 /// 5. Build the ratatui terminal + event source and call
 ///    [`run_with_io`].
-/// 6. On the way out — success or error — call `guard.cleanup()` so
+/// 6. On the way out — success or error — call `guard.cleanup` so
 ///    teardown errors are observed (Drop is the safety net but does
 ///    not surface errors).
 ///
 /// Save persistence is currently a no-op stub: when the loop emits
-/// [`SideEffect::Save`] we ignore it. Task 8 wires the real save
+/// [`SideEffect::Save`] we ignore it. wires the real save
 /// manager in. The signature change will be a breaking one (the stub
-/// here returns `Ok(())` whereas the real path returns the save
-/// manager's result) but isolating it now keeps Task 7d focused on
+/// here returns `Ok` whereas the real path returns the save
+/// manager's result) but isolating it now keeps focused on
 /// the loop wiring.
 pub fn run_built(built: BuiltGame) -> GameResult<()> {
     // Production wiring uses the canonical opener. The injectable
-    // [`run_built_with_opener`] variant exists so Task 10c can
+    // [`run_built_with_opener`] variant exists so can
     // simulate a DB-open failure under test without standing up a
     // real broken SQLite path.
     run_built_with_opener(built, &open_world_db_if_enabled)
@@ -717,13 +717,13 @@ pub fn run_built(built: BuiltGame) -> GameResult<()> {
 /// monomorphic — the opener only needs to be invoked once and the
 /// indirection cost is irrelevant against terminal I/O. Tests box a
 /// closure that returns a synthetic [`GameError::WorldOpen`] to
-/// exercise the failure ordering described by SPEC §7.1 / Task 10c.
+/// exercise the failure ordering described by /.
 pub type WorldOpenerFn = dyn Fn(&GameConfig) -> GameResult<Option<WorldDb>>;
 
 /// Like [`run_built`] but with the world-DB opener supplied by the
 /// caller.
 ///
-/// Task 10c: locks in the SPEC §7.1 invariant that DB-open MUST run
+/// : locks in the invariant that DB-open MUST run
 /// **before** any terminal raw-mode toggle, so a DB-open failure
 /// trivially leaves the terminal in its original state — there is
 /// nothing to restore because nothing was changed. The injectable
@@ -734,31 +734,31 @@ pub type WorldOpenerFn = dyn Fn(&GameConfig) -> GameResult<Option<WorldDb>>;
 /// Production callers should use [`run_built`]; this variant is
 /// public so future work (e.g. wiring a process-wide opener override
 /// for staging environments) can plug in without re-implementing the
-/// SPEC §7.1 startup sequence.
+///  startup sequence.
 pub fn run_built_with_opener(mut built: BuiltGame, open_world: &WorldOpenerFn) -> GameResult<()> {
     // Required deps — checked before touching the terminal so a
     // misconfigured author gets a clear-error exit with no terminal
-    // state changed. We `take()` the optionals out of `built` so the
+    // state changed. We `take` the optionals out of `built` so the
     // remaining `BuiltGame` can be moved into `run_with_io` while the
     // borrowed config + foglet outlive the call.
     let config = built.config.take().ok_or(GameError::MissingConfig)?;
     let foglet = built.foglet.take().ok_or(GameError::MissingContext)?;
 
     // Open the shared-world DB *before* engaging the terminal guard.
-    // SPEC §7.1 / Task 10c: this ordering is the load-bearing
+    //  /: this ordering is the load-bearing
     // invariant — a DB-open failure here returns `Err` while the
     // terminal is still in its untouched, cooked-mode state, so no
     // restoration is required and any operator-facing error message
     // prints to a normal terminal. Moving this call after the guard
     // is constructed would re-introduce the "error message lost
-    // inside the alternate screen" hazard that SPEC §7.3 explicitly
+    // inside the alternate screen" hazard that explicitly
     // forbids. The opener is injected so tests can substitute a
     // failing implementation without needing a real broken path.
     let mut world_db = open_world(&config)?;
 
     // Live terminal size. crossterm::terminal::size works on a TTY
     // before raw mode is engaged; using it here keeps the size check
-    // ahead of the guard per SPEC §7.1 step 7.
+    // ahead of the guard step 7.
     let (w, h) = crossterm::terminal::size().map_err(|e| GameError::EventIo(e.to_string()))?;
     let (mw, mh) = built.min_size;
     if w < mw || h < mh {
@@ -772,8 +772,8 @@ pub fn run_built_with_opener(mut built: BuiltGame, open_world: &WorldOpenerFn) -
 
     // Install the panic hook *before* the guard arms so a panic during
     // guard construction itself still has a restorer registered. The
-    // guard's own `new()` does this internally, but doing it explicitly
-    // here documents the SPEC §7.1 ordering.
+    // guard's own `new` does this internally, but doing it explicitly
+    // here documents the ordering.
     install_panic_hook();
     let mut guard: TerminalGuard<TermCrosstermBackend> = TerminalGuard::new()?;
     arm_panic_hook();
@@ -787,12 +787,12 @@ pub fn run_built_with_opener(mut built: BuiltGame, open_world: &WorldOpenerFn) -
     let mut events = CrosstermEventSource::new();
 
     // Save sink: prefer the handler installed via
-    // [`Game::with_save_handler`] (Task 4b). When the author hasn't
+    // [`Game::with_save_handler`]. When the author hasn't
     // installed one, fall back to a no-op so a screen that emits
     // [`crate::ScreenCommand::Save`] without configured persistence
-    // does not abort the run — SPEC_v2_1 §4.4 explicitly allows games
+    // does not abort the run — explicitly allows games
     // to opt out of save by simply never calling `with_save_handler`.
-    // We `take()` the handler out of `built` so `run_with_io` can move
+    // We `take` the handler out of `built` so `run_with_io` can move
     // `built` while the closure lives outside that ownership.
     let mut on_save: SaveHandler = built
         .save_handler
@@ -813,10 +813,10 @@ pub fn run_built_with_opener(mut built: BuiltGame, open_world: &WorldOpenerFn) -
         &mut on_save,
     );
 
-    // Explicit cleanup so SPEC §7.3 "controlled error" messages can
+    // Explicit cleanup so "controlled error" messages can
     // print *after* terminal restoration. Drop is still the safety
     // net — we don't propagate cleanup errors past the loop's own
-    // result, but we do log via the file appender once Task 14c lands.
+    // result, but we do log via the file appender once lands.
     let _ = guard.cleanup();
 
     result.map(|_reason| ())
@@ -825,22 +825,22 @@ pub fn run_built_with_opener(mut built: BuiltGame, open_world: &WorldOpenerFn) -
 /// Invoke the runtime save handler and normalise any error into
 /// [`GameError::Save`].
 ///
-/// Task 4e: SPEC_v2_1 §4.4 pins that "a handler error MUST surface as
+/// : pins that "a handler error MUST surface as
 /// `GameError::Save(_)`". The handler signature ([`SaveHandler`])
-/// returns `Result<(), GameError>`, so a careless implementation can
-/// hand back any [`GameError`] variant — `EventIo`, `Render`,
+/// returns `Result<, GameError>`, so a careless implementation can
+/// hand back any [`GameError`] variant — `EventIo`, `Render`.
 /// `Terminal`, anything. Without this funnel a misclassified error
-/// would bypass the SPEC contract and confuse callers who pattern
+/// would bypass the contract and confuse callers who pattern
 /// match on `Err(GameError::Save(_))` to decide whether to retry the
 /// flush.
 ///
-/// We collapse via `Display` (`e.to_string()`) rather than wrapping
+/// We collapse via `Display` (`e.to_string`) rather than wrapping
 /// the error: [`GameError::Save`] is already a `String` payload and
 /// the original variant's `Display` impl carries the actionable
 /// message. Terminal restoration is unaffected: this helper only
-/// translates the error value; the caller still propagates via `?`,
+/// translates the error value; the caller still propagates via `?`.
 /// the loop unwinds back to [`run_built`], and the explicit
-/// `guard.cleanup()` in that path runs regardless of the error kind.
+/// `guard.cleanup` in that path runs regardless of the error kind.
 fn invoke_save(on_save: &mut dyn FnMut() -> Result<(), GameError>) -> GameResult<()> {
     on_save().map_err(|e| match e {
         // Already a Save error — pass through verbatim so authors who
@@ -888,8 +888,8 @@ fn run_due_ticks_on_login_if_enabled(
 /// `run_with_io` + cleanup".
 ///
 /// The returned [`ExitReason`] tells the caller *why* the loop ended
-/// — useful for both production logging and test assertions. SPEC
-/// §7.3 distinguishes "the player asked to quit" from "the last screen
+/// — useful for both production logging and test assertions.
+///  distinguishes "the player asked to quit" from "the last screen
 /// popped itself"; preserving the distinction here lets future
 /// behaviours like "auto-save on Quit but not on EmptyStack" land
 /// without a signature change.
@@ -909,9 +909,9 @@ fn run_due_ticks_on_login_if_enabled(
 ///   dispatching to the screen, so `on_resize` and the next render
 ///   both see the new dimensions.
 /// - **Side effects**: `Save` calls the `on_save` callback; any error
-///   it returns is normalised to [`GameError::Save`] (Task 4e).
+///   it returns is normalised to [`GameError::Save`].
 ///   `Message` and `Error` are currently swallowed (the status-line
-///   widget lives in Task 9c); `Exit(reason)` returns from the loop.
+///   widget lives in ); `Exit(reason)` returns from the loop.
 #[allow(clippy::too_many_arguments)]
 pub fn run_with_io<B, E>(
     mut built: BuiltGame,
@@ -929,9 +929,9 @@ where
 {
     run_due_ticks_on_login_if_enabled(config, world_db.as_deref_mut())?;
 
-    // Defensive: `BuiltGame` invariant says the stack is non-empty,
+    // Defensive: `BuiltGame` invariant says the stack is non-empty.
     // but we re-check here so a future BuiltGame that allows zero
-    // screens cannot accidentally drive the loop into a `last_mut()
+    // screens cannot accidentally drive the loop into a `last_mut
     // == None` panic on the very first render.
     if built.screens.is_empty() {
         return Err(GameError::NoStartingScreen);
@@ -976,7 +976,7 @@ where
                 // Update the cached size *before* dispatching, so
                 // both `on_resize` and the next render see the new
                 // dimensions. The screen still gets the explicit
-                // `width, height` arguments per SPEC §8.2.
+                // `width, height` arguments
                 size = (width, height);
                 let top = built.screens.last_mut().expect("non-empty");
                 let mut ctx = GameContext::new(config, foglet, size);
@@ -1011,20 +1011,20 @@ where
         match apply_command(&mut built.screens, cmd) {
             SideEffect::None => {}
             SideEffect::Save => invoke_save(on_save)?,
-            // Message / Error UI lives in Task 9c — for now the
+            // Message Error UI lives in — for now the
             // status-line slot is unwired and these are swallowed.
             // Errors specifically are not promoted to GameError
             // because a screen-level error is screen-level by
-            // construction; the runtime fails only on I/O / render
+            // construction; the runtime fails only on I/O render
             // / save problems.
             SideEffect::Message(_) | SideEffect::Error(_) => {}
             SideEffect::Exit(reason) => {
-                // Task 4d: fire `on_save` once on the clean-exit drain
+                // : fire `on_save` once on the clean-exit drain
                 // path so an author who installed a handler via
                 // [`Game::with_save_handler`] gets a final flush on
                 // both `ExitReason::Quit` (explicit `ScreenCommand::Quit`)
                 // and `ExitReason::EmptyStack` (the last screen popped
-                // itself). SPEC_v2_1 §4.4 calls this out as the whole
+                // itself). calls this out as the whole
                 // point of having a runtime-level save handler — the
                 // game shouldn't have to remember to flush on every
                 // exit path. Errors short-circuit through `?` above
@@ -1044,9 +1044,9 @@ where
 mod tests {
     //! Builder validation coverage for 7c plus runtime-loop coverage
     //! for 7d. The production `run_built` path is exercised here only
-    //! through its validation prefix (missing config / context) — the
+    //! through its validation prefix (missing config context) — the
     //! full wiring requires a TTY and is covered by the manual-smoke
-    //! recipe documented for SPEC §13.1.
+    //! recipe documented for
 
     use super::*;
     use crate::config::{GameConfig, GameSection, ManifestSection, SaveSection, SaveStrategy};
@@ -1270,7 +1270,7 @@ mod tests {
 
     #[test]
     fn with_save_handler_stores_handler_on_builder() {
-        // Task 4b: the builder must hold onto the handler so a later
+        // : the builder must hold onto the handler so a later
         // task (4c/4d) can hand it to the runtime. We verify both that
         // the field flips from `None` to `Some` and that the closure
         // we passed in is the one stored — by invoking it and watching
@@ -1288,7 +1288,7 @@ mod tests {
             "with_save_handler must populate the field"
         );
 
-        // Invoke the stored handler. `as_mut()` because `FnMut` needs
+        // Invoke the stored handler. `as_mut` because `FnMut` needs
         // unique access; the runtime will do the same thing in 4c.
         let handler = g.save_handler.as_mut().expect("just set");
         handler().expect("handler ok");
@@ -1297,7 +1297,7 @@ mod tests {
 
     #[test]
     fn with_save_handler_replaces_rather_than_stacks() {
-        // SPEC_v2_1 §4.4 contract: the runtime owns *one* save effect.
+        //  contract: the runtime owns *one* save effect.
         // Calling `with_save_handler` twice must overwrite — invoking
         // the stored handler once after two installs should fire only
         // the second closure. (If we stacked, both would tick.)
@@ -1341,7 +1341,7 @@ mod tests {
     fn run_built_rejects_missing_config() {
         // Without a config attached, `run_built` must error *before*
         // touching the terminal. We test by calling `run_built`
-        // directly so we never reach the size-check / TerminalGuard
+        // directly so we never reach the size-check TerminalGuard
         // construction (which would require a TTY).
         let built = Game::new("T")
             .push_screen(dummy())
@@ -1597,7 +1597,7 @@ mod tests {
         .expect("loop ok");
 
         assert_eq!(reason, ExitReason::Quit);
-        // Task 4c emitted Save → on_save once; Task 4d adds a second
+        //  emitted Save → on_save once; adds a second
         // call on the Quit drain path. Two invocations total: one
         // explicit, one from clean-exit auto-flush.
         assert_eq!(
@@ -1609,10 +1609,10 @@ mod tests {
 
     #[test]
     fn built_game_save_handler_threads_into_runtime_loop() {
-        // Task 4c: the handler installed via `Game::with_save_handler`
-        // must travel through `Game::build()` onto `BuiltGame`, and
+        // : the handler installed via `Game::with_save_handler`
+        // must travel through `Game::build` onto `BuiltGame`, and
         // from there `run_built` (here: `run_with_io` driven by the
-        // same `take()` move that `run_built_with_opener` performs)
+        // same `take` move that `run_built_with_opener` performs)
         // must observe it as the `on_save` sink. Asserts the handler
         // fires exactly once for a single `ScreenCommand::Save`.
         let cfg = fixture_config();
@@ -1663,9 +1663,9 @@ mod tests {
         .expect("loop ok");
 
         assert_eq!(reason, ExitReason::Quit);
-        // One call from the Save side effect (Task 4c) + one from the
-        // Quit drain (Task 4d). The "exactly once per Save" semantic
-        // for Task 4c is now exercised by `loop_save_only_invokes_handler_once`.
+        // One call from the Save side effect + one from the
+        // Quit drain. The "exactly once per Save" semantic
+        // for is now exercised by `loop_save_only_invokes_handler_once`.
         assert_eq!(
             *saves.borrow(),
             2,
@@ -1675,7 +1675,7 @@ mod tests {
 
     #[test]
     fn loop_quit_drain_invokes_save_handler_once() {
-        // Task 4d: a clean exit via `ScreenCommand::Quit` — with no
+        // : a clean exit via `ScreenCommand::Quit` — with no
         // explicit `Save` emitted by any screen — must still invoke
         // the runtime save handler exactly once so games that opt
         // into `Game::with_save_handler` get an unconditional flush
@@ -1717,9 +1717,9 @@ mod tests {
 
     #[test]
     fn loop_empty_stack_drain_invokes_save_handler_once() {
-        // Task 4d: `ExitReason::EmptyStack` is the other clean-exit
-        // path — the last screen `Pop`s itself off the stack. SPEC_v2_1
-        // §4.4 lists "explicit Quit or empty stack" as the conditions
+        // : `ExitReason::EmptyStack` is the other clean-exit
+        // path — the last screen `Pop`s itself off the stack.
+        //  lists "explicit Quit or empty stack" as the conditions
         // for the drain call, so the handler must fire here too.
         let cfg = fixture_config();
         let fc = fixture_context();
@@ -1758,7 +1758,7 @@ mod tests {
 
     #[test]
     fn loop_error_exit_does_not_invoke_save_handler() {
-        // Task 4d: an error path (e.g. a failing Save callback or a
+        // : an error path (e.g. a failing Save callback or a
         // render IO error) must NOT trigger the drain call — the
         // drain is for *clean* exits only. Here we drive a failing
         // Save and assert the handler ran exactly once (for the
@@ -1801,7 +1801,7 @@ mod tests {
     fn loop_save_callback_error_propagates() {
         // A failing save must abort the loop. The runtime can't keep
         // running with an unflushed save state across a screen
-        // transition without violating SPEC §7.2 ("Save on important
+        // transition without violating ("Save on important
         // durable state changes").
         let cfg = fixture_config();
         let fc = fixture_context();
@@ -1829,9 +1829,9 @@ mod tests {
 
     #[test]
     fn loop_handler_non_save_error_is_normalised_to_save() {
-        // Task 4e: a handler that returns *any* GameError — not just
+        // : a handler that returns *any* GameError — not just
         // GameError::Save — must surface to the caller as
-        // GameError::Save(_). SPEC_v2_1 §4.4 line 188 pins this so
+        // GameError::Save(_). line 188 pins this so
         // downstream `match Err(GameError::Save(_))` arms are reliable.
         // The original message is preserved via Display.
         let cfg = fixture_config();
@@ -1866,7 +1866,7 @@ mod tests {
 
     #[test]
     fn loop_handler_save_error_message_passes_through_unchanged() {
-        // Task 4e: when the handler already returns GameError::Save the
+        // : when the handler already returns GameError::Save the
         // runtime must NOT re-stringify it. Authors who craft a
         // specific Save message rely on it reaching the caller verbatim.
         let cfg = fixture_config();
@@ -1898,7 +1898,7 @@ mod tests {
 
     #[test]
     fn loop_handler_non_save_error_on_quit_drain_normalises_to_save() {
-        // Task 4e + 4d: the Quit-drain invocation must apply the same
+        //  + 4d: the Quit-drain invocation must apply the same
         // normalisation as the SideEffect::Save path. Drive a clean
         // Quit with a handler that returns a non-Save GameError and
         // assert the loop returns GameError::Save(_).
@@ -2063,7 +2063,7 @@ mod tests {
 
     #[test]
     fn loop_message_and_error_side_effects_do_not_break_the_loop() {
-        // Until Task 9c wires the status-line widget, Message/Error
+        // Until wires the status-line widget, Message/Error
         // are routed to a no-op. The contract: the loop continues
         // running so subsequent commands still drive transitions.
         let cfg = fixture_config();
@@ -2116,7 +2116,7 @@ mod tests {
     //
     // We can't drive the production `run_built` path under `cargo
     // test` (no TTY), but we can prove that *any* runtime path that
-    // wraps `run_with_io` between guard construction and `cleanup()`
+    // wraps `run_with_io` between guard construction and `cleanup`
     // restores the terminal even when the loop returns an error.
     // -------------------------------------------------------------
 
@@ -2139,7 +2139,7 @@ mod tests {
     #[test]
     fn terminal_restoration_runs_when_loop_exits_cleanly() {
         // Mirror the production shape: construct guard → run loop →
-        // cleanup. Recording backend asserts leave() fires exactly
+        // cleanup. Recording backend asserts leave fires exactly
         // once.
         let log = Rc::new(RefCell::new(Vec::new()));
         let backend = RecordingBackend { log: log.clone() };
@@ -2178,7 +2178,7 @@ mod tests {
 
     #[test]
     fn terminal_restoration_runs_when_loop_returns_error() {
-        // SPEC §7.3 controlled-error path: even if the loop bubbles
+        //  controlled-error path: even if the loop bubbles
         // up an error, the terminal must be restored before the
         // caller prints the diagnostic. Mirrored at the test level.
         let log = Rc::new(RefCell::new(Vec::new()));
@@ -2232,11 +2232,11 @@ mod tests {
     }
 
     // -------------------------------------------------------------
-    // Task 10b — world DB startup wiring
+    //  — world DB startup wiring
     // -------------------------------------------------------------
 
     /// A world-disabled config (the `fixture_config` baseline) MUST
-    /// short-circuit to `Ok(None)` so v1 games keep booting unchanged.
+    /// short-circuit to `Ok(None)` so games keep booting unchanged.
     #[test]
     fn open_world_db_if_enabled_returns_none_when_disabled() {
         let cfg = fixture_config();
@@ -2308,10 +2308,10 @@ mod tests {
     }
 
     // -------------------------------------------------------------
-    // Task 10c — DB-open failure must not engage the terminal
+    //  — DB-open failure must not engage the terminal
     // -------------------------------------------------------------
 
-    /// SPEC §7.1 / Task 10c invariant: when the world-DB opener
+    ///  / invariant: when the world-DB opener
     /// fails, `run_built_with_opener` MUST return the error before
     /// any terminal state changes. The injected opener never touches
     /// SQLite — it just returns a synthetic `WorldOpen` — which lets
@@ -2319,10 +2319,10 @@ mod tests {
     ///
     /// Verification has two prongs:
     ///
-    /// 1. The returned error matches `GameError::WorldOpen(_)` —
+    /// 1. The returned error matches `GameError::WorldOpen(_)`
     ///    proving the opener's error was the cause of exit, not some
     ///    later step (e.g. a missing TTY in CI).
-    /// 2. `crossterm::terminal::is_raw_mode_enabled()` is unchanged
+    /// 2. `crossterm::terminal::is_raw_mode_enabled` is unchanged
     ///    across the call. If a regression ever moves DB-open after
     ///    the guard, the guard's setup would flip raw mode to `true`;
     ///    even if the guard's `Drop` later restored it, we would have
@@ -2339,7 +2339,7 @@ mod tests {
         let screen = ScriptedScreen::new("never-reached", log, vec![], vec![], vec![]);
         let mut built = make_built(Box::new(screen));
         // `run_built_with_opener` requires both config and foglet to
-        // be present (it `take()`s them up front). The fixtures are
+        // be present (it `take`s them up front). The fixtures are
         // the same ones every other 10x test uses.
         built.config = Some(fixture_config());
         built.foglet = Some(fixture_context());
@@ -2375,7 +2375,7 @@ mod tests {
     /// When `run_with_io` is given `Some(world_db)`, every per-frame
     /// `GameContext` must carry the same handle so screens can reach
     /// the world layer via `ctx.world_db`. We verify by recording the
-    /// `is_some()` result from inside `render`, `tick`, and
+    /// `is_some` result from inside `render`, `tick`, and
     /// `handle_input` and asserting all three saw the handle.
     #[test]
     fn run_with_io_threads_world_db_into_context() {
@@ -2493,7 +2493,7 @@ mod tests {
 
     #[test]
     fn run_with_io_runs_due_ticks_on_login_when_enabled() {
-        // Task 11d: the runtime may opt in to one login-time catch-up
+        // : the runtime may opt in to one login-time catch-up
         // pass before entering the normal event loop.
         let tmp = tempfile::tempdir().expect("tempdir");
         let mut db = WorldDb::open(tmp.path().join("world.sqlite")).expect("open db");

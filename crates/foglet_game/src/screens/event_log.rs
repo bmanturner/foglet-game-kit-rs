@@ -1,4 +1,4 @@
-//! `EventLogScreen` — reusable read-only v2 event log/news surface.
+//! `EventLogScreen` — reusable read-only event log/news surface.
 
 use std::fmt;
 use std::sync::Arc;
@@ -60,7 +60,7 @@ pub struct EventLogLine {
     pub secondary: Option<String>,
 }
 
-/// Read-only screen over v2 `world_events`.
+/// Read-only screen over `world_events`.
 #[derive(Clone)]
 pub struct EventLogScreen {
     title: String,

@@ -1,11 +1,11 @@
-//! `events` — shared-world append-only event log schema (SPEC_v2 §Task 7).
+//! `events` — shared-world append-only event log schema.
 //!
-//! Task 7a shipped the `world_events` migration. Subsequent sub-tasks
+//!  shipped the `world_events` migration. Subsequent sub-tasks
 //! layer behavior on top of the schema introduced here:
 //!
 //! - 7b added `WorldDb::append_event` for inserting one row.
 //! - 7c added `WorldDb::recent_events(limit)` for the lobby bulletin
-//!   (SPEC §3.1 / §13).
+//!   .
 //! - 7d added `WorldDb::player_events(player_id, limit)` for per-player
 //!   history. Mirrors 7c's contract but constrains the result to one
 //!   player via the `idx_world_events_player_recent` partial index.
@@ -19,14 +19,14 @@
 //! sharp: a regression that drops a column flunks the schema test in
 //! this module rather than a higher-level append/query assertion that's
 //! harder to attribute. The migration is exported as a `pub const` so
-//! the runtime startup path (Task 10) and game-author code can reference
+//! the runtime startup path and game-author code can reference
 //! one canonical definition without redeclaring the schema and drifting
 //! from it — same pattern as [`crate::players::PLAYERS_MIGRATION`] and
 //! [`crate::turns::TURN_LEDGER_MIGRATION`].
 //!
 //! # Why a dedicated table instead of folding events onto another row
 //!
-//! SPEC_v2 §4.7 mandates four behaviors that all assume an immutable
+//!  mandates four behaviors that all assume an immutable
 //! sequence of records:
 //!
 //! 1. Append a new entry.
@@ -44,60 +44,60 @@
 //! It also gives operators a queryable audit trail: `sqlite3
 //! world.sqlite 'SELECT created_at, kind FROM world_events ORDER BY id
 //! DESC LIMIT 20'` is the cold-debug story for "what just happened in
-//! this door". That's not a SPEC requirement, but it's a free
+//! this door". That's not a requirement, but it's a free
 //! side-effect of the keying choice and worth not throwing away.
 
 use thiserror::Error;
 
 use crate::world_db::{WorldDb, WorldMigration};
 
-/// Schema for the shared-world event log — SPEC_v2 §4.7 / §Task 7a.
+/// Schema for the shared-world event log —.
 ///
 /// One row per emitted event. Rows are append-only by convention: no
-/// authoring API in v2 will expose an `UPDATE` or `DELETE`. SQLite does
+/// authoring API in will expose an `UPDATE` or `DELETE`. SQLite does
 /// not enforce this at the storage layer (the table is a regular
 /// `INTEGER PRIMARY KEY` table, not WAL-frozen) so the contract lives in
-/// the helpers Tasks 7b–7e expose. An operator with a `sqlite3` shell
+/// the helpers expose. An operator with a `sqlite3` shell
 /// can still rewrite history; the kit's contract is "if you only go
 /// through the public API, the log is append-only".
 ///
 /// # Column shape
 ///
 /// - `id` — `INTEGER PRIMARY KEY`. Autoincrement-aliased rowid. Used as
-///   the deterministic tiebreaker for `recent_events` (Task 7c) when two
-///   events share the same `created_at` text — the SPEC's "newest first
+///   the deterministic tiebreaker for `recent_events` when two
+///   events share the same `created_at` text — the 's "newest first
 ///   with deterministic tie ordering" rule resolves to `ORDER BY
 ///   created_at DESC, id DESC`.
 /// - `created_at` — `TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP`. UTC
 ///   timestamp written by SQLite at insert time. Stored as ISO text so
 ///   it's human-readable in the `sqlite3` CLI and sorts lexically the
 ///   same way it sorts chronologically. Defaulted at the SQL layer so
-///   `append_event` (Task 7b) doesn't have to thread a clock.
+///   `append_event` doesn't have to thread a clock.
 /// - `kind` — `TEXT NOT NULL`. Short machine-readable label
 ///   (e.g. `"room_7_opened"`, `"clue_found"`). Game authors pick the
 ///   namespace; the kit's only rule is "it must round-trip as text".
-/// - `player_id` — `INTEGER REFERENCES players(id)`, **nullable**. SPEC
-///   §4.7 explicitly types this column as optional so the log can carry
+/// - `player_id` — `INTEGER REFERENCES players(id)`, **nullable**.
+///    explicitly types this column as optional so the log can carry
 ///   "system" events that aren't attributable to one player (e.g. a
 ///   future "midnight reset" tick the runtime might emit). Foreign-keyed
 ///   for the same reason as the turn ledger: a phantom id should never
-///   land here. SQLite enforces FKs only when `PRAGMA foreign_keys = ON`,
-///   which the runtime layer (Task 10) is responsible for; until then the
+///   land here. SQLite enforces FKs only when `PRAGMA foreign_keys = ON`.
+///   which the runtime layer is responsible for; until then the
 ///   constraint is documentation but the column shape is already correct.
-/// - `message` — `TEXT NOT NULL`. Game-authored display string —
-///   "@alice opened Room 7". §4.7 calls out that messages are
-///   game-authored, **not raw terminal transcripts**. Task 7e installs a
+/// - `message` — `TEXT NOT NULL`. Game-authored display string
+///   "@alice opened Room 7". calls out that messages are
+///   game-authored, **not raw terminal transcripts**. installs a
 ///   length/empty guard so the kit can't be tricked into storing
 ///   pathological values.
 /// - `metadata` — `TEXT`, nullable. Optional JSON object (per the
-///   SPEC's `metadata_json` field). Stored as text rather than `BLOB`
+///   's `metadata_json` field). Stored as text rather than `BLOB`
 ///   so an operator inspecting the file with `sqlite3 -json` can pretty-
 ///   print it without a hex dump. The kit treats this column as opaque;
-///   serialization happens in the Task 7b helper.
+///   serialization happens in the helper.
 ///
 /// # Indexes
 ///
-/// Two covering indexes are created up-front so the Task 7c/7d query
+/// Two covering indexes are created up-front so the query
 /// patterns are seek-bound from the moment they land. Adding them later
 /// would require a follow-up migration and a backfill window where the
 /// query path scans the table; we avoid that by paying the index cost
@@ -112,14 +112,14 @@ use crate::world_db::{WorldDb, WorldMigration};
 /// - `idx_world_events_player_recent` is a partial index over
 ///   `(player_id, created_at, id)` `WHERE player_id IS NOT NULL`. The
 ///   partial predicate keeps the index small (it skips system events
-///   with `NULL` player) and matches the Task 7d query exactly:
+///   with `NULL` player) and matches the query exactly:
 ///   `WHERE player_id = ? ORDER BY created_at DESC, id DESC`.
 ///
 /// # Version
 ///
 /// `version = 4`. Versions 1–3 are reserved for prior kit migrations
 /// (1 reserved, 2 = players, 3 = turn_ledger). Game-authored migrations
-/// (Murder Motel's `motel_world_state` from Task 12a) start from a higher
+/// (Murder Motel's `motel_world_state` from ) start from a higher
 /// band so they don't collide with kit migrations the runtime applies on
 /// every open.
 pub const WORLD_EVENTS_MIGRATION: WorldMigration = WorldMigration {
@@ -141,10 +141,10 @@ CREATE INDEX IF NOT EXISTS idx_world_events_player_recent\n\
 ",
 };
 
-/// Decoded `world_events` row — SPEC_v2 §4.7 read model.
+/// Decoded `world_events` row — read model.
 ///
 /// Mirrors the column shape pinned by [`WORLD_EVENTS_MIGRATION`]. The
-/// runtime layer (Task 10) and Murder Motel screens (Task 13) consume
+/// runtime layer and Murder Motel screens consume
 /// this struct rather than reaching into raw `rusqlite::Row`s — that
 /// keeps the schema-to-Rust mapping in one place and turns a column
 /// rename into a single compile error instead of a fan-out of runtime
@@ -155,12 +155,12 @@ CREATE INDEX IF NOT EXISTS idx_world_events_player_recent\n\
 /// `sqlite3` story (see the module docs) reads the same value the
 /// runtime sees; parsing it into a richer type would be a one-way trip
 /// that hides corrupt data instead of surfacing it. `metadata` is
-/// likewise opaque text — Task 7b does not own JSON serialization, and
+/// likewise opaque text — does not own JSON serialization, and
 /// the kit treats the column as "whatever the caller put there".
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EventRecord {
     /// Autoincrement primary key. Doubles as the deterministic
-    /// tiebreaker for `recent_events` (Task 7c) when two rows share a
+    /// tiebreaker for `recent_events` when two rows share a
     /// `created_at` value at second resolution.
     pub id: i64,
     /// UTC timestamp written by SQLite at insert time
@@ -171,10 +171,10 @@ pub struct EventRecord {
     /// verbatim; the kit imposes no namespace.
     pub kind: String,
     /// Player attribution. `None` for "system" events the runtime emits
-    /// without a player on whose behalf they acted (SPEC §4.7 calls
+    /// without a player on whose behalf they acted ( calls
     /// this case out explicitly).
     pub player_id: Option<i64>,
-    /// Display string the lobby bulletin / per-player history will
+    /// Display string the lobby bulletin per-player history will
     /// render. Game-authored — never a raw transcript.
     pub message: String,
     /// Optional opaque metadata blob (typically a JSON object). Stored
@@ -183,17 +183,17 @@ pub struct EventRecord {
     pub metadata: Option<String>,
 }
 
-/// Maximum allowed character length for an event message — SPEC_v2
-/// §Task 7e cap.
+/// Maximum allowed character length for an event message
+///  cap.
 ///
 /// Counted as Unicode scalar values via [`str::chars`] rather than
 /// bytes, because the lobby bulletin renders by visible characters and
 /// a byte cap would arbitrarily punish non-ASCII handles
-/// (e.g. "@玲" costs three bytes per character). The number itself —
+/// (e.g. "@玲" costs three bytes per character). The number itself
 /// 500 — is chosen to comfortably exceed a few wrapped lines on an
-/// 80-column terminal (the SPEC §13.1 minimum) while still rejecting
+/// 80-column terminal (the minimum) while still rejecting
 /// pathological multi-megabyte inputs that could DOS the bulletin
-/// query path or eat operator disk in seconds. SPEC_v2 §4.7 deliberately
+/// query path or eat operator disk in seconds. deliberately
 /// leaves the cap to the kit; pinning it here lets game authors call
 /// `MAX_EVENT_MESSAGE_LEN` rather than re-derive it from a magic number
 /// in this module.
@@ -201,14 +201,14 @@ pub const MAX_EVENT_MESSAGE_LEN: usize = 500;
 
 /// Failure modes for [`WorldDb::append_event`].
 ///
-/// Library-internal `thiserror` shape — Task 10 will wrap these with
+/// Library-internal `thiserror` shape — will wrap these with
 /// `anyhow` at the process boundary so the operator-facing message
 /// stays a single sentence. Mirrors [`crate::players::PlayerError`]
 /// and [`crate::turns::TurnError`] so all world-DB write paths surface
 /// errors with the same shape.
 #[derive(Debug, Error)]
 pub enum EventError {
-    /// The supplied message was empty (or whitespace-only). SPEC §4.7
+    /// The supplied message was empty (or whitespace-only).
     /// describes messages as game-authored display strings; a blank row
     /// has no useful UI rendering and almost certainly indicates a
     /// caller bug (forgot to substitute a template variable, etc.).
@@ -223,7 +223,7 @@ pub enum EventError {
     #[error("event message too long: {len} chars exceeds max of {max}")]
     MessageTooLong {
         /// The character count of the rejected message — measured as
-        /// Unicode scalar values (`chars().count()`), the same unit the
+        /// Unicode scalar values (`chars.count`), the same unit the
         /// cap is expressed in.
         len: usize,
         /// The cap the message exceeded. Mirrors
@@ -233,7 +233,7 @@ pub enum EventError {
         max: usize,
     },
     /// The `INSERT … RETURNING` round-trip failed. Wrapping
-    /// `rusqlite::Error` keeps the call site readable (one error type,
+    /// `rusqlite::Error` keeps the call site readable (one error type.
     /// one mapping) while preserving the underlying cause for
     /// `tracing` and operator-facing messages.
     #[error("failed to append event to world database: {source}")]
@@ -244,17 +244,17 @@ pub enum EventError {
     },
 }
 
-/// Validate `message` against the SPEC_v2 §Task 7e guard rails — empty
+/// Validate `message` against the guard rails — empty
 /// rejection and the [`MAX_EVENT_MESSAGE_LEN`] cap.
 ///
 /// Pulled out of [`WorldDb::append_event`] so future paths that emit
-/// events through a different surface (e.g. the Task 9c spend-turn +
+/// events through a different surface (e.g. the spend-turn +
 /// append-event transaction helper) can share one validator instead of
 /// reimplementing the rule and drifting. The function is `pub(crate)`
 /// because callers outside the world-DB module shouldn't be inventing
 /// their own validation — they should go through `append_event`.
 ///
-/// "Empty" is interpreted as `trim().is_empty()`: a message of `" "`
+/// "Empty" is interpreted as `trim.is_empty`: a message of `" "`
 /// or `"\n"` would render as a blank line in the bulletin, which is
 /// indistinguishable from a missing event and almost always a caller
 /// bug. Failing both literal empty and whitespace-only with the same
@@ -263,7 +263,7 @@ pub(crate) fn validate_event_message(message: &str) -> Result<(), EventError> {
     if message.trim().is_empty() {
         return Err(EventError::EmptyMessage);
     }
-    // Counted as `chars()` rather than `len()` so the cap is in
+    // Counted as `chars` rather than `len` so the cap is in
     // user-visible characters, not UTF-8 bytes. See the const docs for
     // why that matters for non-ASCII handles.
     let len = message.chars().count();
@@ -278,7 +278,7 @@ pub(crate) fn validate_event_message(message: &str) -> Result<(), EventError> {
 
 impl WorldDb {
     /// Append one row to `world_events` and return the canonical
-    /// [`EventRecord`] SQLite produced (SPEC_v2 §4.7 / §Task 7b).
+    /// [`EventRecord`] SQLite produced.
     ///
     /// The contract is "the row I asked you to insert is now durably
     /// in the log, with the id and timestamp the database assigned".
@@ -292,7 +292,7 @@ impl WorldDb {
     /// SQL round-trip — empty, whitespace-only, or longer than
     /// [`MAX_EVENT_MESSAGE_LEN`] inputs fail fast with
     /// [`EventError::EmptyMessage`] or [`EventError::MessageTooLong`]
-    /// (SPEC_v2 §Task 7e). `kind` and
+    /// . `kind` and
     /// `metadata` are intentionally not validated: `kind` is a
     /// game-authored namespace and `metadata` is opaque text whose
     /// shape the kit doesn't own.
@@ -301,7 +301,7 @@ impl WorldDb {
     ///
     /// Takes `&self`: the insert is a single statement, so the busy
     /// timeout configured at open time is the only contention story
-    /// we need. `&mut self` would fight the runtime layer (Task 10)
+    /// we need. `&mut self` would fight the runtime layer
     /// where `GameContext` borrows the world DB once per tick.
     pub fn append_event(
         &self,
@@ -314,16 +314,16 @@ impl WorldDb {
     }
 
     /// Return the `limit` most recently appended events, newest first
-    /// (SPEC_v2 §4.7 / §Task 7c).
+    /// .
     ///
-    /// Powers the Murder Motel lobby bulletin (Task 13d): "what's
+    /// Powers the Murder Motel lobby bulletin: "what's
     /// happened recently across this door". The ordering contract is
-    /// `ORDER BY created_at DESC, id DESC` — newest timestamp wins,
+    /// `ORDER BY created_at DESC, id DESC` — newest timestamp wins.
     /// and within one timestamp the higher (later) `id` wins. The
     /// `id` tiebreaker matters because `created_at` is stored at
     /// `CURRENT_TIMESTAMP` second resolution; two events appended in
     /// the same second would otherwise sort non-deterministically.
-    /// SPEC §Task 7c specifically requires deterministic tie ordering
+    ///   specifically requires deterministic tie ordering
     /// so the bulletin renders the same sequence on every refresh.
     ///
     /// The query is index-bound: `idx_world_events_recent` covers
@@ -346,7 +346,7 @@ impl WorldDb {
     ///
     /// Takes `&self`: a single statement under the configured busy
     /// timeout, same as [`Self::append_event`]. The runtime layer
-    /// (Task 10) will call this from the lobby render path; keeping
+    ///  will call this from the lobby render path; keeping
     /// the borrow shared lets `GameContext` share one world-DB
     /// reference across screens without a `RefCell` dance.
     pub fn recent_events(&self, limit: u32) -> Result<Vec<EventRecord>, EventError> {
@@ -367,12 +367,12 @@ LIMIT ?1";
             .map_err(|source| EventError::Sqlite { source })
     }
 
-    /// Return the `limit` most recent events attributed to one player,
-    /// newest first (SPEC_v2 §4.7 / §Task 7d).
+    /// Return the `limit` most recent events attributed to one player.
+    /// newest first.
     ///
     /// Powers per-player history surfaces — Murder Motel will use this
     /// to render "your last N actions" alongside the global lobby
-    /// bulletin (Task 13d). The ordering contract matches
+    /// bulletin. The ordering contract matches
     /// [`Self::recent_events`]: `ORDER BY created_at DESC, id DESC` so
     /// two events appended in the same SQLite-second sort
     /// deterministically by their autoincrement id.
@@ -435,11 +435,11 @@ LIMIT ?2";
 /// closure inside [`WorldDb::transaction`] (since `rusqlite::Transaction`
 /// derefs to `Connection`).
 ///
-/// Pulled out so the SPEC_v2 §Task 9c spend-turn + mutate + append-event
+/// Pulled out so the spend-turn + mutate + append-event
 /// helper can compose the validated event insert into a single
 /// transaction with the turn spend without re-borrowing the
 /// [`WorldDb`]. Validation runs first so a malformed message is rejected
-/// before any SQL round-trip — and, when called from the 9c helper,
+/// before any SQL round-trip — and, when called from the 9c helper.
 /// before the wrapping transaction has done any work.
 pub(crate) fn append_event_on(
     conn: &rusqlite::Connection,
@@ -465,9 +465,9 @@ RETURNING id, created_at, kind, player_id, message, metadata";
 
 /// Decode a `world_events` row into [`EventRecord`].
 ///
-/// Pulled out of the append call site so Task 7c/7d read helpers can
+/// Pulled out of the append call site so read helpers can
 /// share one decoder. Column order matches the `RETURNING` clause in
-/// [`WorldDb::append_event`] and the SPEC §4.7 schema; a regression
+/// [`WorldDb::append_event`] and the schema; a regression
 /// that reorders columns in the migration will surface here as a
 /// `rusqlite` type error rather than a runtime panic in production.
 fn row_to_event_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<EventRecord> {
@@ -489,19 +489,19 @@ mod tests {
     use crate::world_db::WorldDb;
     use tempfile::tempdir;
 
-    /// SPEC_v2 §Task 7a acceptance: applying [`WORLD_EVENTS_MIGRATION`]
+    ///   acceptance: applying [`WORLD_EVENTS_MIGRATION`]
     /// creates the documented `world_events` table with the column shape
     /// later sub-tasks (7b–7e) depend on. Asserts both:
     ///
     /// 1. The table exists in `sqlite_master` (so a regression that
     ///    silently dropped the migration body would flunk).
-    /// 2. The columns and order match the SPEC §4.7 contract (so a
+    /// 2. The columns and order match the contract (so a
     ///    later edit that renames or reorders a column flunks here
     ///    rather than buried in a 7b append-event test).
     ///
     /// We apply the players migration first because `world_events`
     /// references it via `FOREIGN KEY`. With FK enforcement off (the
-    /// SQLite default until Task 10 turns it on) the migration would
+    /// SQLite default until turns it on) the migration would
     /// succeed even without the parent table, but exercising the real
     /// dependency order here mirrors how the runtime startup path will
     /// drive migrations on a real door open.
@@ -551,11 +551,11 @@ mod tests {
                 "message".to_string(),
                 "metadata".to_string(),
             ],
-            "world_events column shape must match the SPEC §4.7 contract"
+            "world_events column shape must match the contract"
         );
     }
 
-    /// SPEC §4.7 calls out that `player_id` is optional so the log can
+    ///  calls out that `player_id` is optional so the log can
     /// carry "system" events. A regression that flipped the column to
     /// `NOT NULL` would silently force every future caller to invent a
     /// fake player id; pin the nullability explicitly.
@@ -605,7 +605,7 @@ mod tests {
         assert_eq!(kind_notnull, 1, "kind must remain NOT NULL");
     }
 
-    /// The Task 7c/7d query plans rely on the indexes shipped with this
+    /// The query plans rely on the indexes shipped with this
     /// migration. Asserting the indexes exist by name pins the contract
     /// without coupling the test to the SQL planner's choice of access
     /// path (which is implementation-defined and changes across SQLite
@@ -690,7 +690,7 @@ mod tests {
         world
     }
 
-    /// SPEC_v2 §Task 7b acceptance: `append_event` durably stores the
+    ///   acceptance: `append_event` durably stores the
     /// row with the supplied `kind` and `player_id`, and the returned
     /// [`EventRecord`] echoes the same values plus a SQLite-assigned
     /// `id` and `created_at`.
@@ -749,9 +749,9 @@ mod tests {
         );
     }
 
-    /// SPEC §4.7 explicitly types `player_id` as optional so the log
+    ///  explicitly types `player_id` as optional so the log
     /// can carry "system" events with no player attribution. Pin that
-    /// the append path accepts `None` and stores it as SQL `NULL` —
+    /// the append path accepts `None` and stores it as SQL `NULL`
     /// otherwise a future caller emitting a midnight-reset tick would
     /// be forced to invent a fake player id.
     #[test]
@@ -768,7 +768,7 @@ mod tests {
         // Confirm the column is stored as SQL NULL, not as the string
         // "None" or the integer `0` — both would silently pass the
         // `Option<i64>` decode in `EventRecord` if the column were a
-        // legitimate row but corrupt the per-player query in Task 7d.
+        // legitimate row but corrupt the per-player query in.
         let raw_is_null: bool = world
             .connection()
             .query_row(
@@ -780,10 +780,10 @@ mod tests {
         assert!(raw_is_null, "system event must store player_id as SQL NULL");
     }
 
-    /// SPEC_v2 §Task 7c acceptance (empty case): `recent_events` on a
+    ///   acceptance (empty case): `recent_events` on a
     /// fresh table returns an empty vec rather than erroring or
     /// returning a sentinel row. The lobby bulletin renders this case
-    /// as "no events yet" and assumes a clean `Vec::is_empty()`.
+    /// as "no events yet" and assumes a clean `Vec::is_empty`.
     #[test]
     fn recent_events_empty_returns_empty_vec() {
         let dir = tempdir().expect("tempdir creates");
@@ -797,7 +797,7 @@ mod tests {
         assert!(none.is_empty(), "limit=0 short-circuits to empty");
     }
 
-    /// SPEC_v2 §Task 7c acceptance (ordering + tiebreak): newest events
+    ///   acceptance (ordering + tiebreak): newest events
     /// come first, and when two events share `created_at` (stored at
     /// SQLite's `CURRENT_TIMESTAMP` second resolution) the one with
     /// the higher `id` wins. Also pins that `limit` truncates the
@@ -814,9 +814,9 @@ mod tests {
         let world = open_world_with_events(&dir);
 
         // Two pairs of ties at two distinct timestamps. After the
-        // inserts, ids 1..=4 map to ("first", "second", "third",
+        // inserts, ids 1..=4 map to ("first", "second", "third".
         // "fourth") in the order shown. Newest-first ordering should
-        // surface them as fourth → third (newer ts pair, id desc),
+        // surface them as fourth → third (newer ts pair, id desc).
         // then second → first (older ts pair, id desc).
         world
             .connection()
@@ -854,7 +854,7 @@ mod tests {
         );
     }
 
-    /// SPEC_v2 §Task 7d acceptance: `player_events` filters by
+    ///   acceptance: `player_events` filters by
     /// `player_id`, returns newest-first with the same id-tiebreak as
     /// `recent_events`, excludes `NULL`-player system events, and
     /// returns an empty vec for an unknown id.
@@ -931,7 +931,7 @@ mod tests {
         assert!(none.is_empty(), "unknown player id → empty vec");
     }
 
-    /// SPEC_v2 §Task 7e acceptance (empty rejection): `append_event`
+    ///   acceptance (empty rejection): `append_event`
     /// rejects a literal empty message with [`EventError::EmptyMessage`]
     /// and writes nothing to the table. Pinning that the row count
     /// stays at zero proves the validator runs *before* the SQL
@@ -960,8 +960,8 @@ mod tests {
         assert_eq!(count, 0, "rejected empty message must not persist a row");
     }
 
-    /// SPEC §Task 7e acceptance (whitespace-only): a message of just
-    /// spaces / tabs / newlines is treated as empty. The SPEC §4.7
+    ///   acceptance (whitespace-only): a message of just
+    /// spaces tabs newlines is treated as empty. The
     /// contract is "game-authored display string"; a blank-rendering
     /// row is indistinguishable from a missing event in the lobby
     /// bulletin and almost always a caller bug (forgot to substitute a
@@ -982,10 +982,10 @@ mod tests {
         }
     }
 
-    /// SPEC §Task 7e acceptance (overlong rejection): a message longer
+    ///   acceptance (overlong rejection): a message longer
     /// than [`MAX_EVENT_MESSAGE_LEN`] characters is rejected with
     /// [`EventError::MessageTooLong`] carrying both the offending
-    /// length and the cap. A message of exactly the cap is accepted —
+    /// length and the cap. A message of exactly the cap is accepted
     /// the boundary is `len > MAX`, not `>= MAX`, so authors can paste
     /// a known-good template right at the limit without surprise
     /// failures.
@@ -995,7 +995,7 @@ mod tests {
         let world = open_world_with_events(&dir);
 
         // One character over the cap → rejected. Build the string from
-        // ASCII so the char-count and byte-count happen to match,
+        // ASCII so the char-count and byte-count happen to match.
         // making the assertion's failure mode obvious if it triggers.
         let too_long: String = "a".repeat(MAX_EVENT_MESSAGE_LEN + 1);
         let err = world
@@ -1017,10 +1017,10 @@ mod tests {
             .expect("message at exactly the cap must be accepted");
     }
 
-    /// SPEC §Task 7e acceptance (Unicode counting): the cap is
+    ///   acceptance (Unicode counting): the cap is
     /// expressed in characters (Unicode scalar values), not bytes. A
-    /// non-ASCII message whose `len()` (bytes) exceeds the cap but
-    /// whose `chars().count()` does not must be accepted — otherwise
+    /// non-ASCII message whose `len` (bytes) exceeds the cap but
+    /// whose `chars.count` does not must be accepted — otherwise
     /// the kit silently penalizes non-ASCII handles.
     ///
     /// Pick a 3-byte-per-char glyph ("玲") and emit exactly

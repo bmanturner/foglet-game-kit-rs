@@ -1,10 +1,10 @@
 # Terminal-safety manual smoke recipe
 
-SPEC §13.1 declares terminal restoration release-critical and §14
-explicitly accepts manual evidence for the cases CI cannot drive
-(real TTY, real `Ctrl-C`, real panic-during-TUI). This file documents
-those checks. Re-run before any release that touches `terminal.rs` or
-the runtime loop, and reference this file from the commit body.
+Terminal restoration is release-critical. The following scenarios
+cover the cases CI cannot drive: a real TTY, a real `Ctrl-C`, and a
+real panic-during-TUI. Re-run before any release that touches
+`terminal.rs` or the runtime loop, and reference this file from the
+commit body.
 
 The expected "good" outcome for every scenario below is **the same**:
 after the test ends, the operator's shell prompt re-appears, typing
@@ -16,17 +16,14 @@ applicable) is visible *outside* the alternate screen.
 - A real terminal emulator (iTerm2, Alacritty, GNOME Terminal,
   `tmux` pane, etc.). Piped stdout will short-circuit the
   alternate-screen sequences and invalidate the test.
-- A scratch binary that exercises the guard — once Task 7 lands the
-  `murder_motel` example serves; in the meantime, write a throwaway
-  binary that calls `TerminalGuard::new()` and then sleeps or loops
-  on input.
+- A scratch binary that exercises the guard — the `murder_motel`
+  example serves; alternatively, write a throwaway binary that calls
+  `TerminalGuard::new()` and then sleeps or loops on input.
 
 ## Scenario 1 — Clean quit
 
 1. Launch the binary in a terminal.
-2. Press the documented quit key (eventually `q`; before Task 7,
-   exit the loop via whatever mechanism the throwaway binary
-   provides).
+2. Press the documented quit key (`q`).
 3. **Expected:** alt-screen exits, raw mode disabled, shell prompt
    restored, terminal echoes typed input normally.
 
@@ -35,10 +32,10 @@ applicable) is visible *outside* the alternate screen.
 1. Launch the binary.
 2. Press `Ctrl-C` mid-session.
 3. **Expected:** the runtime treats `Ctrl-C` as a controlled
-   shutdown (Task 6 + Task 7d wire the input mapping); the guard's
-   `cleanup()` runs and the terminal is restored.
+   shutdown via the input mapper; the guard's `cleanup()` runs and
+   the terminal is restored.
 
-## Scenario 3 — Panic during TUI ownership (Task 5c)
+## Scenario 3 — Panic during TUI ownership
 
 1. Launch a build of the binary that deliberately panics after
    engaging the guard. For example:
@@ -69,8 +66,8 @@ applicable) is visible *outside* the alternate screen.
    minimum-size check.
 2. Resize the terminal smaller than the configured minimum.
 3. **Expected:** the runtime surfaces a "terminal too small" notice
-   inside the alt screen (Task 7d) without exiting raw mode mid-
-   render. Restoring the window restores normal rendering.
+   inside the alt screen without exiting raw mode mid-render.
+   Restoring the window restores normal rendering.
 4. Quit (Scenario 1). The terminal is restored cleanly.
 
 ## Scenario 5 — SSH disconnect (best-effort)
@@ -82,9 +79,9 @@ applicable) is visible *outside* the alternate screen.
    `Drop` cannot run if the process is killed by SIGHUP-without-
    handler, but the next shell will reset terminal state on
    attachment, so a `reset` is the worst case. Document any
-   regression here in `DECISIONS.md`.
+   regression in the commit body.
 
-## Scenario 6 — Save persistence round trip (Task 13h)
+## Scenario 6 — Save persistence round trip
 
 The save manager writes per-user JSON via `write_atomic` and reloads it
 on the next launch. CI cannot drive a real Foglet door, so the
@@ -113,10 +110,10 @@ Cleanup: `rm -rf "$FGK_SAVE_DIR"`. The save is JSON pretty-printed via
 `serde_json::to_writer_pretty` per `crates/foglet_game/src/save.rs`, so
 an operator inspecting `save.json` can read every field at a glance.
 
-## Scenario 7 — Lost-and-Found Drawer prompt (v1.1 Task 10)
+## Scenario 7 — Lost-and-Found Drawer prompt
 
-The drawer is the v1.1 proof scene for direct-key choice prompts with
-a disabled choice and feedback messages.
+The drawer is the proof scene for direct-key choice prompts with a
+disabled choice and feedback messages.
 
 1. Launch: `cargo run --example murder_motel`. From the title press
    Enter, choose **New Game**.
@@ -142,9 +139,9 @@ by the unit suite (`lost_and_found_*` tests in
 `examples/murder_motel/src/main.rs`); this manual recipe confirms the
 same behaviour through a real TTY.
 
-## Scenario 8 — Night-clerk vendor prompt (v1.1 Task 11)
+## Scenario 8 — Night-clerk vendor prompt
 
-The night-clerk vendor is the v1.1 proof scene for dynamic labels,
+The night-clerk vendor is the proof scene for dynamic labels,
 disabled-by-state choices, and any-key continuation.
 
 1. Launch: `cargo run --example murder_motel`. Title → **New Game**.
@@ -170,14 +167,12 @@ disabled-by-state choices, and any-key continuation.
 The state transitions are exercised by the `night_clerk_vendor_*`
 tests; this recipe confirms the live-TTY rendering and key path.
 
-## Scenario 9 — Shared Room 7 evidence across two players (v2 / v2.1)
+## Scenario 9 — Shared Room 7 evidence across two players
 
-The shared Room 7 scene is the v2 acceptance demo for the SQLite-backed
-shared world. v2.1 keeps the demo behaviourally identical — only the
-example's plumbing changed (`SaveSlot<SaveState>` and
-`Game::with_save_handler` replaced the manual save tail). Re-run this
-recipe whenever `examples/murder_motel/src/{state,map,world}.rs` or any
-v2 shared-world wiring is touched.
+The shared Room 7 scene demonstrates the SQLite-backed shared world:
+two players observe the same door state. Re-run this recipe whenever
+`examples/murder_motel/src/{state,map,world}.rs` or the shared-world
+wiring is touched.
 
 1. From a clean scratch dir, launch as Alice:
    ```bash
@@ -187,9 +182,9 @@ v2 shared-world wiring is touched.
 2. Title → **New Game**. Walk to Room 7's door, open it (the door
    transitions to "opened by alice" in the shared world). Quit with `q`.
 3. **Expected:** the terminal restores cleanly and `alice`'s save file
-   is written under `$FGK_SAVE_DIR` (the v2.1 `Game::with_save_handler`
-   wiring fires once on Quit drain — no manual `write_atomic` tail
-   remains in `main.rs`).
+   is written under `$FGK_SAVE_DIR` (`Game::with_save_handler` fires
+   once on Quit drain — no manual `write_atomic` tail remains in
+   `main.rs`).
 4. Re-launch as Bob against the **same** `FGK_SAVE_DIR`:
    ```bash
    cargo run --example murder_motel -- --local-dev-user bob
@@ -208,8 +203,8 @@ v2 shared-world wiring is touched.
 The non-interactive proxy for the cross-player invariants is
 `examples/murder_motel/src/map.rs::two_players_share_room_7_evidence`
 (part of the regular `cargo test --workspace` suite). This recipe
-confirms the same behaviour through a real TTY and that the v2.1
-`SaveSlot` / `with_save_handler` refactor did not regress the live
+confirms the same behaviour through a real TTY and that the
+`SaveSlot` / `with_save_handler` wiring did not regress the live
 quit-and-persist path.
 
 ## What this file is not
@@ -218,6 +213,6 @@ quit-and-persist path.
   arm/disarm contract, the idempotency invariants, and the recording-
   backend orchestration. This file covers the parts that need a real
   TTY.
-- Not run by CI. SPEC §14 explicitly lists the manual checks as
-  "implementation-defined" QA, and the maintainer is responsible
-  for re-running them before tagging a release.
+- Not run by CI. These checks cover TTY behaviour that automated
+  tests cannot drive; the maintainer is responsible for re-running
+  them before tagging a release.
