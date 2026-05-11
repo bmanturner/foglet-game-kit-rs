@@ -102,6 +102,15 @@ pub enum PlaceError {
         #[source]
         source: rusqlite::Error,
     },
+    /// The underlying SQL lookup by stable key failed.
+    #[error("failed to look up place `{key}`: {source}")]
+    LookupByKey {
+        /// Place key for caller-friendly diagnostics.
+        key: String,
+        /// Underlying `rusqlite` error.
+        #[source]
+        source: rusqlite::Error,
+    },
 }
 
 /// Errors for shared-route mutations.
@@ -136,6 +145,17 @@ pub enum RouteError {
     /// The underlying SQL query for inbound adjacency failed.
     #[error("failed to list inbound routes for `{to_place_id}`: {source}")]
     ListInbound {
+        /// Destination place id for diagnostics.
+        to_place_id: i64,
+        /// Underlying `rusqlite` error.
+        #[source]
+        source: rusqlite::Error,
+    },
+    /// The underlying SQL lookup for a directed route pair failed.
+    #[error("failed to look up route from `{from_place_id}` to `{to_place_id}`: {source}")]
+    LookupBetween {
+        /// Source place id for diagnostics.
+        from_place_id: i64,
         /// Destination place id for diagnostics.
         to_place_id: i64,
         /// Underlying `rusqlite` error.
@@ -408,6 +428,47 @@ ORDER BY from_place_id ASC, id ASC";
         Ok(routes)
     }
 
+    /// Load one directed route from `from_place_id` to `to_place_id`.
+    ///
+    /// Use this when game code already knows the two endpoint ids and needs
+    /// the authored edge row without writing raw SQL. The lookup is
+    /// direction-sensitive: a route from `A` to `B` does not satisfy a lookup
+    /// from `B` to `A` unless the game has inserted a separate reverse route.
+    ///
+    /// If multiple parallel routes exist for the same directed pair, the
+    /// oldest inserted route is returned. Games that need all parallel
+    /// channels should use [`WorldDb::outbound_routes`] and filter by
+    /// `to_place_id` or `kind`.
+    ///
+    /// Returns `Ok(None)` when no directed route exists between the supplied
+    /// endpoints; SQL failures surface as [`RouteError`].
+    pub fn get_route_between(
+        &self,
+        from_place_id: i64,
+        to_place_id: i64,
+    ) -> Result<Option<Route>, RouteError> {
+        const SQL: &str = "\
+SELECT from_place_id, to_place_id, id, kind, requirements_json, metadata_json, created_at\n\
+FROM routes\n\
+WHERE from_place_id = ?1 AND to_place_id = ?2\n\
+ORDER BY id ASC\n\
+LIMIT 1";
+
+        match self.connection().query_row(
+            SQL,
+            rusqlite::params![from_place_id, to_place_id],
+            row_to_route,
+        ) {
+            Ok(route) => Ok(Some(route)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(source) => Err(RouteError::LookupBetween {
+                from_place_id,
+                to_place_id,
+                source,
+            }),
+        }
+    }
+
     /// Load one place by its stable `key`.
     ///
     /// This is the primary lookup for game code that stores authored
@@ -433,7 +494,7 @@ WHERE key = ?1";
         {
             Ok(place) => Ok(Some(place)),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(source) => Err(PlaceError::Sqlite {
+            Err(source) => Err(PlaceError::LookupByKey {
                 key: key.to_string(),
                 source,
             }),
@@ -720,6 +781,45 @@ mod tests {
             rendered.contains("failed to insert place"),
             "error should be emitted from the insert path"
         );
+    }
+
+    #[test]
+    fn get_place_by_key_returns_present_row_and_none_when_missing() {
+        let dir = tempdir().expect("tempdir creates");
+        let db_path = dir.path().join("world.sqlite");
+        let mut world = WorldDb::open(&db_path).expect("open succeeds");
+        world
+            .apply_migration(&PLACES_MIGRATION)
+            .expect("places migration applies");
+
+        let inserted = world
+            .insert_place(
+                "harbor-gate",
+                "Harbor Gate",
+                "gate",
+                Some(r#"{"weather":"clear"}"#),
+            )
+            .expect("place insert succeeds");
+
+        let loaded = world
+            .get_place_by_key("harbor-gate")
+            .expect("place lookup succeeds")
+            .expect("inserted key should resolve");
+        assert_eq!(loaded, inserted);
+        assert_eq!(
+            loaded.metadata_json.as_deref(),
+            Some(r#"{"weather":"clear"}"#),
+            "lookup should preserve metadata decoding"
+        );
+        assert_eq!(
+            loaded.created_at, inserted.created_at,
+            "lookup should preserve SQLite timestamp text"
+        );
+
+        let missing = world
+            .get_place_by_key("missing-gate")
+            .expect("missing lookup should not be an error");
+        assert_eq!(missing, None);
     }
 
     ///  requires deterministic list ordering so game-side
@@ -1027,6 +1127,68 @@ mod tests {
             .expect("inbound query should return reverse set");
         assert_eq!(to_dungeon.len(), 1);
         assert_eq!(to_dungeon[0], tunnel);
+    }
+
+    #[test]
+    fn get_route_between_returns_present_missing_and_direction_sensitive_results() {
+        let dir = tempdir().expect("tempdir creates");
+        let db_path = dir.path().join("world.sqlite");
+        let mut world = WorldDb::open(&db_path).expect("open succeeds");
+
+        world
+            .apply_migration(&PLACES_MIGRATION)
+            .expect("places migration applies");
+        world
+            .apply_migration(&ROUTES_MIGRATION)
+            .expect("routes migration applies");
+
+        let harbor = world
+            .insert_place("harbor", "Harbor", "dock", None)
+            .expect("source place inserts");
+        let tower = world
+            .insert_place("tower", "Tower", "gate", None)
+            .expect("destination place inserts");
+        let vault = world
+            .insert_place("vault", "Vault", "room", None)
+            .expect("unrelated place inserts");
+
+        let forward = world
+            .create_route(
+                harbor.id,
+                tower.id,
+                "lift",
+                Some(r#"{"requires":"badge"}"#),
+                Some(r#"{"speed":"slow"}"#),
+            )
+            .expect("directed route inserts");
+
+        let loaded = world
+            .get_route_between(harbor.id, tower.id)
+            .expect("route lookup succeeds")
+            .expect("directed route should resolve");
+        assert_eq!(loaded, forward);
+
+        let reverse_missing = world
+            .get_route_between(tower.id, harbor.id)
+            .expect("reverse lookup succeeds");
+        assert_eq!(
+            reverse_missing, None,
+            "forward routes must not imply reverse routes"
+        );
+
+        let unrelated_missing = world
+            .get_route_between(harbor.id, vault.id)
+            .expect("missing pair lookup succeeds");
+        assert_eq!(unrelated_missing, None);
+
+        let reverse = world
+            .create_route(tower.id, harbor.id, "return-lift", None, None)
+            .expect("reverse route inserts");
+        let reverse_loaded = world
+            .get_route_between(tower.id, harbor.id)
+            .expect("reverse route lookup succeeds")
+            .expect("reverse route should resolve once inserted");
+        assert_eq!(reverse_loaded, reverse);
     }
 
     ///  — `inbound_routes` should return only routes whose

@@ -2,6 +2,10 @@
 
 ## 0.1.1
 
+- Added `WorldDb::get_place_by_key` and `WorldDb::get_route_between`
+  for typed shared-world spatial lookups without game-local raw SQL.
+- Added `WorldDb::create_and_accept_contract` for atomically creating
+  and accepting a contract with optional transaction-scoped side effects.
 - Added `events::append_event_on` for appending validated `world_events`
   rows on an existing SQLite connection or transaction.
 - Added `inventory::transfer_on` for composing owner-keyed inventory

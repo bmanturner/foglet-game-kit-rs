@@ -61,6 +61,9 @@ change by genre.
 - `WorldDb::list_places()` returns deterministic key-ordered rows.
 
 Deterministic ordering keeps admin tools and tests stable across runs.
+`get_place_by_key` returns `Ok(None)` for unknown keys, so bootstrap and
+admin flows can treat "not authored yet" as a normal branch instead of
+falling back to raw SQL.
 
 ## 4. Route APIs
 
@@ -94,6 +97,9 @@ Both are just directed rows. No reverse link is implied.
 
 - `WorldDb::outbound_routes(place_id)` returns routes that leave a place.
 - `WorldDb::inbound_routes(place_id)` returns routes that arrive at a place.
+- `WorldDb::get_route_between(from_place_id, to_place_id)` resolves one
+  directed route for an exact pair and returns `Ok(None)` when that edge
+  has not been authored.
 
 Two key rules:
 
@@ -101,7 +107,17 @@ Two key rules:
 - Bidirectional travel requires two rows.
 
 Parallel routes are allowed when they differ by `kind`, so a game can
-model multiple channels between the same two places.
+model multiple channels between the same two places. `get_route_between`
+returns the oldest inserted route for a directed pair; use
+`outbound_routes` when a game needs to inspect every parallel channel.
+
+Example pair lookup:
+
+```rust
+if let Some(route) = world.get_route_between(starport.id, relay.id)? {
+    // Game-owned movement code can now inspect route.kind or opaque JSON.
+}
+```
 
 ## 5. Authoring guidance
 

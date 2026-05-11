@@ -291,6 +291,112 @@ RETURNING id, key, kind, issuer_owner_kind, issuer_owner_id, \
             .map_err(|source| ContractError::Sqlite { source })
     }
 
+    /// Create and accept a contract for `player_id` in one transaction.
+    ///
+    /// This helper is for the common "claim this newly-authored opportunity"
+    /// workflow where game code would otherwise call [`WorldDb::create_contract`]
+    /// and then [`WorldDb::accept_contract`] as two separate lifecycle steps.
+    /// Keeping both writes in one SQLite transaction avoids leaving behind an
+    /// available row if acceptance or game-authored side effects fail.
+    ///
+    /// The input fields are the same core payload used by
+    /// [`WorldDb::create_contract`]. `objective_json`, `reward_json`, and
+    /// `metadata_json` remain opaque; the kit stores them verbatim and does not
+    /// validate game-specific objectives or rewards.
+    ///
+    /// The optional callback runs after the contract is accepted while the
+    /// transaction is still open. Use it to reserve generic resources or append
+    /// game-owned audit rows that must roll back with the acceptance.
+    ///
+    /// Genre-neutral usage:
+    ///
+    /// - A **delivery commission** can be created for an issuer, accepted by
+    ///   the current player, and reserve a package row in the callback.
+    /// - A **dungeon guild job** can be accepted immediately and append a
+    ///   guild-ledger entry in the same transaction.
+    pub fn create_and_accept_contract<F>(
+        &mut self,
+        input: CreateContractInput<'_>,
+        player_id: i64,
+        on_commit: Option<F>,
+    ) -> Result<Contract, ContractError>
+    where
+        F: FnOnce(&rusqlite::Transaction<'_>, &Contract) -> Result<(), rusqlite::Error>,
+    {
+        const INSERT_SQL: &str = "\
+INSERT INTO contracts \
+    (key, kind, issuer_owner_kind, issuer_owner_id, state, objective_json, reward_json, metadata_json, expires_at) \
+VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) \
+RETURNING id, key, kind, issuer_owner_kind, issuer_owner_id, \
+          acceptor_player_id, state, objective_json, reward_json, metadata_json, \
+          created_at, accepted_at, completed_at, expires_at";
+        const ACCEPT_SQL: &str = "\
+UPDATE contracts\n\
+SET state = ?2,\n\
+    acceptor_player_id = ?3,\n\
+    accepted_at = CURRENT_TIMESTAMP\n\
+WHERE id = ?1\n\
+  AND state = ?4\n\
+  AND acceptor_player_id IS NULL\n\
+  AND (expires_at IS NULL OR datetime(expires_at) > CURRENT_TIMESTAMP)\n\
+RETURNING id, key, kind, issuer_owner_kind, issuer_owner_id, \
+          acceptor_player_id, state, objective_json, reward_json, metadata_json, \
+          created_at, accepted_at, completed_at, expires_at";
+
+        let tx = self
+            .connection_mut()
+            .transaction()
+            .map_err(|source| ContractError::Sqlite { source })?;
+
+        let created = tx
+            .query_row(
+                INSERT_SQL,
+                rusqlite::params![
+                    input.key,
+                    input.kind,
+                    input.issuer_owner_kind,
+                    input.issuer_owner_id,
+                    ContractState::Available.as_str(),
+                    input.objective_json,
+                    input.reward_json,
+                    input.metadata_json,
+                    input.expires_at,
+                ],
+                row_to_contract,
+            )
+            .map_err(|source| ContractError::Sqlite { source })?;
+
+        let accepted = match tx.query_row(
+            ACCEPT_SQL,
+            rusqlite::params![
+                created.id,
+                ContractState::Accepted.as_str(),
+                player_id,
+                ContractState::Available.as_str(),
+            ],
+            row_to_contract,
+        ) {
+            Ok(contract) => contract,
+            Err(rusqlite::Error::QueryReturnedNoRows) => {
+                return Err(Self::diagnose_failed_accept_contract(&tx, created.id));
+            }
+            Err(source) => return Err(ContractError::Sqlite { source }),
+        };
+
+        if let Some(on_commit) = on_commit {
+            on_commit(&tx, &accepted).map_err(|source| ContractError::OnCommitRejected {
+                id: created.id,
+                attempted: ContractState::Accepted,
+                source,
+            })?;
+        }
+
+        tx.commit()
+            .map_err(|source| ContractError::Sqlite { source })?;
+
+        Ok(accepted)
+    }
+
     /// Load a single contract by numeric id.
     ///
     /// Returns `Ok(None)` when the id is unknown. This keeps callers
@@ -1748,6 +1854,180 @@ mod tests {
         assert_eq!(
             persisted.accepted_at, None,
             "callback error must roll back accepted timestamp"
+        );
+    }
+
+    #[test]
+    fn create_and_accept_contract_returns_accepted_row_without_two_step_gap() {
+        let dir = tempdir().expect("tempdir creates");
+        let db_path = dir.path().join("world.sqlite");
+        let mut world = WorldDb::open(&db_path).expect("open succeeds");
+        world
+            .apply_migration(&CONTRACTS_MIGRATION)
+            .expect("contracts migration applies");
+
+        let accepted = world
+            .create_and_accept_contract(
+                CreateContractInput {
+                    key: Some("guild-immediate"),
+                    kind: "recovery",
+                    issuer_owner_kind: "guild",
+                    issuer_owner_id: 91,
+                    objective_json: r#"{"target":"sun-medallion"}"#,
+                    reward_json: r#"{"favor":{"guild":4}}"#,
+                    metadata_json: Some(r#"{"rank":"bronze"}"#),
+                    expires_at: None,
+                },
+                515,
+                None::<
+                    fn(&rusqlite::Transaction<'_>, &super::Contract) -> Result<(), rusqlite::Error>,
+                >,
+            )
+            .expect("create-and-accept succeeds");
+
+        assert!(accepted.id > 0);
+        assert_eq!(accepted.key.as_deref(), Some("guild-immediate"));
+        assert_eq!(accepted.state, ContractState::Accepted.as_str());
+        assert_eq!(accepted.acceptor_player_id, Some(515));
+        assert!(
+            accepted.accepted_at.is_some(),
+            "create-and-accept should stamp accepted_at"
+        );
+        assert_eq!(accepted.completed_at, None);
+        assert_eq!(accepted.objective_json, r#"{"target":"sun-medallion"}"#);
+        assert_eq!(accepted.reward_json, r#"{"favor":{"guild":4}}"#);
+
+        let persisted = world
+            .contract_by_id(accepted.id)
+            .expect("lookup succeeds")
+            .expect("contract row persists");
+        assert_eq!(persisted, accepted);
+
+        let available_rows = world
+            .available_contracts(&AvailableContractsFilter::default())
+            .expect("available list succeeds");
+        assert!(
+            available_rows.is_empty(),
+            "helper should not leave a newly-created row available"
+        );
+    }
+
+    #[test]
+    fn create_and_accept_contract_rolls_back_contract_and_callback_side_effects() {
+        let dir = tempdir().expect("tempdir creates");
+        let db_path = dir.path().join("world.sqlite");
+        let mut world = WorldDb::open(&db_path).expect("open succeeds");
+        world
+            .apply_migration(&CONTRACTS_MIGRATION)
+            .expect("contracts migration applies");
+        world
+            .connection()
+            .execute(
+                "CREATE TABLE contract_audit (contract_key TEXT NOT NULL, player_id INTEGER NOT NULL)",
+                [],
+            )
+            .expect("audit table creates");
+
+        let result = world.create_and_accept_contract(
+            CreateContractInput {
+                key: Some("rollback-immediate"),
+                kind: "delivery",
+                issuer_owner_kind: "station",
+                issuer_owner_id: 12,
+                objective_json: r#"{"to":"north-market"}"#,
+                reward_json: r#"{"credits":25}"#,
+                metadata_json: None,
+                expires_at: None,
+            },
+            616,
+            Some(
+                |tx: &rusqlite::Transaction<'_>,
+                 accepted: &super::Contract|
+                 -> Result<(), rusqlite::Error> {
+                    tx.execute(
+                        "INSERT INTO contract_audit (contract_key, player_id) VALUES (?1, ?2)",
+                        rusqlite::params![accepted.key.as_deref(), accepted.acceptor_player_id],
+                    )?;
+                    Err(rusqlite::Error::InvalidQuery)
+                },
+            ),
+        );
+
+        assert!(
+            matches!(
+                result,
+                Err(super::ContractError::OnCommitRejected {
+                    attempted: ContractState::Accepted,
+                    source: rusqlite::Error::InvalidQuery,
+                    ..
+                })
+            ),
+            "callback rejection should surface as a typed contract error"
+        );
+
+        let contract_count: i64 = world
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM contracts WHERE key = ?1",
+                rusqlite::params!["rollback-immediate"],
+                |row| row.get(0),
+            )
+            .expect("contract count query succeeds");
+        assert_eq!(
+            contract_count, 0,
+            "callback failure should roll back the created contract row"
+        );
+
+        let audit_count: i64 = world
+            .connection()
+            .query_row("SELECT COUNT(*) FROM contract_audit", [], |row| row.get(0))
+            .expect("audit count query succeeds");
+        assert_eq!(
+            audit_count, 0,
+            "callback side effects should roll back with the contract transaction"
+        );
+    }
+
+    #[test]
+    fn create_and_accept_contract_rolls_back_when_acceptance_lifecycle_rejects() {
+        let dir = tempdir().expect("tempdir creates");
+        let db_path = dir.path().join("world.sqlite");
+        let mut world = WorldDb::open(&db_path).expect("open succeeds");
+        world
+            .apply_migration(&CONTRACTS_MIGRATION)
+            .expect("contracts migration applies");
+
+        let result = world.create_and_accept_contract(
+            CreateContractInput {
+                key: Some("expired-immediate"),
+                kind: "delivery",
+                issuer_owner_kind: "station",
+                issuer_owner_id: 12,
+                objective_json: r#"{"to":"south-market"}"#,
+                reward_json: r#"{"credits":35}"#,
+                metadata_json: None,
+                expires_at: Some("2000-01-01 00:00:00"),
+            },
+            717,
+            None::<fn(&rusqlite::Transaction<'_>, &super::Contract) -> Result<(), rusqlite::Error>>,
+        );
+
+        assert!(
+            matches!(result, Err(super::ContractError::ExpiredOnAccept { .. })),
+            "expired freshly-created rows should use the typed accept lifecycle error"
+        );
+
+        let contract_count: i64 = world
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM contracts WHERE key = ?1",
+                rusqlite::params!["expired-immediate"],
+                |row| row.get(0),
+            )
+            .expect("contract count query succeeds");
+        assert_eq!(
+            contract_count, 0,
+            "acceptance lifecycle failure should roll back creation"
         );
     }
 
