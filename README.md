@@ -1,6 +1,6 @@
 # foglet-game-kit-rs
 
-A Rust authoring kit for [Foglet](https://github.com/bmanturner/foglet-bbs)
+A Rust authoring kit for [Foglet BBS](https://github.com/bmanturner/foglet-bbs)
 door games. It ships a library crate (`foglet_game`) for building the
 game itself and a CLI (`fgk`) for scaffolding, packaging, and emitting
 the Foglet operator manifest.
@@ -63,8 +63,10 @@ context handed in via `FOGLET_DOOR_CONTEXT` and `FOGLET_*` env vars.
 - **`fgk`** — `new` (scaffolder), `emit-manifest` (Foglet operator
   JSON), and `package` (deployable bundle with a boring auditable
   `run.sh` wrapper).
-- **`murder_motel`** — a complete sample game that exercises every
-  primitive, runnable as `cargo run --example murder_motel`.
+- **`murder_motel`** — a repository sample game and fixture used for
+  local development, runnable from a checkout with
+  `cargo run --example murder_motel`. It is not part of the published
+  crates.
 
 ## Quickstart — from zero to a working Foglet door
 
@@ -107,7 +109,7 @@ Saves land in `.fgk/saves/local-dev/save.json` so they don't collide
 with packaged installs. Quit with `q` from the title screen; resize and
 Ctrl-C are handled by the terminal guard.
 
-To exercise the bundled sample game instead:
+To exercise the repository sample game from a local checkout:
 
 ```bash
 cargo run --example murder_motel
@@ -187,15 +189,7 @@ touching anything that owns the alternate screen.
 These are documented rather than worked around. They affect the
 *verification* surface, not the runtime contract.
 
-- **Scaffolded projects depend on an unpublished crate.** `fgk new`
-  emits a `Cargo.toml` with `foglet_game = "0.1"`, matching the kit's
-  pre-1.0 plan. Until `foglet_game` is published to crates.io, point
-  the dependency at a checkout — e.g. `foglet_game = { path =
-  "../foglet-game-kit-rs/crates/foglet_game" }` — to compile a
-  freshly-scaffolded project. The scaffold smoke test in
-  `crates/fgk/tests/cli_new.rs` verifies file generation; running
-  `cargo test` inside the scaffold is gated on the publish step.
-- **`murder_motel` is a workspace example, not a standalone project.**
+- **`murder_motel` is a repository fixture, not part of the published crates.**
   Sources live at `examples/murder_motel/` and compile via
   `cargo run --example murder_motel`. To package it with `fgk
   package`, build the example first and pass `--binary` so the CLI
@@ -219,4 +213,4 @@ These are documented rather than worked around. They affect the
 ## License
 
 Dual-licensed under MIT or Apache-2.0, matching the wider Rust
-ecosystem. See `LICENSE-MIT` / `LICENSE-APACHE` once added.
+ecosystem. See `LICENSE-MIT` and `LICENSE-APACHE`.

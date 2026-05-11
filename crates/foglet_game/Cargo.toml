@@ -12,6 +12,8 @@ rust-version = { workspace = true }
 license      = { workspace = true }
 repository   = { workspace = true }
 authors      = { workspace = true }
+readme       = "README.md"
+keywords     = ["foglet", "bbs", "tui", "gamedev", "ratatui"]
 
 [lib]
 # Explicit so future binaries in `examples/` or `crates/fgk` can link
@@ -67,15 +69,12 @@ anyhow = { workspace = true }
 # `cargo test` rather than in production.
 rstest = { workspace = true }
 
-# --- Examples ---------------------------------------------------------
+# --- Workspace fixture ------------------------------------------------
 #
-# `murder_motel` is the acceptance fixture: a small but complete door
-# game exercised by `cargo run --example murder_motel`.
-# Its sources live at the workspace root (`examples/murder_motel/`)
-# rather than under `crates/foglet_game/examples/` so the project also
-# reads as a self-contained scaffold an author can copy. Cargo accepts
-# example paths outside the package directory — the only constraint is
-# that the file lives somewhere on disk relative to this manifest.
+# `murder_motel` is a repository fixture and sample game kept outside
+# the published crate payload. It remains registered here so local
+# contributors can run `cargo run --example murder_motel` from a repo
+# checkout while crates.io users only receive the library itself.
 [[example]]
 name = "murder_motel"
 path = "../../examples/murder_motel/src/main.rs"

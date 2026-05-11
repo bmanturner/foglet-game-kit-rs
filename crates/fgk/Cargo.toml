@@ -21,6 +21,8 @@ rust-version = { workspace = true }
 license      = { workspace = true }
 repository   = { workspace = true }
 authors      = { workspace = true }
+readme       = "README.md"
+keywords     = ["foglet", "bbs", "cli", "scaffold", "gamedev"]
 
 [lib]
 # Explicit lib name so `use fgk::...` works in both unit tests and
@@ -37,7 +39,7 @@ path = "src/main.rs"
 [dependencies]
 # Library crate: every CLI subcommand will eventually reach into
 # `foglet_game` (manifest emission, config parsing, etc.).
-foglet_game = { path = "../foglet_game" }
+foglet_game = { version = "0.1.0", path = "../foglet_game" }
 
 # Argument parsing for the `fgk` subcommands. `derive` keeps the
 # subcommand definitions colocated with the structs they populate.
