@@ -1,15 +1,15 @@
-//! End-to-end smoke test for `fgk package` (Task 12).
+//! End-to-end smoke test for `fgk package`.
 //!
 //! Unit tests in `src/package.rs` cover assembly logic, exec-bit
-//! handling, and `run.sh` byte equality with SPEC §10.4. This file
-//! exercises the wiring from `clap` argument parsing into the
-//! `assemble_bundle` path — i.e. the operator-facing CLI path that
-//! takes `--binary` and skips the cargo build (running cargo build in
-//! a smoke test would dominate the test suite's runtime for no
-//! additional invariant beyond what unit tests already cover).
+//! handling, and `run.sh` byte equality. This file exercises the
+//! wiring from `clap` argument parsing into the `assemble_bundle`
+//! path — i.e. the operator-facing CLI path that takes `--binary` and
+//! skips the cargo build (running cargo build in a smoke test would
+//! dominate the test suite's runtime for no additional invariant
+//! beyond what unit tests already cover).
 //!
-//! The full `cargo build --release` path is exercised manually per
-//! SPEC §14, with evidence captured in commit bodies.
+//! The full `cargo build --release` path requires manual verification,
+//! with evidence captured in commit bodies.
 
 use std::fs;
 
@@ -62,8 +62,8 @@ fn fgk_package_with_binary_writes_full_bundle() {
     assert_eq!(v["slug"], "smoke-game");
     assert_eq!(v["command"], "/srv/foglet/doors/smoke-game/run.sh");
 
-    // run.sh references the slug; sanity-check the SPEC §10.4 shape
-    // without re-asserting byte equality (covered by unit tests).
+    // run.sh references the slug; sanity-check without re-asserting
+    // byte equality (covered by unit tests).
     let run_sh = fs::read_to_string(out.join("run.sh")).unwrap();
     assert!(run_sh.contains(r#"exec "$DIR/smoke-game""#));
 
@@ -85,14 +85,13 @@ fn fgk_package_with_binary_writes_full_bundle() {
 
 #[test]
 fn fgk_package_murder_motel_seeds_world_directory() {
-    // Task 11c: world-enabled bundles must ship a writable `world/`
-    // directory so operators don't have to remember to chmod or mkdir
-    // it on first install. The Murder Motel example is the canonical
-    // SPEC v2 fixture — it opts into `[world]`, so packaging it must
-    // materialize the parent of `world/world.sqlite` and seed it with
-    // a `.keep` file (Task 11a). Asserting it here, against the real
-    // example rather than a synthetic fixture, gives us a smoke test
-    // that the example's `game.toml` and the packager agree.
+    // World-enabled bundles must ship a writable `world/` directory so
+    // operators don't have to remember to chmod or mkdir it on first
+    // install. The Murder Motel example opts into `[world]`, so
+    // packaging it must materialize the parent of `world/world.sqlite`
+    // and seed it with a `.keep` file. Asserting against the real
+    // example (not a synthetic fixture) proves the example's
+    // `game.toml` and the packager agree.
     let project = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("..")
         .join("..")
@@ -124,7 +123,7 @@ fn fgk_package_murder_motel_seeds_world_directory() {
     // The example's `[world].path = "world/world.sqlite"`, so the
     // packager should have created `<out>/world/` and dropped the
     // `.keep` sentinel. The DB file itself is intentionally absent;
-    // SPEC v2 §5 has the runtime create it on first launch.
+    // the runtime creates it on first launch.
     let world_dir = out.join("world");
     assert!(
         world_dir.is_dir(),

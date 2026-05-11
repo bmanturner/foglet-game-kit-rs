@@ -1,28 +1,25 @@
 //! Embedded `fgk new` project templates.
 //!
-//! Task 10a stands up the **fixtures** that `fgk new` (Task 10b) will
-//! materialise on disk. Each [`Template`] carries the destination path
-//! relative to the new project's root and the file contents, with
-//! `{name}` placeholders left in place for [`substitute`] to fill in
-//! at generation time.
+//! Each [`Template`] carries the destination path relative to the new
+//! project's root and the file contents, with `{name}` placeholders
+//! left in place for [`substitute`] to fill in at generation time.
 //!
 //! ## Why `include_str!` instead of a build script
 //!
-//! The templates are plain text fixtures the loop edits often during
-//! the early days of the kit. Reading them through `include_str!` keeps
-//! authoring trivial (touch a file, recompile) and lets `cargo`'s file
-//! tracking invalidate the binary when a template changes — no
-//! `build.rs` boilerplate, no second source of truth.
+//! The templates are plain text fixtures. Reading them through
+//! `include_str!` keeps authoring trivial (touch a file, recompile)
+//! and lets `cargo`'s file tracking invalidate the binary when a
+//! template changes — no `build.rs` boilerplate, no second source of
+//! truth.
 //!
 //! ## Why a single `{name}` placeholder
 //!
-//! SPEC §10.1 names the project after the user's argument; downstream
+//! The project is named after the user's argument; downstream
 //! validators (the slug rule in [`foglet_game::GameConfig`], Cargo's
 //! crate-name rule) accept the same lowercase-alphanumeric-with-dashes
 //! shape. One token covers the crate name, the slug, the README title,
 //! and the Foglet door id without forcing the CLI to reason about
-//! per-field transformations. Multi-token substitutions can be added
-//! when a template grows a field that genuinely diverges from the slug.
+//! per-field transformations.
 
 /// One file the `fgk new` scaffolder writes into the destination
 /// directory.
@@ -92,14 +89,14 @@ mod tests {
     use super::*;
 
     /// Sample name used across the substitution tests. `test-game`
-    /// satisfies the SPEC §9.1 slug rule (lowercase alphanumeric +
-    /// `-`, no leading/trailing `-`) and Cargo's crate-name rule, so
-    /// the substituted output should pass every parser we throw at it.
+    /// satisfies the slug rule (lowercase alphanumeric + `-`, no
+    /// leading/trailing `-`) and Cargo's crate-name rule, so the
+    /// substituted output passes every parser we throw at it.
     const SAMPLE_NAME: &str = "test-game";
 
     #[test]
-    fn templates_cover_spec_10_1_required_files() {
-        // SPEC §10.1: `fgk new` MUST generate Cargo project, src/main.rs,
+    fn templates_cover_required_files() {
+        // `fgk new` must generate Cargo project, src/main.rs,
         // assets/game.toml, starter map, .gitignore, README.
         let paths: Vec<&str> = TEMPLATES.iter().map(|t| t.dest_path).collect();
         for required in [
@@ -188,8 +185,8 @@ mod tests {
         let body = rendered("assets/game.toml");
         let cfg = foglet_game::GameConfig::from_toml_str(&body)
             .expect("rendered game.toml should pass GameConfig validation");
-        // Title and slug both flow from `{name}`; if either drifts, the
-        // scaffolder will produce a config the SPEC §9.1 validator
+        // Title and slug both flow from `{name}`; if either drifts,
+        // the scaffolder will produce a config the slug validator
         // rejects.
         assert_eq!(cfg.game.slug, SAMPLE_NAME);
         assert_eq!(cfg.game.title, SAMPLE_NAME);
@@ -259,9 +256,9 @@ mod tests {
         );
     }
 
-    /// Regression guard for v1.1 Task 9d: the scaffolded README must
-    /// surface the prompt primitives so authors know they're available
-    /// without spelunking the kit's API docs.
+    /// Regression guard: the scaffolded README must surface the prompt
+    /// primitives so authors know they're available without spelunking
+    /// the kit's API docs.
     #[test]
     fn readme_template_mentions_prompt_primitives() {
         let body = rendered("README.md");

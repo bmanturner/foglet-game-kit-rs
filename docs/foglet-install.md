@@ -82,17 +82,16 @@ Substitute the actual user/group Foglet runs under on your host. If
 you use `FGK_SAVE_DIR` to override the save root, point it at a
 directory with the same ownership.
 
-### 3.1 Shared-world directory (v2 world-enabled games)
+### 3.1 Shared-world directory (world-enabled games)
 
 If `[world].enabled = true` in `assets/game.toml`, the package ships a
-`world/` directory at the install root (SPEC_v2 §6.1). The runtime
-opens (and on first launch creates) the SQLite file at
-`<install-dir>/world/world.sqlite` — by default `world/world.sqlite`
-relative to the binary, or whatever absolute/relative path
-`[world].path` points at. The directory MUST be writable by the same
-identity that owns `saves/`, because SQLite needs to write the DB file
-itself plus `-wal` and `-shm` siblings when WAL journaling is enabled
-(SPEC_v2 §6, default `journal_mode = "wal"`).
+`world/` directory at the install root. The runtime opens (and on first
+launch creates) the SQLite file at `<install-dir>/world/world.sqlite`
+— by default `world/world.sqlite` relative to the binary, or whatever
+absolute/relative path `[world].path` points at. The directory MUST be
+writable by the same identity that owns `saves/`, because SQLite needs
+to write the DB file itself plus `-wal` and `-shm` siblings when WAL
+journaling is enabled (default `journal_mode = "wal"`).
 
 Pre-create the directory with the same ownership as `saves/`:
 
@@ -101,13 +100,13 @@ sudo install -d -m 0755 -o foglet -g foglet \
   /srv/foglet/doors/<slug>/world
 ```
 
-`run.sh` never deletes or recreates `world/world.sqlite` (SPEC_v2
-§6.1), and `fgk package` does not pre-populate it — the database is
-authored by the game on first launch, then evolves through the
-migrations declared in `assets/world/migrations/`. Treat the file as
-durable game state, not a build artifact.
+`run.sh` never deletes or recreates `world/world.sqlite`, and
+`fgk package` does not pre-populate it — the database is authored by
+the game on first launch, then evolves through the migrations declared
+in `assets/world/migrations/`. Treat the file as durable game state,
+not a build artifact.
 
-### 3.2 Scheduling `fgk tick` from cron (v4 world ticks)
+### 3.2 Scheduling `fgk tick` from cron
 
 If your game enables `[world_ticks].enabled = true`, run `fgk tick`
 outside the active TUI on a schedule (for example, once per minute).
@@ -156,17 +155,17 @@ Foglet's logs — manifest validation errors are printed at boot.
 ## 5. Permission and isolation expectations
 
 The kit does not provide sandboxing. Process isolation is controlled
-entirely by the Foglet manifest and host deployment (SPEC §13.3):
+entirely by the Foglet manifest and host deployment:
 
 - The `env` and `env_allowlist` fields in the generated manifest
   define the only environment the door sees. The kit emits
   `TERM=xterm-256color` and `LANG=C.UTF-8` by default; add anything
   else explicitly. **No app secrets, DB URLs, or API tokens** belong
-  here — the game is not allowed to depend on them (SPEC §2.2).
+  here — the game must not depend on them.
 - Foglet's PTY adapter is responsible for process-group cleanup,
-  timeouts, idle timeouts, resize forwarding, and disconnect handling
-  (SPEC §2.1). The game cooperates by restoring the terminal on every
-  exit path; see [`terminal-safety.md`](terminal-safety.md).
+  timeouts, idle timeouts, resize forwarding, and disconnect handling.
+  The game cooperates by restoring the terminal on every exit path; see
+  [`terminal-safety.md`](terminal-safety.md).
 - If your Foglet deployment uses the helper-backed PTY with sandbox
   identity, ensure that identity has read access to the install
   directory and write access to the saves root. Sandboxed doors fail
@@ -179,11 +178,11 @@ entirely by the Foglet manifest and host deployment (SPEC §13.3):
   — both owned by the door runtime user. Sandboxed deployments must
   ensure the sandbox identity retains write access to `world/`, or the
   shared world will fail to open and the door will exit with a
-  controlled error after terminal restoration (SPEC_v2 §8).
+  controlled error after terminal restoration.
 
 The kit refuses to read inherited host environment beyond the
 documented `FOGLET_*` variables, and save files contain only
-game-defined state — never the Foglet context (SPEC §5.6, §12).
+game-defined state — never the Foglet context.
 
 ### 5.1 Backing up and maintaining the shared world
 
@@ -233,18 +232,18 @@ DB file and its `-wal`/`-shm` siblings at the same instant.
 
 The kit does not migrate world data for you. If a migration in
 `assets/world/migrations/` is destructive, take a backup first; world
-migrations run idempotently on launch (SPEC_v2 §4) but the schema
-they leave behind is binding.
+migrations run idempotently on launch but the schema they leave
+behind is binding.
 
 For routine maintenance, run occasional `PRAGMA wal_checkpoint(TRUNCATE);`
 during low traffic and `VACUUM` during scheduled downtime if the world
-file grows from churn in v4-heavy tables like `place_recall` and
-`inventory_slots`, or v5-heavy tables like `contracts` when games post
-and expire large numbers of jobs. Always take a backup first.
+file grows from churn in high-volume tables like `place_recall`,
+`inventory_slots`, or `contracts` when games post and expire large
+numbers of jobs. Always take a backup first.
 
 ## 6. Foglet QA standards
 
-SPEC §14 requires the following before signing off on an install:
+Before signing off on an install:
 
 - **80x24 baseline.** The game must launch and play through one full
   loop at the standard BBS size.
@@ -265,8 +264,7 @@ The recommended smoke flow once the door is live:
 2. Open the Door Games list and confirm the slug appears.
 3. Launch the door; play through title → menu → map → dialog →
    inventory → save → quit.
-4. Relaunch and verify the save survived (per-user persistence,
-   SPEC §12).
+4. Relaunch and verify the save survived (per-user persistence).
 5. Resize the terminal mid-game; confirm no corruption.
 6. Force a disconnect (close the SSH session) and reconnect; confirm
    Foglet has cleaned up the PTY and the door is launchable again.
@@ -294,7 +292,7 @@ saves for you.
 - **Door launches but exits immediately.** Run the binary directly on
   the host with the documented `FOGLET_*` env vars set; the game's
   controlled-error path prints a short message after terminal
-  restoration (SPEC §7.3). Check that `assets/` shipped alongside the
+  restoration. Check that `assets/` shipped alongside the
   binary — the runtime resolves asset paths from `--assets`, which
   `run.sh` points at the install directory's `assets/`.
 - **Shared world fails to open / SQLite `database is locked`.**
@@ -306,7 +304,7 @@ saves for you.
   alive, and remove only the `-wal` / `-shm` files (never
   `world.sqlite` itself). The runtime opens the DB during startup
   and surfaces failures as a controlled error after terminal
-  restoration (SPEC_v2 §8).
+  restoration.
 - **Saves not persisting across launches.** Confirm
   `/srv/foglet/doors/<slug>/saves/` is writable by the user Foglet
   runs the door under. Atomic writes go through a temp file in the
@@ -314,7 +312,7 @@ saves for you.
   surfaces as a controlled error after terminal restoration.
 - **Terminal corruption on disconnect or crash.** The kit installs a
   panic hook that runs the restoration sequence before the panic
-  message prints (SPEC §13.1). If you see corruption, capture the
+  message prints. If you see corruption, capture the
   reproduction recipe and check
   [`terminal-safety.md`](terminal-safety.md) — the contract there is
   the source of truth for what should and should not happen on every

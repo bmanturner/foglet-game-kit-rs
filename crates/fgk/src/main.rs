@@ -6,11 +6,11 @@
 //! only parses arguments via `clap` and dispatches to the right
 //! library entry point.
 //!
-//! Subcommand status (per SPEC §15):
-//!   - `fgk new <path>`            ← Task 10b
-//!   - `fgk emit-manifest`         ← Task 11
-//!   - `fgk package`               ← Task 12
-//!   - `fgk tick --project <path>` ← Task 10
+//! Subcommands:
+//!   - `fgk new <path>`            scaffold a starter game project
+//!   - `fgk emit-manifest`         print Foglet manifest JSON
+//!   - `fgk package`               produce a deployable door bundle
+//!   - `fgk tick --project <path>` run world tick tasks
 
 use std::path::PathBuf;
 
@@ -37,8 +37,8 @@ enum Command {
     /// Scaffold a new game project at the given path.
     ///
     /// The final path component is used as both the Cargo crate name
-    /// and the SPEC §9.1 game slug, so it must satisfy the slug rule
-    /// (lowercase ASCII alphanumeric or `-`, no leading/trailing `-`).
+    /// and the game slug, so it must satisfy the slug rule (lowercase
+    /// ASCII alphanumeric or `-`, no leading/trailing `-`).
     New {
         /// Destination directory. Must either not exist or be empty.
         path: PathBuf,
@@ -46,15 +46,14 @@ enum Command {
 
     /// Emit a Foglet operator manifest JSON for the current project.
     ///
-    /// Reads `<project>/assets/game.toml` and prints the SPEC §10.3
-    /// JSON to stdout. Operators redirect into the Foglet manifest
-    /// directory (`fgk emit-manifest ... > /etc/foglet/manifests/...`).
+    /// Reads `<project>/assets/game.toml` and prints the manifest JSON
+    /// to stdout. Operators redirect into the Foglet manifest directory
+    /// (`fgk emit-manifest ... > /etc/foglet/manifests/...`).
     EmitManifest {
         /// Absolute path the door will be installed at on the Foglet
         /// host (typically `/srv/foglet/doors/<slug>`). The manifest's
         /// `command` and `working_dir` are derived from this; relative
-        /// paths are rejected to keep Foglet from resolving them
-        /// against an unintended CWD (SPEC §10.3 + §13.2).
+        /// paths are rejected to prevent CWD-relative resolution.
         #[arg(long, value_name = "ABSOLUTE_PATH")]
         install_dir: String,
 
@@ -69,7 +68,7 @@ enum Command {
     /// Build and assemble a deployable Foglet door bundle.
     ///
     /// Runs `cargo build --release` in the project, then writes
-    /// `<out>/{<slug>, run.sh, manifest.json, assets/}` per SPEC §10.4.
+    /// `<out>/{<slug>, run.sh, manifest.json, assets/}`.
     /// The output directory must be empty or non-existent.
     Package {
         /// Output directory for the bundle. Required so operators

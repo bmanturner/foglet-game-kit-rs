@@ -38,7 +38,7 @@ The design biases that follow from this:
   player-typed field has a length cap enforced before the SQL
   round-trip, and rejected drafts never produce autoincrement gaps.
 
-What this layer explicitly does *not* do is covered separately in §10.
+What this layer explicitly does *not* do is covered separately in the limitations section below.
 
 ## 2. The five primitives at a glance
 
@@ -391,7 +391,7 @@ This is mailbox multiplayer; the contract is refresh-on-navigation.
 This is the load-bearing exclusion the rest of the document is built
 around, so it gets its own subsection rather than a bullet in a
 list. This section explains what that means in practice for a game
-author who has just finished reading §§3–7 and is now wondering
+author who has just finished reading sections 3–7 and is now wondering
 "can I add a chat window?"
 
 **No.** The async multiplayer layer explicitly forbids:
@@ -406,7 +406,7 @@ author who has just finished reading §§3–7 and is now wondering
   typing…" indicator. The design bias is *mailbox over live*;
   everything else follows from that.
 - **Background pollers, daemons, or long-lived threads** to simulate
-  the above. The runtime contract from §9 is refresh-on-navigation;
+  the above. The runtime contract is refresh-on-navigation;
   a 1-second poll loop that updates an inbox badge is still
   forbidden, because it pulls the runtime away from the BBS-native
   model and toward a presence-aware client. (Sweepers like
@@ -434,7 +434,7 @@ Three reasons, in priority order:
    is the exact failure mode the guard exists to prevent. Mailbox
    multiplayer keeps the terminal-owning thread the *only* writer.
 2. **Transactional state machines over ad-hoc flags.** Every lifecycle
-   edge in §§3–7 is a single conditional `UPDATE … RETURNING`. That
+   edge described above is a single conditional `UPDATE … RETURNING`. That
    works because there is exactly one writer per row at a time,
    serialised by SQLite's write lock. A real-time layer re-introduces
    the optimistic-concurrency / merge-conflict problem the mailbox

@@ -1,7 +1,7 @@
 # Authoring a loot prompt
 
-This walkthrough builds the **Giant Spider corpse** loot prompt from
-SPEC §4.3 end-to-end: the choice model, the reducer, the post-action
+This walkthrough builds the **Giant Spider corpse** loot prompt
+end-to-end: the choice model, the reducer, the post-action
 [`FeedbackLine`], and a small render check. It is meant as the
 canonical "first prompt" example for new authors — copy-paste, then
 swap in your game's enum and items.
@@ -19,8 +19,8 @@ Your choice:
 ```
 
 That output comes out of the kit unchanged — the renderer in
-`ChoicePrompt::render` produces SPEC §4.3's example verbatim from a
-plain builder chain.
+`ChoicePrompt::render` produces that output verbatim from a plain
+builder chain.
 
 ## 1. Define the action enum
 
@@ -57,7 +57,7 @@ fn spider_loot_prompt() -> ChoicePrompt<SpiderLoot> {
 }
 ```
 
-Direct hotkeys are case-insensitive (SPEC §4.2). `'e'` and `'E'`
+Direct hotkeys are case-insensitive. `'e'` and `'E'`
 both select `Equip`. No Enter key is needed for the compact unboxed
 mode shown above; the renderer adds a trailing `Your choice:` label
 for free.
@@ -98,7 +98,7 @@ fn on_input(prompt: &ChoicePrompt<SpiderLoot>, input: Input)
 }
 ```
 
-The three `FeedbackLine` constructors map to the three SPEC §4.7
+The three `FeedbackLine` constructors map to the three
 severities: `info` is unmarked, `success` prepends `+ `, `error`
 prepends `! `. The markers carry the meaning on a black-and-white
 BBS terminal where color is gone — never assume a player can see
@@ -124,12 +124,12 @@ fn draw(frame_area: Rect, buf: &mut ratatui::buffer::Buffer,
 `render` returns the row count it consumed so a custom screen can
 stack a transcript above and a status footer below without
 overlapping. Both render paths honour the default `Theme` and stay
-SPEC §4.7 monochrome-safe.
+Monochrome-safe.
 
 ## 5. Write a TestBackend assertion
 
 Every prompt SHOULD have at least one `TestBackend` snapshot test —
-it catches accidental layout drift and double-checks the SPEC §4.3
+it catches accidental layout drift and double-checks the
 example shape. The whole test fits in fifteen lines:
 
 ```rust
@@ -157,8 +157,8 @@ fn spider_loot_prompt_matches_spec_example() {
 The loot prompt above stays static once the corpse is on the floor.
 A shop or vendor is the opposite case: prices are fixed by the world
 but the *player* state — gold on hand, free slots in a potion bag —
-shifts every time they open the menu. SPEC §5 calls this out
-explicitly with the wandering monk example, and §4.2 requires that
+shifts every time they open the menu. The kit calls this out
+explicitly with the wandering monk example, and the kit requires that
 disabled choices stay visible with a reason. This section shows the
 end-to-end shape using the same builder API as the loot prompt.
 
@@ -219,7 +219,7 @@ impl VendorView {
 
 Two reasons, two checks: surface the *binding* constraint so the
 player knows whether to drop a potion or earn more gold. A single
-"unavailable" string is a SPEC §4.7 anti-pattern — it forces the
+"unavailable" string is an anti-pattern — it forces the
 player to guess.
 
 ### 2. Build the prompt with dynamic labels
@@ -328,13 +328,9 @@ fn monk_prompt_disables_purchase_when_broke() {
 If a test fails because the row wraps onto a second line, widen the
 `TestBackend` rather than shortening the label — vendors in real
 games tend to grow longer labels, and the prompt renderer's wrap
-behaviour is covered separately by the SPEC §6 rendering tests.
+behaviour is covered separately by the rendering tests.
 
 ## See also
 
 - [`prompt-screens.md`](prompt-screens.md) — when to wrap a prompt
   in `PromptScreen<T>` versus a hand-rolled `Screen`.
-- SPEC §4.3 — full `PromptChoice` / `ChoicePrompt` contract.
-- SPEC §4.5 — `ConfirmPrompt` for the dangerous-action variant.
-- SPEC §4.6 — `AnyKeyPrompt` for the post-feedback pause.
-- SPEC §5 — wandering monk vendor example this walkthrough mirrors.

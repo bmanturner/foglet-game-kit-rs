@@ -1,9 +1,9 @@
 //! `fgk package --out <dir>` — assemble a deployable Foglet door bundle.
 //!
-//! SPEC §10.4 says: given a scaffolded project, produce a directory
-//! containing the release binary, a boring `run.sh` wrapper,
-//! `manifest.json`, and a copy of `assets/`. This module is the
-//! library half of that subcommand; `main.rs` is the thin CLI shell.
+//! Given a scaffolded project, produces a directory containing the
+//! release binary, a `run.sh` wrapper, `manifest.json`, and a copy of
+//! `assets/`. This module is the library half of that subcommand;
+//! `main.rs` is the thin CLI shell.
 //!
 //! ## Two entry points
 //!
@@ -19,13 +19,12 @@
 //!
 //! ## What we do *not* do
 //!
-//! - We do not strip, sign, or compress the binary. SPEC §13.3 leaves
-//!   sandboxing/hardening to the Foglet manifest and host deployment.
+//! - We do not strip, sign, or compress the binary. Sandboxing and
+//!   hardening are controlled by the Foglet manifest and host deployment.
 //! - We do not interpolate any user-supplied data into `run.sh` beyond
-//!   the validated slug. SPEC §10.4 explicitly forbids it; the slug is
-//!   already constrained to lowercase ASCII alphanumerics and `-` by
-//!   `GameConfig` validation, so there is no shell-metacharacter
-//!   surface to escape.
+//!   the validated slug. The slug is constrained to lowercase ASCII
+//!   alphanumerics and `-` by `GameConfig` validation, so there is no
+//!   shell-metacharacter surface to escape.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -35,15 +34,10 @@ use foglet_game::{ConfigError, GameConfig};
 
 use crate::emit_manifest::{self, EmitManifestError, GAME_TOML_RELATIVE};
 
-/// Boring, auditable wrapper script per SPEC §10.4.
+/// Auditable wrapper script template written to `run.sh`.
 ///
-/// Stored as a single static string so the bytes the loop produces
-/// match the SPEC example character-for-character (modulo the slug
-/// substitution). The only placeholder is `{slug}`; everything else
-/// is fixed shell.
-///
-/// **Do not** add new placeholders here without revisiting SPEC §10.4
-/// — the wrapper's auditability story rests on the file being short
+/// The only placeholder is `{slug}`; everything else is fixed shell.
+/// The wrapper's auditability story rests on the file being short
 /// enough to read in one sitting and free of any path that interpolates
 /// arbitrary user input.
 const RUN_SH_TEMPLATE: &str = r#"#!/usr/bin/env bash
@@ -153,19 +147,18 @@ pub struct PackageOutputs {
     pub out_dir: PathBuf,
     /// `<out>/<slug>` — the executable game binary.
     pub binary: PathBuf,
-    /// `<out>/run.sh` — the SPEC §10.4 wrapper script.
+    /// `<out>/run.sh` — the auditable wrapper script.
     pub run_sh: PathBuf,
     /// `<out>/manifest.json` — the Foglet operator manifest.
     pub manifest: PathBuf,
     /// `<out>/assets/` — directory containing the project's assets.
     pub assets: PathBuf,
-    /// `<out>/<world-parent>/` — present only for world-enabled games
-    /// (SPEC v2 §5 + Task 11a). The world DB itself is created on
-    /// first launch by the runtime; we ship the parent directory with
-    /// a `.keep` sentinel so operators get a clearly-named writable
-    /// slot in the bundle and `tar` / `cp -r` don't drop an empty
-    /// directory. `None` for v1-style games without `[world]
-    /// enabled = true`.
+    /// `<out>/<world-parent>/` — present only for world-enabled games.
+    /// The world DB itself is created on first launch by the runtime;
+    /// we ship the parent directory with a `.keep` sentinel so
+    /// operators get a clearly-named writable slot in the bundle and
+    /// `tar` / `cp -r` don't drop an empty directory. `None` for
+    /// games without `[world] enabled = true`.
     pub world_dir: Option<PathBuf>,
     /// Slug derived from the project's `game.toml`, exposed so callers
     /// (the CLI summary line, future packagers) don't have to re-read
@@ -222,9 +215,9 @@ pub fn assemble_bundle(inputs: PackageInputs<'_>, binary: &Path) -> PackageResul
     copy_file(binary, &dest_binary)?;
     set_executable(&dest_binary)?;
 
-    // Render and write run.sh. SPEC §10.4 requires the wrapper be
-    // executable; without the +x bit Foglet would run it via /bin/sh
-    // anyway, but operators expect to be able to invoke it directly.
+    // Render and write run.sh. The wrapper must be executable;
+    // without the +x bit Foglet would run it via /bin/sh anyway, but
+    // operators expect to be able to invoke it directly.
     let run_sh_path = out_dir.join("run.sh");
     let run_sh_body = render_run_sh(&slug);
     write_file(&run_sh_path, run_sh_body.as_bytes())?;
@@ -242,9 +235,9 @@ pub fn assemble_bundle(inputs: PackageInputs<'_>, binary: &Path) -> PackageResul
     let src_assets = project_dir.join("assets");
     copy_dir_recursive(&src_assets, &dest_assets)?;
 
-    // World directory. SPEC v2 §5 says the runtime opens
-    // `<package_root>/<world.path>` (default `world/world.sqlite`) at
-    // startup and creates parent dirs lazily. But operators package the
+    // World directory. The runtime opens `<package_root>/<world.path>`
+    // (default `world/world.sqlite`) at startup and creates parent
+    // dirs lazily. But operators package the
     // bundle with `tar` / `rsync` / `cp -r`, all of which drop empty
     // directories, and they need to know where the writable slot lives
     // before the door has been launched even once. So when the project
@@ -296,7 +289,7 @@ fn materialize_world_dir(out_dir: &Path, world_path: &str) -> PackageResult<Opti
     Ok(Some(world_dir))
 }
 
-/// Render the SPEC §10.4 wrapper for a given slug.
+/// Render the `run.sh` wrapper body for a given slug.
 ///
 /// Public so tests (and any future operator-facing diagnostic that
 /// wants to preview the wrapper before writing it) can call it without
@@ -422,9 +415,9 @@ fn copy_dir_recursive(src: &Path, dest: &Path) -> PackageResult<()> {
     Ok(())
 }
 
-/// Set the executable bit on Unix. No-op on non-Unix because Windows
-/// has no posix exec bit; SPEC's deployment target is Linux Foglet
-/// hosts, but we keep the kit cross-platform for development.
+/// Set the executable bit on Unix. No-op on non-Unix — the deployment
+/// target is Linux Foglet hosts, but we keep the kit cross-platform
+/// for development.
 #[cfg(unix)]
 fn set_executable(path: &Path) -> PackageResult<()> {
     use std::os::unix::fs::PermissionsExt;
@@ -454,10 +447,9 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    /// Verbatim SPEC §9.1 game config — same fixture
-    /// `emit_manifest::tests` uses, replicated so packaging tests are
-    /// self-contained.
-    const SPEC_GAME_TOML: &str = r#"
+    /// Canonical game config fixture — same as `emit_manifest::tests`,
+    /// replicated so packaging tests are self-contained.
+    const CANONICAL_GAME_TOML: &str = r#"
 [game]
 title = "Murder Motel"
 slug = "murder-motel"
@@ -500,9 +492,9 @@ auth_scope = "site"
     }
 
     #[test]
-    fn run_sh_matches_spec_10_4_for_canonical_slug() {
-        // SPEC §10.4 example, byte-for-byte. If this ever drifts the
-        // diff is auditable in one screen.
+    fn run_sh_renders_correctly_for_canonical_slug() {
+        // Byte-for-byte match. If this ever drifts the diff is
+        // auditable in one screen.
         let expected = "#!/usr/bin/env bash\n\
                         set -euo pipefail\n\
                         \n\
@@ -524,7 +516,7 @@ auth_scope = "site"
 
     #[test]
     fn assemble_writes_full_layout() {
-        let project = project_with_assets(SPEC_GAME_TOML);
+        let project = project_with_assets(CANONICAL_GAME_TOML);
         let bin_td = TempDir::new().unwrap();
         let bin = fake_binary(&bin_td, "murder-motel");
         let out_td = TempDir::new().unwrap();
@@ -558,7 +550,7 @@ auth_scope = "site"
 
     #[test]
     fn assemble_marks_binary_and_run_sh_executable() {
-        let project = project_with_assets(SPEC_GAME_TOML);
+        let project = project_with_assets(CANONICAL_GAME_TOML);
         let bin_td = TempDir::new().unwrap();
         let bin = fake_binary(&bin_td, "murder-motel");
         let out_td = TempDir::new().unwrap();
@@ -589,7 +581,7 @@ auth_scope = "site"
 
     #[test]
     fn assemble_writes_valid_manifest_json() {
-        let project = project_with_assets(SPEC_GAME_TOML);
+        let project = project_with_assets(CANONICAL_GAME_TOML);
         let bin_td = TempDir::new().unwrap();
         let bin = fake_binary(&bin_td, "murder-motel");
         let out_td = TempDir::new().unwrap();
@@ -615,7 +607,7 @@ auth_scope = "site"
 
     #[test]
     fn assemble_defaults_install_dir_from_slug_when_unset() {
-        let project = project_with_assets(SPEC_GAME_TOML);
+        let project = project_with_assets(CANONICAL_GAME_TOML);
         let bin_td = TempDir::new().unwrap();
         let bin = fake_binary(&bin_td, "murder-motel");
         let out_td = TempDir::new().unwrap();
@@ -638,7 +630,7 @@ auth_scope = "site"
 
     #[test]
     fn assemble_rejects_relative_install_dir() {
-        let project = project_with_assets(SPEC_GAME_TOML);
+        let project = project_with_assets(CANONICAL_GAME_TOML);
         let bin_td = TempDir::new().unwrap();
         let bin = fake_binary(&bin_td, "murder-motel");
         let out_td = TempDir::new().unwrap();
@@ -665,7 +657,7 @@ auth_scope = "site"
 
     #[test]
     fn assemble_rejects_non_empty_out_dir() {
-        let project = project_with_assets(SPEC_GAME_TOML);
+        let project = project_with_assets(CANONICAL_GAME_TOML);
         let bin_td = TempDir::new().unwrap();
         let bin = fake_binary(&bin_td, "murder-motel");
         let out_td = TempDir::new().unwrap();
@@ -690,7 +682,7 @@ auth_scope = "site"
 
     #[test]
     fn assemble_into_existing_empty_dir_succeeds() {
-        let project = project_with_assets(SPEC_GAME_TOML);
+        let project = project_with_assets(CANONICAL_GAME_TOML);
         let bin_td = TempDir::new().unwrap();
         let bin = fake_binary(&bin_td, "murder-motel");
         let out_td = TempDir::new().unwrap();
@@ -711,7 +703,7 @@ auth_scope = "site"
 
     #[test]
     fn assemble_errors_when_binary_missing() {
-        let project = project_with_assets(SPEC_GAME_TOML);
+        let project = project_with_assets(CANONICAL_GAME_TOML);
         let out_td = TempDir::new().unwrap();
         let out = out_td.path().join("dist");
         let missing = out_td.path().join("nope");
@@ -732,8 +724,8 @@ auth_scope = "site"
         assert!(!out.exists(), "out_dir created despite validation failure");
     }
 
-    /// Verbatim §5 example so a future SPEC tweak surfaces here.
-    const SPEC_GAME_TOML_WITH_WORLD: &str = r#"
+    /// Canonical world-enabled game config fixture.
+    const CANONICAL_GAME_TOML_WITH_WORLD: &str = r#"
 [game]
 title = "Murder Motel"
 slug = "murder-motel"
@@ -758,12 +750,12 @@ enabled = true
 "#;
 
     #[test]
-    fn assemble_skips_world_dir_for_v1_games() {
-        // Task 11a: a v1 project (no `[world]` section, world disabled
-        // by default) must NOT get a `world/` directory in its bundle —
-        // operators reading the layout shouldn't see a writable slot
-        // the runtime will never touch.
-        let project = project_with_assets(SPEC_GAME_TOML);
+    fn assemble_skips_world_dir_when_world_not_enabled() {
+        // A project without `[world]` (world disabled by default) must
+        // NOT get a `world/` directory in its bundle — operators
+        // reading the layout shouldn't see a writable slot the runtime
+        // will never touch.
+        let project = project_with_assets(CANONICAL_GAME_TOML);
         let bin_td = TempDir::new().unwrap();
         let bin = fake_binary(&bin_td, "murder-motel");
         let out_td = TempDir::new().unwrap();
@@ -779,19 +771,19 @@ enabled = true
         )
         .unwrap();
 
-        assert!(outputs.world_dir.is_none(), "world_dir set for v1 game");
+        assert!(outputs.world_dir.is_none(), "world_dir set for game without world enabled");
         assert!(
             !out.join("world").exists(),
-            "world/ directory created for v1 game"
+            "world/ directory created for game without world enabled"
         );
     }
 
     #[test]
     fn assemble_creates_world_keep_for_enabled_world() {
-        // Task 11a: world-enabled bundles must contain `world/.keep` so
-        // the writable directory survives `tar` / `rsync` archival even
+        // World-enabled bundles must contain `world/.keep` so the
+        // writable directory survives `tar` / `rsync` archival even
         // before the runtime has populated it with a SQLite file.
-        let project = project_with_assets(SPEC_GAME_TOML_WITH_WORLD);
+        let project = project_with_assets(CANONICAL_GAME_TOML_WITH_WORLD);
         let bin_td = TempDir::new().unwrap();
         let bin = fake_binary(&bin_td, "murder-motel");
         let out_td = TempDir::new().unwrap();
@@ -900,11 +892,11 @@ path = "world.sqlite"
 
     #[test]
     fn run_sh_never_touches_world_directory() {
-        // Task 11b: the SPEC §10.4 wrapper must not delete, recreate,
-        // chmod, or otherwise manipulate the bundle's `world/`
-        // directory. The shared-world SQLite file is the live state for
-        // every player who has ever launched the door — wiping it on
-        // launch would destroy the world. This invariant holds today
+        // The run.sh wrapper must not delete, recreate, chmod, or
+        // otherwise manipulate the bundle's `world/` directory. The
+        // shared-world SQLite file is the live state for every player
+        // who has ever launched the door — wiping it on launch would
+        // destroy the world. This invariant holds today
         // (the template has no `world` token at all), but encoding it
         // as a test means a future edit to RUN_SH_TEMPLATE that
         // accidentally adds, say, `rm -rf "$DIR/world"` for "cleanup"

@@ -6,11 +6,11 @@
 //! and so on. The `foglet_game` crate provides the runtime that
 //! drives those screens; this file only wires them together.
 //!
-//! Startup follows SPEC §7.1 by delegating to `foglet_game::Game`:
-//! the runtime checks the terminal's minimum size, installs the
-//! panic-cleanup hook, enters raw mode, and only then enters the
-//! event loop. There is intentionally no terminal-handling code in
-//! this file — that responsibility lives inside the kit.
+//! Startup delegates to `foglet_game::Game`: the runtime checks the
+//! terminal's minimum size, installs the panic-cleanup hook, enters
+//! raw mode, and only then enters the event loop. There is
+//! intentionally no terminal-handling code in this file — that
+//! responsibility lives inside the kit.
 
 use foglet_game::{
     load_context, process_env, Game, GameConfig, GameContext, Input, Screen, ScreenCommand,
@@ -43,8 +43,8 @@ impl Screen for TitleScreen {
 }
 
 fn main() -> anyhow::Result<()> {
-    // `assets/game.toml` is the SPEC §9.1 game manifest; the kit's
-    // `GameConfig` parser handles every field validation rule.
+    // `assets/game.toml` is the game manifest; the kit's `GameConfig`
+    // parser handles every field validation rule.
     let config = GameConfig::load("assets/game.toml")?;
 
     // `load_context` reads `FOGLET_DOOR_CONTEXT` (production) or the

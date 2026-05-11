@@ -1,12 +1,10 @@
 //! Project scaffolding for `fgk new <path>`.
 //!
-//! Task 10b materialises the embedded [`crate::templates::TEMPLATES`]
-//! fixtures onto disk under a fresh project directory. The scaffolder
-//! is deliberately small: it validates the project name, creates the
-//! destination tree, and writes each template after running
-//! [`crate::templates::substitute`] on its body. Anything richer
-//! (post-generation hooks, Git init, optional plugins) is out of
-//! scope until SPEC asks for it.
+//! The scaffolder materialises the embedded [`crate::templates::TEMPLATES`]
+//! fixtures onto disk under a fresh project directory. It validates
+//! the project name, creates the destination tree, and writes each
+//! template after running [`crate::templates::substitute`] on its
+//! body.
 //!
 //! ## Why the scaffolder lives in the library, not `main.rs`
 //!
@@ -66,8 +64,8 @@ pub enum ScaffoldError {
     NameFromPath(PathBuf),
 
     /// The derived (or supplied) project name does not satisfy the
-    /// SPEC §9.1 slug rule. The same rule is also Cargo's crate-name
-    /// rule for the shape we accept, so a single check covers both.
+    /// slug rule (lowercase ASCII alphanumeric or `-`, no leading/
+    /// trailing `-`). The same rule matches Cargo's crate-name rule.
     #[error(
         "project name `{0}` is not a valid slug — must be lowercase ASCII alphanumeric or `-`, \
          must not start or end with `-`, and must be non-empty (e.g. `murder-motel`)"
@@ -222,15 +220,15 @@ pub fn name_from_path(dest: &Path) -> ScaffoldResult<String> {
         .ok_or_else(|| ScaffoldError::NameFromPath(dest.to_path_buf()))
 }
 
-/// SPEC §9.1 slug rule, mirrored locally so the scaffolder can
+/// Slug validation rule, mirrored locally so the scaffolder can
 /// reject bad names *before* writing any files.
 ///
 /// Kept in sync with the validator inside `foglet_game::config`. We
 /// duplicate the rule rather than re-export it to avoid widening the
 /// `foglet_game` public surface for a CLI-only concern; if the rule
-/// drifts, a unit test in 10a (`game_toml_template_parses_as_game_config`)
-/// fails fast because the rendered `assets/game.toml` would no longer
-/// pass `GameConfig` validation.
+/// drifts, the `game_toml_template_parses_as_game_config` test fails
+/// fast because the rendered `assets/game.toml` would no longer pass
+/// `GameConfig` validation.
 fn is_valid_slug(s: &str) -> bool {
     if s.is_empty() {
         return false;
@@ -280,8 +278,8 @@ fn write_file(path: &Path, bytes: &[u8]) -> ScaffoldResult<()> {
 mod tests {
     use super::*;
 
-    /// Canonical good name. Mirrors the SPEC §9.1 example (`murder-motel`)
-    /// without colliding with the actual sample game's slug.
+    /// Canonical good slug name, without colliding with the actual
+    /// sample game's slug.
     const SAMPLE_NAME: &str = "test-game";
 
     fn fresh_dest(td: &tempfile::TempDir, name: &str) -> PathBuf {

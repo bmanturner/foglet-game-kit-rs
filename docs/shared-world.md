@@ -7,7 +7,7 @@ that won't clear.
 
 For the install-side mechanics (creating `world/`, ownership, and the
 in-context backup commands), see
-[`foglet-install.md`](foglet-install.md) §3.1 and §5.1; this doc
+[`foglet-install.md`](foglet-install.md) (sections 3.1 and 5.1); this doc
 focuses on the *why* and on author-facing concerns.
 
 ## 1. Why a per-game SQLite file at all
@@ -143,7 +143,7 @@ What the game author owns:
   the `name` field for human context.
 - Writing forward-only SQL. The shared-world layer does not implement
   automated rollback — if a migration is destructive and you need to
-  undo it, restore from backup (§5).
+  undo it, restore from backup (see section 5 below).
 - Keeping migrations small and self-contained. A migration that
   depends on application code paths (e.g. a Rust callback that calls
   back into game logic) is allowed but discouraged; future-you reading
@@ -164,7 +164,7 @@ with embedded SQL.
   belong in any column.
 - **Don't drop tables that hold game-defined player progress.** The
   kit will not stop you, but the data is the only authoritative copy.
-  If you must drop, take a backup first (§5).
+  If you must drop, take a backup first (see section 5 below).
 - **Don't write `PRAGMA foreign_keys = OFF` in a shipped migration.**
   Enforce constraints at write time; relax them only inside a one-off
   data-fix migration that turns them back on at the end.
@@ -189,7 +189,7 @@ Two safe strategies:
    cooperates with WAL.
 
 The exact commands live in [`foglet-install.md`](foglet-install.md)
-§5.1. Two rules worth repeating because they are the load-bearing
+Section 5.1 of foglet-install.md documents backup strategies. Two rules worth repeating because they are the load-bearing
 ones:
 
 - **Never `cp world.sqlite` while a door process is live under WAL.**
@@ -203,7 +203,7 @@ delete any stale `-wal` / `-shm` siblings, then start the door. The
 runtime applies any migrations the restored file is missing on the
 next open.
 
-Migrations are forward-only (§4). If a future migration is destructive,
+Migrations are forward-only. If a future migration is destructive,
 your backup is the rollback path.
 
 ## 6. Lock recovery
@@ -222,7 +222,7 @@ In a single-process door runtime this almost always means one of:
   panes are the usual culprit. Close them.
 - **The door runtime user lost write permission to `world/`.** The
   open succeeds (read), the first write fails. Re-check ownership;
-  see [`foglet-install.md`](foglet-install.md) §3.1.
+  see [`foglet-install.md`](foglet-install.md) section 3.1.
 - **The filesystem is full or read-only.** SQLite reports a lock or
   IO error indistinguishably in some cases. Check `df` and the
   syslog.
@@ -272,7 +272,7 @@ real-time alternative:
 - **Operational simplicity.** A SQLite file the operator can copy and
   inspect is a much smaller commitment than a service to run, monitor,
   upgrade, secure, and triage at 3am. The whole `world/` directory
-  fits in a `tar` (§5). A real-time server would add a process to
+  fits in a `tar`. A real-time server would add a process to
   supervise, a port to firewall, a deploy story to maintain, and a new
   failure mode to page on.
 - **Foglet's process model.** Doors are `:external_pty` children;

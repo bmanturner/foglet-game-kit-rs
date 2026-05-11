@@ -1,7 +1,7 @@
 #
 # `fgk` — the operator-facing CLI for foglet-game-kit-rs.
 #
-# Eventual subcommands (per SPEC §15):
+# Subcommands:
 #   - `fgk new <path>`            scaffold a starter game project
 #   - `fgk emit-manifest`         print Foglet manifest JSON
 #   - `fgk package`               produce a deployable door bundle
@@ -41,8 +41,7 @@ foglet_game = { path = "../foglet_game" }
 
 # Argument parsing for the `fgk` subcommands. `derive` keeps the
 # subcommand definitions colocated with the structs they populate.
-# Introduced by Task 10b (`fgk new`); future subcommands extend the
-# same enum.
+# Future subcommands extend the same enum.
 clap = { workspace = true }
 
 # Process-boundary error chain for the binary. Library-internal
@@ -54,24 +53,22 @@ thiserror = { workspace = true }
 
 [dev-dependencies]
 # Round-trip the embedded `Cargo.toml` template through a real TOML
-# parser as part of the template fixture tests (Task 10a).
+# parser as part of the template fixture tests.
 toml = { workspace = true }
 
-# Scratch directories for scaffolder tests (Task 10b). The scaffolder
-# writes real files; `tempfile::TempDir` keeps each test hermetic.
+# Scratch directories for scaffolder tests. The scaffolder writes real
+# files; `tempfile::TempDir` keeps each test hermetic.
 tempfile = { workspace = true }
 
-# Drives the `fgk` binary as an end-to-end smoke test (Task 10b).
+# Drives the `fgk` binary as an end-to-end smoke test.
 assert_cmd = { workspace = true }
 predicates = { workspace = true }
 
-# Parse the JSON `fgk emit-manifest` prints to stdout in the Task 11
-# CLI smoke test, so the assertion is on values rather than brittle
-# substring matches.
+# Parse the JSON `fgk emit-manifest` prints to stdout in CLI smoke
+# tests, so assertions are on values rather than brittle substring matches.
 serde_json = { workspace = true }
 
-# Syntactic validation of the embedded `src/main.rs` template — see
-# DECISIONS.md ADR 2026-05-08 (template fixture validation) for why
-# `syn` joins the crate budget. `default-features = false` keeps the
-# dev-dep surface small: we only need the parser, not codegen.
+# Syntactic validation of the embedded `src/main.rs` template.
+# `default-features = false` keeps the dev-dep surface small: we only
+# need the parser, not codegen.
 syn = { version = "2", features = ["full"] }

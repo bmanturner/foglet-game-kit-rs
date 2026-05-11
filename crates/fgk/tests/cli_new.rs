@@ -1,11 +1,10 @@
-//! End-to-end smoke test for `fgk new <path>` (Task 10b).
+//! End-to-end smoke test for `fgk new <path>`.
 //!
 //! Unit tests in `src/scaffold.rs` cover the generation logic in
 //! detail; this file proves the wiring from `clap` argument parsing
 //! through to the scaffolder is intact when `fgk` is driven as a
-//! real binary. Anything more (running `cargo test` inside the
-//! generated project) is gated as manual evidence — see the commit
-//! body for Task 10b — because compiling a fresh crate inside the
+//! real binary. Running `cargo test` inside the generated project is
+//! manual evidence only — compiling a fresh crate inside the
 //! workspace's own `cargo test` run is too slow for the inner loop.
 
 use assert_cmd::Command;
@@ -25,9 +24,9 @@ fn fgk_new_creates_project_files_at_destination() {
         .success()
         .stdout(contains("Created new Foglet game project"));
 
-    // Spot-check the SPEC §10.1 required outputs. The exhaustive
-    // template-presence check lives in `scaffold::tests`; this just
-    // proves the binary actually wrote files at the requested path.
+    // Spot-check required outputs. The exhaustive template-presence
+    // check lives in `scaffold::tests`; this just proves the binary
+    // actually wrote files at the requested path.
     for rel in [
         "Cargo.toml",
         "src/main.rs",

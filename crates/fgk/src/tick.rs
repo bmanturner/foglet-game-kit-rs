@@ -1,4 +1,4 @@
-//! `fgk tick` — one-shot world-tick runner for hosted v4 worlds.
+//! `fgk tick` — one-shot world-tick runner for hosted games.
 //!
 //! This module is intentionally small and side-effect explicit:
 //!

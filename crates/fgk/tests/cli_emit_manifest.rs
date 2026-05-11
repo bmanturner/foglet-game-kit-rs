@@ -1,4 +1,4 @@
-//! End-to-end smoke test for `fgk emit-manifest` (Task 11).
+//! End-to-end smoke test for `fgk emit-manifest`.
 //!
 //! Unit tests in `src/emit_manifest.rs` cover the assembly logic in
 //! detail; this file proves the wiring from `clap` argument parsing
@@ -10,11 +10,11 @@ use assert_cmd::Command;
 use predicates::str::contains;
 
 /// Scaffold a fresh project with `fgk new`, then point
-/// `fgk emit-manifest` at it. The scaffolded project ships a SPEC §9.1
-/// `assets/game.toml`, so the emitted JSON is the canonical SPEC §10.3
-/// example modulo the slug derived from the temp path.
+/// `fgk emit-manifest` at it. The scaffolded project ships a canonical
+/// `assets/game.toml`, so the emitted JSON matches the expected shape
+/// modulo the slug derived from the temp path.
 #[test]
-fn fgk_emit_manifest_prints_spec_10_3_shape_to_stdout() {
+fn fgk_emit_manifest_prints_canonical_shape_to_stdout() {
     let td = tempfile::tempdir().unwrap();
     let dest = td.path().join("smoke-game");
 

@@ -1,10 +1,6 @@
 #
 # `foglet_game` — the library crate authors depend on to build a
-# Foglet-compatible terminal door game. SPEC §6 lists the module
-# layout this crate will eventually grow into; for Task 1 we only
-# stand up the crate so `cargo check --workspace` and
-# `cargo test --workspace` are green. Real modules land in their own
-# tasks (terminal guard in Task 5, runtime in Task 7, etc.).
+# Foglet-compatible terminal door game.
 #
 
 [package]
@@ -30,48 +26,29 @@ path = "src/lib.rs"
 test-support = []
 
 [dependencies]
-# Task 2 (Foglet context loader) pulls in serde for the typed
-# `FogletContext` struct, serde_json to parse the
-# `FOGLET_DOOR_CONTEXT` file, and thiserror for library-internal
-# error variants (per SPEC §6 + the "thiserror inside libraries"
-# rule in PROMPT.md).
+# Typed `FogletContext` struct, JSON context loader, and
+# library-internal error variants.
 serde      = { workspace = true }
 serde_json = { workspace = true }
-# Task 9b (dialog state machine) reads dialog scripts as structured
-# YAML. The format choice is locked in `DECISIONS.md` (ADR
-# 2026-05-08): YAML for content, JSON for saves and manifests, TOML
-# for config + tile legends. Pulled in at the library boundary so
-# games depend on it transitively rather than re-adding it themselves.
+# Dialog scripts are structured YAML (content), while saves and
+# manifests use JSON, and config uses TOML. Pulled in at the library
+# boundary so games depend on it transitively.
 serde_yaml = { workspace = true }
-# Task 4 (game config parser) reads `assets/game.toml` into a typed
-# `GameConfig`. Sourced from the workspace-pinned crate budget so any
-# other crate parsing TOML in the tree stays in lockstep.
+# Game config parser reads `assets/game.toml` into a typed
+# `GameConfig`. Workspace-pinned so all crates stay in lockstep.
 toml       = { workspace = true }
 thiserror  = { workspace = true }
-# Task 5 (terminal guard) drives raw mode + alternate-screen toggling
-# through `crossterm`. The guard wraps these calls behind a trait so
-# the orchestration logic (Drop ordering, cleaned-flag, panic hook in
-# 5c) is unit-testable without a real TTY, but the production backend
-# delegates straight to `crossterm::terminal` per SPEC §6.
+# Terminal guard drives raw mode + alternate-screen toggling through
+# `crossterm`. The guard wraps these calls behind a trait so the
+# orchestration logic is unit-testable without a real TTY.
 crossterm  = { workspace = true }
-# Task 7 (screen stack + runtime loop) needs `ratatui::Frame` so the
-# `Screen::render` signature in SPEC §8.2 compiles. Pulled in at the
-# library boundary because the trait is part of the public authoring
-# API — every game crate transitively depends on this anyway.
+# `ratatui::Frame` is part of the `Screen::render` public API — every
+# game crate transitively depends on this anyway.
 ratatui    = { workspace = true }
-# Task 8b (atomic save manager) uses `tempfile::NamedTempFile::new_in`
-# to write the JSON sidecar in the *same* directory as the target
-# `save.json` and then `persist()` it. Co-locating the temp file is
-# what makes the final `rename(2)` atomic on POSIX (same filesystem)
-# and what the SPEC §10.4 wrapper, the architecture tenets in
-# PROMPT.md, and SPEC §13's reliability bar all require.
+# Atomic save: `NamedTempFile::new_in` writes to the same directory as
+# `save.json` so the final `rename(2)` is atomic on POSIX.
 tempfile   = { workspace = true }
-# `serde_json` from the workspace pin lets the save manager serialize
-# arbitrary author-defined save state to JSON via `serde_json::to_writer`
-# / `from_reader`. Already declared above for the context loader.
-#
-# SPEC_v2 §Task 3 (world DB open/bootstrap) — rusqlite with bundled
-# SQLite. See DECISIONS.md ADR 2026-05-08. The `bundled` feature vendors
+# World DB: rusqlite with bundled SQLite. The `bundled` feature vendors
 # the SQLite C amalgamation so operators do not need a system
 # libsqlite3 to run a packaged Foglet door.
 rusqlite   = { workspace = true }
@@ -81,25 +58,19 @@ rusqlite   = { workspace = true }
 # needed. The context-loader tests write a context file to a real path
 # on disk via the same crate.)
 #
-# `anyhow` is pulled in only so the `murder_motel` example (Task 13)
-# can present a single Foglet door binary the way author code is meant
-# to: `fn main() -> anyhow::Result<()>` matching the scaffold template
-# from SPEC §10.1. Library code stays on `thiserror`-derived errors per
-# the architecture tenets.
+# `anyhow` lets the `murder_motel` example present `fn main() ->
+# anyhow::Result<()>` the way author code is meant to. Library code
+# stays on `thiserror`-derived errors.
 anyhow = { workspace = true }
-# `rstest` powers SPEC_v3 §Task 4g's invalid-transition table tests
-# for the challenge state machine: one parameterized test per helper
-# (accept/decline/resolve/expire) covering every (from-state, helper)
-# pair so a regression that quietly relaxed a transition gate flunks
-# at `cargo test` rather than in production. Pre-approved in
-# PROMPT.md's crate budget; pulled into the workspace `Cargo.toml`
-# for v3 specifically.
+# `rstest` parameterized tests for state-machine transition tables:
+# one test per (from-state, helper) pair so a relaxed gate flunks at
+# `cargo test` rather than in production.
 rstest = { workspace = true }
 
 # --- Examples ---------------------------------------------------------
 #
-# `murder_motel` is the SPEC §13 acceptance fixture: a small but
-# complete door game exercised by `cargo run --example murder_motel`.
+# `murder_motel` is the acceptance fixture: a small but complete door
+# game exercised by `cargo run --example murder_motel`.
 # Its sources live at the workspace root (`examples/murder_motel/`)
 # rather than under `crates/foglet_game/examples/` so the project also
 # reads as a self-contained scaffold an author can copy. Cargo accepts

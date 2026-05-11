@@ -1,18 +1,17 @@
 //! `fgk emit-manifest` — generate Foglet operator manifest JSON.
 //!
-//! SPEC §10.3 says: given a project's `assets/game.toml` and an
-//! absolute `--install-dir`, emit JSON matching the SPEC example. This
+//! Given a project's `assets/game.toml` and an absolute
+//! `--install-dir`, emit the Foglet operator manifest JSON. This
 //! module is the library half of that subcommand; `main.rs` is the
 //! thin operator-facing wrapper.
 //!
 //! ## Why this is library code
 //!
-//! The same shape we emit on the CLI is used by `fgk package`
-//! (Task 12) when it writes `manifest.json` next to the binary.
-//! Putting the logic here means `package` can call [`emit_manifest_json`]
-//! directly instead of shelling out to itself, and unit tests can
-//! drive both call sites without `assert_cmd`-ing the binary for
-//! every assertion.
+//! The same shape we emit on the CLI is used by `fgk package` when it
+//! writes `manifest.json` next to the binary. Putting the logic here
+//! means `package` can call [`emit_manifest_json`] directly instead of
+//! shelling out to itself, and unit tests can drive both call sites
+//! without `assert_cmd`-ing the binary for every assertion.
 //!
 //! ## Inputs and validation
 //!
@@ -23,16 +22,16 @@
 //!   (typically `/srv/foglet/doors/<slug>`). MUST be absolute — the
 //!   manifest's `command` and `working_dir` are derived from it, and
 //!   relative paths would resolve against whatever CWD Foglet
-//!   happens to be in. SPEC §10.3 + §13.2.
+//!   happens to be in.
 //!
 //! ## What we override vs. inherit
 //!
-//! [`foglet_game::FogletManifest::new`] fills in the SPEC §10.3
-//! defaults (timeouts, visibility, auth_scope, env, env_allowlist,
-//! pty). The author's `[manifest]` section in `assets/game.toml` may
-//! tighten any of those — we apply those overrides here rather than
-//! teaching `FogletManifest::new` about `GameConfig`, so the manifest
-//! crate stays usable from contexts that don't have a TOML config
+//! [`foglet_game::FogletManifest::new`] fills in default timeouts,
+//! visibility, auth_scope, env, env_allowlist, and pty values. The
+//! author's `[manifest]` section in `assets/game.toml` may tighten any
+//! of those — we apply those overrides here rather than teaching
+//! `FogletManifest::new` about `GameConfig`, so the manifest crate
+//! stays usable from contexts that don't have a TOML config
 //! (e.g. ad-hoc tests, future programmatic callers).
 
 use std::path::{Path, PathBuf};
@@ -107,7 +106,7 @@ pub fn build_manifest(
     })?;
 
     // Apply `[manifest]` overrides from the project's TOML. The
-    // defaults baked into `FogletManifest::new` mirror the SPEC §10.3
+    // defaults baked into `FogletManifest::new` mirror the canonical
     // example, so a config that omits the section produces the same
     // bytes either way; this only matters when an author has pinned
     // tighter timeouts or a different visibility/scope.
@@ -126,7 +125,7 @@ pub fn build_manifest(
 /// Build a manifest and serialize it to the on-disk pretty-printed
 /// form (trailing newline, sorted env keys). This is what
 /// `fgk emit-manifest` writes to stdout and what `fgk package`
-/// (Task 12) writes next to the binary.
+/// writes next to the binary.
 pub fn emit_manifest_json(
     project_dir: &Path,
     install_dir: &str,
@@ -151,9 +150,9 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
-    /// Verbatim SPEC §9.1 game config — same fixture the foglet_game
-    /// crate uses, replicated here so the test is self-contained.
-    const SPEC_GAME_TOML: &str = r#"
+    /// Canonical game config fixture — replicated here so the test
+    /// is self-contained.
+    const CANONICAL_GAME_TOML: &str = r#"
 [game]
 title = "Murder Motel"
 slug = "murder-motel"
@@ -185,8 +184,8 @@ auth_scope = "site"
     }
 
     #[test]
-    fn emits_spec_10_3_shape_for_canonical_inputs() {
-        let project = project_with_config(SPEC_GAME_TOML);
+    fn emits_canonical_manifest_shape() {
+        let project = project_with_config(CANONICAL_GAME_TOML);
         let json = emit_manifest_json(project.path(), "/srv/foglet/doors/murder-motel")
             .expect("manifest emits");
 
@@ -207,7 +206,7 @@ auth_scope = "site"
 
     #[test]
     fn rejects_relative_install_dir() {
-        let project = project_with_config(SPEC_GAME_TOML);
+        let project = project_with_config(CANONICAL_GAME_TOML);
         let err = emit_manifest_json(project.path(), "relative/path")
             .expect_err("relative path must be rejected");
         match err {
@@ -220,7 +219,7 @@ auth_scope = "site"
 
     #[test]
     fn rejects_empty_install_dir() {
-        let project = project_with_config(SPEC_GAME_TOML);
+        let project = project_with_config(CANONICAL_GAME_TOML);
         let err = emit_manifest_json(project.path(), "").expect_err("empty path must be rejected");
         assert!(matches!(err, EmitManifestError::InstallDirNotAbsolute(_)));
     }
@@ -231,7 +230,7 @@ auth_scope = "site"
 [game]
 title = "Tight Timeouts"
 slug = "tight-timeouts"
-description = "Pin shorter caps than the SPEC defaults."
+description = "Pin shorter caps than the defaults."
 min_width = 80
 min_height = 24
 start_map = "lobby"
@@ -255,10 +254,9 @@ auth_scope = "none"
     }
 
     #[test]
-    fn inherits_spec_defaults_when_manifest_section_omitted() {
-        // Same config as SPEC, but [manifest] is absent — the loader
-        // fills in defaults at the field level, so the emitted shape
-        // should still match SPEC §10.3 byte-for-byte.
+    fn inherits_defaults_when_manifest_section_omitted() {
+        // [manifest] is absent — the loader fills in defaults at the
+        // field level, so the emitted shape matches the canonical output.
         let toml = r#"
 [game]
 title = "Murder Motel"
@@ -310,7 +308,7 @@ start_y = 8
     /// double-slashed paths in `command`.
     #[test]
     fn normalizes_trailing_slash_on_install_dir() {
-        let project = project_with_config(SPEC_GAME_TOML);
+        let project = project_with_config(CANONICAL_GAME_TOML);
         let manifest = build_manifest(project.path(), "/srv/foglet/doors/murder-motel/")
             .expect("trailing slash is fine");
         assert_eq!(manifest.command, "/srv/foglet/doors/murder-motel/run.sh");

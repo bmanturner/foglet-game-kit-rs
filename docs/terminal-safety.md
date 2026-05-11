@@ -113,7 +113,7 @@ It covers, at minimum:
 
 - **Scenario 1 — Clean quit.** Quit key restores the shell.
 - **Scenario 2 — `Ctrl-C` interrupt.** Mapped to a controlled
-  shutdown by Task 6 / Task 7d; guard `cleanup()` runs.
+  shutdown by the input mapper; guard `cleanup()` runs.
 - **Scenario 3 — Panic during TUI ownership.** Forced panic; alt
   screen exits, raw mode disables, the panic message and (with
   `RUST_BACKTRACE=1`) the backtrace land on the real shell.
@@ -139,7 +139,7 @@ but it does cover the parts that do not need a real TTY:
 - The runtime loop driven by a scripted `EventSource`, asserting that
   `ScreenCommand::Quit` runs `cleanup()` and flushes saves before
   return.
-- Input mapping (Task 6) for arrows, Enter, Esc, chars, `Ctrl-C`, and
+- Input mapping for arrows, Enter, Esc, chars, `Ctrl-C`, and
   `Resize` — the events the safety contract relies on.
 
 The combination — automated coverage of the orchestration plus the

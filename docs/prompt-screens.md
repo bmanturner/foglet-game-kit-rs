@@ -9,9 +9,7 @@ hand-rolled `Screen` impl.
 
 This document is the answer to a question that comes up every time a
 new screen lands: **should this be a `PromptScreen`, or should I write
-my own `Screen`?** SPEC §4 (text-interface primitives) and SPEC §5.5
-(`ScreenCommand` vocabulary) are the underlying contracts; this file
-is the authoring rule of thumb.
+my own `Screen`?**
 
 ## TL;DR
 
@@ -35,8 +33,8 @@ new screen actually needs.
 ## Reach for `PromptScreen` when…
 
 - **The screen *is* the prompt.** Nothing else paints into the frame.
-  The Murder Motel Lost-and-Found Drawer (Task 10) and night-clerk
-  vendor (Task 11) both fit: render the prompt, route the choice, pop
+  The Murder Motel Lost-and-Found Drawer and night-clerk vendor both
+  fit: render the prompt, route the choice, pop
   back. No map, no sidebar, no clock.
 - **You want the standard reducer wiring for free.** `PromptScreen`
   already calls `step_from_input` before `handle`, so navigation keys
@@ -47,8 +45,8 @@ new screen actually needs.
   mutates inventory or cash, and returns `ScreenCommand::Pop`. That
   callback is the entire screen-specific logic; everything else is the
   adapter.
-- **Layout is one of the two SPEC-blessed shapes.** Compact (SPEC §4.3)
-  for menu-style prompts, modal (SPEC §4.8) for confirmations and
+- **Layout is one of the two standard shapes.** Compact
+  for menu-style prompts, modal for confirmations and
   interruptions. `PromptScreen::new(...)` defaults to compact;
   `.modal()` switches.
 
@@ -155,5 +153,5 @@ If a screen outgrows the adapter, the swap is mechanical:
 4. Add `step_from_input` before `handle` in `handle_input`. The adapter
    was doing this for you; the custom screen has to do it explicitly.
 
-No SPEC contract changes during the migration — both shapes call the
+Both shapes call the
 same `ChoicePrompt` reducer and renderer.

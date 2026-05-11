@@ -1,4 +1,4 @@
-//! End-to-end smoke test for `fgk tick --project <path>` (Task 10a).
+//! End-to-end smoke test for `fgk tick --project <path>`.
 //!
 //! This test uses a local synthetic project + world DB fixture to prove
 //! that:
@@ -40,11 +40,11 @@ enabled = true
 max_catchup_per_call = 1
 "#;
 
-/// Directory-backed SQL fixture used by Task 13d completion checks.
+/// Directory-backed SQL fixture for world-tick migration tests.
 ///
 /// Keeping these files on disk (instead of hard-coding SQL in this
-/// test) gives the Ralph loop a literal migration directory to list
-/// when verifying Completion condition 7.
+/// test) gives the test a literal migration directory to list when
+/// verifying migration application.
 const V4_WORLD_MIGRATIONS_DIR: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/tests/fixtures/v4-world-migrations"
@@ -278,10 +278,10 @@ fn v4_migration_directory_initializes_all_required_tables_in_fresh_world_db() {
             [],
             |row| row.get(0),
         )
-        .expect("count tables before applying v4 fixture");
+        .expect("count tables before applying fixture");
     assert_eq!(
         pre_apply_count, 0,
-        "fresh world should not have v4 tables before applying fixture migrations"
+        "fresh world should not have kit tables before applying fixture migrations"
     );
 
     apply_migration_directory(&world, migration_dir);
@@ -311,6 +311,6 @@ fn v4_migration_directory_initializes_all_required_tables_in_fresh_world_db() {
             "routes".to_string(),
             "world_tick_tasks".to_string()
         ],
-        "all required v4 tables should exist after applying migration directory fixture"
+        "all required tables should exist after applying migration directory fixture"
     );
 }
