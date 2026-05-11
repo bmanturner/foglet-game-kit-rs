@@ -35,6 +35,15 @@ pub type TravelValidateCallback<'a> =
 pub type TravelChargeCostCallback<'a> =
     Box<dyn FnMut(&PresenceRecord, &Route) -> Result<(), TravelError> + 'a>;
 
+/// Callback type used to charge movement costs inside travel's active
+/// SQLite transaction.
+///
+/// Use this when cost charging needs to call kit-owned transaction-local
+/// APIs such as inventory transfer or event append without opening a
+/// nested transaction.
+pub type TravelChargeCostTxCallback<'a> =
+    Box<dyn FnMut(&rusqlite::Connection, &PresenceRecord, &Route) -> Result<(), TravelError> + 'a>;
+
 /// Callback type that optionally produces an event payload for a movement.
 ///
 /// Returning `None` means "do not append an event row for this move".
@@ -75,6 +84,9 @@ pub struct TravelRequest<'a> {
     pub validate: TravelValidateCallback<'a>,
     /// Callback run after validation to charge caller-defined travel cost.
     pub charge_cost: TravelChargeCostCallback<'a>,
+    /// Optional transaction-aware cost callback run instead of
+    /// [`Self::charge_cost`] when present.
+    pub charge_cost_tx: Option<TravelChargeCostTxCallback<'a>>,
     /// Whether travel should touch place-recall for the destination.
     pub touch_recall: bool,
     /// Optional callback that can synthesize one event payload.
@@ -97,6 +109,7 @@ impl<'a> TravelRequest<'a> {
             route_id: None,
             validate: Box::new(|_, _| Ok(())),
             charge_cost: Box::new(|_, _| Ok(())),
+            charge_cost_tx: None,
             touch_recall: true,
             append_event: None,
         }
@@ -133,6 +146,22 @@ impl<'a> TravelRequest<'a> {
         F: FnMut(&PresenceRecord, &Route) -> Result<(), TravelError> + 'a,
     {
         self.charge_cost = Box::new(charge_cost);
+        self
+    }
+
+    /// Install a custom cost callback that receives travel's active
+    /// SQLite transaction.
+    ///
+    /// This is the composition path for game-defined costs that need to
+    /// mutate kit-owned tables atomically with route validation,
+    /// presence movement, recall touch, and event append. The kit still
+    /// does not decide what "cost" means; the callback owns that policy.
+    #[must_use]
+    pub fn with_charge_cost_tx<F>(mut self, charge_cost: F) -> Self
+    where
+        F: FnMut(&rusqlite::Connection, &PresenceRecord, &Route) -> Result<(), TravelError> + 'a,
+    {
+        self.charge_cost_tx = Some(Box::new(charge_cost));
         self
     }
 
@@ -325,7 +354,11 @@ impl WorldDb {
             },
         })?;
 
-        (req.charge_cost)(&presence, &route).map_err(|error| match error {
+        match req.charge_cost_tx.as_mut() {
+            Some(charge_cost) => charge_cost(&tx, &presence, &route),
+            None => (req.charge_cost)(&presence, &route),
+        }
+        .map_err(|error| match error {
             TravelError::CostFailed { .. } | TravelError::InventoryError { .. } => error,
             other => TravelError::CostFailed {
                 player_id: req.player_id,
@@ -573,7 +606,7 @@ fn event_error_to_sqlite(error: events::EventError) -> rusqlite::Error {
 mod tests {
     use super::{TravelError, TravelEventDraft, TravelRequest};
     use crate::events::WORLD_EVENTS_MIGRATION;
-    use crate::inventory::InventoryError;
+    use crate::inventory::{transfer_on, InventoryError, InventorySlot, INVENTORY_SLOTS_MIGRATION};
     use crate::place_recall::PLACE_RECALL_MIGRATION;
     use crate::players::PLAYERS_MIGRATION;
     use crate::presence::PresenceRecord;
@@ -828,6 +861,185 @@ mod tests {
             "cost failure must not touch destination recall"
         );
         assert!(events.is_empty(), "cost failure must not append events");
+    }
+
+    #[test]
+    fn travel_charge_cost_tx_can_mutate_inventory_inside_travel_transaction() {
+        let TravelFixture {
+            mut world,
+            player_id,
+            destination_id,
+            ..
+        } = setup_travel_fixture();
+        world
+            .apply_migration(&INVENTORY_SLOTS_MIGRATION)
+            .expect("inventory migration applies");
+        world
+            .create_slot("player", player_id, "movement-token", 2, None, None)
+            .expect("cost source exists");
+
+        let result = world
+            .travel(
+                TravelRequest::new(player_id, destination_id).with_charge_cost_tx(
+                    |tx, presence, _route| {
+                        transfer_on(
+                            tx,
+                            ("player", presence.player_id),
+                            ("world-sink", 1),
+                            "movement-token",
+                            1,
+                            None::<
+                                fn(
+                                    &rusqlite::Connection,
+                                    &InventorySlot,
+                                    &InventorySlot,
+                                ) -> rusqlite::Result<()>,
+                            >,
+                        )?;
+                        Ok(())
+                    },
+                ),
+            )
+            .expect("travel succeeds with transaction-local cost");
+
+        let source = world
+            .get_slot("player", player_id, "movement-token")
+            .expect("source reads")
+            .expect("source remains");
+        let sink = world
+            .get_slot("world-sink", 1, "movement-token")
+            .expect("sink reads")
+            .expect("sink created");
+
+        assert_eq!(result.to_place_id, destination_id);
+        assert_eq!(source.quantity, 1);
+        assert_eq!(sink.quantity, 1);
+    }
+
+    #[test]
+    fn travel_charge_cost_tx_insufficient_stock_rolls_back_travel() {
+        let TravelFixture {
+            mut world,
+            player_id,
+            origin_id,
+            destination_id,
+            ..
+        } = setup_travel_fixture();
+        world
+            .apply_migration(&INVENTORY_SLOTS_MIGRATION)
+            .expect("inventory migration applies");
+        world
+            .create_slot("player", player_id, "movement-token", 0, None, None)
+            .expect("cost source exists");
+
+        let rejected = world.travel(
+            TravelRequest::new(player_id, destination_id).with_charge_cost_tx(
+                |tx, presence, _route| {
+                    transfer_on(
+                        tx,
+                        ("player", presence.player_id),
+                        ("world-sink", 1),
+                        "movement-token",
+                        1,
+                        None::<
+                            fn(
+                                &rusqlite::Connection,
+                                &InventorySlot,
+                                &InventorySlot,
+                            ) -> rusqlite::Result<()>,
+                        >,
+                    )?;
+                    Ok(())
+                },
+            ),
+        );
+
+        assert!(matches!(rejected, Err(TravelError::InventoryError { .. })));
+        let presence = world
+            .get_presence(player_id)
+            .expect("presence reads")
+            .expect("presence row exists");
+        let sink = world
+            .get_slot("world-sink", 1, "movement-token")
+            .expect("sink reads");
+        assert_eq!(presence.place_id, origin_id);
+        assert!(sink.is_none(), "failed cost must not create sink inventory");
+    }
+
+    #[test]
+    fn travel_event_append_failure_rolls_back_cost_presence_and_recall() {
+        let TravelFixture {
+            mut world,
+            player_id,
+            origin_id,
+            destination_id,
+            ..
+        } = setup_travel_fixture();
+        world
+            .apply_migration(&INVENTORY_SLOTS_MIGRATION)
+            .expect("inventory migration applies");
+        world
+            .create_slot("player", player_id, "movement-token", 2, None, None)
+            .expect("cost source exists");
+
+        let rejected = world.travel(
+            TravelRequest::new(player_id, destination_id)
+                .with_charge_cost_tx(|tx, presence, _route| {
+                    transfer_on(
+                        tx,
+                        ("player", presence.player_id),
+                        ("world-sink", 1),
+                        "movement-token",
+                        1,
+                        None::<
+                            fn(
+                                &rusqlite::Connection,
+                                &InventorySlot,
+                                &InventorySlot,
+                            ) -> rusqlite::Result<()>,
+                        >,
+                    )?;
+                    Ok(())
+                })
+                .with_append_event(|_, _| {
+                    Some(TravelEventDraft {
+                        kind: "arrived".to_string(),
+                        message: " ".to_string(),
+                        metadata_json: None,
+                    })
+                }),
+        );
+
+        assert!(matches!(
+            rejected,
+            Err(TravelError::Database {
+                step: "append travel event",
+                ..
+            })
+        ));
+        let presence = world
+            .get_presence(player_id)
+            .expect("presence reads")
+            .expect("presence row exists");
+        let source = world
+            .get_slot("player", player_id, "movement-token")
+            .expect("source reads")
+            .expect("source remains");
+        let sink = world
+            .get_slot("world-sink", 1, "movement-token")
+            .expect("sink reads");
+        let recall = world
+            .recall_for_player(player_id)
+            .expect("recall reads after rollback");
+        assert_eq!(presence.place_id, origin_id);
+        assert_eq!(source.quantity, 2);
+        assert!(sink.is_none());
+        assert!(
+            !recall
+                .iter()
+                .any(|row| row.player_id == player_id && row.place_id == destination_id),
+            "event failure should roll back recall touch"
+        );
     }
 
     #[test]

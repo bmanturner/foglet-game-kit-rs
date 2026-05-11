@@ -3,6 +3,12 @@
 The Event Log screen is a reusable read-only view over v2
 `world_events`.
 
+Write events through `WorldDb::append_event` for standalone appends or
+`events::append_event_on` when the event must compose with other
+kit-owned mutations inside an existing transaction. Avoid direct SQL
+against `world_events` in normal gameplay code so message validation,
+timestamp decoding, and row shape stay centralized in the kit.
+
 Scope:
 
 - `global` shows all events.

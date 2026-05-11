@@ -7,7 +7,7 @@ members = ["crates/foglet_game", "crates/fgk"]
 # inherit consistently. Bump deliberately, never opportunistically.
 edition     = "2021"
 rust-version = "1.80"
-version     = "0.1.0"
+version     = "0.1.1"
 license     = "MIT OR Apache-2.0"
 repository  = "https://github.com/bmanturner/foglet-game-kit-rs"
 authors     = ["foglet-game-kit-rs contributors"]

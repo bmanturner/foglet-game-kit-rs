@@ -441,7 +441,7 @@ LIMIT ?2";
 /// [`WorldDb`]. Validation runs first so a malformed message is rejected
 /// before any SQL round-trip — and, when called from the 9c helper.
 /// before the wrapping transaction has done any work.
-pub(crate) fn append_event_on(
+pub fn append_event_on(
     conn: &rusqlite::Connection,
     kind: &str,
     player_id: Option<i64>,
@@ -747,6 +747,49 @@ mod tests {
             stored,
             (event.id, event.kind, event.player_id, event.message)
         );
+    }
+
+    #[test]
+    fn append_event_on_uses_surrounding_transaction_and_rolls_back() {
+        let dir = tempdir().expect("tempdir creates");
+        let mut world = open_world_with_events(&dir);
+
+        {
+            let tx = world
+                .connection_mut()
+                .transaction()
+                .expect("transaction begins");
+            let event = append_event_on(&tx, "inside_tx", None, "inside a transaction", None)
+                .expect("transaction-local append succeeds");
+            assert_eq!(event.id, 1);
+            assert_eq!(event.kind, "inside_tx");
+        }
+
+        let count: i64 = world
+            .connection()
+            .query_row("SELECT COUNT(*) FROM world_events", [], |row| row.get(0))
+            .expect("count query runs");
+        assert_eq!(
+            count, 0,
+            "dropping the surrounding transaction must roll back the event append"
+        );
+    }
+
+    #[test]
+    fn append_event_on_reuses_message_validation() {
+        let dir = tempdir().expect("tempdir creates");
+        let world = open_world_with_events(&dir);
+
+        for blank in ["", "   "] {
+            let err = append_event_on(world.connection(), "bad", None, blank, None)
+                .expect_err("blank message should be rejected");
+            assert!(matches!(err, EventError::EmptyMessage));
+        }
+
+        let too_long = "x".repeat(MAX_EVENT_MESSAGE_LEN + 1);
+        let err = append_event_on(world.connection(), "bad", None, &too_long, None)
+            .expect_err("overlong message should be rejected");
+        assert!(matches!(err, EventError::MessageTooLong { .. }));
     }
 
     ///  explicitly types `player_id` as optional so the log

@@ -9,7 +9,8 @@ Transaction order:
 2. Resolve the explicit route, or the unique outbound route to the
    destination when no `route_id` is supplied.
 3. Run the game `validate` callback.
-4. Run the game `charge_cost` callback.
+4. Run the game `charge_cost` callback, or the transaction-aware
+   `with_charge_cost_tx` callback when installed.
 5. Move presence to the destination.
 6. Touch place recall when enabled and requested.
 7. Append an event when the optional event callback returns a draft and
@@ -19,6 +20,18 @@ Any error rolls back prior writes. `validate` is for rules such as
 locked doors or required permits. `charge_cost` is for game-owned costs
 such as stamina, fuel, or inventory debits; the kit does not define a
 currency or turn cost.
+
+Use `TravelRequest::with_charge_cost_tx` when charging travel cost needs
+to mutate kit-owned tables in the active travel transaction. The
+callback receives the SQLite connection for that transaction, so it can
+call helpers such as `inventory::transfer_on` or `events::append_event_on`
+without opening a nested transaction or writing raw SQL against
+`presence`, `place_recall`, `inventory_slots`, or `world_events`.
+
+Travel remains genre-neutral. The kit orchestrates atomic route
+resolution, validation, optional cost charging, presence movement,
+optional recall touch, and optional event append; the game still decides
+fuel, credits, turn costs, hazards, and route policy.
 
 Examples:
 

@@ -28,3 +28,10 @@ Examples:
   pickup owner, destination owner, and deadline, reward names payment.
   Completion can validate that the cargo was delivered before marking
   the contract completed.
+
+When contract completion needs to move inventory or emit events in the
+same transaction as the lifecycle transition, use the transaction-local
+kit APIs from the callback: `inventory::transfer_on` for
+`inventory_slots` and `events::append_event_on` for `world_events`.
+Those helpers preserve kit validation while avoiding direct SQL against
+kit-owned tables.

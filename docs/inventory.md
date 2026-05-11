@@ -108,7 +108,19 @@ let (after_player, after_chest) = world.transfer(
 If the callback fails, both slot quantities stay as they were before the
 call.
 
-### 4.2 Worked example: trading-post commerce
+### 4.2 Compose inside a caller-owned transaction
+
+Use `inventory::transfer_on(connection, source, destination, item_key,
+quantity, on_commit)` when inventory movement must happen inside an
+existing SQLite transaction, such as a contract completion callback or a
+travel cost hook. It uses the same validation and transfer algorithm as
+`WorldDb::transfer`, but it does not commit; the surrounding transaction
+decides whether the mutation persists.
+
+`transfer_on` is the preferred replacement for direct SQL against
+`inventory_slots` in normal gameplay code.
+
+### 4.3 Worked example: trading-post commerce
 
 ```rust
 let (after_caravan, after_stall) = world.transfer(

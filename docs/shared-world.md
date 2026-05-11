@@ -206,6 +206,35 @@ next open.
 Migrations are forward-only. If a future migration is destructive,
 your backup is the rollback path.
 
+## 5.1 Kit-owned tables and API boundary
+
+The kit owns the schema and invariants for these shared-world tables.
+Consuming games should prefer the public Rust APIs below instead of raw
+SQL against these tables. Direct SQL is reasonable only for temporary
+adapters, local migrations, operator repair, or a documented kit gap.
+
+| Behavior | Kit-owned table(s) | Preferred API |
+| --- | --- | --- |
+| Player registry | `players` | `WorldDb::upsert_player` and player lookup helpers |
+| Presence | `presence` | `WorldDb::set_presence`, `WorldDb::get_presence`, `WorldDb::travel` |
+| Place recall | `place_recall` | `WorldDb::touch_recall`, `WorldDb::recall_for_player`, `WorldDb::travel` |
+| Turns | `turn_ledger` | turn ledger helpers in `foglet_game::turns` |
+| Inventory | `inventory_slots` | `WorldDb::create_slot`, `WorldDb::get_slot`, `WorldDb::slots_for_owner`, `WorldDb::transfer`, `inventory::transfer_on` |
+| Contracts | `contracts` | contract lifecycle helpers and transition callbacks |
+| Events | `world_events` | `WorldDb::append_event`, `events::append_event_on`, `WorldDb::recent_events`, `WorldDb::player_events` |
+| Travel | `presence`, `place_recall`, `world_events`, and caller-selected cost tables | `WorldDb::travel` with `TravelRequest::with_charge_cost_tx` when costs must compose inside the active transaction |
+
+For multi-step gameplay that must be atomic, compose kit primitives
+inside one transaction-local path instead of writing kit tables
+directly. For example, a travel request can call
+`TravelRequest::with_charge_cost_tx`, then use `inventory::transfer_on`
+from that callback, while travel itself moves `presence`, touches
+`place_recall`, and appends `world_events`.
+
+The new transaction-local APIs are deliberately genre-neutral: callers
+choose owner kinds, item keys, event names, cost policy, route policy,
+and reward policy.
+
 ## 6. Lock recovery
 
 SQLite reports `database is locked` (or `SQLITE_BUSY` returns) when a

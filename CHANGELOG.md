@@ -1,0 +1,16 @@
+# Changelog
+
+## 0.1.1
+
+- Added `events::append_event_on` for appending validated `world_events`
+  rows on an existing SQLite connection or transaction.
+- Added `inventory::transfer_on` for composing owner-keyed inventory
+  transfers with other kit-owned mutations inside a caller-owned
+  transaction.
+- Added `TravelRequest::with_charge_cost_tx` so game-defined travel
+  costs can mutate kit-owned tables inside the same transaction that
+  resolves routes, moves presence, touches recall, and appends travel
+  events.
+- Documented the shared-world table boundary and the preferred public
+  APIs for kit-owned tables.
+

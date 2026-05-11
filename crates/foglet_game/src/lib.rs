@@ -89,7 +89,9 @@ pub use dialog::{
     DialogError, DialogState, FlagSet, Node, DIALOG_PROMPT_MAX_CHOICES,
 };
 pub use dialog_screen::{DialogAction, DialogLayout, DialogScreen};
-pub use events::{EventError, EventRecord, MAX_EVENT_MESSAGE_LEN, WORLD_EVENTS_MIGRATION};
+pub use events::{
+    append_event_on, EventError, EventRecord, MAX_EVENT_MESSAGE_LEN, WORLD_EVENTS_MIGRATION,
+};
 pub use factions::{
     Faction, FactionError, FactionMembership, SharedGoal, FACTIONS_MIGRATION,
     FACTION_GOAL_COMPLETED_EVENT_KIND,
@@ -99,7 +101,7 @@ pub use foglet::{
     process_env, synthesize_local_dev, ContextError, ContextSource, FogletContext, LoadOptions,
 };
 pub use input::{from_event, from_key_event, Input};
-pub use inventory::{InventoryError, InventorySlot, INVENTORY_SLOTS_MIGRATION};
+pub use inventory::{transfer_on, InventoryError, InventorySlot, INVENTORY_SLOTS_MIGRATION};
 pub use inventory_capacity::{CapacityError, CapacityPolicy};
 pub use job_board::{
     BountyProvider, BuiltInProviders, ChallengeProvider, ContractProvider, JobBoard, JobBoardEntry,
@@ -148,8 +150,8 @@ pub use terminal::{
     TerminalGuard,
 };
 pub use travel::{
-    TravelAppendEventCallback, TravelChargeCostCallback, TravelError, TravelEventDraft,
-    TravelRequest, TravelResult, TravelValidateCallback,
+    TravelAppendEventCallback, TravelChargeCostCallback, TravelChargeCostTxCallback, TravelError,
+    TravelEventDraft, TravelRequest, TravelResult, TravelValidateCallback,
 };
 pub use turns::{
     DateProvider, FixedDateProvider, LocalDate, TurnError, TurnLedgerRow, TURN_LEDGER_MIGRATION,
@@ -177,5 +179,10 @@ mod tests {
     #[test]
     fn version_is_non_empty() {
         assert!(!VERSION.is_empty(), "CARGO_PKG_VERSION should be set");
+    }
+
+    #[test]
+    fn version_reports_patch_release() {
+        assert_eq!(VERSION, "0.1.1");
     }
 }
