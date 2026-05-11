@@ -1,5 +1,10 @@
 # foglet-game-kit-rs
 
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE-MIT)
+[![Rust 1.80+](https://img.shields.io/badge/rust-1.80%2B-orange.svg)](Cargo.toml)
+[![crate: foglet_game](https://img.shields.io/badge/crate-foglet__game-2f7ed8.svg)](crates/foglet_game)
+[![crate: fgk](https://img.shields.io/badge/crate-fgk-2f7ed8.svg)](crates/fgk)
+
 A Rust authoring kit for [Foglet BBS](https://github.com/bmanturner/foglet-bbs)
 door games. It ships a library crate (`foglet_game`) for building the
 game itself and a CLI (`fgk`) for scaffolding, packaging, and emitting
