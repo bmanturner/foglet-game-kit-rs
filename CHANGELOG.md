@@ -24,6 +24,13 @@
   costs can mutate kit-owned tables inside the same transaction that
   resolves routes, moves presence, touches recall, and appends travel
   events.
+- Added generic triggered-outcome contracts plus
+  `TravelRequest::with_after_move_tx`, letting games apply
+  transaction-scoped arrival consequences after presence moves and
+  return structured UI feedback through `TravelResult`.
+- Added reusable contract job read models for available, accepted,
+  ready-to-complete, completed, failed, abandoned, and expired work,
+  with game-supplied objective readiness and requirement rows.
 - Added `spend_turns_on` for spending Daily Turns on an existing SQLite
   connection or transaction, including from transaction-aware travel
   cost callbacks.
