@@ -13,7 +13,9 @@ Transaction order:
    `with_charge_cost_tx` callback when installed.
 5. Move presence to the destination.
 6. Touch place recall when enabled and requested.
-7. Append an event when the optional event callback returns a draft and
+7. Run the optional transaction-aware post-move callback for triggered
+   outcomes.
+8. Append an event when the optional event callback returns a draft and
    the event table is present.
 
 Any error rolls back prior writes. `validate` is for rules such as
@@ -34,10 +36,27 @@ For Daily Turn travel costs, call `spend_turns_on` from
 with route validation, presence movement, recall touch, and travel event
 append if any later travel step fails.
 
+Use `TravelRequest::with_after_move_tx` for arrival consequences that
+need to observe the committed destination inside the same transaction.
+The callback receives the transaction connection, the pre-move presence
+row, the moved presence row, and the route. It runs after movement and
+recall, before travel's optional event append and commit, and returns
+structured `TriggeredOutcome` values through `TravelResult`.
+
+Triggered outcomes separate immediate UI feedback from durable history.
+If a game wants an Event Log row for an outcome, append it inside the
+callback with `events::append_event_on` or return an event draft in the
+outcome for the caller to inspect. Notices, Daily Intel, world-state
+changes, and proof tables remain separate game-owned channels.
+Idempotency is also game-owned: build a stable key from
+`TriggerContext`, insert a proof/progress row with a uniqueness guard,
+and emit feedback/events only when that insert wins.
+
 Travel remains genre-neutral. The kit orchestrates atomic route
 resolution, validation, optional cost charging, presence movement,
-optional recall touch, and optional event append; the game still decides
-fuel, credits, turn costs, hazards, and route policy.
+optional recall touch, post-move outcomes, and optional event append;
+the game still decides fuel, credits, turn costs, hazards, and route
+policy.
 
 Examples:
 

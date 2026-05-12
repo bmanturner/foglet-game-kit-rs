@@ -34,6 +34,7 @@
 pub mod bounties;
 pub mod challenges;
 pub mod config;
+pub mod contract_jobs;
 pub mod contracts;
 pub mod dialog;
 pub mod dialog_screen;
@@ -65,6 +66,7 @@ pub mod terminal;
 #[cfg(feature = "test-support")]
 pub mod test_support;
 pub mod travel;
+pub mod triggered_outcomes;
 pub mod turns;
 pub mod widgets;
 pub mod world_db;
@@ -80,6 +82,11 @@ pub use config::{
     LeaderboardSection, LeaderboardSort, ManifestSection, MultiplayerSection, PlaceRecallSection,
     PresenceSection, SaveSection, SaveStrategy, SpatialSection, TurnReset, TurnsSection,
     WorldSection, WorldTicksSection,
+};
+pub use contract_jobs::{
+    available_contract_job_views, player_contract_job_views, project_contract_job_view,
+    ContractJobError, ContractJobView, ContractObjectiveView, ContractObjectiveViewProvider,
+    JobLifecycleView, JobRequirementView, NoObjectiveViewProvider,
 };
 pub use contracts::{
     Contract, ContractError, ContractState, CreateContractInput, CONTRACTS_MIGRATION,
@@ -150,8 +157,13 @@ pub use terminal::{
     TerminalGuard,
 };
 pub use travel::{
-    TravelAppendEventCallback, TravelChargeCostCallback, TravelChargeCostTxCallback, TravelError,
-    TravelEventDraft, TravelRequest, TravelResult, TravelValidateCallback,
+    TravelAfterMoveTxCallback, TravelAppendEventCallback, TravelChargeCostCallback,
+    TravelChargeCostTxCallback, TravelError, TravelEventDraft, TravelRequest, TravelResult,
+    TravelValidateCallback,
+};
+pub use triggered_outcomes::{
+    OutcomeApplication, OutcomeFeedback, TriggerContext, TriggerKind, TriggeredEventDraft,
+    TriggeredOutcome,
 };
 pub use turns::{
     spend_turns_on, DateProvider, FixedDateProvider, LocalDate, TurnError, TurnLedgerRow,

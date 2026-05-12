@@ -31,6 +31,25 @@ The kit does not inspect, normalize, or validate game-specific objective
 or reward semantics. Games still own delivery proof, dungeon objective
 checks, credit ledgers, item grants, and faction policy.
 
+## Contract job views
+
+Use `player_contract_job_views` when rendering a player's accepted and
+completed work. The helper projects durable `Contract` rows into
+`ContractJobView` values with list/detail fields such as title, summary,
+kind label, state label, reward preview, location preview, next step,
+requirements, and accept/complete action tokens.
+
+The kit still treats `objective_json` and `reward_json` as opaque. A
+game supplies objective readiness through `ContractObjectiveViewProvider`.
+That provider can read game-owned proof/progress tables and return
+whether an accepted contract is ready to complete, what the next step is,
+which requirements are met, and what completion action token the UI
+should pass back to game code.
+
+`available_contract_job_views` provides the same projection shape for
+available contracts. It complements `JobBoard::query`; it does not
+replace the existing available-opportunity provider.
+
 Examples:
 
 - RPG escort quest: `kind = "escort"`, objective names an NPC and

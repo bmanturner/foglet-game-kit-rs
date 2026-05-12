@@ -21,6 +21,15 @@ Provider boundaries:
 - `title` and `summary` are sanitized at the aggregation boundary using
   the same bounded text rules as other multiplayer-facing surfaces.
 
+Player work:
+
+- `ContractProvider` remains source-compatible and lists only available
+  contracts for opportunity boards.
+- Use `contract_jobs` helpers for a player's accepted, ready,
+  completed, failed, abandoned, or expired contract rows.
+- Games decide objective readiness through `ContractObjectiveViewProvider`;
+  the kit does not parse `objective_json` or grant `reward_json`.
+
 Examples:
 
 - Tavern board: contracts represent escort jobs, bounties represent

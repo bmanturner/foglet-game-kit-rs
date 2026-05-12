@@ -19,6 +19,7 @@ use crate::events;
 use crate::inventory::InventoryError;
 use crate::presence::PresenceRecord;
 use crate::spatial::Route;
+use crate::triggered_outcomes::TriggeredOutcome;
 use crate::world_db::WorldDb;
 
 /// Callback type used to validate a route before movement mutates presence.
@@ -43,6 +44,22 @@ pub type TravelChargeCostCallback<'a> =
 /// nested transaction.
 pub type TravelChargeCostTxCallback<'a> =
     Box<dyn FnMut(&rusqlite::Connection, &PresenceRecord, &Route) -> Result<(), TravelError> + 'a>;
+
+/// Callback type used to apply arrival consequences after movement.
+///
+/// The callback runs inside travel's active SQLite transaction after
+/// presence has moved and recall has been touched, but before travel's
+/// optional event append and commit. Returned outcomes are surfaced in
+/// [`TravelResult::triggered_outcomes`].
+pub type TravelAfterMoveTxCallback<'a> = Box<
+    dyn FnMut(
+            &rusqlite::Connection,
+            &PresenceRecord,
+            &PresenceRecord,
+            &Route,
+        ) -> Result<Vec<TriggeredOutcome>, TravelError>
+        + 'a,
+>;
 
 /// Callback type that optionally produces an event payload for a movement.
 ///
@@ -89,6 +106,8 @@ pub struct TravelRequest<'a> {
     pub charge_cost_tx: Option<TravelChargeCostTxCallback<'a>>,
     /// Whether travel should touch place-recall for the destination.
     pub touch_recall: bool,
+    /// Optional transaction-aware callback for post-move arrival outcomes.
+    pub after_move_tx: Option<TravelAfterMoveTxCallback<'a>>,
     /// Optional callback that can synthesize one event payload.
     pub append_event: Option<TravelAppendEventCallback<'a>>,
 }
@@ -111,6 +130,7 @@ impl<'a> TravelRequest<'a> {
             charge_cost: Box::new(|_, _| Ok(())),
             charge_cost_tx: None,
             touch_recall: true,
+            after_move_tx: None,
             append_event: None,
         }
     }
@@ -165,6 +185,25 @@ impl<'a> TravelRequest<'a> {
         self
     }
 
+    /// Install a transaction-aware post-move callback.
+    ///
+    /// This hook is for arrival consequences, not travel costs. It runs after
+    /// the destination presence row exists and after optional recall touch.
+    #[must_use]
+    pub fn with_after_move_tx<F>(mut self, after_move: F) -> Self
+    where
+        F: FnMut(
+                &rusqlite::Connection,
+                &PresenceRecord,
+                &PresenceRecord,
+                &Route,
+            ) -> Result<Vec<TriggeredOutcome>, TravelError>
+            + 'a,
+    {
+        self.after_move_tx = Some(Box::new(after_move));
+        self
+    }
+
     /// Install an optional event-payload callback.
     #[must_use]
     pub fn with_append_event<F>(mut self, append_event: F) -> Self
@@ -183,6 +222,7 @@ impl fmt::Debug for TravelRequest<'_> {
             .field("dest_place_id", &self.dest_place_id)
             .field("route_id", &self.route_id)
             .field("touch_recall", &self.touch_recall)
+            .field("has_after_move_tx", &self.after_move_tx.is_some())
             .field("has_append_event", &self.append_event.is_some())
             .finish()
     }
@@ -205,6 +245,8 @@ pub struct TravelResult {
     pub entered_at: String,
     /// Optional `world_events.id` inserted by travel event append.
     pub event_id: Option<i64>,
+    /// Structured outcomes returned by the post-move callback.
+    pub triggered_outcomes: Vec<TriggeredOutcome>,
 }
 
 /// Typed failures for travel orchestration.
@@ -266,6 +308,16 @@ pub enum TravelError {
         /// Caller-supplied player id.
         player_id: i64,
         /// Route id whose cost charge failed.
+        route_id: i64,
+        /// Game-authored explanation surfaced to callers.
+        reason: String,
+    },
+    /// Game-supplied post-move callback rejected arrival outcomes.
+    #[error("travel post-move outcome hook failed for player `{player_id}` on route `{route_id}`: {reason}")]
+    OutcomeFailed {
+        /// Caller-supplied player id.
+        player_id: i64,
+        /// Route id whose arrival outcome hook failed.
         route_id: i64,
         /// Game-authored explanation surfaced to callers.
         reason: String,
@@ -373,6 +425,20 @@ impl WorldDb {
             touch_recall(&tx, req.player_id, req.dest_place_id)?;
         }
 
+        let triggered_outcomes = match req.after_move_tx.as_mut() {
+            Some(after_move) => {
+                after_move(&tx, &presence, &moved, &route).map_err(|error| match error {
+                    TravelError::OutcomeFailed { .. } => error,
+                    other => TravelError::OutcomeFailed {
+                        player_id: req.player_id,
+                        route_id: route.id,
+                        reason: other.to_string(),
+                    },
+                })?
+            }
+            None => Vec::new(),
+        };
+
         let event_id = match req.append_event.as_mut() {
             Some(append_event) if table_exists(&tx, "world_events")? => {
                 append_event(&presence, &route)
@@ -401,6 +467,7 @@ impl WorldDb {
             route_id: route.id,
             entered_at: moved.entered_at,
             event_id,
+            triggered_outcomes,
         };
 
         tx.commit().map_err(|source| TravelError::Database {
@@ -612,7 +679,10 @@ mod tests {
     use crate::presence::PresenceRecord;
     use crate::presence::PRESENCE_MIGRATION;
     use crate::spatial::{Route, PLACES_MIGRATION, ROUTES_MIGRATION};
+    use crate::triggered_outcomes::{OutcomeFeedback, TriggerContext, TriggeredOutcome};
     use crate::world_db::WorldDb;
+    use std::cell::RefCell;
+    use std::rc::Rc;
     use tempfile::tempdir;
 
     fn sample_presence(place_id: i64) -> PresenceRecord {
@@ -643,6 +713,7 @@ mod tests {
         assert_eq!(request.dest_place_id, 12);
         assert_eq!(request.route_id, None);
         assert!(request.touch_recall);
+        assert!(request.after_move_tx.is_none());
         assert!(request.append_event.is_none());
 
         let presence = sample_presence(5);
@@ -681,6 +752,11 @@ mod tests {
                 route_id: 44,
                 reason: "not enough rations".to_string(),
             },
+            TravelError::OutcomeFailed {
+                player_id: 1,
+                route_id: 44,
+                reason: "proof rejected".to_string(),
+            },
             TravelError::InventoryError {
                 source: Box::new(InventoryError::MissingSourceSlot {
                     owner_kind: "player".to_string(),
@@ -690,7 +766,7 @@ mod tests {
             },
         ];
 
-        assert_eq!(errors.len(), 6);
+        assert_eq!(errors.len(), 7);
     }
 
     #[test]
@@ -736,6 +812,7 @@ mod tests {
         assert_eq!(result.to_place_id, destination_id);
         assert_eq!(result.route_id, route.id);
         assert_eq!(result.event_id, events.first().map(|event| event.id));
+        assert!(result.triggered_outcomes.is_empty());
         assert_eq!(loaded_presence.place_id, destination_id);
         assert!(
             recall
@@ -746,6 +823,201 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].kind, "arrived");
         assert_eq!(events[0].metadata, Some(r#"{"via":"hall"}"#.to_string()));
+    }
+
+    #[test]
+    fn post_move_callback_runs_after_presence_moves_and_returns_outcome() {
+        let TravelFixture {
+            mut world,
+            player_id,
+            origin_id,
+            destination_id,
+            route,
+            ..
+        } = setup_travel_fixture();
+
+        let result = world
+            .travel(
+                TravelRequest::new(player_id, destination_id).with_after_move_tx(
+                    |tx, before, after, route| {
+                        let observed_place: i64 = tx
+                            .query_row(
+                                "SELECT place_id FROM presence WHERE player_id = ?1",
+                                rusqlite::params![before.player_id],
+                                |row| row.get(0),
+                            )
+                            .map_err(|source| TravelError::Database {
+                                step: "read moved presence in test",
+                                source,
+                            })?;
+                        assert_eq!(before.place_id, origin_id);
+                        assert_eq!(after.place_id, destination_id);
+                        assert_eq!(observed_place, destination_id);
+
+                        let context = TriggerContext::place_arrived(
+                            before.player_id,
+                            after.place_id,
+                            Some(route.id),
+                        );
+                        Ok(vec![TriggeredOutcome::new("arrival.proof", context)
+                            .with_idempotency_key("arrival.proof:9:8")
+                            .with_feedback(OutcomeFeedback::new(
+                                "proof",
+                                "Arrival proof recorded.",
+                            ))])
+                    },
+                ),
+            )
+            .expect("travel succeeds with post-move callback");
+
+        assert_eq!(result.from_place_id, origin_id);
+        assert_eq!(result.to_place_id, destination_id);
+        assert_eq!(result.route_id, route.id);
+        assert_eq!(result.triggered_outcomes.len(), 1);
+        assert_eq!(result.triggered_outcomes[0].key, "arrival.proof");
+        assert_eq!(
+            result.triggered_outcomes[0].feedback[0].message,
+            "Arrival proof recorded."
+        );
+    }
+
+    #[test]
+    fn event_append_runs_after_post_move_callback_and_keeps_returned_outcomes() {
+        let TravelFixture {
+            mut world,
+            player_id,
+            destination_id,
+            ..
+        } = setup_travel_fixture();
+        let order = Rc::new(RefCell::new(Vec::new()));
+        let after_order = Rc::clone(&order);
+        let event_order = Rc::clone(&order);
+
+        let result = world
+            .travel(
+                TravelRequest::new(player_id, destination_id)
+                    .with_after_move_tx(move |_, before, after, route| {
+                        after_order.borrow_mut().push("after_move");
+                        Ok(vec![TriggeredOutcome::new(
+                            "arrival.marker",
+                            TriggerContext::place_arrived(
+                                before.player_id,
+                                after.place_id,
+                                Some(route.id),
+                            ),
+                        )])
+                    })
+                    .with_append_event(move |_, _| {
+                        assert_eq!(event_order.borrow().as_slice(), ["after_move"]);
+                        event_order.borrow_mut().push("append_event");
+                        Some(TravelEventDraft {
+                            kind: "arrived".to_string(),
+                            message: "arrived after outcomes".to_string(),
+                            metadata_json: None,
+                        })
+                    }),
+            )
+            .expect("travel succeeds with outcomes and event append");
+
+        let events = world
+            .player_events(player_id, 10)
+            .expect("player events read after travel");
+        assert_eq!(order.borrow().as_slice(), ["after_move", "append_event"]);
+        assert_eq!(result.triggered_outcomes.len(), 1);
+        assert_eq!(result.triggered_outcomes[0].key, "arrival.marker");
+        assert_eq!(result.event_id, events.first().map(|event| event.id));
+        assert_eq!(events[0].message, "arrived after outcomes");
+    }
+
+    #[test]
+    fn post_move_callback_failure_rolls_back_movement_recall_cost_and_event_append() {
+        let TravelFixture {
+            mut world,
+            player_id,
+            origin_id,
+            destination_id,
+            ..
+        } = setup_travel_fixture();
+        world
+            .apply_migration(&INVENTORY_SLOTS_MIGRATION)
+            .expect("inventory migration applies");
+        world
+            .create_slot("player", player_id, "movement-token", 2, None, None)
+            .expect("cost source exists");
+
+        let rejected = world.travel(
+            TravelRequest::new(player_id, destination_id)
+                .with_charge_cost_tx(|tx, presence, _route| {
+                    transfer_on(
+                        tx,
+                        ("player", presence.player_id),
+                        ("world-sink", 1),
+                        "movement-token",
+                        1,
+                        None::<
+                            fn(
+                                &rusqlite::Connection,
+                                &InventorySlot,
+                                &InventorySlot,
+                            ) -> rusqlite::Result<()>,
+                        >,
+                    )?;
+                    Ok(())
+                })
+                .with_after_move_tx(|_, _, _, route| {
+                    Err(TravelError::OutcomeFailed {
+                        player_id,
+                        route_id: route.id,
+                        reason: "duplicate proof".to_string(),
+                    })
+                })
+                .with_append_event(|_, _| {
+                    Some(TravelEventDraft {
+                        kind: "arrived".to_string(),
+                        message: "should not persist".to_string(),
+                        metadata_json: None,
+                    })
+                }),
+        );
+
+        match rejected {
+            Err(TravelError::OutcomeFailed { reason, .. }) => {
+                assert_eq!(reason, "duplicate proof");
+            }
+            other => panic!("expected outcome failure, got {other:?}"),
+        }
+
+        let presence = world
+            .get_presence(player_id)
+            .expect("presence reads")
+            .expect("presence row exists");
+        let source = world
+            .get_slot("player", player_id, "movement-token")
+            .expect("source reads")
+            .expect("source remains");
+        let sink = world
+            .get_slot("world-sink", 1, "movement-token")
+            .expect("sink reads");
+        let recall = world
+            .recall_for_player(player_id)
+            .expect("recall reads after rollback");
+        let events = world
+            .player_events(player_id, 10)
+            .expect("events read after rollback");
+
+        assert_eq!(presence.place_id, origin_id);
+        assert_eq!(source.quantity, 2);
+        assert!(sink.is_none());
+        assert!(
+            !recall
+                .iter()
+                .any(|row| row.player_id == player_id && row.place_id == destination_id),
+            "outcome failure should roll back recall touch"
+        );
+        assert!(
+            events.is_empty(),
+            "event append should not run after outcome failure"
+        );
     }
 
     #[test]
