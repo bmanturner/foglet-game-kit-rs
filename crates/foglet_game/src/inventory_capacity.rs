@@ -12,7 +12,7 @@
 use serde_json::Value;
 use thiserror::Error;
 
-use crate::inventory::{InventoryError, InventorySlot};
+use crate::inventory::{grant_inventory_on, InventoryError, InventorySlot};
 use crate::world_db::WorldDb;
 
 /// Game-supplied capacity policy used by inventory helpers.
@@ -351,6 +351,71 @@ fn validate_incoming_in_tx(
     Ok(())
 }
 
+/// Grant item quantity to one owner on an existing connection or
+/// transaction after validating caller-defined capacity.
+///
+/// This is the capacity-aware counterpart to
+/// [`crate::inventory::grant_inventory_on`]. It does not commit; callers
+/// keep ownership of the surrounding transaction. Capacity remains
+/// game-authored through [`CapacityPolicy`], while the inventory mutation
+/// uses the kit-owned metadata-compatible grant/upsert behavior.
+pub fn grant_inventory_with_capacity_on(
+    conn: &rusqlite::Connection,
+    owner: (&str, i64),
+    item_key: &str,
+    quantity: i64,
+    metadata_json: Option<&str>,
+    policy: &impl CapacityPolicy,
+) -> Result<InventorySlot, CapacityError> {
+    if quantity <= 0 {
+        return Err(InventoryError::InvalidTransferQuantity { quantity }.into());
+    }
+
+    let (owner_kind, owner_id) = owner;
+    validate_incoming_with_metadata_in_tx(
+        conn,
+        owner_kind,
+        owner_id,
+        item_key,
+        quantity,
+        metadata_json,
+        policy,
+    )?;
+
+    grant_inventory_on(conn, owner, item_key, quantity, metadata_json).map_err(Into::into)
+}
+
+fn validate_incoming_with_metadata_in_tx(
+    conn: &rusqlite::Connection,
+    owner_kind: &str,
+    owner_id: i64,
+    item_key: &str,
+    quantity: i64,
+    metadata_json: Option<&str>,
+    policy: &impl CapacityPolicy,
+) -> Result<(), CapacityError> {
+    let Some(capacity) = policy.owner_capacity(owner_kind, owner_id)? else {
+        return Ok(());
+    };
+    let used = used_capacity_in_tx(conn, owner_kind, owner_id, policy)?;
+    let metadata = metadata_json
+        .map(serde_json::from_str::<Value>)
+        .transpose()
+        .map_err(|source| CapacityError::PolicyError(source.to_string()))?
+        .unwrap_or(Value::Null);
+    let requested = policy.item_volume(item_key, &metadata)? * quantity;
+
+    if used + requested > capacity {
+        return Err(CapacityError::InsufficientCapacity {
+            used,
+            requested,
+            capacity,
+        });
+    }
+
+    Ok(())
+}
+
 fn used_capacity_in_tx(
     conn: &rusqlite::Connection,
     owner_kind: &str,
@@ -635,6 +700,46 @@ mod tests {
             }
             other => panic!("expected insufficient capacity, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn grant_inventory_with_capacity_on_rejects_over_capacity_without_mutating() {
+        let dir = tempdir().expect("tempdir creates");
+        let db_path = dir.path().join("world.sqlite");
+        let mut world = WorldDb::open(&db_path).expect("open succeeds");
+        world
+            .apply_migration(&INVENTORY_SLOTS_MIGRATION)
+            .expect("inventory_slots migration applies");
+        world
+            .create_slot("player", 7, "ration", 4, None, None)
+            .expect("existing inventory slot inserts");
+
+        let rejected = super::grant_inventory_with_capacity_on(
+            world.connection(),
+            ("player", 7),
+            "ration",
+            2,
+            None,
+            &FixedPolicy,
+        );
+
+        match rejected {
+            Err(CapacityError::InsufficientCapacity {
+                used,
+                requested,
+                capacity,
+            }) => {
+                assert_eq!(used, 8);
+                assert_eq!(requested, 4);
+                assert_eq!(capacity, 10);
+            }
+            other => panic!("expected capacity rejection, got {other:?}"),
+        }
+        let slot = world
+            .get_slot("player", 7, "ration")
+            .expect("slot lookup succeeds")
+            .expect("slot still exists");
+        assert_eq!(slot.quantity, 4);
     }
 
     #[test]

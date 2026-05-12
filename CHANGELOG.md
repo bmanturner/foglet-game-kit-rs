@@ -31,9 +31,21 @@
 - Added reusable contract job read models for available, accepted,
   ready-to-complete, completed, failed, abandoned, and expired work,
   with game-supplied objective readiness and requirement rows.
+- Added `inventory::grant_inventory_on` and
+  `inventory_capacity::grant_inventory_with_capacity_on` for
+  transaction-scoped direct rewards and pickups with metadata-compatible
+  upsert behavior.
+- Added connection-scoped contract key/acceptor lookup helpers for
+  transaction-local lifecycle checks without raw SQL.
+- Added player-scoped map projection helpers that combine presence,
+  place recall, game-authored visibility policy, and route availability
+  for graph, room, atlas, or star-chart UIs.
 - Added `spend_turns_on` for spending Daily Turns on an existing SQLite
   connection or transaction, including from transaction-aware travel
   cost callbacks.
+- Documented why generic market quote/read-model support is deferred
+  until pricing, balance, and disabled-reason patterns repeat across
+  more downstream games.
 - Enabled SQLite foreign-key enforcement for every `WorldDb` connection,
   so kit and game migrations that declare parent rows are enforced without
   game-local trigger duplicates.

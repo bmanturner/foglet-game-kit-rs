@@ -49,6 +49,7 @@ pub mod job_board_screen;
 pub mod leaderboards;
 pub mod manifest;
 pub mod map;
+pub mod map_projection;
 pub mod market;
 pub mod notices;
 pub mod place_recall;
@@ -89,7 +90,9 @@ pub use contract_jobs::{
     JobLifecycleView, JobRequirementView, NoObjectiveViewProvider,
 };
 pub use contracts::{
-    Contract, ContractError, ContractState, CreateContractInput, CONTRACTS_MIGRATION,
+    acceptor_has_contract_state_on, contract_by_key_for_acceptor_on,
+    contract_state_by_key_for_acceptor_on, Contract, ContractError, ContractState,
+    CreateContractInput, CONTRACTS_MIGRATION,
 };
 pub use dialog::{
     dialog_choice_prompt, dialog_handle_prompt_input, load_dialog, Choice, ChoiceError, Dialog,
@@ -108,8 +111,10 @@ pub use foglet::{
     process_env, synthesize_local_dev, ContextError, ContextSource, FogletContext, LoadOptions,
 };
 pub use input::{from_event, from_key_event, Input};
-pub use inventory::{transfer_on, InventoryError, InventorySlot, INVENTORY_SLOTS_MIGRATION};
-pub use inventory_capacity::{CapacityError, CapacityPolicy};
+pub use inventory::{
+    grant_inventory_on, transfer_on, InventoryError, InventorySlot, INVENTORY_SLOTS_MIGRATION,
+};
+pub use inventory_capacity::{grant_inventory_with_capacity_on, CapacityError, CapacityPolicy};
 pub use job_board::{
     BountyProvider, BuiltInProviders, ChallengeProvider, ContractProvider, JobBoard, JobBoardEntry,
     JobBoardError, JobBoardFilter, JobBoardSort, JobBoardSource, OpportunityProvider,
@@ -122,6 +127,11 @@ pub use manifest::{
 };
 pub use map::{
     parse_map, EntityPlacement, Map, MapError, Tile, TileKind, TileLegend, PLAYER_GLYPH,
+};
+pub use map_projection::{
+    project_player_map, project_player_map_with_options, MapProjectionError, MapProjectionOptions,
+    PlaceProjection, PlaceVisibility, PlaceVisibilityPolicy, PlayerMapProjection,
+    RouteAvailability, RouteProjection,
 };
 pub use market::{
     MarketError, MarketListing, MARKET_BUY_EVENT_KIND, MARKET_DISPLAY_NAME_MAX_CHARS,

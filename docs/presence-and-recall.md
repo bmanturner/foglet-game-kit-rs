@@ -150,3 +150,41 @@ That sequence can be different by game family:
 - A **town simulation** may touch recall only for named landmarks.
 
 The kit stays genre-agnostic by not forcing one policy.
+
+## 5. Player map projection
+
+Use `map_projection::project_player_map` when a UI needs a player-facing
+atlas, star chart, room list, or route list that combines current
+presence with player-scoped recall.
+
+Games provide a `PlaceVisibilityPolicy`:
+
+```rust
+struct SimplePolicy;
+
+impl PlaceVisibilityPolicy for SimplePolicy {
+    fn visibility_for_place(
+        &self,
+        place: &Place,
+        recall: Option<&PlaceRecallRecord>,
+        _current_place_id: i64,
+    ) -> PlaceVisibility {
+        if recall.is_some() {
+            PlaceVisibility::Seen
+        } else if place.kind == "hub" {
+            PlaceVisibility::Known
+        } else if place.metadata_json.as_deref() == Some(r#"{"rumored":true}"#) {
+            PlaceVisibility::Rumored
+        } else {
+            PlaceVisibility::Hidden
+        }
+    }
+}
+```
+
+`project_player_map` always marks the current place as `Current`, passes
+only that player's recall rows into the policy, omits hidden places by
+default, and labels routes as `Outbound`, `Unavailable`, or `Hidden`
+relative to the player's current presence. It does not require a grid;
+the same projection works for graph maps, rooms, stations, and route
+lists.

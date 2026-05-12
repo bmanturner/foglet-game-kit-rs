@@ -120,7 +120,24 @@ decides whether the mutation persists.
 `transfer_on` is the preferred replacement for direct SQL against
 `inventory_slots` in normal gameplay code.
 
-### 4.3 Worked example: trading-post commerce
+### 4.3 Grant direct rewards inside a caller-owned transaction
+
+Use `inventory::grant_inventory_on(connection, owner, item_key, quantity,
+metadata_json)` when stock appears without debiting another owner:
+quest pickups, contract rewards, arrival outcomes, admin repair tools,
+or authored event consequences.
+
+The helper rejects non-positive quantities with
+`InventoryError::InvalidTransferQuantity`. Metadata is part of slot
+compatibility: an existing slot is incremented only when
+`owner_kind`, `owner_id`, `item_key`, and `metadata_json` match exactly.
+If metadata differs, the helper creates a separate slot instead of
+accidentally merging opaque game state.
+
+Use `transfer_on` when inventory moves from one owner to another. Use
+`grant_inventory_on` when the game is minting or awarding quantity.
+
+### 4.4 Worked example: trading-post commerce
 
 ```rust
 let (after_caravan, after_stall) = world.transfer(

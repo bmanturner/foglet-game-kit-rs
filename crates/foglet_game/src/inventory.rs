@@ -135,6 +135,19 @@ pub enum InventoryError {
         /// Requested transfer quantity.
         quantity: i64,
     },
+    /// SQL failed while granting stock into an owner slot.
+    #[error("failed to grant `{item_key}` to `{owner_kind}:{owner_id}`: {source}")]
+    GrantFailed {
+        /// Owner bucket for diagnostics.
+        owner_kind: String,
+        /// Owner row id for diagnostics.
+        owner_id: i64,
+        /// Item key being granted.
+        item_key: String,
+        /// Underlying SQL failure.
+        #[source]
+        source: rusqlite::Error,
+    },
     /// Slot write failed.
     #[error("failed to create inventory slot for owner `{owner_kind}:{owner_id}`, item `{item_key}`: {source}")]
     CreateFailed {
@@ -707,6 +720,94 @@ where
     Ok((post_source, post_destination))
 }
 
+/// Grant item quantity to one owner on an existing SQLite connection or
+/// transaction.
+///
+/// Use this helper for direct rewards, pickups, arrival outcomes, and
+/// other game events that create stock without debiting another owner.
+/// It does not commit; callers own the surrounding transaction boundary.
+///
+/// Metadata is part of slot compatibility. The helper increments the
+/// oldest slot whose `(owner_kind, owner_id, item_key, metadata_json)`
+/// exactly matches the requested grant, including `NULL` metadata. If no
+/// compatible slot exists, it creates a new slot with the provided
+/// metadata. This keeps two rows for the same item key but different
+/// opaque game metadata from merging accidentally.
+pub fn grant_inventory_on(
+    connection: &rusqlite::Connection,
+    owner: (&str, i64),
+    item_key: &str,
+    quantity: i64,
+    metadata_json: Option<&str>,
+) -> Result<InventorySlot, InventoryError> {
+    if quantity <= 0 {
+        return Err(InventoryError::InvalidTransferQuantity { quantity });
+    }
+
+    let (owner_kind, owner_id) = owner;
+
+    let compatible_slot = find_slot_for_owner_with_metadata(
+        connection,
+        owner_kind,
+        owner_id,
+        item_key,
+        metadata_json,
+    )
+    .map_err(|source| InventoryError::GrantFailed {
+        owner_kind: owner_kind.to_string(),
+        owner_id,
+        item_key: item_key.to_string(),
+        source,
+    })?;
+
+    match compatible_slot {
+        Some(slot) => {
+            connection
+                .execute(
+                    "UPDATE inventory_slots\n\
+                     SET quantity = quantity + ?2,\n\
+                         updated_at = CURRENT_TIMESTAMP\n\
+                     WHERE id = ?1",
+                    rusqlite::params![slot.id, quantity],
+                )
+                .and_then(|updated| {
+                    if updated == 0 {
+                        Err(rusqlite::Error::QueryReturnedNoRows)
+                    } else {
+                        Ok(updated)
+                    }
+                })
+                .map_err(|source| InventoryError::GrantFailed {
+                    owner_kind: owner_kind.to_string(),
+                    owner_id,
+                    item_key: item_key.to_string(),
+                    source,
+                })?;
+
+            load_slot_by_id(connection, slot.id).map_err(|source| InventoryError::GrantFailed {
+                owner_kind: owner_kind.to_string(),
+                owner_id,
+                item_key: item_key.to_string(),
+                source,
+            })
+        }
+        None => connection
+            .query_row(
+                "INSERT INTO inventory_slots (owner_kind, owner_id, item_key, quantity, equilibrium, metadata_json)\n\
+                 VALUES (?1, ?2, ?3, ?4, NULL, ?5)\n\
+                 RETURNING id, owner_kind, owner_id, item_key, quantity, equilibrium, metadata_json",
+                rusqlite::params![owner_kind, owner_id, item_key, quantity, metadata_json],
+                row_to_inventory_slot,
+            )
+            .map_err(|source| InventoryError::GrantFailed {
+                owner_kind: owner_kind.to_string(),
+                owner_id,
+                item_key: item_key.to_string(),
+                source,
+            }),
+    }
+}
+
 fn row_to_inventory_slot(row: &rusqlite::Row<'_>) -> rusqlite::Result<InventorySlot> {
     Ok(InventorySlot {
         id: row.get(0)?,
@@ -717,6 +818,34 @@ fn row_to_inventory_slot(row: &rusqlite::Row<'_>) -> rusqlite::Result<InventoryS
         equilibrium: row.get(5)?,
         metadata_json: row.get(6)?,
     })
+}
+
+fn find_slot_for_owner_with_metadata(
+    connection: &rusqlite::Connection,
+    owner_kind: &str,
+    owner_id: i64,
+    item_key: &str,
+    metadata_json: Option<&str>,
+) -> rusqlite::Result<Option<InventorySlot>> {
+    const SQL: &str = "\
+SELECT id, owner_kind, owner_id, item_key, quantity, equilibrium, metadata_json\n\
+FROM inventory_slots\n\
+WHERE owner_kind = ?1\n\
+  AND owner_id = ?2\n\
+  AND item_key = ?3\n\
+  AND ((?4 IS NULL AND metadata_json IS NULL) OR metadata_json = ?4)\n\
+ORDER BY id ASC\n\
+LIMIT 1";
+
+    match connection.query_row(
+        SQL,
+        rusqlite::params![owner_kind, owner_id, item_key, metadata_json],
+        row_to_inventory_slot,
+    ) {
+        Ok(slot) => Ok(Some(slot)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(source) => Err(source),
+    }
 }
 
 fn transfer_transition(
@@ -1257,6 +1386,153 @@ mod tests {
         assert!(
             destination.is_none(),
             "dropping the surrounding transaction should roll back destination creation"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn grant_inventory_on_creates_slot_inside_caller_transaction() -> Result<(), InventoryError> {
+        let dir = tempdir().expect("tempdir creates");
+        let db_path = dir.path().join("world.sqlite");
+        let mut world = WorldDb::open(&db_path).expect("open succeeds");
+
+        world
+            .apply_migration(&INVENTORY_SLOTS_MIGRATION)
+            .expect("inventory_slots migration applies");
+
+        let tx = world
+            .connection_mut()
+            .transaction()
+            .expect("transaction begins");
+        let granted = super::grant_inventory_on(
+            &tx,
+            ("player", 7),
+            "blue-key",
+            1,
+            Some(r#"{"source":"quest"}"#),
+        )?;
+        tx.commit().expect("transaction commits");
+
+        let persisted = world
+            .get_slot("player", 7, "blue-key")?
+            .expect("grant creates slot");
+        assert_eq!(persisted, granted);
+        assert_eq!(persisted.quantity, 1);
+        assert_eq!(
+            persisted.metadata_json,
+            Some(r#"{"source":"quest"}"#.to_string())
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn grant_inventory_on_increments_compatible_metadata_slot() -> Result<(), InventoryError> {
+        let dir = tempdir().expect("tempdir creates");
+        let db_path = dir.path().join("world.sqlite");
+        let mut world = WorldDb::open(&db_path).expect("open succeeds");
+
+        world
+            .apply_migration(&INVENTORY_SLOTS_MIGRATION)
+            .expect("inventory_slots migration applies");
+
+        let original = world.create_slot("ship", 1, "ore", 4, None, Some(r#"{"grade":"a"}"#))?;
+        let granted = super::grant_inventory_on(
+            world.connection(),
+            ("ship", 1),
+            "ore",
+            3,
+            Some(r#"{"grade":"a"}"#),
+        )?;
+
+        assert_eq!(granted.id, original.id);
+        assert_eq!(granted.quantity, 7);
+        assert_eq!(world.slots_for_owner("ship", 1)?.len(), 1);
+
+        Ok(())
+    }
+
+    #[test]
+    fn grant_inventory_on_rejects_non_positive_quantity() -> Result<(), InventoryError> {
+        let dir = tempdir().expect("tempdir creates");
+        let db_path = dir.path().join("world.sqlite");
+        let mut world = WorldDb::open(&db_path).expect("open succeeds");
+
+        world
+            .apply_migration(&INVENTORY_SLOTS_MIGRATION)
+            .expect("inventory_slots migration applies");
+
+        let rejected = super::grant_inventory_on(world.connection(), ("ship", 1), "ore", 0, None);
+
+        match rejected {
+            Err(InventoryError::InvalidTransferQuantity { quantity }) => assert_eq!(quantity, 0),
+            other => panic!("expected invalid quantity, got {other:?}"),
+        }
+        assert!(world.get_slot("ship", 1, "ore")?.is_none());
+
+        Ok(())
+    }
+
+    #[test]
+    fn grant_inventory_on_keeps_incompatible_metadata_in_separate_slots(
+    ) -> Result<(), InventoryError> {
+        let dir = tempdir().expect("tempdir creates");
+        let db_path = dir.path().join("world.sqlite");
+        let mut world = WorldDb::open(&db_path).expect("open succeeds");
+
+        world
+            .apply_migration(&INVENTORY_SLOTS_MIGRATION)
+            .expect("inventory_slots migration applies");
+
+        let sealed =
+            world.create_slot("cargo", 2, "sample", 2, None, Some(r#"{"seal":"intact"}"#))?;
+        let cracked = super::grant_inventory_on(
+            world.connection(),
+            ("cargo", 2),
+            "sample",
+            5,
+            Some(r#"{"seal":"cracked"}"#),
+        )?;
+
+        let slots = world.slots_for_owner("cargo", 2)?;
+        assert_eq!(slots.len(), 2);
+        assert_eq!(sealed.quantity, 2);
+        assert_ne!(sealed.id, cracked.id);
+        assert_eq!(cracked.quantity, 5);
+        assert_eq!(
+            slots
+                .iter()
+                .map(|slot| slot.metadata_json.as_deref())
+                .collect::<Vec<_>>(),
+            vec![Some(r#"{"seal":"intact"}"#), Some(r#"{"seal":"cracked"}"#)]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn grant_inventory_on_rolls_back_with_surrounding_transaction() -> Result<(), InventoryError> {
+        let dir = tempdir().expect("tempdir creates");
+        let db_path = dir.path().join("world.sqlite");
+        let mut world = WorldDb::open(&db_path).expect("open succeeds");
+
+        world
+            .apply_migration(&INVENTORY_SLOTS_MIGRATION)
+            .expect("inventory_slots migration applies");
+
+        {
+            let tx = world
+                .connection_mut()
+                .transaction()
+                .expect("transaction begins");
+            let granted = super::grant_inventory_on(&tx, ("player", 9), "ration", 2, None)?;
+            assert_eq!(granted.quantity, 2);
+        }
+
+        assert!(
+            world.get_slot("player", 9, "ration")?.is_none(),
+            "dropping the caller transaction should roll back the grant"
         );
 
         Ok(())

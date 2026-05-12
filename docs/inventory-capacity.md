@@ -18,6 +18,10 @@ Helpers:
   the same SQLite transaction that debits the source and credits the
   destination, so concurrent transfers cannot collectively exceed the
   cap.
+- `grant_inventory_with_capacity_on` validates capacity and then grants
+  quantity with metadata-compatible upsert behavior on an existing
+  SQLite connection or transaction. Use it for rewards and pickups that
+  should respect backpack, hold, or warehouse limits.
 
 Examples:
 

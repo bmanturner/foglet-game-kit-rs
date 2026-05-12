@@ -90,6 +90,19 @@ impl ContractState {
             ContractState::Expired => "expired",
         }
     }
+
+    /// Decode SQLite text into a typed lifecycle state.
+    pub fn from_state_str(value: &str) -> Option<Self> {
+        match value {
+            "available" => Some(Self::Available),
+            "accepted" => Some(Self::Accepted),
+            "completed" => Some(Self::Completed),
+            "failed" => Some(Self::Failed),
+            "abandoned" => Some(Self::Abandoned),
+            "expired" => Some(Self::Expired),
+            _ => None,
+        }
+    }
 }
 
 /// Errors for contract write/read helpers.
@@ -157,6 +170,12 @@ pub enum ContractError {
         /// Underlying SQL failure.
         #[source]
         source: rusqlite::Error,
+    },
+    /// A contract row contained a state outside the documented vocabulary.
+    #[error("contract row contained unknown lifecycle state `{state}`")]
+    InvalidState {
+        /// Unknown state text read from SQLite.
+        state: String,
     },
 }
 
@@ -1081,6 +1100,68 @@ RETURNING id, key, kind, issuer_owner_kind, issuer_owner_id, \
     }
 }
 
+/// Load a contract by stable key and acceptor on an existing SQLite
+/// connection or transaction.
+///
+/// Use this when transaction-local hooks need lifecycle context without
+/// issuing game-local SQL against the kit-owned `contracts` table. The
+/// query requires an exact key match and an exact acceptor match; rows
+/// for other players or merely similar keys are ignored.
+pub fn contract_by_key_for_acceptor_on(
+    conn: &rusqlite::Connection,
+    acceptor_player_id: i64,
+    key: &str,
+) -> Result<Option<Contract>, ContractError> {
+    const SQL: &str = "\
+SELECT id, key, kind, issuer_owner_kind, issuer_owner_id, \
+       acceptor_player_id, state, objective_json, reward_json, metadata_json, \
+       created_at, accepted_at, completed_at, expires_at\n\
+FROM contracts\n\
+WHERE acceptor_player_id = ?1\n\
+  AND key = ?2\n\
+ORDER BY id ASC\n\
+LIMIT 1";
+
+    match conn.query_row(
+        SQL,
+        rusqlite::params![acceptor_player_id, key],
+        row_to_contract,
+    ) {
+        Ok(contract) => Ok(Some(contract)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(source) => Err(ContractError::Sqlite { source }),
+    }
+}
+
+/// Return the typed lifecycle state for a key + acceptor lookup on an
+/// existing SQLite connection or transaction.
+pub fn contract_state_by_key_for_acceptor_on(
+    conn: &rusqlite::Connection,
+    acceptor_player_id: i64,
+    key: &str,
+) -> Result<Option<ContractState>, ContractError> {
+    let Some(contract) = contract_by_key_for_acceptor_on(conn, acceptor_player_id, key)? else {
+        return Ok(None);
+    };
+
+    ContractState::from_state_str(&contract.state)
+        .map(Some)
+        .ok_or(ContractError::InvalidState {
+            state: contract.state,
+        })
+}
+
+/// Return whether an acceptor owns a contract with the given key and
+/// lifecycle state on an existing SQLite connection or transaction.
+pub fn acceptor_has_contract_state_on(
+    conn: &rusqlite::Connection,
+    acceptor_player_id: i64,
+    key: &str,
+    state: ContractState,
+) -> Result<bool, ContractError> {
+    Ok(contract_state_by_key_for_acceptor_on(conn, acceptor_player_id, key)? == Some(state))
+}
+
 /// Decode one `contracts` row in the column order used by this module.
 fn row_to_contract(row: &rusqlite::Row<'_>) -> rusqlite::Result<Contract> {
     Ok(Contract {
@@ -1615,6 +1696,135 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![guild_accepted_alice.id]
         );
+    }
+
+    #[test]
+    fn connection_scoped_contract_key_helpers_cover_lifecycle_and_transactions() {
+        let dir = tempdir().expect("tempdir creates");
+        let db_path = dir.path().join("world.sqlite");
+        let mut world = WorldDb::open(&db_path).expect("open succeeds");
+        world
+            .apply_migration(&CONTRACTS_MIGRATION)
+            .expect("contracts migration applies");
+
+        let accepted = world
+            .create_and_accept_contract(
+                CreateContractInput {
+                    key: Some("relay-run"),
+                    kind: "delivery",
+                    issuer_owner_kind: "station",
+                    issuer_owner_id: 1,
+                    objective_json: r#"{"dropoff":"relay"}"#,
+                    reward_json: r#"{"credits":20}"#,
+                    metadata_json: None,
+                    expires_at: None,
+                },
+                100,
+                None::<fn(&rusqlite::Transaction<'_>, &super::Contract) -> rusqlite::Result<()>>,
+            )
+            .expect("contract is accepted");
+
+        world
+            .create_and_accept_contract(
+                CreateContractInput {
+                    key: Some("relay-run-bonus"),
+                    kind: "delivery",
+                    issuer_owner_kind: "station",
+                    issuer_owner_id: 1,
+                    objective_json: r#"{"dropoff":"relay","bonus":true}"#,
+                    reward_json: r#"{"credits":5}"#,
+                    metadata_json: None,
+                    expires_at: None,
+                },
+                100,
+                None::<fn(&rusqlite::Transaction<'_>, &super::Contract) -> rusqlite::Result<()>>,
+            )
+            .expect("similar key contract is accepted");
+
+        assert!(
+            super::contract_by_key_for_acceptor_on(world.connection(), 100, "missing")
+                .expect("missing lookup succeeds")
+                .is_none()
+        );
+        assert!(
+            super::contract_by_key_for_acceptor_on(world.connection(), 200, "relay-run")
+                .expect("wrong acceptor lookup succeeds")
+                .is_none()
+        );
+
+        let loaded = super::contract_by_key_for_acceptor_on(world.connection(), 100, "relay-run")
+            .expect("lookup succeeds")
+            .expect("accepted contract exists");
+        assert_eq!(loaded.id, accepted.id);
+        assert_eq!(loaded.state, ContractState::Accepted.as_str());
+        assert_eq!(
+            super::contract_state_by_key_for_acceptor_on(world.connection(), 100, "relay-run")
+                .expect("state lookup succeeds"),
+            Some(ContractState::Accepted)
+        );
+        assert!(super::acceptor_has_contract_state_on(
+            world.connection(),
+            100,
+            "relay-run",
+            ContractState::Accepted,
+        )
+        .expect("state predicate succeeds"));
+        assert!(!super::acceptor_has_contract_state_on(
+            world.connection(),
+            100,
+            "relay-run",
+            ContractState::Completed,
+        )
+        .expect("negative state predicate succeeds"));
+
+        let completed = world
+            .complete_contract(
+                accepted.id,
+                None::<fn(&rusqlite::Transaction<'_>, &super::Contract) -> rusqlite::Result<()>>,
+            )
+            .expect("contract completes");
+        assert_eq!(completed.state, ContractState::Completed.as_str());
+        assert_eq!(
+            super::contract_state_by_key_for_acceptor_on(world.connection(), 100, "relay-run")
+                .expect("completed state lookup succeeds"),
+            Some(ContractState::Completed)
+        );
+
+        let exact =
+            super::contract_by_key_for_acceptor_on(world.connection(), 100, "relay-run-bonus")
+                .expect("similar key lookup succeeds")
+                .expect("similar key contract exists");
+        assert_ne!(exact.id, accepted.id);
+
+        world
+            .create_and_accept_contract(
+                CreateContractInput {
+                    key: Some("callback-check"),
+                    kind: "patrol",
+                    issuer_owner_kind: "guild",
+                    issuer_owner_id: 7,
+                    objective_json: r#"{"route":"north"}"#,
+                    reward_json: r#"{"favor":1}"#,
+                    metadata_json: None,
+                    expires_at: None,
+                },
+                300,
+                Some(
+                    |tx: &rusqlite::Transaction<'_>, contract: &super::Contract| {
+                        assert_eq!(
+                            super::contract_state_by_key_for_acceptor_on(
+                                tx,
+                                300,
+                                contract.key.as_deref().expect("callback contract has key"),
+                            )
+                            .expect("transaction-local lookup succeeds"),
+                            Some(ContractState::Accepted)
+                        );
+                        Ok(())
+                    },
+                ),
+            )
+            .expect("transaction-local callback lookup succeeds");
     }
 
     #[test]

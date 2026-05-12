@@ -67,6 +67,20 @@ kit APIs from the callback: `inventory::transfer_on` for
 Those helpers preserve kit validation while avoiding direct SQL against
 kit-owned tables.
 
+Transaction-local contract checks:
+
+- `contract_by_key_for_acceptor_on(connection, player_id, key)` returns
+  the matching `Contract` row, if this exact player accepted this exact
+  key.
+- `contract_state_by_key_for_acceptor_on(connection, player_id, key)`
+  returns the typed `ContractState`, if present.
+- `acceptor_has_contract_state_on(connection, player_id, key, state)` is
+  the small predicate form for travel hooks, outcome callbacks, and
+  completion checks.
+
+Prefer these helpers inside existing transactions instead of raw SQL
+against `contracts`.
+
 Create-and-accept example:
 
 ```rust
