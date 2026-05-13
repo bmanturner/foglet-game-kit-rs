@@ -125,6 +125,54 @@ pub enum PlaceRecallError {
         /// Existing non-object snapshot payload.
         snapshot_json: String,
     },
+    /// A namespace merge was requested without at least one path segment.
+    #[error(
+        "recall namespace path for player `{player_id}` at place `{place_id}` must not be empty"
+    )]
+    NamespacePathEmpty {
+        /// Player identifier used in `merge_recall_namespace`.
+        player_id: i64,
+        /// Place identifier used in `merge_recall_namespace`.
+        place_id: i64,
+    },
+    /// A namespace merge path contained an empty segment.
+    #[error(
+        "recall namespace path segment {index} for player `{player_id}` at place `{place_id}` must not be empty"
+    )]
+    NamespacePathSegmentEmpty {
+        /// Player identifier used in `merge_recall_namespace`.
+        player_id: i64,
+        /// Place identifier used in `merge_recall_namespace`.
+        place_id: i64,
+        /// Segment index in the namespace path.
+        index: usize,
+    },
+    /// A namespace merge payload was not a JSON object.
+    #[error(
+        "recall namespace merge for `{namespace_path}` at player `{player_id}` place `{place_id}` must be a JSON object"
+    )]
+    NamespaceMergeNotObject {
+        /// Player identifier used in `merge_recall_namespace`.
+        player_id: i64,
+        /// Place identifier used in `merge_recall_namespace`.
+        place_id: i64,
+        /// Human-readable namespace path.
+        namespace_path: String,
+    },
+    /// A namespace path hit an existing non-object value.
+    #[error(
+        "recall namespace `{namespace_path}` for player `{player_id}` at place `{place_id}` contains non-object segment `{segment}`"
+    )]
+    NamespaceNotObject {
+        /// Player identifier used in `merge_recall_namespace`.
+        player_id: i64,
+        /// Place identifier used in `merge_recall_namespace`.
+        place_id: i64,
+        /// Human-readable namespace path.
+        namespace_path: String,
+        /// Segment whose existing value was not an object.
+        segment: String,
+    },
     /// Serializing the merged snapshot failed.
     #[error("failed to serialize merged recall snapshot for player `{player_id}` at place `{place_id}`: {source}")]
     SnapshotSerializeFailed {
@@ -268,6 +316,29 @@ ORDER BY last_seen_at DESC, place_id DESC";
     {
         merge_recall_snapshot_on(self.connection(), player_id, place_id, merge)
     }
+
+    /// Deep-merge a JSON object into one namespace path inside a recall
+    /// snapshot.
+    ///
+    /// This is the connection-scoped convenience wrapper around
+    /// [`merge_recall_namespace_on`]. It creates missing namespace
+    /// objects, preserves sibling namespaces, and rejects existing
+    /// non-object values at the requested path with typed errors.
+    pub fn merge_recall_namespace(
+        &self,
+        player_id: i64,
+        place_id: i64,
+        namespace_path: &[&str],
+        merge_value: serde_json::Value,
+    ) -> Result<PlaceRecallRecord, PlaceRecallError> {
+        merge_recall_namespace_on(
+            self.connection(),
+            player_id,
+            place_id,
+            namespace_path,
+            merge_value,
+        )
+    }
 }
 
 /// Merge one game-owned recall snapshot object using an existing
@@ -291,6 +362,58 @@ pub fn merge_recall_snapshot_on<F>(
 ) -> Result<PlaceRecallRecord, PlaceRecallError>
 where
     F: FnOnce(&mut serde_json::Map<String, serde_json::Value>),
+{
+    merge_recall_snapshot_on_result(conn, player_id, place_id, |snapshot| {
+        merge(snapshot);
+        Ok(())
+    })
+}
+
+/// Deep-merge a JSON object into a namespace path in one recall snapshot.
+///
+/// `namespace_path` is a sequence such as
+/// `["salvage", "derelicts", "derelict.key"]`. Missing path segments
+/// are created as JSON objects. Existing sibling keys and sibling
+/// namespaces are preserved. If an existing value at the namespace path
+/// is not an object, the helper returns
+/// [`PlaceRecallError::NamespaceNotObject`] and leaves the row unchanged.
+///
+/// The helper accepts an existing SQLite connection or transaction and
+/// does not commit, so larger game actions can roll back recall facts
+/// with inventory, events, proof rows, or movement.
+pub fn merge_recall_namespace_on(
+    conn: &rusqlite::Connection,
+    player_id: i64,
+    place_id: i64,
+    namespace_path: &[&str],
+    merge_value: serde_json::Value,
+) -> Result<PlaceRecallRecord, PlaceRecallError> {
+    let path = normalize_namespace_path(namespace_path, player_id, place_id)?;
+    let namespace_path = namespace_path_label(&path);
+    let serde_json::Value::Object(merge_object) = merge_value else {
+        return Err(PlaceRecallError::NamespaceMergeNotObject {
+            player_id,
+            place_id,
+            namespace_path,
+        });
+    };
+
+    merge_recall_snapshot_on_result(conn, player_id, place_id, |snapshot| {
+        let namespace =
+            namespace_object_mut(snapshot, &path, &namespace_path, player_id, place_id)?;
+        deep_merge_object(namespace, merge_object);
+        Ok(())
+    })
+}
+
+fn merge_recall_snapshot_on_result<F>(
+    conn: &rusqlite::Connection,
+    player_id: i64,
+    place_id: i64,
+    merge: F,
+) -> Result<PlaceRecallRecord, PlaceRecallError>
+where
+    F: FnOnce(&mut serde_json::Map<String, serde_json::Value>) -> Result<(), PlaceRecallError>,
 {
     let current_snapshot: Option<Option<String>> = conn
         .query_row(
@@ -330,7 +453,7 @@ where
         None => serde_json::Map::new(),
     };
 
-    merge(&mut object);
+    merge(&mut object)?;
 
     let merged_json =
         serde_json::to_string(&serde_json::Value::Object(object)).map_err(|source| {
@@ -359,6 +482,86 @@ RETURNING player_id, place_id, first_seen_at, last_seen_at, snapshot_json";
         place_id,
         source,
     })
+}
+
+fn normalize_namespace_path(
+    namespace_path: &[&str],
+    player_id: i64,
+    place_id: i64,
+) -> Result<Vec<String>, PlaceRecallError> {
+    if namespace_path.is_empty() {
+        return Err(PlaceRecallError::NamespacePathEmpty {
+            player_id,
+            place_id,
+        });
+    }
+
+    namespace_path
+        .iter()
+        .enumerate()
+        .map(|(index, segment)| {
+            if segment.is_empty() {
+                Err(PlaceRecallError::NamespacePathSegmentEmpty {
+                    player_id,
+                    place_id,
+                    index,
+                })
+            } else {
+                Ok((*segment).to_string())
+            }
+        })
+        .collect()
+}
+
+fn namespace_path_label(namespace_path: &[String]) -> String {
+    namespace_path.join("/")
+}
+
+fn namespace_object_mut<'a>(
+    object: &'a mut serde_json::Map<String, serde_json::Value>,
+    path: &[String],
+    namespace_path: &str,
+    player_id: i64,
+    place_id: i64,
+) -> Result<&'a mut serde_json::Map<String, serde_json::Value>, PlaceRecallError> {
+    let Some((segment, rest)) = path.split_first() else {
+        return Ok(object);
+    };
+
+    let value = object
+        .entry(segment.clone())
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    match value {
+        serde_json::Value::Object(child) => {
+            namespace_object_mut(child, rest, namespace_path, player_id, place_id)
+        }
+        _ => Err(PlaceRecallError::NamespaceNotObject {
+            player_id,
+            place_id,
+            namespace_path: namespace_path.to_string(),
+            segment: segment.clone(),
+        }),
+    }
+}
+
+fn deep_merge_object(
+    target: &mut serde_json::Map<String, serde_json::Value>,
+    patch: serde_json::Map<String, serde_json::Value>,
+) {
+    for (key, value) in patch {
+        match value {
+            serde_json::Value::Object(patch_child) => {
+                if let Some(serde_json::Value::Object(target_child)) = target.get_mut(&key) {
+                    deep_merge_object(target_child, patch_child);
+                } else {
+                    target.insert(key, serde_json::Value::Object(patch_child));
+                }
+            }
+            other => {
+                target.insert(key, other);
+            }
+        }
+    }
 }
 
 fn row_to_place_recall(row: &rusqlite::Row<'_>) -> rusqlite::Result<PlaceRecallRecord> {
@@ -755,6 +958,192 @@ mod tests {
         );
     }
 
+    #[test]
+    fn merge_recall_namespace_preserves_sibling_namespaces() {
+        let NamespaceFixture {
+            world,
+            player_id,
+            place_id,
+            _dir,
+        } = setup_namespace_fixture();
+
+        world
+            .touch_recall(
+                player_id,
+                place_id,
+                Some(
+                    r#"{
+                        "navigation":{"visited":true},
+                        "salvage":{
+                            "summary":"mapped",
+                            "derelicts":{
+                                "other":{"status":"open"},
+                                "derelict.key":{"status":"old","nested":{"first":1}}
+                            }
+                        }
+                    }"#,
+                ),
+            )
+            .expect("initial namespaced recall inserts");
+
+        let merged = world
+            .merge_recall_namespace(
+                player_id,
+                place_id,
+                &["salvage", "derelicts", "derelict.key"],
+                serde_json::json!({
+                    "status": "stripped",
+                    "nested": {"second": 2},
+                    "proof": "black-box"
+                }),
+            )
+            .expect("namespace merge succeeds");
+
+        let snapshot = snapshot_value(&merged);
+        assert_eq!(snapshot["navigation"], serde_json::json!({"visited": true}));
+        assert_eq!(snapshot["salvage"]["summary"], "mapped");
+        assert_eq!(
+            snapshot["salvage"]["derelicts"]["other"],
+            serde_json::json!({"status": "open"})
+        );
+        assert_eq!(
+            snapshot["salvage"]["derelicts"]["derelict.key"],
+            serde_json::json!({
+                "status": "stripped",
+                "nested": {"first": 1, "second": 2},
+                "proof": "black-box"
+            }),
+            "one system should update its namespace without erasing sibling facts"
+        );
+    }
+
+    #[test]
+    fn merge_recall_namespace_rejects_non_object_path_without_rewriting() {
+        let NamespaceFixture {
+            world,
+            player_id,
+            place_id,
+            _dir,
+        } = setup_namespace_fixture();
+        let original = r#"{"navigation":{"visited":true},"salvage":{"derelicts":"sealed"}}"#;
+        world
+            .touch_recall(player_id, place_id, Some(original))
+            .expect("initial recall inserts");
+
+        let err = world
+            .merge_recall_namespace(
+                player_id,
+                place_id,
+                &["salvage", "derelicts", "derelict.key"],
+                serde_json::json!({"status":"mapped"}),
+            )
+            .expect_err("non-object namespace path should fail");
+
+        match err {
+            PlaceRecallError::NamespaceNotObject {
+                player_id: err_player,
+                place_id: err_place,
+                namespace_path,
+                segment,
+            } => {
+                assert_eq!(err_player, player_id);
+                assert_eq!(err_place, place_id);
+                assert_eq!(namespace_path, "salvage/derelicts/derelict.key");
+                assert_eq!(segment, "derelicts");
+            }
+            other => panic!("expected NamespaceNotObject, got {other:?}"),
+        }
+
+        let stored: String = world
+            .connection()
+            .query_row(
+                "SELECT snapshot_json FROM place_recall WHERE player_id = ?1 AND place_id = ?2",
+                rusqlite::params![player_id, place_id],
+                |row| row.get(0),
+            )
+            .expect("stored snapshot reads");
+        assert_eq!(
+            stored, original,
+            "failed namespace merge must not rewrite sibling facts"
+        );
+    }
+
+    #[test]
+    fn merge_recall_namespace_rejects_non_object_merge_value() {
+        let NamespaceFixture {
+            world,
+            player_id,
+            place_id,
+            _dir,
+        } = setup_namespace_fixture();
+
+        let err = world
+            .merge_recall_namespace(
+                player_id,
+                place_id,
+                &["salvage"],
+                serde_json::json!(["not", "an", "object"]),
+            )
+            .expect_err("namespace merge payload must be an object");
+
+        match err {
+            PlaceRecallError::NamespaceMergeNotObject {
+                player_id: err_player,
+                place_id: err_place,
+                namespace_path,
+            } => {
+                assert_eq!(err_player, player_id);
+                assert_eq!(err_place, place_id);
+                assert_eq!(namespace_path, "salvage");
+            }
+            other => panic!("expected NamespaceMergeNotObject, got {other:?}"),
+        }
+        assert!(
+            world
+                .recall_for_player(player_id)
+                .expect("recall reads")
+                .is_empty(),
+            "invalid merge value should not create a recall row"
+        );
+    }
+
+    #[test]
+    fn merge_recall_namespace_on_observes_transaction_rollback() {
+        let NamespaceFixture {
+            mut world,
+            player_id,
+            place_id,
+            _dir,
+        } = setup_namespace_fixture();
+
+        {
+            let tx = world
+                .connection_mut()
+                .transaction()
+                .expect("transaction begins");
+            let record = super::merge_recall_namespace_on(
+                &tx,
+                player_id,
+                place_id,
+                &["salvage", "derelicts", "derelict.key"],
+                serde_json::json!({"status":"mapped"}),
+            )
+            .expect("namespace merge works inside transaction");
+            assert_eq!(
+                snapshot_value(&record)["salvage"]["derelicts"]["derelict.key"]["status"],
+                "mapped"
+            );
+        }
+
+        assert!(
+            world
+                .recall_for_player(player_id)
+                .expect("recall reads after rollback")
+                .is_empty(),
+            "dropping the caller transaction should roll back namespace merge"
+        );
+    }
+
     ///  requires `first_seen_at` to stay fixed after the first
     /// touch, even while `last_seen_at` updates.
     ///
@@ -970,6 +1359,48 @@ mod tests {
         assert_eq!(items[0], vault_recall);
         assert_eq!(items[1], tunnel_recall);
         assert_eq!(items[2], hub_recall);
+    }
+
+    struct NamespaceFixture {
+        world: WorldDb,
+        player_id: i64,
+        place_id: i64,
+        _dir: tempfile::TempDir,
+    }
+
+    fn setup_namespace_fixture() -> NamespaceFixture {
+        let dir = tempdir().expect("tempdir creates");
+        let db_path = dir.path().join("world.sqlite");
+        let mut world = WorldDb::open(&db_path).expect("open succeeds");
+
+        world
+            .apply_migration(&PLAYERS_MIGRATION)
+            .expect("players migration applies");
+        world
+            .apply_migration(&PLACES_MIGRATION)
+            .expect("places migration applies");
+        world
+            .apply_migration(&PLACE_RECALL_MIGRATION)
+            .expect("place_recall migration applies");
+
+        let player_id: i64 = world
+            .connection()
+            .query_row(
+                "INSERT INTO players (handle) VALUES (?1) RETURNING id",
+                rusqlite::params!["Namespace Tester"],
+                |row| row.get(0),
+            )
+            .expect("fixture player inserts");
+        let place = world
+            .insert_place("namespace-room", "Namespace Room", "room", None)
+            .expect("fixture place inserts");
+
+        NamespaceFixture {
+            world,
+            player_id,
+            place_id: place.id,
+            _dir: dir,
+        }
     }
 
     fn snapshot_value(record: &PlaceRecallRecord) -> serde_json::Value {

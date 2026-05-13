@@ -93,6 +93,9 @@ unchanged.
 - `WorldDb::merge_recall_snapshot(player_id, place_id, merge)`
 - `merge_recall_snapshot_on(conn, player_id, place_id, merge)` for
   connection- or transaction-scoped snapshot merges
+- `WorldDb::merge_recall_namespace(player_id, place_id, path, value)`
+- `merge_recall_namespace_on(conn, player_id, place_id, path, value)`
+  for namespace-safe object merges inside an existing transaction
 - `WorldDb::recall_for_player(player_id)`
 
 `place_recall` rows store `(player_id, place_id)` plus `first_seen_at`,
@@ -163,7 +166,51 @@ For larger actions, call `merge_recall_snapshot_on(tx, ...)` inside the
 active transaction so map annotations, scanned exits, room hazards, event
 rows, inventory changes, or movement all commit or roll back together.
 
-### 3.3 Query remembered places
+### 3.3 Merge one namespace without erasing siblings
+
+Use `merge_recall_namespace` when multiple game systems share one recall
+snapshot and each system owns a separate JSON namespace:
+
+```rust
+let recall = world.merge_recall_namespace(
+    captain_id,
+    derelict_airlock_id,
+    &["salvage", "derelicts", "derelict.key"],
+    serde_json::json!({
+        "mapped": true,
+        "hazards": {"sparks": "cleared"}
+    }),
+)?;
+```
+
+If the existing snapshot contains sibling namespaces, they survive:
+
+```json
+{
+  "navigation": {"visited": true},
+  "salvage": {
+    "derelicts": {
+      "other.key": {"mapped": true},
+      "derelict.key": {"mapped": true}
+    }
+  }
+}
+```
+
+The helper creates missing namespace objects and deep-merges object
+fields at the target path. Existing non-object values at the namespace
+path are rejected with a typed error instead of being overwritten, so a
+bad payload cannot silently erase another system's facts.
+
+Use `merge_recall_namespace_on(tx, ...)` inside a larger transaction
+when recall facts need to commit with inventory movement, event rows, or
+game-owned proof tables. Use the lower-level
+`merge_recall_snapshot_on(tx, ...)` closure instead when the game needs
+custom behavior the namespace helper intentionally avoids, such as
+deleting keys, replacing arrays wholesale, normalizing a legacy snapshot,
+or editing several unrelated namespaces in one pass.
+
+### 3.4 Query remembered places
 
 `recall_for_player` returns newest-touched-first entries:
 

@@ -142,7 +142,8 @@ pub use market::{
 };
 pub use notices::{Notice, NoticeError, NOTICES_MIGRATION, NOTICE_SUBJECT_MAX_CHARS};
 pub use place_recall::{
-    merge_recall_snapshot_on, PlaceRecallError, PlaceRecallRecord, PLACE_RECALL_MIGRATION,
+    merge_recall_namespace_on, merge_recall_snapshot_on, PlaceRecallError, PlaceRecallRecord,
+    PLACE_RECALL_MIGRATION,
 };
 pub use players::{PlayerError, PlayerRecord, PLAYERS_MIGRATION};
 pub use presence::{get_presence_on, PresenceRecord, PRESENCE_MIGRATION};
