@@ -223,3 +223,115 @@ impl Screen for StationServicesScreen {
 The important boundary is simple: the custom screen renders the detail
 panes and executes domain actions; `ChoicePrompt` still owns the reducer
 and choice-row behavior.
+
+## Worked sketch — map, details, and action prompt
+
+When a room screen has a map panel, a detail panel, and an action prompt,
+use a custom `Screen`. Rebuild the prompt from live state whenever the
+room state changes; do not keep a second table of hotkeys or disabled
+reasons beside it.
+
+```rust
+#[derive(Clone)]
+enum RoomAction {
+    MoveTo(String),
+    TakeItem,
+    Leave,
+}
+
+struct RoomState {
+    cargo_full: bool,
+    hazard_unresolved: bool,
+}
+
+struct DerelictRoomScreen {
+    current_node: String,
+    actions: ChoicePrompt<RoomAction>,
+}
+
+impl DerelictRoomScreen {
+    fn rebuild_actions(&mut self, exits: &[MapNodeExit], state: &RoomState) {
+        let take_disabled_reason = if state.hazard_unresolved {
+            Some("clear hazard first")
+        } else if state.cargo_full {
+            Some("cargo full")
+        } else {
+            None
+        };
+
+        let mut prompt = ChoicePrompt::new().title("Actions").navigable(true);
+        for (index, exit) in exits.iter().enumerate() {
+            let key = char::from(b'1' + index as u8);
+            prompt = prompt.choice(
+                key,
+                RoomAction::MoveTo(exit.target_key.clone()),
+                format!("Move to {}", exit.target_key),
+            );
+        }
+        prompt = prompt
+            .choice('t', RoomAction::TakeItem, "Take black box")
+            .disabled_if(take_disabled_reason.is_some(), take_disabled_reason.unwrap_or(""))
+            .choice('l', RoomAction::Leave, "Leave")
+            .cancellable(true);
+        self.actions = prompt;
+    }
+
+    fn handle_input(&mut self, ctx: &mut GameContext<'_>, input: Input) -> ScreenCommand {
+        if self.actions.step_from_input(input) {
+            return ScreenCommand::None;
+        }
+        match self.actions.handle(input) {
+            PromptAction::Selected(RoomAction::MoveTo(node)) => self.move_to(ctx, node),
+            PromptAction::Selected(RoomAction::TakeItem) => self.take_item(ctx),
+            PromptAction::Selected(RoomAction::Leave) | PromptAction::Cancelled => {
+                ScreenCommand::Pop
+            }
+            PromptAction::Disabled { reason, .. } => {
+                self.show_feedback(reason.unwrap_or_else(|| "unavailable".to_string()));
+                ScreenCommand::None
+            }
+            PromptAction::None => ScreenCommand::None,
+        }
+    }
+}
+```
+
+The render side is ordinary layout code: draw
+`topology.render_lines(&self.current_node, '@')` in the map panel, draw
+game-owned room description/hazard text in the detail panel, then call
+`self.actions.render(action_area, frame.buffer_mut())` for the prompt.
+`ChoicePrompt` remains the only owner of action hotkeys, navigation, and
+disabled-choice text.
+
+Pin the layout and disabled rows with `TestBackend`:
+
+```rust
+#[test]
+fn derelict_room_screen_renders_layout_and_disabled_take_reason() {
+    use ratatui::{backend::TestBackend, Terminal};
+
+    let mut screen = DerelictRoomScreen::test_room(RoomState {
+        cargo_full: true,
+        hazard_unresolved: false,
+    });
+    let mut term = Terminal::new(TestBackend::new(72, 14)).unwrap();
+
+    term.draw(|frame| screen.render_for_test(frame)).unwrap();
+
+    let body = term
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+    assert!(body.contains("#####"));          // map panel
+    assert!(body.contains("Outer lock"));     // detail panel
+    assert!(body.contains("Take black box")); // prompt row
+    assert!(body.contains("cargo full"));     // disabled reason
+}
+```
+
+This is the point where `PromptScreen` is too small for the job: the
+screen owns multiple panels and live room state, while `ChoicePrompt`
+owns the action reducer and rows.
