@@ -62,6 +62,7 @@ pub mod runtime;
 pub mod save;
 pub mod screen;
 pub mod screens;
+pub mod services;
 pub mod spatial;
 pub mod terminal;
 #[cfg(feature = "test-support")]
@@ -163,6 +164,7 @@ pub use screen::{
     apply_command, ExitReason, GameContext, Screen, ScreenCommand, ScreenStack, SideEffect,
 };
 pub use screens::event_log::{EventLogLine, EventLogScope, EventLogScreen, TimestampStyle};
+pub use services::ServiceContext;
 pub use spatial::{
     get_place_by_id_on, get_route_by_id_between_on, Place, PlaceError, Route, RouteError,
     PLACES_MIGRATION, ROUTES_MIGRATION,

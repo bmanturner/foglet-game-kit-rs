@@ -155,3 +155,71 @@ If a screen outgrows the adapter, the swap is mechanical:
 
 Both shapes call the
 same `ChoicePrompt` reducer and renderer.
+
+## Worked sketch — custom detail panes with prompt-owned choices
+
+For multi-panel screens, keep `ChoicePrompt` as the source of truth for
+hotkeys, disabled rows, cancellation, and cursor movement. Let the
+custom screen own only the surrounding layout and domain-specific panes:
+
+```rust
+struct StationServicesScreen {
+    services: Vec<ServiceView>,
+    actions: ChoicePrompt<ServiceAction>,
+    feedback: Option<FeedbackLine>,
+}
+
+impl StationServicesScreen {
+    fn rebuild_prompt(&mut self, credits: u32, cargo_free: u32) {
+        self.actions = ChoicePrompt::new()
+            .title("Services")
+            .choice('r', ServiceAction::Refuel, "Refuel")
+            .disabled_if(credits < 25, "need 25 credits")
+            .choice('s', ServiceAction::Scan, "Buy local scan")
+            .disabled_if(cargo_free == 0, "cargo full")
+            .choice('l', ServiceAction::Leave, "Leave")
+            .cancellable(true)
+            .navigable(true);
+    }
+
+    fn render_details(&self, area: Rect, buf: &mut Buffer) {
+        // Draw game-specific details, prices, stock, hazards, or route
+        // previews here. Do not duplicate hotkey or disabled-choice
+        // logic; the prompt still renders those rows.
+    }
+}
+
+impl Screen for StationServicesScreen {
+    fn render(&mut self, _ctx: &mut GameContext<'_>, frame: &mut Frame<'_>) {
+        let [list_area, detail_area] = split_horizontal(frame.area(), 40);
+        self.actions.render(list_area, frame.buffer_mut());
+        self.render_details(detail_area, frame.buffer_mut());
+        if let Some(feedback) = &self.feedback {
+            feedback.render(feedback_area(frame.area()), frame.buffer_mut());
+        }
+    }
+
+    fn handle_input(&mut self, ctx: &mut GameContext<'_>, input: Input) -> ScreenCommand {
+        if self.actions.step_from_input(input) {
+            return ScreenCommand::None;
+        }
+
+        match self.actions.handle(input) {
+            PromptAction::Selected(ServiceAction::Refuel) => self.refuel(ctx),
+            PromptAction::Selected(ServiceAction::Scan) => self.buy_scan(ctx),
+            PromptAction::Selected(ServiceAction::Leave) | PromptAction::Cancelled => {
+                ScreenCommand::Pop
+            }
+            PromptAction::Disabled { reason, .. } => {
+                self.feedback = reason.map(FeedbackLine::error);
+                ScreenCommand::None
+            }
+            PromptAction::None => ScreenCommand::None,
+        }
+    }
+}
+```
+
+The important boundary is simple: the custom screen renders the detail
+panes and executes domain actions; `ChoicePrompt` still owns the reducer
+and choice-row behavior.
