@@ -90,6 +90,9 @@ unchanged.
 `crates/foglet_game/src/place_recall.rs` exposes:
 
 - `WorldDb::touch_recall(player_id, place_id, snapshot_json)`
+- `WorldDb::merge_recall_snapshot(player_id, place_id, merge)`
+- `merge_recall_snapshot_on(conn, player_id, place_id, merge)` for
+  connection- or transaction-scoped snapshot merges
 - `WorldDb::recall_for_player(player_id)`
 
 `place_recall` rows store `(player_id, place_id)` plus `first_seen_at`,
@@ -123,7 +126,44 @@ let recall = world.touch_recall(
 - later calls preserve `first_seen_at`, update `last_seen_at`, and replace
   `snapshot_json`
 
-### 3.2 Query remembered places
+### 3.2 Merge one snapshot key without erasing the rest
+
+Use `merge_recall_snapshot` when your game wants to update one JSON
+field while preserving unrelated game-owned recall data:
+
+```rust
+let recall = world.merge_recall_snapshot(captain_id, relay_gate_id, |snapshot| {
+    snapshot.insert(
+        "map_annotation".to_string(),
+        serde_json::json!("safe docking corridor"),
+    );
+})?;
+```
+
+```rust
+let recall = world.merge_recall_snapshot(hero_id, flooded_hall_id, |snapshot| {
+    snapshot.insert("scanned_exits".to_string(), serde_json::json!(["north", "east"]));
+    snapshot.insert("room_hazards".to_string(), serde_json::json!({"water": true}));
+})?;
+```
+
+The JSON schema is still game-owned. The kit treats `snapshot_json` as a
+JSON object and only provides the merge container:
+
+- Missing rows are created.
+- `NULL` snapshots become an empty object before your merge runs.
+- Existing object keys not touched by your closure are preserved.
+- `first_seen_at` is preserved and `last_seen_at` advances.
+- Invalid existing JSON returns a typed error and is not rewritten.
+- Existing non-object JSON returns a typed error because object merging
+  cannot preserve unrelated fields inside arrays, strings, booleans, or
+  numbers.
+
+For larger actions, call `merge_recall_snapshot_on(tx, ...)` inside the
+active transaction so map annotations, scanned exits, room hazards, event
+rows, inventory changes, or movement all commit or roll back together.
+
+### 3.3 Query remembered places
 
 `recall_for_player` returns newest-touched-first entries:
 

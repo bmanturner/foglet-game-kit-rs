@@ -18,6 +18,7 @@
 //! In a **dungeon crawler**, it can record each chamber a character has
 //! entered for mini-map recoloration.
 
+use rusqlite::OptionalExtension;
 use thiserror::Error;
 
 use crate::world_db::WorldDb;
@@ -72,6 +73,68 @@ pub enum PlaceRecallError {
         /// Underlying SQL failure (constraint, lock, corruption, etc.).
         #[source]
         source: rusqlite::Error,
+    },
+    /// Reading the existing snapshot before a merge failed.
+    #[error(
+        "failed to read recall snapshot for player `{player_id}` at place `{place_id}`: {source}"
+    )]
+    MergeReadFailed {
+        /// Player identifier used in `merge_recall_snapshot`.
+        player_id: i64,
+        /// Place identifier used in `merge_recall_snapshot`.
+        place_id: i64,
+        /// Underlying SQL failure (constraint, lock, corruption, etc.).
+        #[source]
+        source: rusqlite::Error,
+    },
+    /// Writing the merged snapshot failed.
+    #[error("failed to write merged recall snapshot for player `{player_id}` at place `{place_id}`: {source}")]
+    MergeWriteFailed {
+        /// Player identifier used in `merge_recall_snapshot`.
+        player_id: i64,
+        /// Place identifier used in `merge_recall_snapshot`.
+        place_id: i64,
+        /// Underlying SQL failure (constraint, lock, corruption, etc.).
+        #[source]
+        source: rusqlite::Error,
+    },
+    /// Existing `snapshot_json` could not be parsed as JSON.
+    #[error(
+        "invalid recall snapshot JSON for player `{player_id}` at place `{place_id}`: {source}"
+    )]
+    InvalidSnapshotJson {
+        /// Player identifier used in `merge_recall_snapshot`.
+        player_id: i64,
+        /// Place identifier used in `merge_recall_snapshot`.
+        place_id: i64,
+        /// Existing invalid snapshot payload.
+        snapshot_json: String,
+        /// JSON parse error.
+        #[source]
+        source: serde_json::Error,
+    },
+    /// Existing `snapshot_json` parsed, but was not a JSON object.
+    #[error(
+        "recall snapshot JSON for player `{player_id}` at place `{place_id}` must be an object"
+    )]
+    SnapshotNotObject {
+        /// Player identifier used in `merge_recall_snapshot`.
+        player_id: i64,
+        /// Place identifier used in `merge_recall_snapshot`.
+        place_id: i64,
+        /// Existing non-object snapshot payload.
+        snapshot_json: String,
+    },
+    /// Serializing the merged snapshot failed.
+    #[error("failed to serialize merged recall snapshot for player `{player_id}` at place `{place_id}`: {source}")]
+    SnapshotSerializeFailed {
+        /// Player identifier used in `merge_recall_snapshot`.
+        player_id: i64,
+        /// Place identifier used in `merge_recall_snapshot`.
+        place_id: i64,
+        /// JSON serialization error.
+        #[source]
+        source: serde_json::Error,
     },
 }
 
@@ -186,6 +249,116 @@ ORDER BY last_seen_at DESC, place_id DESC";
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(|source| PlaceRecallError::ListFailed { player_id, source })
     }
+
+    /// Merge one game-owned recall snapshot object and write it back.
+    ///
+    /// This method is the connection-scoped convenience wrapper around
+    /// [`merge_recall_snapshot_on`]. It does not open a transaction; use
+    /// the free function with an active `&rusqlite::Transaction` when a
+    /// larger game action needs the merge to roll back with surrounding
+    /// work.
+    pub fn merge_recall_snapshot<F>(
+        &self,
+        player_id: i64,
+        place_id: i64,
+        merge: F,
+    ) -> Result<PlaceRecallRecord, PlaceRecallError>
+    where
+        F: FnOnce(&mut serde_json::Map<String, serde_json::Value>),
+    {
+        merge_recall_snapshot_on(self.connection(), player_id, place_id, merge)
+    }
+}
+
+/// Merge one game-owned recall snapshot object using an existing
+/// connection or transaction.
+///
+/// The helper reads the current `(player_id, place_id)` row, treats a
+/// missing or `NULL` snapshot as an empty JSON object, lets `merge`
+/// mutate that object, and writes the merged object back. It preserves
+/// `first_seen_at`, advances `last_seen_at`, and creates the row when
+/// it does not yet exist.
+///
+/// Existing invalid JSON returns [`PlaceRecallError::InvalidSnapshotJson`]
+/// and leaves the row unchanged. Existing valid non-object JSON returns
+/// [`PlaceRecallError::SnapshotNotObject`] because object merging cannot
+/// preserve unrelated keys inside arrays, strings, booleans, or numbers.
+pub fn merge_recall_snapshot_on<F>(
+    conn: &rusqlite::Connection,
+    player_id: i64,
+    place_id: i64,
+    merge: F,
+) -> Result<PlaceRecallRecord, PlaceRecallError>
+where
+    F: FnOnce(&mut serde_json::Map<String, serde_json::Value>),
+{
+    let current_snapshot: Option<Option<String>> = conn
+        .query_row(
+            "SELECT snapshot_json FROM place_recall WHERE player_id = ?1 AND place_id = ?2",
+            rusqlite::params![player_id, place_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|source| PlaceRecallError::MergeReadFailed {
+            player_id,
+            place_id,
+            source,
+        })?;
+
+    let mut object = match current_snapshot.flatten() {
+        Some(snapshot_json) => {
+            let value: serde_json::Value =
+                serde_json::from_str(&snapshot_json).map_err(|source| {
+                    PlaceRecallError::InvalidSnapshotJson {
+                        player_id,
+                        place_id,
+                        snapshot_json: snapshot_json.clone(),
+                        source,
+                    }
+                })?;
+            match value {
+                serde_json::Value::Object(object) => object,
+                _ => {
+                    return Err(PlaceRecallError::SnapshotNotObject {
+                        player_id,
+                        place_id,
+                        snapshot_json,
+                    });
+                }
+            }
+        }
+        None => serde_json::Map::new(),
+    };
+
+    merge(&mut object);
+
+    let merged_json =
+        serde_json::to_string(&serde_json::Value::Object(object)).map_err(|source| {
+            PlaceRecallError::SnapshotSerializeFailed {
+                player_id,
+                place_id,
+                source,
+            }
+        })?;
+
+    const SQL: &str = "\
+INSERT INTO place_recall (player_id, place_id, first_seen_at, last_seen_at, snapshot_json)\n\
+VALUES (?1, ?2, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, ?3)\n\
+ON CONFLICT(player_id, place_id) DO UPDATE\n\
+SET last_seen_at = CURRENT_TIMESTAMP,\n\
+    snapshot_json = excluded.snapshot_json\n\
+RETURNING player_id, place_id, first_seen_at, last_seen_at, snapshot_json";
+
+    conn.query_row(
+        SQL,
+        rusqlite::params![player_id, place_id, merged_json],
+        row_to_place_recall,
+    )
+    .map_err(|source| PlaceRecallError::MergeWriteFailed {
+        player_id,
+        place_id,
+        source,
+    })
 }
 
 fn row_to_place_recall(row: &rusqlite::Row<'_>) -> rusqlite::Result<PlaceRecallRecord> {
@@ -200,7 +373,7 @@ fn row_to_place_recall(row: &rusqlite::Row<'_>) -> rusqlite::Result<PlaceRecallR
 
 #[cfg(test)]
 mod tests {
-    use super::{row_to_place_recall, PlaceRecallRecord, PLACE_RECALL_MIGRATION};
+    use super::{row_to_place_recall, PlaceRecallError, PlaceRecallRecord, PLACE_RECALL_MIGRATION};
     use crate::players::PLAYERS_MIGRATION;
     use crate::spatial::PLACES_MIGRATION;
     use crate::world_db::WorldDb;
@@ -352,6 +525,234 @@ mod tests {
             .expect("touched recall row query");
 
         assert_eq!(second, loaded);
+    }
+
+    #[test]
+    fn merge_recall_snapshot_inserts_missing_row() {
+        let dir = tempdir().expect("tempdir creates");
+        let db_path = dir.path().join("world.sqlite");
+        let mut world = WorldDb::open(&db_path).expect("open succeeds");
+
+        world
+            .apply_migration(&PLAYERS_MIGRATION)
+            .expect("players migration applies");
+        world
+            .apply_migration(&PLACES_MIGRATION)
+            .expect("places migration applies");
+        world
+            .apply_migration(&PLACE_RECALL_MIGRATION)
+            .expect("place_recall migration applies");
+
+        let player_id: i64 = world
+            .connection()
+            .query_row(
+                "INSERT INTO players (handle) VALUES (?1) RETURNING id",
+                rusqlite::params!["Cartographer"],
+                |row| row.get(0),
+            )
+            .expect("fixture player inserts");
+        let place = world
+            .insert_place("map-room", "Map Room", "room", None)
+            .expect("fixture place inserts");
+
+        let record = world
+            .merge_recall_snapshot(player_id, place.id, |snapshot| {
+                snapshot.insert(
+                    "map_annotation".to_string(),
+                    serde_json::Value::String("marked northern stairs".to_string()),
+                );
+            })
+            .expect("merge inserts missing recall row");
+
+        assert_eq!(record.player_id, player_id);
+        assert_eq!(record.place_id, place.id);
+        assert!(!record.first_seen_at.is_empty());
+        assert!(!record.last_seen_at.is_empty());
+
+        let snapshot = snapshot_value(&record);
+        assert_eq!(
+            snapshot["map_annotation"],
+            serde_json::Value::String("marked northern stairs".to_string())
+        );
+    }
+
+    #[test]
+    fn merge_recall_snapshot_preserves_unrelated_keys_and_advances_last_seen() {
+        let dir = tempdir().expect("tempdir creates");
+        let db_path = dir.path().join("world.sqlite");
+        let mut world = WorldDb::open(&db_path).expect("open succeeds");
+
+        world
+            .apply_migration(&PLAYERS_MIGRATION)
+            .expect("players migration applies");
+        world
+            .apply_migration(&PLACES_MIGRATION)
+            .expect("places migration applies");
+        world
+            .apply_migration(&PLACE_RECALL_MIGRATION)
+            .expect("place_recall migration applies");
+
+        let player_id: i64 = world
+            .connection()
+            .query_row(
+                "INSERT INTO players (handle) VALUES (?1) RETURNING id",
+                rusqlite::params!["Surveyor"],
+                |row| row.get(0),
+            )
+            .expect("fixture player inserts");
+        let place = world
+            .insert_place("hazard-hall", "Hazard Hall", "hall", None)
+            .expect("fixture place inserts");
+
+        let first = world
+            .touch_recall(
+                player_id,
+                place.id,
+                Some(
+                    r#"{"map_annotation":"old note","scanned_exits":["north"],"room_hazards":{"gas":true}}"#,
+                ),
+            )
+            .expect("initial recall touch");
+        sleep(Duration::from_secs(1));
+
+        let merged = world
+            .merge_recall_snapshot(player_id, place.id, |snapshot| {
+                snapshot.insert(
+                    "map_annotation".to_string(),
+                    serde_json::Value::String("updated note".to_string()),
+                );
+                snapshot.insert("scan_depth".to_string(), serde_json::Value::from(3));
+            })
+            .expect("merge updates existing object");
+
+        assert_eq!(
+            merged.first_seen_at, first.first_seen_at,
+            "merge must preserve first_seen_at"
+        );
+        assert!(
+            merged.last_seen_at > first.last_seen_at,
+            "merge must advance last_seen_at"
+        );
+
+        let snapshot = snapshot_value(&merged);
+        assert_eq!(snapshot["map_annotation"], "updated note");
+        assert_eq!(snapshot["scan_depth"], 3);
+        assert_eq!(snapshot["scanned_exits"], serde_json::json!(["north"]));
+        assert_eq!(snapshot["room_hazards"], serde_json::json!({"gas": true}));
+    }
+
+    #[test]
+    fn merge_recall_snapshot_rejects_invalid_existing_json_without_rewriting() {
+        let dir = tempdir().expect("tempdir creates");
+        let db_path = dir.path().join("world.sqlite");
+        let mut world = WorldDb::open(&db_path).expect("open succeeds");
+
+        world
+            .apply_migration(&PLAYERS_MIGRATION)
+            .expect("players migration applies");
+        world
+            .apply_migration(&PLACES_MIGRATION)
+            .expect("places migration applies");
+        world
+            .apply_migration(&PLACE_RECALL_MIGRATION)
+            .expect("place_recall migration applies");
+
+        let player_id: i64 = world
+            .connection()
+            .query_row(
+                "INSERT INTO players (handle) VALUES (?1) RETURNING id",
+                rusqlite::params!["Archivist"],
+                |row| row.get(0),
+            )
+            .expect("fixture player inserts");
+        let place = world
+            .insert_place("broken-memory", "Broken Memory", "room", None)
+            .expect("fixture place inserts");
+
+        world
+            .touch_recall(player_id, place.id, Some("{not-json"))
+            .expect("touch_recall stores opaque game-owned payload");
+
+        let err = world
+            .merge_recall_snapshot(player_id, place.id, |snapshot| {
+                snapshot.insert("map_annotation".to_string(), serde_json::json!("repaired"));
+            })
+            .expect_err("invalid existing JSON should fail before writing");
+        match err {
+            PlaceRecallError::InvalidSnapshotJson {
+                player_id: err_player,
+                place_id: err_place,
+                snapshot_json,
+                ..
+            } => {
+                assert_eq!(err_player, player_id);
+                assert_eq!(err_place, place.id);
+                assert_eq!(snapshot_json, "{not-json");
+            }
+            other => panic!("expected InvalidSnapshotJson, got {other:?}"),
+        }
+
+        let stored: String = world
+            .connection()
+            .query_row(
+                "SELECT snapshot_json FROM place_recall WHERE player_id = ?1 AND place_id = ?2",
+                rusqlite::params![player_id, place.id],
+                |row| row.get(0),
+            )
+            .expect("stored snapshot is queryable");
+        assert_eq!(
+            stored, "{not-json",
+            "failed merge must not rewrite invalid game-owned payload"
+        );
+    }
+
+    #[test]
+    fn merge_recall_snapshot_on_observes_transaction_rollback() {
+        let dir = tempdir().expect("tempdir creates");
+        let db_path = dir.path().join("world.sqlite");
+        let mut world = WorldDb::open(&db_path).expect("open succeeds");
+
+        world
+            .apply_migration(&PLAYERS_MIGRATION)
+            .expect("players migration applies");
+        world
+            .apply_migration(&PLACES_MIGRATION)
+            .expect("places migration applies");
+        world
+            .apply_migration(&PLACE_RECALL_MIGRATION)
+            .expect("place_recall migration applies");
+
+        let player_id: i64 = world
+            .connection()
+            .query_row(
+                "INSERT INTO players (handle) VALUES (?1) RETURNING id",
+                rusqlite::params!["Mapper"],
+                |row| row.get(0),
+            )
+            .expect("fixture player inserts");
+        let place = world
+            .insert_place("rollback-room", "Rollback Room", "room", None)
+            .expect("fixture place inserts");
+
+        {
+            let tx = world
+                .connection_mut()
+                .transaction()
+                .expect("transaction begins");
+            let record = super::merge_recall_snapshot_on(&tx, player_id, place.id, |snapshot| {
+                snapshot.insert("scanned_exit".to_string(), serde_json::json!("east"));
+            })
+            .expect("merge works inside transaction");
+            assert_eq!(snapshot_value(&record)["scanned_exit"], "east");
+        }
+
+        let rows = world
+            .recall_for_player(player_id)
+            .expect("recall query succeeds after dropped transaction");
+        assert!(
+            rows.is_empty(),
+            "dropped transaction should roll back inserted recall merge"
+        );
     }
 
     ///  requires `first_seen_at` to stay fixed after the first
@@ -569,5 +970,15 @@ mod tests {
         assert_eq!(items[0], vault_recall);
         assert_eq!(items[1], tunnel_recall);
         assert_eq!(items[2], hub_recall);
+    }
+
+    fn snapshot_value(record: &PlaceRecallRecord) -> serde_json::Value {
+        serde_json::from_str(
+            record
+                .snapshot_json
+                .as_deref()
+                .expect("snapshot_json should be present"),
+        )
+        .expect("snapshot_json should parse")
     }
 }

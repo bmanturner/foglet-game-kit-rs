@@ -15,6 +15,9 @@ Use these APIs instead of direct SQL against kit-owned tables:
 - `get_route_by_id_between_on(conn, route_id, from_place_id,
   to_place_id)` verifies an outbound route id against an exact directed
   origin and destination in the active connection or transaction.
+- `merge_recall_snapshot_on(conn, player_id, place_id, merge)` updates
+  one game-owned recall snapshot object while preserving unrelated keys
+  and leaving commit or rollback to the surrounding transaction.
 - `inventory::transfer_on(conn, source, destination, item_key, quantity,
   on_commit)` moves owner-keyed inventory using the same semantics as
   `WorldDb::transfer`, but leaves commit or rollback to the surrounding
