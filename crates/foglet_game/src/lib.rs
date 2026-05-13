@@ -69,6 +69,7 @@ pub mod test_support;
 pub mod travel;
 pub mod triggered_outcomes;
 pub mod turns;
+pub mod weighted;
 pub mod widgets;
 pub mod world_db;
 pub mod world_ticks;
@@ -178,6 +179,11 @@ pub use triggered_outcomes::{
 pub use turns::{
     spend_turns_on, DateProvider, FixedDateProvider, LocalDate, TurnError, TurnLedgerRow,
     TURN_LEDGER_MIGRATION,
+};
+pub use weighted::{
+    explain_weighted_selection, seed_to_bucket, select_weighted, stable_hash, WeightedEntry,
+    WeightedNoSelectionReason, WeightedRejectedEntry, WeightedRejectedReason, WeightedRoll,
+    WeightedSelection, WeightedSelectionExplanation,
 };
 pub use widgets::{
     centred_rect, render_hint_line, render_inventory_list, render_menu_list, render_message_line,
