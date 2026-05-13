@@ -35,6 +35,28 @@ pub trait CapacityPolicy {
         -> Result<Option<i64>, CapacityError>;
 }
 
+/// Result of a capacity-checked finite pickup transfer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FinitePickupResult {
+    /// Source slot after the pickup debit.
+    pub source: InventorySlot,
+    /// Destination slot after the pickup credit.
+    pub destination: InventorySlot,
+    /// Whether the source owner has no remaining quantity for this item.
+    pub source_exhausted: bool,
+}
+
+impl FinitePickupResult {
+    fn new(source: InventorySlot, destination: InventorySlot) -> Self {
+        let source_exhausted = source.quantity == 0;
+        Self {
+            source,
+            destination,
+            source_exhausted,
+        }
+    }
+}
+
 /// Errors produced by capacity validation and transfers.
 #[derive(Debug, Error)]
 pub enum CapacityError {
@@ -310,6 +332,40 @@ impl WorldDb {
 
         Ok((post_source, post_destination))
     }
+
+    /// Take from a finite shared source while validating destination
+    /// capacity in the same transaction.
+    ///
+    /// This is a pickup-shaped wrapper around [`WorldDb::transfer_with_capacity`].
+    /// It returns [`FinitePickupResult`] so games can branch on whether a
+    /// shared source owner was exhausted. The optional callback runs before
+    /// commit and receives the same result shape, making it suitable for
+    /// game-owned story state, proof rows, or event rows that must roll
+    /// back with inventory movement.
+    pub fn take_finite_pickup_with_capacity<F>(
+        &mut self,
+        source: (&str, i64),
+        destination: (&str, i64),
+        item_key: &str,
+        quantity: i64,
+        policy: &impl CapacityPolicy,
+        on_commit: Option<F>,
+    ) -> Result<FinitePickupResult, CapacityError>
+    where
+        F: FnOnce(&rusqlite::Transaction<'_>, &FinitePickupResult) -> Result<(), rusqlite::Error>,
+    {
+        let callback = on_commit.map(|on_commit| {
+            move |tx: &rusqlite::Transaction<'_>,
+                  source_slot: &InventorySlot,
+                  destination_slot: &InventorySlot| {
+                let result = FinitePickupResult::new(source_slot.clone(), destination_slot.clone());
+                on_commit(tx, &result)
+            }
+        });
+        let (source, destination) =
+            self.transfer_with_capacity(source, destination, item_key, quantity, policy, callback)?;
+        Ok(FinitePickupResult::new(source, destination))
+    }
 }
 
 fn validate_incoming_in_tx(
@@ -530,8 +586,8 @@ fn transfer_transition(
 
 #[cfg(test)]
 mod tests {
-    use super::{CapacityError, CapacityPolicy};
-    use crate::inventory::INVENTORY_SLOTS_MIGRATION;
+    use super::{CapacityError, CapacityPolicy, FinitePickupResult};
+    use crate::inventory::{InventoryError, INVENTORY_SLOTS_MIGRATION};
     use crate::world_db::WorldDb;
     use serde_json::json;
     use std::sync::{Arc, Barrier};
@@ -812,6 +868,242 @@ mod tests {
                 .quantity,
             4
         );
+    }
+
+    #[test]
+    fn finite_pickup_reports_exhausted_source_and_runs_callback() {
+        let dir = tempdir().expect("tempdir creates");
+        let db_path = dir.path().join("world.sqlite");
+        let mut world = WorldDb::open(&db_path).expect("open succeeds");
+        world
+            .apply_migration(&INVENTORY_SLOTS_MIGRATION)
+            .expect("inventory migration applies");
+        world
+            .connection()
+            .execute(
+                "CREATE TABLE pickup_story (item_key TEXT NOT NULL, exhausted INTEGER NOT NULL)",
+                [],
+            )
+            .expect("story table creates");
+        world
+            .create_slot("site", 1, "black-box", 2, None, None)
+            .expect("finite source inserts");
+
+        let result = world
+            .take_finite_pickup_with_capacity(
+                ("site", 1),
+                ("player", 7),
+                "black-box",
+                2,
+                &FixedPolicy,
+                Some(
+                    |tx: &rusqlite::Transaction<'_>, result: &FinitePickupResult| {
+                        tx.execute(
+                            "INSERT INTO pickup_story (item_key, exhausted) VALUES (?1, ?2)",
+                            rusqlite::params![
+                                &result.destination.item_key,
+                                if result.source_exhausted {
+                                    1_i64
+                                } else {
+                                    0_i64
+                                }
+                            ],
+                        )?;
+                        Ok(())
+                    },
+                ),
+            )
+            .expect("finite pickup succeeds");
+
+        assert_eq!(result.source.quantity, 0);
+        assert_eq!(result.destination.quantity, 2);
+        assert!(result.source_exhausted);
+        let exhausted: i64 = world
+            .connection()
+            .query_row("SELECT exhausted FROM pickup_story", [], |row| row.get(0))
+            .expect("story row reads");
+        assert_eq!(exhausted, 1);
+    }
+
+    #[test]
+    fn finite_pickup_capacity_failure_leaves_inventory_and_callback_state_unchanged() {
+        let dir = tempdir().expect("tempdir creates");
+        let db_path = dir.path().join("world.sqlite");
+        let mut world = WorldDb::open(&db_path).expect("open succeeds");
+        world
+            .apply_migration(&INVENTORY_SLOTS_MIGRATION)
+            .expect("inventory migration applies");
+        world
+            .connection()
+            .execute("CREATE TABLE pickup_story (message TEXT NOT NULL)", [])
+            .expect("story table creates");
+        world
+            .create_slot("site", 1, "ration", 3, None, None)
+            .expect("finite source inserts");
+        world
+            .create_slot("player", 7, "ration", 5, None, None)
+            .expect("full destination inserts");
+
+        let rejected = world.take_finite_pickup_with_capacity(
+            ("site", 1),
+            ("player", 7),
+            "ration",
+            1,
+            &FixedPolicy,
+            Some(|tx: &rusqlite::Transaction<'_>, _: &FinitePickupResult| {
+                tx.execute("INSERT INTO pickup_story (message) VALUES ('called')", [])?;
+                Ok(())
+            }),
+        );
+
+        match rejected {
+            Err(CapacityError::InsufficientCapacity {
+                used,
+                requested,
+                capacity,
+            }) => {
+                assert_eq!(used, 10);
+                assert_eq!(requested, 2);
+                assert_eq!(capacity, 10);
+            }
+            other => panic!("expected capacity rejection, got {other:?}"),
+        }
+        assert_eq!(
+            world
+                .get_slot("site", 1, "ration")
+                .expect("source reads")
+                .expect("source exists")
+                .quantity,
+            3
+        );
+        assert_eq!(
+            world
+                .get_slot("player", 7, "ration")
+                .expect("destination reads")
+                .expect("destination exists")
+                .quantity,
+            5
+        );
+        let story_count: i64 = world
+            .connection()
+            .query_row("SELECT COUNT(*) FROM pickup_story", [], |row| row.get(0))
+            .expect("story count reads");
+        assert_eq!(story_count, 0);
+    }
+
+    #[test]
+    fn finite_pickup_rejects_already_empty_source() {
+        let dir = tempdir().expect("tempdir creates");
+        let db_path = dir.path().join("world.sqlite");
+        let mut world = WorldDb::open(&db_path).expect("open succeeds");
+        world
+            .apply_migration(&INVENTORY_SLOTS_MIGRATION)
+            .expect("inventory migration applies");
+        world
+            .create_slot("site", 1, "sample", 0, None, None)
+            .expect("empty source inserts");
+
+        let rejected = world.take_finite_pickup_with_capacity(
+            ("site", 1),
+            ("player", 7),
+            "sample",
+            1,
+            &FixedPolicy,
+            Option::<
+                fn(&rusqlite::Transaction<'_>, &FinitePickupResult) -> Result<(), rusqlite::Error>,
+            >::None,
+        );
+
+        match rejected {
+            Err(CapacityError::InventoryError { source }) => match source.as_ref() {
+                InventoryError::InsufficientStock {
+                    owner_kind,
+                    owner_id,
+                    item_key,
+                    requested,
+                    available,
+                } => {
+                    assert_eq!(owner_kind, "site");
+                    assert_eq!(*owner_id, 1);
+                    assert_eq!(item_key, "sample");
+                    assert_eq!(*requested, 1);
+                    assert_eq!(*available, 0);
+                }
+                other => panic!("expected insufficient stock, got {other:?}"),
+            },
+            other => panic!("expected inventory error, got {other:?}"),
+        }
+        assert!(
+            world
+                .get_slot("player", 7, "sample")
+                .expect("destination reads")
+                .is_none(),
+            "empty-source pickup should not create destination stock"
+        );
+    }
+
+    #[test]
+    fn finite_pickup_callback_failure_rolls_back_inventory_and_story_state() {
+        let dir = tempdir().expect("tempdir creates");
+        let db_path = dir.path().join("world.sqlite");
+        let mut world = WorldDb::open(&db_path).expect("open succeeds");
+        world
+            .apply_migration(&INVENTORY_SLOTS_MIGRATION)
+            .expect("inventory migration applies");
+        world
+            .connection()
+            .execute("CREATE TABLE pickup_story (message TEXT NOT NULL)", [])
+            .expect("story table creates");
+        world
+            .create_slot("site", 1, "relic", 2, None, None)
+            .expect("finite source inserts");
+
+        let rejected = world.take_finite_pickup_with_capacity(
+            ("site", 1),
+            ("player", 7),
+            "relic",
+            1,
+            &FixedPolicy,
+            Some(|tx: &rusqlite::Transaction<'_>, _: &FinitePickupResult| {
+                tx.execute("INSERT INTO pickup_story (message) VALUES ('claimed')", [])?;
+                Err(rusqlite::Error::InvalidQuery)
+            }),
+        );
+
+        match rejected {
+            Err(CapacityError::InventoryError { source }) => match source.as_ref() {
+                InventoryError::TransferRejected {
+                    transition,
+                    item_key,
+                    ..
+                } => {
+                    assert_eq!(transition, "site:1 -> player:7");
+                    assert_eq!(item_key, "relic");
+                }
+                other => panic!("expected transfer rejection, got {other:?}"),
+            },
+            other => panic!("expected callback rejection, got {other:?}"),
+        }
+        assert_eq!(
+            world
+                .get_slot("site", 1, "relic")
+                .expect("source reads")
+                .expect("source exists")
+                .quantity,
+            2
+        );
+        assert!(
+            world
+                .get_slot("player", 7, "relic")
+                .expect("destination reads")
+                .is_none(),
+            "failed callback should roll back destination creation"
+        );
+        let story_count: i64 = world
+            .connection()
+            .query_row("SELECT COUNT(*) FROM pickup_story", [], |row| row.get(0))
+            .expect("story count reads");
+        assert_eq!(story_count, 0);
     }
 
     #[test]

@@ -22,6 +22,10 @@ Helpers:
   quantity with metadata-compatible upsert behavior on an existing
   SQLite connection or transaction. Use it for rewards and pickups that
   should respect backpack, hold, or warehouse limits.
+- `take_finite_pickup_with_capacity` transfers from a finite source
+  owner to a destination owner, validates destination capacity, returns
+  whether the source was exhausted, and lets game-owned callback writes
+  roll back with the inventory movement.
 
 Examples:
 
@@ -31,3 +35,41 @@ Examples:
 - Town warehouse slots: crates consume shelf slots, bulky machinery uses
   metadata to consume more slots, and municipal warehouses have a fixed
   cap while outdoor yards are uncapped.
+
+## Finite Pickup Pattern
+
+Use owner-keyed inventory for both sides of a finite pickup:
+
+- The shared source owner might be `("site", derelict_id)` or
+  `("chest", room_id)`.
+- The destination owner might be `("player", player_id)` or
+  `("ship", ship_id)`.
+- Narrative state, proof rows, and event text stay in game-owned tables.
+
+```rust
+let result = world.take_finite_pickup_with_capacity(
+    ("site", derelict_id),
+    ("player", player_id),
+    "black-box",
+    1,
+    &cargo_policy,
+    Some(|tx, pickup| {
+        tx.execute(
+            "INSERT INTO salvage_proof (player_id, item_key, source_exhausted)
+             VALUES (?1, ?2, ?3)",
+            rusqlite::params![
+                player_id,
+                &pickup.destination.item_key,
+                if pickup.source_exhausted { 1_i64 } else { 0_i64 },
+            ],
+        )?;
+        Ok(())
+    }),
+)?;
+```
+
+The kit-owned part is only the inventory transfer and capacity check.
+If capacity fails, no inventory moves and the callback is not run. If
+the callback returns an error after writing game-owned story/proof state,
+the transaction rolls back both the inventory movement and those
+callback writes.

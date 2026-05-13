@@ -116,7 +116,9 @@ pub use input::{from_event, from_key_event, Input};
 pub use inventory::{
     grant_inventory_on, transfer_on, InventoryError, InventorySlot, INVENTORY_SLOTS_MIGRATION,
 };
-pub use inventory_capacity::{grant_inventory_with_capacity_on, CapacityError, CapacityPolicy};
+pub use inventory_capacity::{
+    grant_inventory_with_capacity_on, CapacityError, CapacityPolicy, FinitePickupResult,
+};
 pub use job_board::{
     BountyProvider, BuiltInProviders, ChallengeProvider, ContractProvider, JobBoard, JobBoardEntry,
     JobBoardError, JobBoardFilter, JobBoardSort, JobBoardSource, OpportunityProvider,
