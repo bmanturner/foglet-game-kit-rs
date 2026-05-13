@@ -48,21 +48,12 @@ pub trait PlaceVisibilityPolicy {
 }
 
 /// Projection options for hidden rows.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct MapProjectionOptions {
     /// Include hidden places in `places`.
     pub include_hidden_places: bool,
     /// Include policy-hidden routes in `routes`.
     pub include_hidden_routes: bool,
-}
-
-impl Default for MapProjectionOptions {
-    fn default() -> Self {
-        Self {
-            include_hidden_places: false,
-            include_hidden_routes: false,
-        }
-    }
 }
 
 /// Render-ready place row for map, atlas, star-chart, or room-list UIs.

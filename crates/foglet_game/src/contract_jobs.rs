@@ -421,14 +421,14 @@ mod tests {
             ready_view.complete_action.as_deref(),
             Some(format!("complete:{}", ready.id).as_str())
         );
-        assert_eq!(ready_view.requirements[0].met, true);
+        assert!(ready_view.requirements[0].met);
 
         let blocked_view = views
             .iter()
             .find(|view| view.contract_id == blocked.id)
             .expect("blocked view exists");
         assert_eq!(blocked_view.state, JobLifecycleView::Accepted);
-        assert_eq!(blocked_view.requirements[0].met, false);
+        assert!(!blocked_view.requirements[0].met);
         assert!(blocked_view.complete_action.is_none());
     }
 
