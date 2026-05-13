@@ -263,11 +263,18 @@ fn parse_contract_job_metadata(raw: Option<&str>) -> ContractJobMetadata {
 #[cfg(test)]
 mod tests {
     use super::{
-        player_contract_job_views, ContractObjectiveView, JobLifecycleView, JobRequirementView,
+        player_contract_job_views, ContractJobError, ContractObjectiveView, JobLifecycleView,
+        JobRequirementView,
     };
-    use crate::contracts::{ContractState, CreateContractInput, CONTRACTS_MIGRATION};
+    use crate::contracts::{
+        Contract, ContractError, ContractState, CreateContractInput, CONTRACTS_MIGRATION,
+    };
+    use crate::inventory::{transfer_on, InventorySlot, INVENTORY_SLOTS_MIGRATION};
     use crate::players::PLAYERS_MIGRATION;
+    use crate::presence::{get_presence_on, PRESENCE_MIGRATION};
+    use crate::spatial::PLACES_MIGRATION;
     use crate::world_db::WorldDb;
+    use serde::Deserialize;
     use tempfile::tempdir;
 
     #[test]
@@ -462,5 +469,328 @@ mod tests {
         assert_eq!(ContractState::Available.as_str(), "available");
         assert_eq!(ContractState::Accepted.as_str(), "accepted");
         assert_eq!(ContractState::Completed.as_str(), "completed");
+    }
+
+    #[test]
+    fn custom_objective_provider_requires_place_cargo_and_proof() {
+        let CustomObjectiveFixture {
+            world,
+            player_id,
+            contract,
+            archive_id,
+            _tempdir,
+        } = setup_custom_objective_world();
+
+        let blocked_views = player_contract_job_views(&world, player_id, &cargo_proof_readiness)
+            .expect("blocked views project");
+        let blocked = blocked_views
+            .iter()
+            .find(|view| view.contract_id == contract.id)
+            .expect("blocked contract view exists");
+        assert_eq!(blocked.state, JobLifecycleView::Accepted);
+        assert_eq!(
+            blocked.next_step.as_deref(),
+            Some("Bring the cargo and proof to the archive.")
+        );
+        assert_eq!(
+            blocked
+                .requirements
+                .iter()
+                .map(|requirement| (requirement.label.as_str(), requirement.met))
+                .collect::<Vec<_>>(),
+            vec![
+                ("At archive", false),
+                ("Has black-box", false),
+                ("Proof recorded", false),
+            ]
+        );
+
+        world
+            .set_presence(player_id, archive_id, None)
+            .expect("player moves to archive");
+        world
+            .create_slot("player", player_id, "black-box", 1, None, None)
+            .expect("cargo inserts");
+        world
+            .connection()
+            .execute(
+                "INSERT INTO salvage_proofs (player_id, proof_key, details) VALUES (?1, ?2, ?3)",
+                rusqlite::params![player_id, "wreck-alpha", "Recovered recorder hash."],
+            )
+            .expect("proof inserts");
+
+        let ready_views = player_contract_job_views(&world, player_id, &cargo_proof_readiness)
+            .expect("ready views project");
+        let ready = ready_views
+            .iter()
+            .find(|view| view.contract_id == contract.id)
+            .expect("ready contract view exists");
+        assert_eq!(ready.state, JobLifecycleView::ReadyToComplete);
+        assert_eq!(ready.next_step.as_deref(), Some("Complete at the archive."));
+        assert!(ready.requirements.iter().all(|requirement| requirement.met));
+        assert_eq!(
+            ready.complete_action.as_deref(),
+            Some(format!("complete:{}", contract.id).as_str())
+        );
+    }
+
+    #[test]
+    fn custom_objective_completion_transfers_inventory_and_preserves_proof() {
+        let CustomObjectiveFixture {
+            mut world,
+            player_id,
+            contract,
+            archive_id,
+            _tempdir,
+        } = setup_custom_objective_world();
+        world
+            .set_presence(player_id, archive_id, None)
+            .expect("player moves to archive");
+        world
+            .create_slot("player", player_id, "black-box", 1, None, None)
+            .expect("cargo inserts");
+        world
+            .connection()
+            .execute(
+                "INSERT INTO salvage_proofs (player_id, proof_key, details) VALUES (?1, ?2, ?3)",
+                rusqlite::params![player_id, "wreck-alpha", "Recovered recorder hash."],
+            )
+            .expect("proof inserts");
+
+        let completed = world
+            .complete_contract(
+                contract.id,
+                Some(
+                    |tx: &rusqlite::Transaction<'_>, _: &Contract| -> rusqlite::Result<()> {
+                        transfer_on(
+                            tx,
+                            ("player", player_id),
+                            ("archive", archive_id),
+                            "black-box",
+                            1,
+                            None::<
+                                fn(
+                                    &rusqlite::Connection,
+                                    &InventorySlot,
+                                    &InventorySlot,
+                                ) -> rusqlite::Result<()>,
+                            >,
+                        )
+                        .map_err(|err| rusqlite::Error::InvalidParameterName(err.to_string()))?;
+                        Ok(())
+                    },
+                ),
+            )
+            .expect("contract completes");
+        assert_eq!(completed.state, ContractState::Completed.as_str());
+
+        assert_eq!(
+            world
+                .get_slot("player", player_id, "black-box")
+                .expect("player cargo reads")
+                .expect("player cargo slot remains")
+                .quantity,
+            0
+        );
+        assert_eq!(
+            world
+                .get_slot("archive", archive_id, "black-box")
+                .expect("archive cargo reads")
+                .expect("archive cargo exists")
+                .quantity,
+            1
+        );
+        let proof_count: i64 = world
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM salvage_proofs WHERE player_id = ?1 AND proof_key = ?2",
+                rusqlite::params![player_id, "wreck-alpha"],
+                |row| row.get(0),
+            )
+            .expect("proof count reads");
+        assert_eq!(
+            proof_count, 1,
+            "game-owned proof history should survive item consumption"
+        );
+
+        let duplicate = world.complete_contract(
+            contract.id,
+            None::<fn(&rusqlite::Transaction<'_>, &Contract) -> rusqlite::Result<()>>,
+        );
+        match duplicate {
+            Err(ContractError::InvalidTransition { from, to, .. }) => {
+                assert_eq!(from, ContractState::Completed.as_str());
+                assert_eq!(to, ContractState::Completed);
+            }
+            other => panic!("expected duplicate completion lifecycle failure, got {other:?}"),
+        }
+        assert_eq!(
+            world
+                .get_slot("archive", archive_id, "black-box")
+                .expect("archive cargo reads")
+                .expect("archive cargo exists")
+                .quantity,
+            1,
+            "duplicate completion must not consume cargo again"
+        );
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct CargoProofObjective {
+        item_key: String,
+        proof_key: String,
+        place_id: i64,
+    }
+
+    fn cargo_proof_readiness(
+        world: &WorldDb,
+        contract: &Contract,
+    ) -> Result<ContractObjectiveView, ContractJobError> {
+        let objective: CargoProofObjective =
+            serde_json::from_str(&contract.objective_json).expect("fixture objective parses");
+        let player_id = contract
+            .acceptor_player_id
+            .expect("fixture contract is accepted");
+        let at_place = get_presence_on(world.connection(), player_id)
+            .expect("presence lookup succeeds")
+            .is_some_and(|presence| presence.place_id == objective.place_id);
+        let has_cargo = world
+            .get_slot("player", player_id, &objective.item_key)
+            .expect("inventory lookup succeeds")
+            .is_some_and(|slot| slot.quantity > 0);
+        let has_proof: bool = world
+            .connection()
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM salvage_proofs
+                    WHERE player_id = ?1 AND proof_key = ?2
+                )",
+                rusqlite::params![player_id, &objective.proof_key],
+                |row| row.get(0),
+            )
+            .expect("proof lookup succeeds");
+        let ready_to_complete = at_place && has_cargo && has_proof;
+
+        Ok(ContractObjectiveView {
+            ready_to_complete,
+            next_step: Some(
+                if ready_to_complete {
+                    "Complete at the archive."
+                } else {
+                    "Bring the cargo and proof to the archive."
+                }
+                .to_string(),
+            ),
+            requirements: vec![
+                JobRequirementView {
+                    label: "At archive".to_string(),
+                    met: at_place,
+                },
+                JobRequirementView {
+                    label: format!("Has {}", objective.item_key),
+                    met: has_cargo,
+                },
+                JobRequirementView {
+                    label: "Proof recorded".to_string(),
+                    met: has_proof,
+                },
+            ],
+            complete_action: ready_to_complete.then(|| format!("complete:{}", contract.id)),
+        })
+    }
+
+    struct CustomObjectiveFixture {
+        world: WorldDb,
+        player_id: i64,
+        contract: Contract,
+        archive_id: i64,
+        _tempdir: tempfile::TempDir,
+    }
+
+    fn setup_custom_objective_world() -> CustomObjectiveFixture {
+        let dir = tempdir().expect("tempdir creates");
+        let db_path = dir.path().join("world.sqlite");
+        let mut world = WorldDb::open(&db_path).expect("open succeeds");
+        world
+            .apply_migration(&PLAYERS_MIGRATION)
+            .expect("players migration applies");
+        world
+            .apply_migration(&PLACES_MIGRATION)
+            .expect("places migration applies");
+        world
+            .apply_migration(&PRESENCE_MIGRATION)
+            .expect("presence migration applies");
+        world
+            .apply_migration(&INVENTORY_SLOTS_MIGRATION)
+            .expect("inventory migration applies");
+        world
+            .apply_migration(&CONTRACTS_MIGRATION)
+            .expect("contracts migration applies");
+        world
+            .connection()
+            .execute(
+                "CREATE TABLE salvage_proofs (
+                    player_id INTEGER NOT NULL,
+                    proof_key TEXT NOT NULL,
+                    details TEXT NOT NULL,
+                    PRIMARY KEY (player_id, proof_key)
+                )",
+                [],
+            )
+            .expect("proof table creates");
+
+        let player_id = world
+            .connection()
+            .query_row(
+                "INSERT INTO players (handle) VALUES ('salvager') RETURNING id",
+                [],
+                |row| row.get(0),
+            )
+            .expect("player inserts");
+        let airlock = world
+            .insert_place("airlock", "Airlock", "room", None)
+            .expect("airlock inserts");
+        let archive = world
+            .insert_place("archive", "Archive", "room", None)
+            .expect("archive inserts");
+        world
+            .set_presence(player_id, airlock.id, None)
+            .expect("initial presence sets");
+
+        let objective_json = format!(
+            r#"{{"item_key":"black-box","proof_key":"wreck-alpha","place_id":{}}}"#,
+            archive.id
+        );
+        let contract = world
+            .create_and_accept_contract(
+                CreateContractInput {
+                    key: Some("recover-black-box"),
+                    kind: "custom-proof",
+                    issuer_owner_kind: "archive",
+                    issuer_owner_id: archive.id,
+                    objective_json: &objective_json,
+                    reward_json: r#"{"credits":250}"#,
+                    metadata_json: Some(
+                        r#"{
+                            "title":"Recover the Black Box",
+                            "summary":"Bring cargo and proof to the archive.",
+                            "kind_label":"Salvage",
+                            "location_preview":"Archive"
+                        }"#,
+                    ),
+                    expires_at: None,
+                },
+                player_id,
+                None::<fn(&rusqlite::Transaction<'_>, &Contract) -> rusqlite::Result<()>>,
+            )
+            .expect("contract accepted");
+
+        CustomObjectiveFixture {
+            world,
+            player_id,
+            contract,
+            archive_id: archive.id,
+            _tempdir: dir,
+        }
     }
 }

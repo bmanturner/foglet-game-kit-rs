@@ -104,3 +104,58 @@ Use the callback form when accepting the new contract must also reserve
 game-owned resources or append a game-owned ledger row. If the callback
 returns an error, both the accepted contract and the callback writes roll
 back together.
+
+## Custom objective example
+
+Use `ContractObjectiveViewProvider` when a contract is ready only after
+game-owned requirements are met. The kit projects the row; the game
+parses its own `objective_json` and reads its own proof/progress tables.
+
+```rust
+let views = player_contract_job_views(&world, player_id, &|world, contract| {
+    let objective: CargoProofObjective = serde_json::from_str(&contract.objective_json)?;
+    let player_id = contract.acceptor_player_id.expect("accepted contract");
+    let at_place = get_presence_on(world.connection(), player_id)?
+        .is_some_and(|presence| presence.place_id == objective.archive_place_id);
+    let has_cargo = world
+        .get_slot("player", player_id, &objective.item_key)?
+        .is_some_and(|slot| slot.quantity > 0);
+    let has_proof = game_has_salvage_proof(world.connection(), player_id, &objective.proof_key)?;
+
+    Ok(ContractObjectiveView {
+        ready_to_complete: at_place && has_cargo && has_proof,
+        next_step: Some("Bring cargo and proof to the archive.".to_string()),
+        requirements: vec![
+            JobRequirementView { label: "At archive".to_string(), met: at_place },
+            JobRequirementView { label: "Cargo aboard".to_string(), met: has_cargo },
+            JobRequirementView { label: "Proof recorded".to_string(), met: has_proof },
+        ],
+        complete_action: (at_place && has_cargo && has_proof)
+            .then(|| format!("complete:{}", contract.id)),
+    })
+})?;
+```
+
+Completion still uses the normal lifecycle helper. Consume or transfer
+required cargo inside the completion callback so contract state and
+inventory move atomically:
+
+```rust
+world.complete_contract(contract_id, Some(|tx, _contract| {
+    foglet_game::transfer_on(
+        tx,
+        ("player", player_id),
+        ("archive", archive_place_id),
+        "black-box",
+        1,
+        None::<fn(&rusqlite::Connection, &InventorySlot, &InventorySlot) -> rusqlite::Result<()>>,
+    )
+    .map_err(|err| rusqlite::Error::InvalidParameterName(err.to_string()))?;
+    Ok(())
+}))?;
+```
+
+The proof row is game-owned history, so completion should not delete it
+just because the item was consumed. `objective_json` remains opaque to
+the kit throughout this flow; only the game provider and completion
+handler interpret it.
