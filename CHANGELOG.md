@@ -23,9 +23,19 @@
   objects while preserving unrelated keys, preserving first-seen
   timestamps, advancing last-seen timestamps, and surfacing invalid
   existing JSON as typed errors.
+- Added namespaced place-recall merge helpers that deep-merge a JSON
+  object at a game-owned namespace path while preserving sibling
+  namespaces and rejecting non-object path collisions with typed errors.
+- Added map-backed node topology helpers over the ASCII map parser so
+  games can validate named node anchors, declared exits, and render the
+  same authored map with a current-node marker while keeping room rules
+  game-owned.
 - Added prompt-composition and DateProvider service-layer guidance,
   including a lightweight `ServiceContext` for threading `GameConfig`,
   `FogletContext`, and an injected date provider through game services.
+- Documented a custom map/detail/action-prompt `Screen` pattern that
+  keeps `ChoicePrompt` authoritative for hotkeys, navigation, and
+  disabled-choice reasons, including a `TestBackend` layout assertion.
 - Added `WorldDb::create_and_accept_contract` for atomically creating
   and accepting a contract with optional transaction-scoped side effects.
 - Added `events::append_event_on` for appending validated `world_events`
@@ -33,6 +43,10 @@
 - Added `inventory::transfer_on` for composing owner-keyed inventory
   transfers with other kit-owned mutations inside a caller-owned
   transaction.
+- Added `WorldDb::take_finite_pickup_with_capacity` and
+  `FinitePickupResult` for capacity-checked finite shared pickups that
+  report source exhaustion and let game-owned callback effects roll back
+  with inventory movement.
 - Added `TravelRequest::with_charge_cost_tx` so game-defined travel
   costs can mutate kit-owned tables inside the same transaction that
   resolves routes, moves presence, touches recall, and appends travel
@@ -44,6 +58,10 @@
 - Added reusable contract job read models for available, accepted,
   ready-to-complete, completed, failed, abandoned, and expired work,
   with game-supplied objective readiness and requirement rows.
+- Added a custom contract objective regression example using
+  `ContractObjectiveViewProvider`, game-owned proof rows, and
+  `transfer_on` inside contract completion so cargo consumption remains
+  atomic with lifecycle changes.
 - Added `inventory::grant_inventory_on` and
   `inventory_capacity::grant_inventory_with_capacity_on` for
   transaction-scoped direct rewards and pickups with metadata-compatible
@@ -53,6 +71,10 @@
 - Added player-scoped map projection helpers that combine presence,
   place recall, game-authored visibility policy, and route availability
   for graph, room, atlas, or star-chart UIs.
+- Expanded multi-user test-support guidance with a shared finite-state
+  scenario proving one player can exhaust shared inventory while proof
+  events and recall remain player-scoped unless the game writes shared
+  history intentionally.
 - Added `spend_turns_on` for spending Daily Turns on an existing SQLite
   connection or transaction, including from transaction-aware travel
   cost callbacks.

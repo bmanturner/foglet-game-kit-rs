@@ -412,7 +412,9 @@ fn harness_config(notices_enabled: bool) -> GameConfig {
 #[cfg(test)]
 mod tests {
     use super::{MultiUserHarness, MultiUserHarnessError};
+    use crate::events::append_event_on;
     use crate::inventory::INVENTORY_SLOTS_MIGRATION;
+    use crate::inventory_capacity::{CapacityError, CapacityPolicy, FinitePickupResult};
     use crate::place_recall::PLACE_RECALL_MIGRATION;
     use crate::roles::FogletRole;
     use crate::spatial::PLACES_MIGRATION;
@@ -594,7 +596,7 @@ mod tests {
     }
 
     #[test]
-    fn self_test_shared_inventory_and_per_player_recall() {
+    fn shared_finite_resource_exhaustion_keeps_proof_and_recall_personal() {
         let mut harness = MultiUserHarness::builder()
             .add_user("alice", FogletRole::User)
             .add_user("bob", FogletRole::User)
@@ -602,6 +604,7 @@ mod tests {
             .expect("harness builds");
         let alice_id = harness.player_id_for("alice").expect("alice player id");
         let bob_id = harness.player_id_for("bob").expect("bob player id");
+        let derelict_id;
 
         {
             let world = harness.world_db_mut();
@@ -614,58 +617,122 @@ mod tests {
             world
                 .apply_migration(&PLACE_RECALL_MIGRATION)
                 .expect("recall migration applies");
-            world
-                .create_slot("player", alice_id, "key", 2, None, None)
-                .expect("alice inventory inserts");
-            world
-                .transfer(
-                    ("player", alice_id),
-                    ("player", bob_id),
-                    "key",
-                    1,
-                    Option::<
-                        fn(
-                            &rusqlite::Transaction<'_>,
-                            &crate::inventory::InventorySlot,
-                            &crate::inventory::InventorySlot,
-                        ) -> Result<(), rusqlite::Error>,
-                    >::None,
-                )
-                .expect("alice transfer to bob succeeds");
 
-            let alice_place = world
-                .insert_place("alice-room", "Alice Room", "room", None)
-                .expect("alice place inserts");
-            let bob_place = world
-                .insert_place("bob-room", "Bob Room", "room", None)
-                .expect("bob place inserts");
+            let derelict = world
+                .insert_place("derelict-cache", "Derelict Cache", "site", None)
+                .expect("derelict place inserts");
+            derelict_id = derelict.id;
             world
-                .touch_recall(alice_id, alice_place.id, None)
-                .expect("alice recall touches");
+                .create_slot("site", derelict_id, "black-box", 1, None, None)
+                .expect("finite shared source inserts");
             world
-                .touch_recall(bob_id, bob_place.id, None)
-                .expect("bob recall touches");
+                .touch_recall(
+                    alice_id,
+                    derelict_id,
+                    Some(r#"{"personal_note":"entered through the forward lock"}"#),
+                )
+                .expect("alice personal recall touches");
+
+            let pickup = world
+                .take_finite_pickup_with_capacity(
+                    ("site", derelict_id),
+                    ("player", alice_id),
+                    "black-box",
+                    1,
+                    &UnitCapacity,
+                    Some(
+                        |tx: &rusqlite::Transaction<'_>,
+                         pickup: &FinitePickupResult|
+                         -> rusqlite::Result<()> {
+                            append_event_on(
+                                tx,
+                                "salvage_proof",
+                                Some(alice_id),
+                                "Alice recovered the black box.",
+                                Some(r#"{"proof":"wreck-alpha"}"#),
+                            )
+                            .map_err(|err| {
+                                rusqlite::Error::InvalidParameterName(err.to_string())
+                            })?;
+                            if pickup.source_exhausted {
+                                append_event_on(
+                                    tx,
+                                    "site_exhausted",
+                                    None,
+                                    "The derelict cache is exhausted.",
+                                    Some(r#"{"item":"black-box"}"#),
+                                )
+                                .map_err(|err| {
+                                    rusqlite::Error::InvalidParameterName(err.to_string())
+                                })?;
+                            }
+                            Ok(())
+                        },
+                    ),
+                )
+                .expect("alice finite pickup succeeds");
+            assert!(pickup.source_exhausted);
         }
 
-        let bob_inventory = harness
+        let shared_source = harness
             .world_db()
-            .slots_for_owner("player", bob_id)
-            .expect("bob inventory reads");
-        assert!(
-            bob_inventory
-                .iter()
-                .any(|slot| slot.item_key == "key" && slot.quantity > 0),
-            "Bob should observe Alice's committed transfer"
+            .get_slot("site", derelict_id, "black-box")
+            .expect("shared source reads")
+            .expect("shared source remains as exhausted row");
+        assert_eq!(
+            shared_source.quantity, 0,
+            "Bob can observe the shared finite source is exhausted"
         );
+        harness
+            .assert_event_visible_to("alice", |event| event.kind == "salvage_proof")
+            .expect("alice sees her personal proof event");
+        assert!(matches!(
+            harness.assert_event_visible_to("bob", |event| event.kind == "salvage_proof"),
+            Err(MultiUserHarnessError::EventNotVisible { handle }) if handle == "bob"
+        ));
+        harness
+            .assert_event_visible_to("bob", |event| event.kind == "site_exhausted")
+            .expect("bob sees the intentionally shared exhaustion event");
 
         let alice_recall = harness
             .world_db()
             .recall_for_player(alice_id)
             .expect("alice recall reads");
+        assert!(
+            alice_recall
+                .iter()
+                .any(|recall| recall.place_id == derelict_id),
+            "Alice keeps her personal recall of the site"
+        );
         let bob_recall = harness
             .world_db()
             .recall_for_player(bob_id)
             .expect("bob recall reads");
-        assert_ne!(alice_recall, bob_recall);
+        assert!(
+            bob_recall
+                .iter()
+                .all(|recall| recall.place_id != derelict_id),
+            "Bob's recall remains personal unless the game writes a Bob-scoped recall row"
+        );
+    }
+
+    struct UnitCapacity;
+
+    impl CapacityPolicy for UnitCapacity {
+        fn item_volume(
+            &self,
+            _item_key: &str,
+            _metadata: &serde_json::Value,
+        ) -> Result<i64, CapacityError> {
+            Ok(1)
+        }
+
+        fn owner_capacity(
+            &self,
+            _owner_kind: &str,
+            _owner_id: i64,
+        ) -> Result<Option<i64>, CapacityError> {
+            Ok(Some(1))
+        }
     }
 }
