@@ -138,7 +138,58 @@ if let Some(route) = world.get_route_between(starport.id, relay.id)? {
 - Use transactions around higher-level game actions that combine
   adjacency checks with movement or inventory effects.
 
-## 6. What this layer does not do
+## 6. Map-backed local nodes
+
+For compact authored maps, `MapNodeTopology` layers named nodes over the
+ASCII map parser. The kit parses the grid with `parse_map`, validates
+that each declared node anchor appears exactly once, checks exits target
+known nodes, and can render the same map with the current node marked.
+
+Descriptions, hazards, loot, and rules stay game-owned:
+
+```rust
+use foglet_game::{ChoicePrompt, MapNodeSpec, MapNodeTopology, TileLegend};
+
+struct RoomMeta {
+    description: &'static str,
+    hazard_key: Option<&'static str>,
+}
+
+let legend = TileLegend::from_pairs([
+    ("#", "wall"),
+    (".", "floor"),
+    ("A", "floor"),
+    ("B", "floor"),
+    ("C", "floor"),
+])?;
+let topology = MapNodeTopology::from_ascii(
+    "#####\n#A.B#\n#..C#\n#####\n",
+    &legend,
+    [
+        MapNodeSpec::new("airlock", 'A', RoomMeta {
+            description: "Outer lock, cold and bright.",
+            hazard_key: None,
+        }).with_exits(["bridge", "cargo"]),
+        MapNodeSpec::new("bridge", 'B', RoomMeta {
+            description: "Dead consoles face the viewport.",
+            hazard_key: Some("sparks"),
+        }).with_exits(["airlock"]),
+        MapNodeSpec::new("cargo", 'C', RoomMeta {
+            description: "Cargo webbing blocks the aft hatch.",
+            hazard_key: Some("jammed-door"),
+        }).with_exits(["airlock"]),
+    ],
+)?;
+```
+
+A custom `Screen` can render `topology.render_lines(current, '@')` into
+its map panel, read `topology.node(current).metadata.description` for
+the detail panel, and build a `ChoicePrompt` from
+`topology.exits_for(current)`. The hazard system remains ordinary game
+code: it can disable choices, spend turns, or update inventory without
+the topology helper learning what a hazard means.
+
+## 7. What this layer does not do
 
 - No automatic player placement.
 - No automatic movement logic.

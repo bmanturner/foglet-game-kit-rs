@@ -41,7 +41,7 @@
 //!   per-tile predicate; how a `Screen` consumes it is the game's
 //!   choice.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -296,6 +296,315 @@ impl Map {
     pub fn is_walkable(&self, x: u16, y: u16) -> bool {
         self.tile_at(x, y).is_some_and(Tile::is_walkable)
     }
+}
+
+/// Game-authored node declaration for [`MapNodeTopology`].
+///
+/// A node is anchored by one glyph on the ASCII map and carries any
+/// game-owned metadata the caller wants to keep with that room, station,
+/// encounter space, or local-map point. The kit validates anchors and
+/// exits, but it does not inspect `metadata`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MapNodeSpec<M> {
+    /// Stable game key for this node.
+    pub key: String,
+    /// Glyph that must appear exactly once in the parsed map.
+    pub anchor: char,
+    /// Declared outbound exit target keys in deterministic render/order
+    /// order.
+    pub exits: Vec<String>,
+    /// Game-owned metadata for descriptions, hazards, encounter rules,
+    /// or any other domain state.
+    pub metadata: M,
+}
+
+impl<M> MapNodeSpec<M> {
+    /// Create a node declaration with no exits.
+    pub fn new(key: impl Into<String>, anchor: char, metadata: M) -> Self {
+        Self {
+            key: key.into(),
+            anchor,
+            exits: Vec::new(),
+            metadata,
+        }
+    }
+
+    /// Attach outbound exits in declaration order.
+    #[must_use]
+    pub fn with_exits<I, S>(mut self, exits: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.exits = exits.into_iter().map(Into::into).collect();
+        self
+    }
+}
+
+/// One validated node in a [`MapNodeTopology`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MapNode<M> {
+    /// Stable game key for this node.
+    pub key: String,
+    /// Anchor glyph that located this node on the source ASCII map.
+    pub anchor: char,
+    /// Column of the anchor glyph.
+    pub x: u16,
+    /// Row of the anchor glyph.
+    pub y: u16,
+    /// Declared outbound exits in deterministic order.
+    pub exits: Vec<MapNodeExit>,
+    /// Game-owned metadata carried through from [`MapNodeSpec`].
+    pub metadata: M,
+}
+
+/// One declared outbound edge from a map-backed node.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MapNodeExit {
+    /// Target node key.
+    pub target_key: String,
+}
+
+/// Parsed ASCII map plus validated named-node anchors and exits.
+///
+/// This helper is intentionally local-map oriented. Games still own room
+/// prose, hazards, encounter resolution, pickup rules, and durable world
+/// state. The kit only verifies that authored node anchors exist on the
+/// same grid the screen renders and that declared exits target known
+/// nodes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MapNodeTopology<M> {
+    map: Map,
+    nodes: Vec<MapNode<M>>,
+    node_index_by_key: HashMap<String, usize>,
+}
+
+impl<M> MapNodeTopology<M> {
+    /// Parse `text` with [`parse_map`] and validate game-authored node
+    /// declarations against the parsed grid.
+    pub fn from_ascii<I>(
+        text: &str,
+        legend: &TileLegend,
+        node_specs: I,
+    ) -> Result<Self, MapNodeTopologyError>
+    where
+        I: IntoIterator<Item = MapNodeSpec<M>>,
+    {
+        let map = parse_map(text, legend)?;
+        let mut specs = Vec::new();
+        let mut known_keys = HashSet::new();
+        let mut declared_anchors: HashMap<char, String> = HashMap::new();
+
+        for spec in node_specs {
+            if !known_keys.insert(spec.key.clone()) {
+                return Err(MapNodeTopologyError::DuplicateNodeKey { node_key: spec.key });
+            }
+            if let Some(first_node_key) = declared_anchors.insert(spec.anchor, spec.key.clone()) {
+                return Err(MapNodeTopologyError::DuplicateDeclaredAnchor {
+                    anchor: spec.anchor,
+                    first_node_key,
+                    second_node_key: spec.key,
+                });
+            }
+            specs.push(spec);
+        }
+
+        let mut anchors_by_key = HashMap::new();
+        for spec in &specs {
+            let positions = anchor_positions(&map, spec.anchor);
+            match positions.as_slice() {
+                [] => {
+                    return Err(MapNodeTopologyError::MissingNodeAnchor {
+                        node_key: spec.key.clone(),
+                        anchor: spec.anchor,
+                    });
+                }
+                [(x, y)] => {
+                    anchors_by_key.insert(spec.key.clone(), (*x, *y));
+                }
+                _ => {
+                    return Err(MapNodeTopologyError::DuplicateNodeAnchor {
+                        node_key: spec.key.clone(),
+                        anchor: spec.anchor,
+                        count: positions.len(),
+                    });
+                }
+            }
+        }
+
+        for spec in &specs {
+            for target_key in &spec.exits {
+                if !known_keys.contains(target_key) {
+                    return Err(MapNodeTopologyError::UnknownExit {
+                        node_key: spec.key.clone(),
+                        target_key: target_key.clone(),
+                    });
+                }
+            }
+        }
+
+        let mut nodes = Vec::with_capacity(specs.len());
+        let mut node_index_by_key = HashMap::with_capacity(specs.len());
+        for spec in specs {
+            let Some((x, y)) = anchors_by_key.remove(&spec.key) else {
+                return Err(MapNodeTopologyError::MissingNodeAnchor {
+                    node_key: spec.key,
+                    anchor: spec.anchor,
+                });
+            };
+            let exits = spec
+                .exits
+                .into_iter()
+                .map(|target_key| MapNodeExit { target_key })
+                .collect();
+            node_index_by_key.insert(spec.key.clone(), nodes.len());
+            nodes.push(MapNode {
+                key: spec.key,
+                anchor: spec.anchor,
+                x,
+                y,
+                exits,
+                metadata: spec.metadata,
+            });
+        }
+
+        Ok(Self {
+            map,
+            nodes,
+            node_index_by_key,
+        })
+    }
+
+    /// Parsed backing map.
+    #[must_use]
+    pub fn map(&self) -> &Map {
+        &self.map
+    }
+
+    /// Validated nodes in declaration order.
+    #[must_use]
+    pub fn nodes(&self) -> &[MapNode<M>] {
+        &self.nodes
+    }
+
+    /// Look up one node by key.
+    #[must_use]
+    pub fn node(&self, node_key: &str) -> Option<&MapNode<M>> {
+        let index = self.node_index_by_key.get(node_key)?;
+        self.nodes.get(*index)
+    }
+
+    /// Return declared exits for `node_key` in deterministic order.
+    pub fn exits_for(&self, node_key: &str) -> Result<&[MapNodeExit], MapNodeTopologyError> {
+        self.node(node_key)
+            .map(|node| node.exits.as_slice())
+            .ok_or_else(|| MapNodeTopologyError::UnknownNode {
+                node_key: node_key.to_string(),
+            })
+    }
+
+    /// Render map rows with `current_marker` overlaying the current
+    /// node's anchor cell.
+    ///
+    /// All other cells render their original source glyphs, so games do
+    /// not need separate hard-coded "current room" art.
+    pub fn render_lines(
+        &self,
+        current_node_key: &str,
+        current_marker: char,
+    ) -> Result<Vec<String>, MapNodeTopologyError> {
+        let current =
+            self.node(current_node_key)
+                .ok_or_else(|| MapNodeTopologyError::UnknownNode {
+                    node_key: current_node_key.to_string(),
+                })?;
+        let mut lines = Vec::with_capacity(self.map.cells.len());
+        for (y, row) in self.map.cells.iter().enumerate() {
+            let mut line = String::with_capacity(row.len());
+            for (x, tile) in row.iter().enumerate() {
+                if x == usize::from(current.x) && y == usize::from(current.y) {
+                    line.push(current_marker);
+                } else {
+                    line.push(tile.glyph);
+                }
+            }
+            lines.push(line);
+        }
+        Ok(lines)
+    }
+}
+
+/// Errors produced while building or querying a [`MapNodeTopology`].
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum MapNodeTopologyError {
+    /// The underlying ASCII map failed validation.
+    #[error(transparent)]
+    Map(#[from] MapError),
+    /// Two node declarations used the same key.
+    #[error("duplicate map node key `{node_key}`")]
+    DuplicateNodeKey {
+        /// Repeated node key.
+        node_key: String,
+    },
+    /// Two node declarations used the same anchor glyph.
+    #[error(
+        "duplicate declared map node anchor {anchor:?} for `{first_node_key}` and `{second_node_key}`"
+    )]
+    DuplicateDeclaredAnchor {
+        /// Anchor glyph reused by two declarations.
+        anchor: char,
+        /// First node key that declared the glyph.
+        first_node_key: String,
+        /// Second node key that declared the glyph.
+        second_node_key: String,
+    },
+    /// A declared anchor glyph was not present in the parsed map.
+    #[error("map node `{node_key}` anchor {anchor:?} is missing from the map")]
+    MissingNodeAnchor {
+        /// Node key whose anchor was missing.
+        node_key: String,
+        /// Expected anchor glyph.
+        anchor: char,
+    },
+    /// A declared anchor glyph appeared more than once in the parsed map.
+    #[error("map node `{node_key}` anchor {anchor:?} appears {count} times")]
+    DuplicateNodeAnchor {
+        /// Node key whose anchor was repeated.
+        node_key: String,
+        /// Repeated anchor glyph.
+        anchor: char,
+        /// Number of occurrences found in the parsed map.
+        count: usize,
+    },
+    /// A declared exit target does not match any node key.
+    #[error("map node `{node_key}` declares exit to unknown node `{target_key}`")]
+    UnknownExit {
+        /// Node key containing the bad exit.
+        node_key: String,
+        /// Unknown target node key.
+        target_key: String,
+    },
+    /// A query referenced a node key that is not in this topology.
+    #[error("unknown map node `{node_key}`")]
+    UnknownNode {
+        /// Unknown node key.
+        node_key: String,
+    },
+}
+
+fn anchor_positions(map: &Map, anchor: char) -> Vec<(u16, u16)> {
+    let mut positions = Vec::new();
+    for (y, row) in map.cells.iter().enumerate() {
+        for (x, tile) in row.iter().enumerate() {
+            if tile.glyph == anchor {
+                positions.push((
+                    u16::try_from(x).unwrap_or(u16::MAX),
+                    u16::try_from(y).unwrap_or(u16::MAX),
+                ));
+            }
+        }
+    }
+    positions
 }
 
 /// Errors produced by [`parse_map`] and the legend constructor.
@@ -643,5 +952,167 @@ mod tests {
         let two = TileLegend::from_pairs([("#", "wall"), (".", "floor")]).unwrap();
         assert!(!two.is_empty());
         assert_eq!(two.len(), 2);
+    }
+
+    fn topology_legend() -> TileLegend {
+        TileLegend::from_pairs([
+            ("#", "wall"),
+            (".", "floor"),
+            ("A", "floor"),
+            ("B", "floor"),
+            ("C", "floor"),
+        ])
+        .expect("static topology legend parses")
+    }
+
+    #[test]
+    fn node_topology_lists_exits_and_renders_current_node() {
+        let topology = MapNodeTopology::from_ascii(
+            "\
+#####
+#A.B#
+#..C#
+#####
+",
+            &topology_legend(),
+            [
+                MapNodeSpec::new("airlock", 'A', "Airlock").with_exits(["bridge", "cargo"]),
+                MapNodeSpec::new("bridge", 'B', "Bridge").with_exits(["airlock"]),
+                MapNodeSpec::new("cargo", 'C', "Cargo Bay").with_exits(["airlock"]),
+            ],
+        )
+        .expect("topology validates");
+
+        let exits = topology.exits_for("airlock").expect("airlock exits");
+        assert_eq!(
+            exits
+                .iter()
+                .map(|exit| exit.target_key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["bridge", "cargo"],
+            "exits should remain in declaration order"
+        );
+        assert_eq!(
+            topology
+                .render_lines("bridge", PLAYER_GLYPH)
+                .expect("map renders")
+                .join("\n"),
+            "#####\n#A.@#\n#..C#\n#####"
+        );
+        assert_eq!(
+            topology.node("cargo").expect("cargo node").metadata,
+            "Cargo Bay"
+        );
+    }
+
+    #[test]
+    fn node_topology_surfaces_ragged_map_errors() {
+        let err = MapNodeTopology::<()>::from_ascii(
+            "\
+###
+##
+",
+            &topology_legend(),
+            [],
+        )
+        .expect_err("ragged source should fail");
+
+        assert_eq!(
+            err,
+            MapNodeTopologyError::Map(MapError::Ragged {
+                row: 1,
+                expected: 3,
+                found: 2,
+            })
+        );
+    }
+
+    #[test]
+    fn node_topology_surfaces_unknown_glyph_errors() {
+        let err = MapNodeTopology::<()>::from_ascii(
+            "\
+###
+#?#
+###
+",
+            &topology_legend(),
+            [],
+        )
+        .expect_err("unknown glyph should fail");
+
+        assert_eq!(
+            err,
+            MapNodeTopologyError::Map(MapError::UnknownGlyph { glyph: '?' })
+        );
+    }
+
+    #[test]
+    fn node_topology_rejects_missing_anchor() {
+        let err = MapNodeTopology::from_ascii(
+            "\
+#####
+#A.B#
+#####
+",
+            &topology_legend(),
+            [MapNodeSpec::new("cargo", 'C', ())],
+        )
+        .expect_err("missing anchor should fail");
+
+        assert_eq!(
+            err,
+            MapNodeTopologyError::MissingNodeAnchor {
+                node_key: "cargo".to_string(),
+                anchor: 'C',
+            }
+        );
+    }
+
+    #[test]
+    fn node_topology_rejects_duplicate_anchor_occurrences() {
+        let err = MapNodeTopology::from_ascii(
+            "\
+#####
+#A.A#
+#####
+",
+            &topology_legend(),
+            [MapNodeSpec::new("airlock", 'A', ())],
+        )
+        .expect_err("duplicate anchor should fail");
+
+        assert_eq!(
+            err,
+            MapNodeTopologyError::DuplicateNodeAnchor {
+                node_key: "airlock".to_string(),
+                anchor: 'A',
+                count: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn node_topology_rejects_exit_to_unknown_node() {
+        let err = MapNodeTopology::from_ascii(
+            "\
+#####
+#A.B#
+#####
+",
+            &topology_legend(),
+            [
+                MapNodeSpec::new("airlock", 'A', ()).with_exits(["missing"]),
+                MapNodeSpec::new("bridge", 'B', ()),
+            ],
+        )
+        .expect_err("unknown exit target should fail");
+
+        assert_eq!(
+            err,
+            MapNodeTopologyError::UnknownExit {
+                node_key: "airlock".to_string(),
+                target_key: "missing".to_string(),
+            }
+        );
     }
 }

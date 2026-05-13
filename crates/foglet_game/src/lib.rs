@@ -128,7 +128,8 @@ pub use manifest::{
     DEFAULT_TIMEOUT_MS, DEFAULT_VISIBILITY, RUNTIME_EXTERNAL_PTY,
 };
 pub use map::{
-    parse_map, EntityPlacement, Map, MapError, Tile, TileKind, TileLegend, PLAYER_GLYPH,
+    parse_map, EntityPlacement, Map, MapError, MapNode, MapNodeExit, MapNodeSpec, MapNodeTopology,
+    MapNodeTopologyError, Tile, TileKind, TileLegend, PLAYER_GLYPH,
 };
 pub use map_projection::{
     project_player_map, project_player_map_with_options, MapProjectionError, MapProjectionOptions,
