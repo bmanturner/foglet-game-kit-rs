@@ -13,6 +13,19 @@
   animated redraws.
 - Added `WorldDb::get_place_by_key` and `WorldDb::get_route_between`
   for typed shared-world spatial lookups without game-local raw SQL.
+- Added deterministic weighted-table helpers for seeded procedural
+  choices, including stable seed-to-bucket hashing, explicit no-selection
+  results, optional roll explanations, and genre-neutral usage docs.
+- Added transaction-scoped `get_place_by_id_on`, `get_presence_on`, and
+  `get_route_by_id_between_on` helpers so game services can query common
+  spatial and presence rows inside an existing SQLite transaction.
+- Added place-recall snapshot merge helpers that update game-owned JSON
+  objects while preserving unrelated keys, preserving first-seen
+  timestamps, advancing last-seen timestamps, and surfacing invalid
+  existing JSON as typed errors.
+- Added prompt-composition and DateProvider service-layer guidance,
+  including a lightweight `ServiceContext` for threading `GameConfig`,
+  `FogletContext`, and an injected date provider through game services.
 - Added `WorldDb::create_and_accept_contract` for atomically creating
   and accepting a contract with optional transaction-scoped side effects.
 - Added `events::append_event_on` for appending validated `world_events`
