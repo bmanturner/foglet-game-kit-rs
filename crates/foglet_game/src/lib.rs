@@ -141,7 +141,7 @@ pub use market::{
 pub use notices::{Notice, NoticeError, NOTICES_MIGRATION, NOTICE_SUBJECT_MAX_CHARS};
 pub use place_recall::{PlaceRecallError, PlaceRecallRecord, PLACE_RECALL_MIGRATION};
 pub use players::{PlayerError, PlayerRecord, PLAYERS_MIGRATION};
-pub use presence::{PresenceRecord, PRESENCE_MIGRATION};
+pub use presence::{get_presence_on, PresenceRecord, PRESENCE_MIGRATION};
 pub use prompt::{
     AnyKeyOutcome, AnyKeyPrompt, ChoicePrompt, ConfirmAction, ConfirmOutcome, ConfirmPrompt,
     FeedbackKind, FeedbackLine, PromptAction, PromptChoice, PromptError, PromptKey, StyleRole,
@@ -161,7 +161,10 @@ pub use screen::{
     apply_command, ExitReason, GameContext, Screen, ScreenCommand, ScreenStack, SideEffect,
 };
 pub use screens::event_log::{EventLogLine, EventLogScope, EventLogScreen, TimestampStyle};
-pub use spatial::{Place, PlaceError, Route, RouteError, PLACES_MIGRATION, ROUTES_MIGRATION};
+pub use spatial::{
+    get_place_by_id_on, get_route_by_id_between_on, Place, PlaceError, Route, RouteError,
+    PLACES_MIGRATION, ROUTES_MIGRATION,
+};
 pub use terminal::{
     arm_panic_hook, disarm_panic_hook, flush_stdout, install_panic_hook, install_panic_hook_with,
     is_panic_hook_armed, CrosstermBackend, PanicRestoreFn, TerminalBackend, TerminalError,

@@ -284,19 +284,7 @@ RETURNING player_id, place_id, entered_at, metadata_json";
     /// - In a **dungeon crawler**, a room map can start with `None`
     ///   and defer spawning checks.
     pub fn get_presence(&self, player_id: i64) -> Result<Option<PresenceRecord>, PresenceError> {
-        const SQL: &str = "\
-SELECT player_id, place_id, entered_at, metadata_json\n\
-FROM presence\n\
-WHERE player_id = ?1";
-
-        match self
-            .connection()
-            .query_row(SQL, rusqlite::params![player_id], row_to_presence)
-        {
-            Ok(presence) => Ok(Some(presence)),
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(source) => Err(PresenceError::GetFailed { player_id, source }),
-        }
+        get_presence_on(self.connection(), player_id)
     }
 
     /// List the players currently present at a place.
@@ -339,6 +327,29 @@ ORDER BY player_id";
             .map_err(|source| PresenceError::ListFailed { place_id, source })?;
 
         Ok(rows)
+    }
+}
+
+/// Read the current presence row for one player using an existing
+/// connection or transaction.
+///
+/// The function takes `&rusqlite::Connection`, so a
+/// `&rusqlite::Transaction` works through deref coercion. It opens no
+/// nested transaction and returns `Ok(None)` when the player has not
+/// been placed yet.
+pub fn get_presence_on(
+    conn: &rusqlite::Connection,
+    player_id: i64,
+) -> Result<Option<PresenceRecord>, PresenceError> {
+    const SQL: &str = "\
+SELECT player_id, place_id, entered_at, metadata_json\n\
+FROM presence\n\
+WHERE player_id = ?1";
+
+    match conn.query_row(SQL, rusqlite::params![player_id], row_to_presence) {
+        Ok(presence) => Ok(Some(presence)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(source) => Err(PresenceError::GetFailed { player_id, source }),
     }
 }
 
@@ -750,6 +761,66 @@ mod tests {
         assert!(
             none.is_none(),
             "fresh players should start without presence"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn transaction_scoped_presence_lookup_observes_rollback() -> Result<(), PresenceError> {
+        let dir = tempdir().expect("tempdir creates");
+        let db_path = dir.path().join("world.sqlite");
+        let mut world = WorldDb::open(&db_path).expect("open succeeds");
+
+        world
+            .apply_migration(&PLAYERS_MIGRATION)
+            .expect("players migration applies");
+        world
+            .apply_migration(&PLACES_MIGRATION)
+            .expect("places migration applies");
+        world
+            .apply_migration(&PRESENCE_MIGRATION)
+            .expect("presence migration applies");
+
+        let player_id: i64 = world
+            .connection()
+            .query_row(
+                "INSERT INTO players (handle) VALUES (?1) RETURNING id",
+                rusqlite::params!["Scout Vale"],
+                |row| row.get(0),
+            )
+            .expect("fixture player insert works");
+        let origin = world
+            .insert_place("origin-dock", "Origin Dock", "dock", None)
+            .expect("origin place insert works");
+        let destination = world
+            .insert_place("destination-vault", "Destination Vault", "vault", None)
+            .expect("destination place insert works");
+
+        world.set_presence(player_id, origin.id, None)?;
+
+        {
+            let tx = world
+                .connection_mut()
+                .transaction()
+                .expect("transaction begins");
+            tx.execute(
+                "UPDATE presence SET place_id = ?1 WHERE player_id = ?2",
+                rusqlite::params![destination.id, player_id],
+            )
+            .expect("presence update inside transaction succeeds");
+
+            let in_tx = super::get_presence_on(&tx, player_id)?
+                .expect("presence should be visible inside transaction");
+            assert_eq!(in_tx.place_id, destination.id);
+        }
+
+        let after_rollback = world
+            .get_presence(player_id)?
+            .expect("presence should still exist after rollback");
+        assert_eq!(
+            after_rollback.place_id, origin.id,
+            "dropped transaction should roll back the presence move"
         );
 
         Ok(())

@@ -29,6 +29,8 @@ The kit does not auto-touch recall during movement.
 - `WorldDb::set_presence(player_id, place_id, metadata_json)`
 - `WorldDb::move_player(player_id, dest_place_id, on_commit)`
 - `WorldDb::get_presence(player_id)`
+- `get_presence_on(conn, player_id)` for connection- or
+  transaction-scoped reads without opening a nested transaction
 - `WorldDb::players_at(place_id)`
 
 `presence` rows store `player_id`, `place_id`, `entered_at`, and optional

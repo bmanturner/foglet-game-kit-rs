@@ -58,6 +58,10 @@ change by genre.
 ### 3.2 Look up and list places
 
 - `WorldDb::get_place_by_key(&str)` resolves authored keys to row IDs.
+- `WorldDb::get_place_by_id(id)` resolves durable row IDs back to
+  `Place` rows.
+- `get_place_by_id_on(conn, id)` performs the same lookup on an existing
+  `rusqlite::Connection` or transaction handle.
 - `WorldDb::list_places()` returns deterministic key-ordered rows.
 
 Deterministic ordering keeps admin tools and tests stable across runs.
@@ -100,6 +104,11 @@ Both are just directed rows. No reverse link is implied.
 - `WorldDb::get_route_between(from_place_id, to_place_id)` resolves one
   directed route for an exact pair and returns `Ok(None)` when that edge
   has not been authored.
+- `WorldDb::get_route_by_id_between(route_id, from_place_id,
+  to_place_id)` verifies a route id belongs to that exact directed edge.
+- `get_route_by_id_between_on(conn, route_id, from_place_id,
+  to_place_id)` performs that verification inside an existing connection
+  or transaction without opening a nested transaction.
 
 Two key rules:
 

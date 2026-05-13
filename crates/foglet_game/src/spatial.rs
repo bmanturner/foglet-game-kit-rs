@@ -111,6 +111,15 @@ pub enum PlaceError {
         #[source]
         source: rusqlite::Error,
     },
+    /// The underlying SQL lookup by row id failed.
+    #[error("failed to look up place id `{place_id}`: {source}")]
+    LookupById {
+        /// Place row id for caller-friendly diagnostics.
+        place_id: i64,
+        /// Underlying `rusqlite` error.
+        #[source]
+        source: rusqlite::Error,
+    },
 }
 
 /// Errors for shared-route mutations.
@@ -154,6 +163,21 @@ pub enum RouteError {
     /// The underlying SQL lookup for a directed route pair failed.
     #[error("failed to look up route from `{from_place_id}` to `{to_place_id}`: {source}")]
     LookupBetween {
+        /// Source place id for diagnostics.
+        from_place_id: i64,
+        /// Destination place id for diagnostics.
+        to_place_id: i64,
+        /// Underlying `rusqlite` error.
+        #[source]
+        source: rusqlite::Error,
+    },
+    /// The underlying SQL lookup for a specific outbound route id failed.
+    #[error(
+        "failed to look up route `{route_id}` from `{from_place_id}` to `{to_place_id}`: {source}"
+    )]
+    LookupByIdBetween {
+        /// Route row id for diagnostics.
+        route_id: i64,
         /// Source place id for diagnostics.
         from_place_id: i64,
         /// Destination place id for diagnostics.
@@ -469,6 +493,22 @@ LIMIT 1";
         }
     }
 
+    /// Load one outbound route by route id and exact directed endpoints.
+    ///
+    /// This method form is convenient outside a transaction. For
+    /// transaction-local game services, use
+    /// [`get_route_by_id_between_on`] with the active
+    /// `&rusqlite::Transaction` so the lookup observes the same
+    /// uncommitted state as the surrounding write.
+    pub fn get_route_by_id_between(
+        &self,
+        route_id: i64,
+        from_place_id: i64,
+        to_place_id: i64,
+    ) -> Result<Option<Route>, RouteError> {
+        get_route_by_id_between_on(self.connection(), route_id, from_place_id, to_place_id)
+    }
+
     /// Load one place by its stable `key`.
     ///
     /// This is the primary lookup for game code that stores authored
@@ -499,6 +539,16 @@ WHERE key = ?1";
                 source,
             }),
         }
+    }
+
+    /// Load one place by row id.
+    ///
+    /// This mirrors [`WorldDb::get_place_by_key`] for call sites that
+    /// already hold durable row ids from presence, routes, recall, or
+    /// game-owned tables. For transaction-local use, call
+    /// [`get_place_by_id_on`] with the active connection or transaction.
+    pub fn get_place_by_id(&self, place_id: i64) -> Result<Option<Place>, PlaceError> {
+        get_place_by_id_on(self.connection(), place_id)
     }
 
     /// Return all places in deterministic key order.
@@ -537,6 +587,61 @@ ORDER BY key ASC, id ASC";
             })?;
 
         Ok(places)
+    }
+}
+
+/// Load one place by row id using an existing connection or transaction.
+///
+/// The function takes `&rusqlite::Connection`, so a
+/// `&rusqlite::Transaction` works through deref coercion. It opens no
+/// nested transaction and returns `Ok(None)` when the id is not present.
+pub fn get_place_by_id_on(
+    conn: &rusqlite::Connection,
+    place_id: i64,
+) -> Result<Option<Place>, PlaceError> {
+    const SQL: &str = "\
+SELECT id, key, display_name, kind, metadata_json, created_at\n\
+FROM places\n\
+WHERE id = ?1";
+
+    match conn.query_row(SQL, rusqlite::params![place_id], row_to_place) {
+        Ok(place) => Ok(Some(place)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(source) => Err(PlaceError::LookupById { place_id, source }),
+    }
+}
+
+/// Load one outbound route by route id and exact directed endpoints.
+///
+/// Use this inside larger service transactions when a caller has a
+/// route id from UI or persisted state and still needs to prove it
+/// leaves `from_place_id` and arrives at `to_place_id`. The helper
+/// opens no nested transaction and returns `Ok(None)` when no such row
+/// exists.
+pub fn get_route_by_id_between_on(
+    conn: &rusqlite::Connection,
+    route_id: i64,
+    from_place_id: i64,
+    to_place_id: i64,
+) -> Result<Option<Route>, RouteError> {
+    const SQL: &str = "\
+SELECT from_place_id, to_place_id, id, kind, requirements_json, metadata_json, created_at\n\
+FROM routes\n\
+WHERE id = ?1 AND from_place_id = ?2 AND to_place_id = ?3";
+
+    match conn.query_row(
+        SQL,
+        rusqlite::params![route_id, from_place_id, to_place_id],
+        row_to_route,
+    ) {
+        Ok(route) => Ok(Some(route)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(source) => Err(RouteError::LookupByIdBetween {
+            route_id,
+            from_place_id,
+            to_place_id,
+            source,
+        }),
     }
 }
 
@@ -689,6 +794,101 @@ mod tests {
             "to_place_id".to_string(),
             "id".to_string()
         )));
+    }
+
+    #[test]
+    fn transaction_scoped_place_and_route_lookup_observes_rollback() {
+        let dir = tempdir().expect("tempdir creates");
+        let db_path = dir.path().join("world.sqlite");
+        let mut world = WorldDb::open(&db_path).expect("open succeeds");
+
+        world
+            .apply_migration(&PLACES_MIGRATION)
+            .expect("places migration applies");
+        world
+            .apply_migration(&ROUTES_MIGRATION)
+            .expect("routes migration applies");
+
+        let (origin, destination, route) = {
+            let tx = world
+                .connection_mut()
+                .transaction()
+                .expect("transaction begins");
+
+            let origin = tx
+                .query_row(
+                    "INSERT INTO places (key, display_name, kind, metadata_json) \
+                     VALUES (?1, ?2, ?3, ?4) \
+                     RETURNING id, key, display_name, kind, metadata_json, created_at",
+                    rusqlite::params!["transient-origin", "Transient Origin", "dock", None::<&str>],
+                    super::row_to_place,
+                )
+                .expect("origin inserts inside transaction");
+            let destination = tx
+                .query_row(
+                    "INSERT INTO places (key, display_name, kind, metadata_json) \
+                     VALUES (?1, ?2, ?3, ?4) \
+                     RETURNING id, key, display_name, kind, metadata_json, created_at",
+                    rusqlite::params![
+                        "transient-destination",
+                        "Transient Destination",
+                        "chamber",
+                        None::<&str>
+                    ],
+                    super::row_to_place,
+                )
+                .expect("destination inserts inside transaction");
+            let route = tx
+                .query_row(
+                    "INSERT INTO routes (from_place_id, to_place_id, kind, requirements_json, metadata_json) \
+                     VALUES (?1, ?2, ?3, ?4, ?5) \
+                     RETURNING from_place_id, to_place_id, id, kind, requirements_json, metadata_json, created_at",
+                    rusqlite::params![
+                        origin.id,
+                        destination.id,
+                        "temporary-lane",
+                        None::<&str>,
+                        None::<&str>
+                    ],
+                    super::row_to_route,
+                )
+                .expect("route inserts inside transaction");
+
+            assert_eq!(
+                super::get_place_by_id_on(&tx, origin.id)
+                    .expect("place lookup in transaction succeeds"),
+                Some(origin.clone())
+            );
+            assert_eq!(
+                super::get_route_by_id_between_on(&tx, route.id, origin.id, destination.id)
+                    .expect("route lookup in transaction succeeds"),
+                Some(route.clone())
+            );
+
+            (origin, destination, route)
+        };
+
+        assert!(
+            world
+                .get_place_by_id(origin.id)
+                .expect("post-rollback origin lookup succeeds")
+                .is_none(),
+            "dropped transaction should roll back transient origin"
+        );
+        assert!(
+            world
+                .get_place_by_id(destination.id)
+                .expect("post-rollback destination lookup succeeds")
+                .is_none(),
+            "dropped transaction should roll back transient destination"
+        );
+        assert!(
+            world
+                .get_route_by_id_between(route.id, origin.id, destination.id)
+                .expect("post-rollback route lookup succeeds")
+                .is_none(),
+            "dropped transaction should roll back transient route"
+        );
     }
 
     ///  requires a typed round-trip surface for a

@@ -8,6 +8,13 @@ Use these APIs instead of direct SQL against kit-owned tables:
 - `events::append_event_on(conn, kind, player_id, message, metadata)`
   appends a validated `world_events` row and returns the assigned id and
   timestamp.
+- `get_place_by_id_on(conn, place_id)` reads a `Place` row by id from
+  the active connection or transaction.
+- `get_presence_on(conn, player_id)` reads the player's current
+  `PresenceRecord` from the active connection or transaction.
+- `get_route_by_id_between_on(conn, route_id, from_place_id,
+  to_place_id)` verifies an outbound route id against an exact directed
+  origin and destination in the active connection or transaction.
 - `inventory::transfer_on(conn, source, destination, item_key, quantity,
   on_commit)` moves owner-keyed inventory using the same semantics as
   `WorldDb::transfer`, but leaves commit or rollback to the surrounding
