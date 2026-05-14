@@ -87,11 +87,16 @@ pub struct WorldDbOptions {
 
 /// Type-erased callback signature for a durable world-tick key.
 ///
-/// The callback receives the active transaction that owns the due
-/// tick's row lock. This lets runtime-authored task logic mutate
-/// game tables in the same SQL transaction as `last_run_at`.
-pub(crate) type WorldTickCallback =
-    Box<dyn for<'tx> FnMut(&rusqlite::Transaction<'tx>) -> rusqlite::Result<()> + 'static>;
+/// The callback receives the active transaction and tick context that own
+/// the due tick's row lock. This lets runtime-authored task logic mutate
+/// game tables in the same SQL transaction as the completion marker.
+pub(crate) trait WorldTickCallback {
+    fn call(
+        &mut self,
+        tx: &rusqlite::Transaction<'_>,
+        context: &crate::world_ticks::WorldTickContext,
+    ) -> rusqlite::Result<()>;
+}
 
 /// Journal modes the world-DB open path will pass through to SQLite.
 ///
@@ -157,7 +162,7 @@ pub struct WorldDb {
     ///
     /// This registry stays in-memory because `WorldDb` is the runtime
     /// owner for both durability and task callback dispatch.
-    pub(crate) tick_callbacks: RefCell<HashMap<String, WorldTickCallback>>,
+    pub(crate) tick_callbacks: RefCell<HashMap<String, Box<dyn WorldTickCallback>>>,
 }
 
 impl std::fmt::Debug for WorldDb {

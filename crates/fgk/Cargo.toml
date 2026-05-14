@@ -53,6 +53,8 @@ anyhow = { workspace = true }
 
 thiserror = { workspace = true }
 
+serde_json = { workspace = true }
+
 [dev-dependencies]
 # Round-trip the embedded `Cargo.toml` template through a real TOML
 # parser as part of the template fixture tests.
@@ -65,10 +67,6 @@ tempfile = { workspace = true }
 # Drives the `fgk` binary as an end-to-end smoke test.
 assert_cmd = { workspace = true }
 predicates = { workspace = true }
-
-# Parse the JSON `fgk emit-manifest` prints to stdout in CLI smoke
-# tests, so assertions are on values rather than brittle substring matches.
-serde_json = { workspace = true }
 
 # Syntactic validation of the embedded `src/main.rs` template.
 # `default-features = false` keeps the dev-dep surface small: we only

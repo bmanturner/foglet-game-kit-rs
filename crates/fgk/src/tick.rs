@@ -120,6 +120,12 @@ pub struct TickRunSummary {
     pub tasks_skipped: usize,
 }
 
+#[derive(Debug)]
+enum DurableTickTask {
+    Interval { key: String, interval_seconds: i64 },
+    DailySlots { key: String, slots: Vec<String> },
+}
+
 /// Execute one `fgk tick` call against a project.
 ///
 /// This is the library half of the CLI subcommand. It is intentionally
@@ -166,20 +172,45 @@ pub fn run_tick(project_dir: &Path) -> Result<TickRunSummary, TickCommandError> 
         .apply_migration(&WORLD_TICK_TASKS_MIGRATION)
         .map_err(|source| TickCommandError::EnsureTickTable { source })?;
 
-    let tasks: Vec<(String, i64)> = {
+    let tasks: Vec<DurableTickTask> = {
         let mut stmt = world
             .connection()
-            .prepare("SELECT key, interval_seconds FROM world_tick_tasks ORDER BY key")
+            .prepare(
+                "SELECT key, interval_seconds, COALESCE(schedule_kind, 'interval'), daily_slots_json\n\
+                 FROM world_tick_tasks ORDER BY key",
+            )
             .map_err(|source| TickCommandError::ReadTasks {
                 details: source.to_string(),
             })?;
         let rows = stmt
-            .query_map([], |row| Ok::<(String, i64), _>((row.get(0)?, row.get(1)?)))
+            .query_map([], |row| {
+                let key: String = row.get(0)?;
+                let interval_seconds: i64 = row.get(1)?;
+                let schedule_kind: String = row.get(2)?;
+                let slots_json: Option<String> = row.get(3)?;
+                match schedule_kind.as_str() {
+                    "interval" => Ok(DurableTickTask::Interval {
+                        key,
+                        interval_seconds,
+                    }),
+                    "daily_slots" => {
+                        let slots = slots_json
+                            .as_deref()
+                            .and_then(|raw| serde_json::from_str::<Vec<String>>(raw).ok())
+                            .unwrap_or_default();
+                        Ok(DurableTickTask::DailySlots { key, slots })
+                    }
+                    _ => Ok(DurableTickTask::Interval {
+                        key,
+                        interval_seconds,
+                    }),
+                }
+            })
             .map_err(|source| TickCommandError::ReadTasks {
                 details: source.to_string(),
             })?;
 
-        let mut out = Vec::<(String, i64)>::new();
+        let mut out = Vec::<DurableTickTask>::new();
         for row in rows {
             out.push(row.map_err(|source| TickCommandError::ReadTasks {
                 details: source.to_string(),
@@ -188,16 +219,34 @@ pub fn run_tick(project_dir: &Path) -> Result<TickRunSummary, TickCommandError> 
         out
     };
 
-    for (key, interval_seconds) in tasks {
+    for task in tasks {
         let delay_ms = callback_delay_ms;
-        world
-            .register_tick(&key, interval_seconds, move |_tx| {
-                if let Some(delay_ms) = delay_ms {
-                    thread::sleep(Duration::from_millis(delay_ms));
-                }
-                Ok(())
-            })
-            .map_err(|source| TickCommandError::RegisterCallback { key, source })?;
+        match task {
+            DurableTickTask::Interval {
+                key,
+                interval_seconds,
+            } => {
+                world
+                    .register_tick(&key, interval_seconds, move |_tx| {
+                        if let Some(delay_ms) = delay_ms {
+                            thread::sleep(Duration::from_millis(delay_ms));
+                        }
+                        Ok(())
+                    })
+                    .map_err(|source| TickCommandError::RegisterCallback { key, source })?;
+            }
+            DurableTickTask::DailySlots { key, slots } => {
+                let slot_refs = slots.iter().map(String::as_str).collect::<Vec<_>>();
+                world
+                    .register_daily_slot_tick(&key, &slot_refs, move |_tx, _context| {
+                        if let Some(delay_ms) = delay_ms {
+                            thread::sleep(Duration::from_millis(delay_ms));
+                        }
+                        Ok(())
+                    })
+                    .map_err(|source| TickCommandError::RegisterCallback { key, source })?;
+            }
+        }
     }
 
     let now: String = world
@@ -226,9 +275,14 @@ pub fn run_tick(project_dir: &Path) -> Result<TickRunSummary, TickCommandError> 
     let tasks_run = world
         .run_due_ticks(&now, config.world_ticks.max_catchup_per_call)
         .map_err(|source| TickCommandError::RunDueTicks { source })?;
+    let more_due = world
+        .has_due_ticks(&now)
+        .map_err(|source| TickCommandError::RunDueTicks { source })?;
 
     Ok(TickRunSummary {
         tasks_run,
-        tasks_skipped: due_count.saturating_sub(tasks_run),
+        tasks_skipped: due_count
+            .saturating_sub(tasks_run)
+            .max(usize::from(more_due)),
     })
 }

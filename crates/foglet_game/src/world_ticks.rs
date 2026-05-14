@@ -21,9 +21,40 @@
 //! - In a **dungeon crawler**, tasks can restock room hazards.
 //!   reset timed puzzle state, or run patrol-wave churn.
 
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::world_db::{WorldDb, WorldMigration, WorldTickCallback};
+
+struct IntervalTickCallback<F>(F);
+
+impl<F> WorldTickCallback for IntervalTickCallback<F>
+where
+    F: FnMut(&rusqlite::Transaction<'_>) -> rusqlite::Result<()> + 'static,
+{
+    fn call(
+        &mut self,
+        tx: &rusqlite::Transaction<'_>,
+        _context: &WorldTickContext,
+    ) -> rusqlite::Result<()> {
+        (self.0)(tx)
+    }
+}
+
+struct ContextTickCallback<F>(F);
+
+impl<F> WorldTickCallback for ContextTickCallback<F>
+where
+    F: FnMut(&rusqlite::Transaction<'_>, &WorldTickContext) -> rusqlite::Result<()> + 'static,
+{
+    fn call(
+        &mut self,
+        tx: &rusqlite::Transaction<'_>,
+        context: &WorldTickContext,
+    ) -> rusqlite::Result<()> {
+        (self.0)(tx, context)
+    }
+}
 
 /// Durable timer task persisted in `world_tick_tasks`.
 ///
@@ -47,6 +78,92 @@ pub struct WorldTickTask {
     pub interval_seconds: i64,
     /// Optional game-authored metadata payload.
     pub metadata_json: Option<String>,
+    /// Durable schedule kind for this task.
+    pub schedule_kind: WorldTickScheduleKind,
+    /// Fixed daily slots for daily-slot tasks.
+    pub daily_slots: Vec<DailySlot>,
+    /// Last completed scheduled slot for daily-slot tasks.
+    pub last_completed_slot_at: Option<String>,
+}
+
+/// Schedule kind persisted for a world tick task.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorldTickScheduleKind {
+    /// Legacy interval task using `last_run_at + interval_seconds`.
+    Interval,
+    /// Fixed clock slots that do not drift when execution is late.
+    DailySlots,
+}
+
+/// A validated wall-clock daily slot in 24-hour `HH:MM` form.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct DailySlot {
+    hour: u8,
+    minute: u8,
+}
+
+impl DailySlot {
+    /// Create a validated daily slot from hour and minute components.
+    pub fn new(hour: u8, minute: u8) -> Result<Self, WorldTickError> {
+        if hour > 23 || minute > 59 {
+            return Err(WorldTickError::InvalidDailySlot {
+                slot: format!("{hour:02}:{minute:02}"),
+            });
+        }
+        Ok(Self { hour, minute })
+    }
+
+    /// Parse a validated daily slot from `HH:MM`.
+    pub fn parse(raw: &str) -> Result<Self, WorldTickError> {
+        let Some((hour, minute)) = raw.split_once(':') else {
+            return Err(WorldTickError::InvalidDailySlot {
+                slot: raw.to_string(),
+            });
+        };
+        if hour.len() != 2 || minute.len() != 2 {
+            return Err(WorldTickError::InvalidDailySlot {
+                slot: raw.to_string(),
+            });
+        }
+        let hour = hour
+            .parse::<u8>()
+            .map_err(|_| WorldTickError::InvalidDailySlot {
+                slot: raw.to_string(),
+            })?;
+        let minute = minute
+            .parse::<u8>()
+            .map_err(|_| WorldTickError::InvalidDailySlot {
+                slot: raw.to_string(),
+            })?;
+        Self::new(hour, minute).map_err(|_| WorldTickError::InvalidDailySlot {
+            slot: raw.to_string(),
+        })
+    }
+
+    /// Return the canonical `HH:MM` representation.
+    pub fn as_hh_mm(self) -> String {
+        format!("{:02}:{:02}", self.hour, self.minute)
+    }
+
+    fn seconds_after_midnight(self) -> i64 {
+        i64::from(self.hour) * 3600 + i64::from(self.minute) * 60
+    }
+}
+
+/// Context supplied to world tick callbacks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorldTickContext {
+    /// Stable task key.
+    pub task_key: String,
+    /// Scheduled slot datetime being applied.
+    pub scheduled_at: String,
+    /// Actual runner datetime supplied to `run_due_ticks`.
+    pub actual_run_at: String,
+    /// Schedule kind that produced this callback.
+    pub schedule_kind: WorldTickScheduleKind,
+    /// Zero-based ordering within this `run_due_ticks` invocation.
+    pub catchup_index: usize,
 }
 
 /// Errors for task registration and lookup.
@@ -113,6 +230,34 @@ pub enum WorldTickError {
         #[source]
         source: rusqlite::Error,
     },
+    /// Daily slot list was empty.
+    #[error("daily slot tick `{key}` must include at least one slot")]
+    EmptyDailySlots {
+        /// Task key that failed validation.
+        key: String,
+    },
+    /// A daily slot was malformed or outside 00:00 through 23:59.
+    #[error("invalid daily slot `{slot}`; expected unique HH:MM between 00:00 and 23:59")]
+    InvalidDailySlot {
+        /// Malformed slot value.
+        slot: String,
+    },
+    /// A daily slot list repeated a slot.
+    #[error("duplicate daily slot `{slot}` for `{key}`")]
+    DuplicateDailySlot {
+        /// Task key that failed validation.
+        key: String,
+        /// Duplicate slot.
+        slot: String,
+    },
+    /// Persisted schedule metadata could not be understood.
+    #[error("ambiguous world tick schedule metadata for `{key}`: {details}")]
+    AmbiguousScheduleMetadata {
+        /// Task key with bad durable metadata.
+        key: String,
+        /// Explanation of the metadata problem.
+        details: String,
+    },
 }
 
 impl WorldDb {
@@ -139,6 +284,8 @@ impl WorldDb {
     where
         F: FnMut(&rusqlite::Transaction<'_>) -> rusqlite::Result<()> + 'static,
     {
+        self.ensure_world_tick_schedule_columns(key)?;
+
         if interval_seconds <= 0 {
             return Err(WorldTickError::InvalidInterval {
                 key: key.to_string(),
@@ -154,10 +301,13 @@ impl WorldDb {
         })?;
 
         tx.execute(
-            "INSERT INTO world_tick_tasks (key, interval_seconds, metadata_json)\n\
-             VALUES (?1, ?2, NULL)\n\
+            "INSERT INTO world_tick_tasks (key, interval_seconds, metadata_json, schedule_kind)\n\
+             VALUES (?1, ?2, NULL, 'interval')\n\
              ON CONFLICT(key) DO UPDATE\n\
-             SET interval_seconds = excluded.interval_seconds",
+             SET interval_seconds = excluded.interval_seconds,\n\
+                 schedule_kind = 'interval',\n\
+                 daily_slots_json = NULL,\n\
+                 last_completed_slot_at = NULL",
             rusqlite::params![key, interval_seconds],
         )
         .map_err(|source| WorldTickError::RegisterFailed {
@@ -167,9 +317,7 @@ impl WorldDb {
 
         let task = tx
             .query_row(
-                "SELECT key, last_run_at, interval_seconds, metadata_json\n\
-                 FROM world_tick_tasks\n\
-                 WHERE key = ?1",
+                &format!("{SELECT_TASK_SQL} FROM world_tick_tasks WHERE key = ?1"),
                 rusqlite::params![key],
                 row_to_world_tick_task,
             )
@@ -186,7 +334,154 @@ impl WorldDb {
 
         self.tick_callbacks
             .borrow_mut()
-            .insert(key.to_string(), Box::new(on_commit) as WorldTickCallback);
+            .insert(key.to_string(), Box::new(IntervalTickCallback(on_commit)));
+
+        Ok(task)
+    }
+
+    fn next_due_tick(&self, now: &str) -> Result<Option<(WorldTickTask, String)>, WorldTickError> {
+        use rusqlite::OptionalExtension;
+
+        let interval = self
+            .connection()
+            .query_row(
+                &format!(
+                    "{SELECT_TASK_SQL} FROM world_tick_tasks\n\
+                     WHERE schedule_kind = 'interval'\n\
+                       AND (last_run_at IS NULL\n\
+                            OR datetime(last_run_at, '+' || interval_seconds || ' seconds') <= ?1)\n\
+                     ORDER BY key LIMIT 1"
+                ),
+                rusqlite::params![now],
+                row_to_world_tick_task,
+            )
+            .optional()
+            .map_err(|source| WorldTickError::DueTasksQueryFailed { source })?
+            .map(|task| (task, now.to_string()));
+
+        let mut stmt = self
+            .connection()
+            .prepare(&format!(
+                "{SELECT_TASK_SQL} FROM world_tick_tasks\n\
+                 WHERE schedule_kind = 'daily_slots'\n\
+                 ORDER BY key"
+            ))
+            .map_err(|source| WorldTickError::DueTasksQueryFailed { source })?;
+        let daily_rows = stmt
+            .query_map([], row_to_world_tick_task)
+            .map_err(|source| WorldTickError::DueTasksQueryFailed { source })?;
+
+        let mut best_daily: Option<(WorldTickTask, String)> = None;
+        for row in daily_rows {
+            let task = row.map_err(|source| WorldTickError::DueTasksQueryFailed { source })?;
+            let scheduled_at = next_due_daily_slot(&task, now)?;
+            if let Some(scheduled_at) = scheduled_at {
+                let replace = best_daily
+                    .as_ref()
+                    .map(|(best_task, best_scheduled_at)| {
+                        scheduled_at < *best_scheduled_at
+                            || (scheduled_at == *best_scheduled_at && task.key < best_task.key)
+                    })
+                    .unwrap_or(true);
+                if replace {
+                    best_daily = Some((task, scheduled_at));
+                }
+            }
+        }
+
+        Ok(match (interval, best_daily) {
+            (Some(interval), Some(daily)) => {
+                if daily.1 <= interval.1 {
+                    Some(daily)
+                } else {
+                    Some(interval)
+                }
+            }
+            (Some(interval), None) => Some(interval),
+            (None, Some(daily)) => Some(daily),
+            (None, None) => None,
+        })
+    }
+
+    /// Register a recurring world tick at fixed daily `HH:MM` wall-clock slots.
+    ///
+    /// Slots are stored in sorted canonical order and the task remains keyed by
+    /// `key`, so re-registering the same key updates the durable schedule
+    /// instead of creating another task. Timestamps are interpreted in the same
+    /// timezone as the `now` string supplied to [`WorldDb::run_due_ticks`].
+    pub fn register_daily_slot_tick<F>(
+        &mut self,
+        key: &str,
+        slots: &[&str],
+        on_commit: F,
+    ) -> Result<WorldTickTask, WorldTickError>
+    where
+        F: FnMut(&rusqlite::Transaction<'_>, &WorldTickContext) -> rusqlite::Result<()> + 'static,
+    {
+        self.ensure_world_tick_schedule_columns(key)?;
+
+        let slots = validate_slots(key, slots)?;
+        self.register_daily_slot_tick_slots(key, &slots, on_commit)
+    }
+
+    /// Register a fixed daily slot tick from already typed slots.
+    pub fn register_daily_slot_tick_slots<F>(
+        &mut self,
+        key: &str,
+        slots: &[DailySlot],
+        on_commit: F,
+    ) -> Result<WorldTickTask, WorldTickError>
+    where
+        F: FnMut(&rusqlite::Transaction<'_>, &WorldTickContext) -> rusqlite::Result<()> + 'static,
+    {
+        self.ensure_world_tick_schedule_columns(key)?;
+
+        let slots = validate_typed_slots(key, slots)?;
+        let slots_json =
+            serde_json::to_string(&slots.iter().map(|slot| slot.as_hh_mm()).collect::<Vec<_>>())
+                .expect("serializing daily slots cannot fail");
+
+        let tx = self.connection_mut().transaction().map_err(|source| {
+            WorldTickError::RegisterFailed {
+                key: key.to_string(),
+                source,
+            }
+        })?;
+
+        tx.execute(
+            "INSERT INTO world_tick_tasks (key, interval_seconds, metadata_json, schedule_kind, daily_slots_json)\n\
+             VALUES (?1, 1, NULL, 'daily_slots', ?2)\n\
+             ON CONFLICT(key) DO UPDATE\n\
+             SET interval_seconds = 1,\n\
+                 schedule_kind = 'daily_slots',\n\
+                 daily_slots_json = excluded.daily_slots_json",
+            rusqlite::params![key, slots_json],
+        )
+        .map_err(|source| WorldTickError::RegisterFailed {
+            key: key.to_string(),
+            source,
+        })?;
+
+        let task = tx
+            .query_row(
+                &format!("{SELECT_TASK_SQL} FROM world_tick_tasks WHERE key = ?1"),
+                rusqlite::params![key],
+                row_to_world_tick_task,
+            )
+            .map_err(|source| WorldTickError::ReadAfterRegisterFailed {
+                key: key.to_string(),
+                source,
+            })?;
+
+        tx.commit()
+            .map_err(|source| WorldTickError::RegisterFailed {
+                key: key.to_string(),
+                source,
+            })?;
+
+        self.tick_callbacks
+            .borrow_mut()
+            .insert(key.to_string(), Box::new(ContextTickCallback(on_commit)));
 
         Ok(task)
     }
@@ -228,30 +523,16 @@ impl WorldDb {
         now: &str,
         max_catchup_per_call: u32,
     ) -> Result<usize, WorldTickError> {
+        self.ensure_world_tick_schedule_columns("run_due_ticks")?;
+
         if max_catchup_per_call == 0 {
             return Ok(0);
         }
 
         use rusqlite::params;
-        use rusqlite::OptionalExtension;
-
         let mut ran = 0_usize;
         while ran < max_catchup_per_call as usize {
-            let Some(task) = self
-                .connection()
-                .query_row(
-                    "SELECT key, last_run_at, interval_seconds, metadata_json\n\
-                     FROM world_tick_tasks\n\
-                     WHERE last_run_at IS NULL\n\
-                        OR datetime(last_run_at, '+' || interval_seconds || ' seconds') <= ?1\n\
-                     ORDER BY key\n\
-                     LIMIT 1",
-                    params![now],
-                    row_to_world_tick_task,
-                )
-                .optional()
-                .map_err(|source| WorldTickError::DueTasksQueryFailed { source })?
-            else {
+            let Some((task, scheduled_at)) = self.next_due_tick(now)? else {
                 break;
             };
 
@@ -271,17 +552,29 @@ impl WorldDb {
                 }
             })?;
 
-            let updated = tx
-                .execute(
+            let updated = if task.schedule_kind == WorldTickScheduleKind::DailySlots {
+                tx.execute(
+                    "UPDATE world_tick_tasks\n\
+                     SET last_run_at = ?3,\n\
+                         last_completed_slot_at = ?2\n\
+                     WHERE key = ?1\n\
+                       AND schedule_kind = 'daily_slots'\n\
+                       AND (last_completed_slot_at IS NULL OR last_completed_slot_at < ?2)",
+                    params![task.key, scheduled_at, now],
+                )
+            } else {
+                tx.execute(
                     "UPDATE world_tick_tasks\n\
                      SET last_run_at = ?2\n\
                      WHERE key = ?1\n\
+                        AND schedule_kind = 'interval'\n\
                         AND (\n\
                              last_run_at IS NULL\n\
                              OR datetime(last_run_at, '+' || interval_seconds || ' seconds') <= ?2\n\
                         )",
                     params![task.key, now],
                 )
+            }
                 .map_err(|source| WorldTickError::RunTickFailed {
                     key: task.key.clone(),
                     source,
@@ -295,7 +588,15 @@ impl WorldDb {
                 continue;
             }
 
-            if let Err(source) = callback(&tx) {
+            let context = WorldTickContext {
+                task_key: task.key.clone(),
+                scheduled_at,
+                actual_run_at: now.to_string(),
+                schedule_kind: task.schedule_kind,
+                catchup_index: ran,
+            };
+
+            if let Err(source) = callback.call(&tx, &context) {
                 drop(tx);
                 self.tick_callbacks
                     .borrow_mut()
@@ -321,15 +622,254 @@ impl WorldDb {
 
         Ok(ran)
     }
+
+    /// Return whether any interval task or fixed daily slot is currently due.
+    ///
+    /// This is intended for operator summaries after a bounded
+    /// [`WorldDb::run_due_ticks`] pass. It uses the same schedule discovery as
+    /// the runner without claiming or mutating a task.
+    pub fn has_due_ticks(&mut self, now: &str) -> Result<bool, WorldTickError> {
+        self.ensure_world_tick_schedule_columns("has_due_ticks")?;
+        self.next_due_tick(now).map(|due| due.is_some())
+    }
+
+    fn ensure_world_tick_schedule_columns(&mut self, key: &str) -> Result<(), WorldTickError> {
+        let existing = self
+            .connection()
+            .prepare("SELECT name FROM pragma_table_info('world_tick_tasks')")
+            .and_then(|mut stmt| {
+                stmt.query_map([], |row| row.get::<_, String>(0))?
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .map_err(|source| WorldTickError::RegisterFailed {
+                key: key.to_string(),
+                source,
+            })?;
+
+        let conn = self.connection_mut();
+        if !existing.iter().any(|name| name == "schedule_kind") {
+            conn.execute_batch(
+                "ALTER TABLE world_tick_tasks ADD COLUMN schedule_kind TEXT NOT NULL DEFAULT 'interval' CHECK (schedule_kind IN ('interval', 'daily_slots'))",
+            )
+            .map_err(|source| WorldTickError::RegisterFailed {
+                key: key.to_string(),
+                source,
+            })?;
+        }
+        if !existing.iter().any(|name| name == "daily_slots_json") {
+            conn.execute_batch("ALTER TABLE world_tick_tasks ADD COLUMN daily_slots_json TEXT")
+                .map_err(|source| WorldTickError::RegisterFailed {
+                    key: key.to_string(),
+                    source,
+                })?;
+        }
+        if !existing.iter().any(|name| name == "last_completed_slot_at") {
+            conn.execute_batch(
+                "ALTER TABLE world_tick_tasks ADD COLUMN last_completed_slot_at TEXT",
+            )
+            .map_err(|source| WorldTickError::RegisterFailed {
+                key: key.to_string(),
+                source,
+            })?;
+        }
+        Ok(())
+    }
 }
 
+const SELECT_TASK_SQL: &str = "\
+SELECT key, last_run_at, interval_seconds, metadata_json,\n\
+       COALESCE(schedule_kind, 'interval'), daily_slots_json, last_completed_slot_at";
+
 fn row_to_world_tick_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorldTickTask> {
+    use rusqlite::types::Type;
+
+    let key: String = row.get(0)?;
+    let schedule_kind_raw: String = row.get(4)?;
+    let schedule_kind = match schedule_kind_raw.as_str() {
+        "interval" => WorldTickScheduleKind::Interval,
+        "daily_slots" => WorldTickScheduleKind::DailySlots,
+        _ => {
+            return Err(rusqlite::Error::FromSqlConversionFailure(
+                4,
+                Type::Text,
+                format!("unknown schedule_kind `{schedule_kind_raw}`").into(),
+            ))
+        }
+    };
+    let daily_slots_json: Option<String> = row.get(5)?;
+    let daily_slots = match (schedule_kind, daily_slots_json) {
+        (WorldTickScheduleKind::Interval, _) => Vec::new(),
+        (WorldTickScheduleKind::DailySlots, Some(raw)) => {
+            let raw_slots: Vec<String> = serde_json::from_str(&raw).map_err(|source| {
+                rusqlite::Error::FromSqlConversionFailure(5, Type::Text, Box::new(source))
+            })?;
+            let slot_refs = raw_slots.iter().map(String::as_str).collect::<Vec<_>>();
+            validate_slots(&key, &slot_refs).map_err(|source| {
+                rusqlite::Error::FromSqlConversionFailure(5, Type::Text, Box::new(source))
+            })?
+        }
+        (WorldTickScheduleKind::DailySlots, None) => {
+            return Err(rusqlite::Error::FromSqlConversionFailure(
+                5,
+                Type::Null,
+                "daily slot schedule missing slots".into(),
+            ))
+        }
+    };
+
     Ok(WorldTickTask {
-        key: row.get(0)?,
+        key,
         last_run_at: row.get(1)?,
         interval_seconds: row.get(2)?,
         metadata_json: row.get(3)?,
+        schedule_kind,
+        daily_slots,
+        last_completed_slot_at: row.get(6)?,
     })
+}
+
+fn validate_slots(key: &str, slots: &[&str]) -> Result<Vec<DailySlot>, WorldTickError> {
+    if slots.is_empty() {
+        return Err(WorldTickError::EmptyDailySlots {
+            key: key.to_string(),
+        });
+    }
+    let parsed = slots
+        .iter()
+        .map(|slot| DailySlot::parse(slot))
+        .collect::<Result<Vec<_>, _>>()?;
+    validate_typed_slots(key, &parsed)
+}
+
+fn validate_typed_slots(key: &str, slots: &[DailySlot]) -> Result<Vec<DailySlot>, WorldTickError> {
+    if slots.is_empty() {
+        return Err(WorldTickError::EmptyDailySlots {
+            key: key.to_string(),
+        });
+    }
+    let mut slots = slots.to_vec();
+    slots.sort();
+    for pair in slots.windows(2) {
+        if pair[0] == pair[1] {
+            return Err(WorldTickError::DuplicateDailySlot {
+                key: key.to_string(),
+                slot: pair[0].as_hh_mm(),
+            });
+        }
+    }
+    Ok(slots)
+}
+
+fn next_due_daily_slot(task: &WorldTickTask, now: &str) -> Result<Option<String>, WorldTickError> {
+    let now_parts =
+        parse_datetime(now).ok_or_else(|| WorldTickError::AmbiguousScheduleMetadata {
+            key: task.key.clone(),
+            details: format!("runner now `{now}` is not YYYY-MM-DD HH:MM:SS"),
+        })?;
+    let last_parts = task
+        .last_completed_slot_at
+        .as_deref()
+        .map(|last| {
+            parse_datetime(last).ok_or_else(|| WorldTickError::AmbiguousScheduleMetadata {
+                key: task.key.clone(),
+                details: "last_completed_slot_at is not YYYY-MM-DD HH:MM:SS".to_string(),
+            })
+        })
+        .transpose()?;
+
+    let now_day = days_from_civil(now_parts.0, now_parts.1, now_parts.2);
+    let now_second = now_parts.3;
+    if task.last_completed_slot_at.is_none() {
+        return Ok(task
+            .daily_slots
+            .iter()
+            .rev()
+            .find(|slot| slot.seconds_after_midnight() <= now_second)
+            .map(|slot| {
+                format!(
+                    "{:04}-{:02}-{:02} {}:00",
+                    now_parts.0,
+                    now_parts.1,
+                    now_parts.2,
+                    slot.as_hh_mm()
+                )
+            }));
+    }
+    let start_day = last_parts
+        .map(|(year, month, day, _)| days_from_civil(year, month, day))
+        .unwrap_or(now_day);
+
+    for day in start_day..=now_day {
+        let (year, month, dom) = civil_from_days(day);
+        for slot in &task.daily_slots {
+            let scheduled_second = slot.seconds_after_midnight();
+            if day == now_day && scheduled_second > now_second {
+                continue;
+            }
+            let scheduled_at = format!("{year:04}-{month:02}-{dom:02} {}:00", slot.as_hh_mm());
+            if task
+                .last_completed_slot_at
+                .as_deref()
+                .map(|last| scheduled_at.as_str() <= last)
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            return Ok(Some(scheduled_at));
+        }
+    }
+
+    Ok(None)
+}
+
+fn parse_datetime(raw: &str) -> Option<(i32, u32, u32, i64)> {
+    let date = raw.get(0..10)?;
+    let time = raw.get(11..19)?;
+    if raw.as_bytes().get(10) != Some(&b' ') {
+        return None;
+    }
+    let year = date.get(0..4)?.parse::<i32>().ok()?;
+    let month = date.get(5..7)?.parse::<u32>().ok()?;
+    let day = date.get(8..10)?.parse::<u32>().ok()?;
+    let hour = time.get(0..2)?.parse::<i64>().ok()?;
+    let minute = time.get(3..5)?.parse::<i64>().ok()?;
+    let second = time.get(6..8)?.parse::<i64>().ok()?;
+    if !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || !(0..=23).contains(&hour)
+        || !(0..=59).contains(&minute)
+        || !(0..=59).contains(&second)
+    {
+        return None;
+    }
+    Some((year, month, day, hour * 3600 + minute * 60 + second))
+}
+
+fn days_from_civil(year: i32, month: u32, day: u32) -> i64 {
+    let year = i64::from(year) - i64::from(month <= 2);
+    let era = (if year >= 0 { year } else { year - 399 }) / 400;
+    let yoe = year - era * 400;
+    let month = i64::from(month);
+    let doy = (153 * (month + if month > 2 { -3 } else { 9 }) + 2) / 5 + i64::from(day) - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe - 719468
+}
+
+fn civil_from_days(days: i64) -> (i32, u32, u32) {
+    let days = days + 719468;
+    let era = (if days >= 0 { days } else { days - 146096 }) / 146097;
+    let doe = days - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = mp + if mp < 10 { 3 } else { -9 };
+    (
+        (year + i64::from(month <= 2)) as i32,
+        month as u32,
+        day as u32,
+    )
 }
 
 /// Migration for the `world_tick_tasks` table.
@@ -350,7 +890,10 @@ CREATE TABLE IF NOT EXISTS world_tick_tasks (
     key             TEXT PRIMARY KEY,
     last_run_at     TEXT,
     interval_seconds INTEGER NOT NULL CHECK (interval_seconds > 0),
-    metadata_json   TEXT
+    metadata_json   TEXT,
+    schedule_kind   TEXT NOT NULL DEFAULT 'interval' CHECK (schedule_kind IN ('interval', 'daily_slots')),
+    daily_slots_json TEXT,
+    last_completed_slot_at TEXT
 );
 ",
 };
@@ -441,7 +984,10 @@ mod tests {
         let persisted = world
             .connection()
             .query_row(
-                "SELECT key, last_run_at, interval_seconds, metadata_json\n                 FROM world_tick_tasks\n                 WHERE key = ?1",
+                &format!(
+                    "{} FROM world_tick_tasks WHERE key = ?1",
+                    super::SELECT_TASK_SQL
+                ),
                 params!["dungeon_patrol"],
                 row_to_world_tick_task,
             )
@@ -713,6 +1259,14 @@ mod tests {
                 ("last_run_at".to_string(), 0, 0, "TEXT".to_string()),
                 ("interval_seconds".to_string(), 1, 0, "INTEGER".to_string()),
                 ("metadata_json".to_string(), 0, 0, "TEXT".to_string()),
+                ("schedule_kind".to_string(), 1, 0, "TEXT".to_string()),
+                ("daily_slots_json".to_string(), 0, 0, "TEXT".to_string()),
+                (
+                    "last_completed_slot_at".to_string(),
+                    0,
+                    0,
+                    "TEXT".to_string(),
+                ),
             ],
             "world_tick_tasks schema must match contract"
         );
@@ -885,5 +1439,170 @@ mod tests {
             1,
             "beta task should run once"
         );
+    }
+
+    #[test]
+    fn daily_slot_tick_runs_late_without_drifting_next_slot() {
+        let dir = tempdir().expect("tempdir creates");
+        let db_path = dir.path().join("world.sqlite");
+        let mut world = WorldDb::open(&db_path).expect("open succeeds");
+        world
+            .apply_migration(&WORLD_TICK_TASKS_MIGRATION)
+            .expect("world_tick_tasks migration applies");
+
+        let observed = Rc::new(RefCell::new(Vec::new()));
+        world
+            .register_daily_slot_tick("station_clock", &["00:00", "06:00", "12:00", "18:00"], {
+                let observed = Rc::clone(&observed);
+                move |_tx, context| {
+                    observed.borrow_mut().push((
+                        context.scheduled_at.clone(),
+                        context.actual_run_at.clone(),
+                        context.catchup_index,
+                    ));
+                    Ok(())
+                }
+            })
+            .expect("register daily slot tick");
+
+        let first = world
+            .run_due_ticks("2026-01-01 06:37:00", 1)
+            .expect("late 06:00 slot runs");
+        assert_eq!(first, 1);
+        assert_eq!(
+            observed.borrow().as_slice(),
+            &[(
+                "2026-01-01 06:00:00".to_string(),
+                "2026-01-01 06:37:00".to_string(),
+                0
+            )]
+        );
+
+        let before_noon = world
+            .run_due_ticks("2026-01-01 11:59:00", 10)
+            .expect("next fixed slot is not drifted");
+        assert_eq!(before_noon, 0);
+
+        let noon = world
+            .run_due_ticks("2026-01-01 12:00:00", 10)
+            .expect("fixed noon slot runs at noon");
+        assert_eq!(noon, 1);
+        assert_eq!(observed.borrow()[1].0, "2026-01-01 12:00:00");
+    }
+
+    #[test]
+    fn daily_slot_tick_catches_up_across_midnight_with_cap() {
+        let dir = tempdir().expect("tempdir creates");
+        let db_path = dir.path().join("world.sqlite");
+        let mut world = WorldDb::open(&db_path).expect("open succeeds");
+        world
+            .apply_migration(&WORLD_TICK_TASKS_MIGRATION)
+            .expect("world_tick_tasks migration applies");
+
+        let observed = Rc::new(RefCell::new(Vec::new()));
+        world
+            .register_daily_slot_tick("station_clock", &["00:00", "06:00", "12:00", "18:00"], {
+                let observed = Rc::clone(&observed);
+                move |_tx, context| {
+                    observed.borrow_mut().push(context.scheduled_at.clone());
+                    Ok(())
+                }
+            })
+            .expect("register daily slot tick");
+        world
+            .connection()
+            .execute(
+                "UPDATE world_tick_tasks SET last_completed_slot_at = ?1, last_run_at = ?1 WHERE key = ?2",
+                params!["2026-01-01 18:00:00", "station_clock"],
+            )
+            .expect("seed previous completed slot");
+
+        let ran = world
+            .run_due_ticks("2026-01-02 12:30:00", 2)
+            .expect("catches up with cap");
+        assert_eq!(ran, 2);
+        assert_eq!(
+            observed.borrow().as_slice(),
+            &[
+                "2026-01-02 00:00:00".to_string(),
+                "2026-01-02 06:00:00".to_string()
+            ]
+        );
+
+        let remaining = world
+            .run_due_ticks("2026-01-02 12:30:00", 10)
+            .expect("remaining due slot runs");
+        assert_eq!(remaining, 1);
+        assert_eq!(observed.borrow()[2], "2026-01-02 12:00:00");
+    }
+
+    #[test]
+    fn daily_slot_registration_rejects_invalid_slot_lists() {
+        let dir = tempdir().expect("tempdir creates");
+        let db_path = dir.path().join("world.sqlite");
+        let mut world = WorldDb::open(&db_path).expect("open succeeds");
+        world
+            .apply_migration(&WORLD_TICK_TASKS_MIGRATION)
+            .expect("world_tick_tasks migration applies");
+
+        assert!(matches!(
+            world.register_daily_slot_tick("empty", &[], |_tx, _ctx| Ok(())),
+            Err(WorldTickError::EmptyDailySlots { key }) if key == "empty"
+        ));
+        assert!(matches!(
+            world.register_daily_slot_tick("bad", &["24:00"], |_tx, _ctx| Ok(())),
+            Err(WorldTickError::InvalidDailySlot { slot }) if slot == "24:00"
+        ));
+        assert!(matches!(
+            world.register_daily_slot_tick("dup", &["06:00", "06:00"], |_tx, _ctx| Ok(())),
+            Err(WorldTickError::DuplicateDailySlot { key, slot }) if key == "dup" && slot == "06:00"
+        ));
+    }
+
+    #[test]
+    fn old_interval_only_row_is_upgraded_and_remains_runnable() {
+        let dir = tempdir().expect("tempdir creates");
+        let db_path = dir.path().join("world.sqlite");
+        let mut world = WorldDb::open(&db_path).expect("open succeeds");
+        world
+            .connection()
+            .execute_batch(
+                "CREATE TABLE world_tick_tasks (
+                    key TEXT PRIMARY KEY,
+                    last_run_at TEXT,
+                    interval_seconds INTEGER NOT NULL CHECK (interval_seconds > 0),
+                    metadata_json TEXT
+                );
+                INSERT INTO world_tick_tasks (key, last_run_at, interval_seconds, metadata_json)
+                VALUES ('legacy_interval', NULL, 300, NULL);",
+            )
+            .expect("seed old interval-only schema");
+
+        let calls = Rc::new(RefCell::new(0));
+        world
+            .register_tick("legacy_interval", 300, {
+                let calls = Rc::clone(&calls);
+                move |_tx| {
+                    *calls.borrow_mut() += 1;
+                    Ok(())
+                }
+            })
+            .expect("legacy row registers after additive upgrade");
+
+        let ran = world
+            .run_due_ticks("2026-01-01 10:00:00", 10)
+            .expect("legacy interval row remains runnable");
+        assert_eq!(ran, 1);
+        assert_eq!(*calls.borrow(), 1);
+
+        let schedule_kind: String = world
+            .connection()
+            .query_row(
+                "SELECT schedule_kind FROM world_tick_tasks WHERE key = ?1",
+                params!["legacy_interval"],
+                |row| row.get(0),
+            )
+            .expect("new schedule column exists");
+        assert_eq!(schedule_kind, "interval");
     }
 }

@@ -86,3 +86,7 @@
   game-local trigger duplicates.
 - Documented the shared-world table boundary and the preferred public
   APIs for kit-owned tables.
+- Added fixed daily slot world ticks with validated `HH:MM` schedules,
+  durable schedule metadata, non-drifting due-slot catch-up,
+  transaction-scoped callback context, and `fgk tick` support alongside
+  legacy interval ticks.

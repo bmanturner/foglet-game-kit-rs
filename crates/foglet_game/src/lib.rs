@@ -201,7 +201,10 @@ pub use widgets::{
     render_modal, InventoryList, MenuList, MessageKind, MessageLine,
 };
 pub use world_db::{WorldDb, WorldDbError, WorldDbOptions, WorldMigration};
-pub use world_ticks::{WorldTickError, WorldTickTask, WORLD_TICK_TASKS_MIGRATION};
+pub use world_ticks::{
+    DailySlot, WorldTickContext, WorldTickError, WorldTickScheduleKind, WorldTickTask,
+    WORLD_TICK_TASKS_MIGRATION,
+};
 
 /// Crate version string, sourced from `Cargo.toml` at build time.
 ///
