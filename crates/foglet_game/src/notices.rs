@@ -310,6 +310,86 @@ pub enum NoticeError {
     },
 }
 
+/// Insert one row into `notices` using an existing SQLite transaction or
+/// connection and return the canonical [`Notice`] SQLite produced.
+///
+/// This is the transaction-scoped companion to [`WorldDb::send_notice`].
+/// Use it when a game action must commit a Notice atomically with adjacent
+/// world writes such as events, challenge state, credits, or proof records.
+///
+/// Validation is identical to [`WorldDb::send_notice`] and runs before the SQL
+/// round-trip, so rejected notices do not create rows.
+#[allow(clippy::too_many_arguments)] // Matches `WorldDb::send_notice` so callers can move between the connection-scoped and transaction-scoped APIs without a wrapper type.
+pub fn send_notice_on(
+    conn: &rusqlite::Connection,
+    sender_player_id: Option<i64>,
+    recipient_player_id: i64,
+    kind: &str,
+    subject: &str,
+    body: &str,
+    expires_at: Option<&str>,
+    metadata: Option<&str>,
+    max_body_chars: u32,
+) -> Result<Notice, NoticeError> {
+    validate_notice(subject, body, max_body_chars)?;
+    // `RETURNING` echoes the full row back — including the SQL-side
+    // `CURRENT_TIMESTAMP` default for `created_at` and the `NULL`
+    // values for `read_at` `archived_at`. The column order here
+    // matches `row_to_notice` and the inbox query so all three share
+    // one decoder.
+    const SQL: &str = "\
+INSERT INTO notices \
+    (sender_player_id, recipient_player_id, kind, subject, body, expires_at, metadata) \
+VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+RETURNING id, created_at, sender_player_id, recipient_player_id, \
+          kind, subject, body, read_at, archived_at, expires_at, metadata";
+
+    conn.query_row(
+        SQL,
+        rusqlite::params![
+            sender_player_id,
+            recipient_player_id,
+            kind,
+            subject,
+            body,
+            expires_at,
+            metadata,
+        ],
+        row_to_notice,
+    )
+    .map_err(|source| NoticeError::Sqlite { source })
+}
+
+fn validate_notice(subject: &str, body: &str, max_body_chars: u32) -> Result<(), NoticeError> {
+    // Validation runs before the SQL round-trip so a rejected notice never
+    // produces a row or an autoincrement gap. Order: emptiness first, then
+    // over-cap, subject before body to match authoring-screen tab order.
+    if subject.is_empty() {
+        return Err(NoticeError::EmptySubject);
+    }
+    if body.is_empty() {
+        return Err(NoticeError::EmptyBody);
+    }
+    // Count Unicode scalar values, not bytes — talk in characters, and a byte
+    // cap would penalise non-ASCII text.
+    let subject_chars = subject.chars().count();
+    if subject_chars > NOTICE_SUBJECT_MAX_CHARS {
+        return Err(NoticeError::SubjectTooLong {
+            max: NOTICE_SUBJECT_MAX_CHARS,
+            actual: subject_chars,
+        });
+    }
+    let max_body = max_body_chars as usize;
+    let body_chars = body.chars().count();
+    if body_chars > max_body {
+        return Err(NoticeError::BodyTooLong {
+            max: max_body,
+            actual: body_chars,
+        });
+    }
+    Ok(())
+}
+
 impl WorldDb {
     /// Insert one row into `notices` and return the canonical
     /// [`Notice`] SQLite produced.
@@ -368,63 +448,17 @@ impl WorldDb {
         metadata: Option<&str>,
         max_body_chars: u32,
     ) -> Result<Notice, NoticeError> {
-        // Validation runs before the SQL round-trip so a rejected
-        // notice never produces a row, an autoincrement gap, or an
-        // event-log entry. Order: emptiness first (cheapest, catches
-        // the "blank submit" path), then over-cap. Subject before body
-        // so a notice that's both empty-subject and overlong-body
-        // surfaces the authoring screen's first input as the failure
-        // — that matches keyboard tab order in the planned UI.
-        if subject.is_empty() {
-            return Err(NoticeError::EmptySubject);
-        }
-        if body.is_empty() {
-            return Err(NoticeError::EmptyBody);
-        }
-        // Count Unicode scalar values, not bytes — talk
-        // in characters, and a byte cap would penalise non-ASCII text.
-        let subject_chars = subject.chars().count();
-        if subject_chars > NOTICE_SUBJECT_MAX_CHARS {
-            return Err(NoticeError::SubjectTooLong {
-                max: NOTICE_SUBJECT_MAX_CHARS,
-                actual: subject_chars,
-            });
-        }
-        let max_body = max_body_chars as usize;
-        let body_chars = body.chars().count();
-        if body_chars > max_body {
-            return Err(NoticeError::BodyTooLong {
-                max: max_body,
-                actual: body_chars,
-            });
-        }
-        // `RETURNING` echoes the full row back — including the SQL-side
-        // `CURRENT_TIMESTAMP` default for `created_at` and the `NULL`
-        // values for `read_at` `archived_at`. The column order here
-        // matches `row_to_notice` and the inbox query in so all
-        // three share one decoder.
-        const SQL: &str = "\
-INSERT INTO notices \
-    (sender_player_id, recipient_player_id, kind, subject, body, expires_at, metadata) \
-VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
-RETURNING id, created_at, sender_player_id, recipient_player_id, \
-          kind, subject, body, read_at, archived_at, expires_at, metadata";
-
-        self.connection()
-            .query_row(
-                SQL,
-                rusqlite::params![
-                    sender_player_id,
-                    recipient_player_id,
-                    kind,
-                    subject,
-                    body,
-                    expires_at,
-                    metadata,
-                ],
-                row_to_notice,
-            )
-            .map_err(|source| NoticeError::Sqlite { source })
+        send_notice_on(
+            self.connection(),
+            sender_player_id,
+            recipient_player_id,
+            kind,
+            subject,
+            body,
+            expires_at,
+            metadata,
+            max_body_chars,
+        )
     }
 
     /// Return the recipient's active inbox, newest first
@@ -695,6 +729,14 @@ mod tests {
         (dir, world)
     }
 
+    fn notice_tx_error(source: NoticeError) -> crate::world_db::WorldDbError {
+        crate::world_db::WorldDbError::Transaction {
+            source: rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(
+                source.to_string(),
+            ))),
+        }
+    }
+
     ///   acceptance: applying [`NOTICES_MIGRATION`]
     /// creates the documented `notices` table with the column shape
     ///  pins. Asserts both:
@@ -955,6 +997,79 @@ mod tests {
             )
             .expect("primary-key SELECT decodes the row");
         assert_eq!(stored, sent, "stored row must equal RETURNING row");
+    }
+
+    #[test]
+    fn send_notice_on_commits_with_surrounding_transaction() {
+        let (_dir, mut world) = world_with_notices();
+        let recipient = world
+            .upsert_player(&ctx("u-recipient", "recipient"))
+            .expect("recipient upsert succeeds");
+
+        let sent = world
+            .transaction(|tx| {
+                send_notice_on(
+                    tx,
+                    None,
+                    recipient.id,
+                    "system_advisory",
+                    "Transaction notice",
+                    "This notice is written inside the caller's transaction.",
+                    None,
+                    Some(r#"{"scope":"transaction"}"#),
+                    1_000,
+                )
+                .map_err(notice_tx_error)
+            })
+            .expect("transaction commits");
+
+        assert_eq!(sent.recipient_player_id, recipient.id);
+        assert_eq!(sent.metadata.as_deref(), Some(r#"{"scope":"transaction"}"#));
+        assert_eq!(
+            world.inbox(recipient.id).expect("inbox query succeeds"),
+            vec![sent],
+            "committed transaction notice must be visible in inbox"
+        );
+    }
+
+    #[test]
+    fn send_notice_on_rolls_back_with_surrounding_transaction() {
+        let (_dir, mut world) = world_with_notices();
+        let recipient = world
+            .upsert_player(&ctx("u-recipient", "recipient"))
+            .expect("recipient upsert succeeds");
+
+        let err = world
+            .transaction(|tx| {
+                send_notice_on(
+                    tx,
+                    None,
+                    recipient.id,
+                    "system_advisory",
+                    "Rolled back notice",
+                    "The caller fails after this insert, so the notice rolls back.",
+                    None,
+                    None,
+                    1_000,
+                )
+                .map_err(notice_tx_error)?;
+                Err::<Notice, crate::world_db::WorldDbError>(
+                    crate::world_db::WorldDbError::Transaction {
+                        source: rusqlite::Error::ExecuteReturnedResults,
+                    },
+                )
+            })
+            .expect_err("transaction returns caller failure");
+
+        assert!(matches!(
+            err,
+            crate::world_db::WorldDbError::Transaction { .. }
+        ));
+        let count: i64 = world
+            .connection()
+            .query_row("SELECT COUNT(*) FROM notices", [], |row| row.get(0))
+            .expect("count query succeeds");
+        assert_eq!(count, 0, "transaction rollback must remove notice row");
     }
 
     /// : "System notices MAY have no sender." A `None`

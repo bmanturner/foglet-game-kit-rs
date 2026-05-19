@@ -142,7 +142,9 @@ pub use market::{
     MarketError, MarketListing, MARKET_BUY_EVENT_KIND, MARKET_DISPLAY_NAME_MAX_CHARS,
     MARKET_LISTINGS_MIGRATION,
 };
-pub use notices::{Notice, NoticeError, NOTICES_MIGRATION, NOTICE_SUBJECT_MAX_CHARS};
+pub use notices::{
+    send_notice_on, Notice, NoticeError, NOTICES_MIGRATION, NOTICE_SUBJECT_MAX_CHARS,
+};
 pub use place_recall::{
     merge_recall_namespace_on, merge_recall_snapshot_on, PlaceRecallError, PlaceRecallRecord,
     PLACE_RECALL_MIGRATION,
