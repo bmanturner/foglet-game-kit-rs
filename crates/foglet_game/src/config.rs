@@ -9,7 +9,7 @@
 //! # Why parse-then-validate (vs. pure serde)
 //!
 //! `serde`'s "missing field" errors are accurate but unfriendly:
-//! authors get a single line about `start_map` and have to go hunting
+//! authors get a single line about the field and have to go hunting
 //! for which TOML key they fat-fingered. The loader funnels `serde`
 //! errors and our own validation through one [`ConfigError`] enum so
 //! the `fgk` CLI can wrap them with `anyhow` at the process boundary
@@ -18,10 +18,10 @@
 //! # What's required vs. optional
 //!
 //! Per, every field listed in the fields block belongs in
-//! `GameConfig`. The `[game]` section is fully required — those values
-//! identify the door and seed the player's spawn point, so silently
-//! defaulting them would mask authoring bugs. The `[save]` and
-//! `[manifest]` sections have -documented defaults
+//! `GameConfig`. The core `[game]` identity fields are required. Spawn
+//! fields have documented defaults because not every game uses the
+//! kit's tile-map coordinate model. The `[save]` and `[manifest]`
+//! sections have -documented defaults
 //! ; we accept both "section omitted" and "section
 //! present but partial" by defaulting at the field level.
 
@@ -190,13 +190,16 @@ pub struct GameSection {
     pub min_width: u16,
     /// Minimum terminal rows the game renders into.
     pub min_height: u16,
-    /// Map name the player starts on — must correspond to a map file
-    /// the game ships in `assets/`. Cross-referenced by the map
-    /// loader, not here.
+    /// Map name the player starts on for games that use the kit's
+    /// tile-map spawn model. Defaults to `start` so place- or
+    /// menu-driven games do not need meaningless coordinate metadata.
+    #[serde(default = "default_start_map")]
     pub start_map: String,
     /// Player spawn column on `start_map`.
+    #[serde(default)]
     pub start_x: u16,
     /// Player spawn row on `start_map`.
+    #[serde(default)]
     pub start_y: u16,
 }
 
@@ -664,6 +667,10 @@ pub struct FactionSeed {
     pub description: String,
 }
 
+fn default_start_map() -> String {
+    "start".to_string()
+}
+
 fn default_world_path() -> String {
     "world/world.sqlite".to_string()
 }
@@ -1000,14 +1007,14 @@ slug = "minimal"
 description = ""
 min_width = 80
 min_height = 24
-start_map = "lobby"
-start_x = 0
-start_y = 0
 "#;
         let config = GameConfig::from_toml_str(minimal).unwrap();
         assert_eq!(config.save.strategy, SaveStrategy::PerFogletUser);
         assert_eq!(config.manifest.timeout_ms, DEFAULT_TIMEOUT_MS);
         assert_eq!(config.manifest.visibility, DEFAULT_VISIBILITY);
+        assert_eq!(config.game.start_map, "start");
+        assert_eq!(config.game.start_x, 0);
+        assert_eq!(config.game.start_y, 0);
     }
 
     #[test]

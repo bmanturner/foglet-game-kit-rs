@@ -279,6 +279,16 @@ pub type GameResult<T> = std::result::Result<T, GameError>;
 /// plumbing that consumes values of this type.
 pub type SaveHandler = Box<dyn FnMut() -> Result<(), GameError>>;
 
+/// Boxed callback-registration hook run on the exact [`WorldDb`] handle
+/// the runtime will later use for optional login-time catch-up.
+///
+/// World-tick schedules are durable, but their Rust callbacks are
+/// in-process. Games that rely on `[world_ticks].run_due_ticks_on_login`
+/// must register callbacks on the runtime-owned handle before
+/// `run_due_ticks` claims due work.
+pub type WorldTickRegistrar =
+    Box<dyn FnMut(&mut WorldDb, &GameConfig, &FogletContext) -> Result<(), GameError>>;
+
 /// Source of normalized [`Input`] events for the runtime loop.
 ///
 /// Production uses [`CrosstermEventSource`] (which polls
@@ -390,6 +400,10 @@ pub struct Game {
     /// overwrites, matching the contract that exactly
     /// one handler is in scope at runtime.
     save_handler: Option<SaveHandler>,
+    /// Optional world-tick callback registrars installed before the
+    /// runtime's login catch-up hook runs. Without this, a durable tick
+    /// row can be due but uncallable on the runtime-owned `WorldDb`.
+    world_tick_registrars: Vec<WorldTickRegistrar>,
 }
 
 impl std::fmt::Debug for Game {
@@ -405,6 +419,7 @@ impl std::fmt::Debug for Game {
             .field("config", &self.config.is_some())
             .field("foglet", &self.foglet.is_some())
             .field("save_handler", &self.save_handler.is_some())
+            .field("world_tick_registrars", &self.world_tick_registrars.len())
             .finish()
     }
 }
@@ -428,6 +443,7 @@ impl Game {
             config: None,
             foglet: None,
             save_handler: None,
+            world_tick_registrars: Vec::new(),
         }
     }
 
@@ -488,6 +504,22 @@ impl Game {
     #[must_use]
     pub fn with_foglet_context(mut self, foglet: FogletContext) -> Self {
         self.foglet = Some(foglet);
+        self
+    }
+
+    /// Register world-tick callbacks on the runtime-owned [`WorldDb`]
+    /// before the optional login catch-up pass.
+    ///
+    /// This is separate from `WorldDb::register_tick` because `Game::run`
+    /// opens its own DB handle. The durable task row lives in SQLite, but
+    /// callback dispatch is intentionally in-process on the handle that
+    /// calls `run_due_ticks`.
+    #[must_use]
+    pub fn with_world_tick_registrar<F>(mut self, registrar: F) -> Self
+    where
+        F: FnMut(&mut WorldDb, &GameConfig, &FogletContext) -> Result<(), GameError> + 'static,
+    {
+        self.world_tick_registrars.push(Box::new(registrar));
         self
     }
 
@@ -572,6 +604,7 @@ impl Game {
             config: self.config,
             foglet: self.foglet,
             save_handler: self.save_handler,
+            world_tick_registrars: self.world_tick_registrars,
         })
     }
 
@@ -612,6 +645,9 @@ pub struct BuiltGame {
     /// stray [`crate::ScreenCommand::Save`] is silently ignored
     /// rather than aborting the run.
     pub(crate) save_handler: Option<SaveHandler>,
+    /// Callback registrars to run against the runtime-owned `WorldDb`
+    /// before optional login catch-up.
+    pub(crate) world_tick_registrars: Vec<WorldTickRegistrar>,
 }
 
 impl std::fmt::Debug for BuiltGame {
@@ -627,6 +663,7 @@ impl std::fmt::Debug for BuiltGame {
             .field("config", &self.config.is_some())
             .field("foglet", &self.foglet.is_some())
             .field("save_handler", &self.save_handler.is_some())
+            .field("world_tick_registrars", &self.world_tick_registrars.len())
             .finish()
     }
 }
@@ -953,6 +990,11 @@ where
     B: Backend,
     E: EventSource,
 {
+    if let Some(db) = world_db.as_deref_mut() {
+        for registrar in &mut built.world_tick_registrars {
+            registrar(db, config, foglet)?;
+        }
+    }
     run_due_ticks_on_login_if_enabled(config, world_db.as_deref_mut())?;
 
     // Defensive: `BuiltGame` invariant says the stack is non-empty.
@@ -2763,6 +2805,67 @@ mod tests {
             calls.load(Ordering::SeqCst),
             1,
             "enabled login hook should run one due tick callback before loop dispatch"
+        );
+    }
+
+    #[test]
+    fn run_with_io_registers_world_tick_callbacks_before_login_hook() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut db = WorldDb::open(tmp.path().join("world.sqlite")).expect("open db");
+        db.apply_migration(&crate::world_ticks::WORLD_TICK_TASKS_MIGRATION)
+            .expect("install world_tick_tasks migration");
+
+        let registrar_calls = Arc::new(AtomicUsize::new(0));
+        let registrar_calls_for_hook = Arc::clone(&registrar_calls);
+        let tick_calls = Arc::new(AtomicUsize::new(0));
+        let tick_calls_for_hook = Arc::clone(&tick_calls);
+
+        let mut cfg = fixture_config();
+        cfg.world_ticks.enabled = true;
+        cfg.world_ticks.run_due_ticks_on_login = true;
+
+        let fc = fixture_context();
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let screen = ScriptedScreen::new("title", log, vec![ScreenCommand::Quit], vec![], vec![]);
+        let built = Game::new("title")
+            .with_config(cfg.clone())
+            .with_foglet_context(fc.clone())
+            .with_world_tick_registrar(move |world, _config, _foglet| {
+                registrar_calls_for_hook.fetch_add(1, Ordering::SeqCst);
+                let tick_calls_for_callback = Arc::clone(&tick_calls_for_hook);
+                world
+                    .register_tick("registered-before-login", 60, move |_tx| {
+                        tick_calls_for_callback.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
+                    })
+                    .map(|_| ())
+                    .map_err(|source| GameError::WorldTickOnLogin(source.to_string()))
+            })
+            .push_screen(Box::new(screen))
+            .build()
+            .expect("build");
+        let mut term = make_terminal();
+        let mut events = VecEventSource::new(vec![Some(Input::Char('q'))]);
+        let mut on_save: Box<dyn FnMut() -> Result<(), GameError>> = Box::new(|| Ok(()));
+
+        let reason = run_with_io(
+            built,
+            &cfg,
+            &fc,
+            Some(&mut db),
+            (40, 10),
+            &mut term,
+            &mut events,
+            &mut on_save,
+        )
+        .expect("loop ok");
+
+        assert_eq!(reason, ExitReason::Quit);
+        assert_eq!(registrar_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            tick_calls.load(Ordering::SeqCst),
+            1,
+            "registrar-installed callback should be callable by the login hook"
         );
     }
 
